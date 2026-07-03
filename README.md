@@ -340,19 +340,11 @@ All controls are fully remappable — press **F2** to open the Controls Editor. 
 
 | Role | Name | GitHub |
 |------|------|--------|
-| **Lead Developer** | TheMegineBraine | -- |
-| **Developer / Project Creator** | TheCorrectSynovian | [@QuantumCreeper](https://github.com/TheCorrectSynovian) |
-| **Developer** | MrSinup | -- |
-
-### v7.2 Contributors
-
-| Contribution | Name |
-|-------------|------|
-| **MP3 Playback & Direct libmpg123 Integration** | MrSinup |
-| **KiwiAPI Buttons & Touchables** | Mano K |
-| **Music System Improvements** | Mano K |
-| **I/O Optimization & Build Script Refactoring** | QuantumCreeper |
-| **Launcher & Configuration Architecture** | QuantumCreeper |
+| **Lead Developer** | TheMegineBraine | [@Mano K](https://github.com/branirayine) |
+| **Developer** | TheCorrectSynovian | [@QuantumCreeper](https://github.com/TheCorrectSynovian) |
+| **Developer** | MrSinup | [@BingsWumpus](https://github.com/MrSinup) |
+| **Developer** | X Dukinja | [@Duke](https://github.com/Dukinja) |
+| **Designer** | ETPV | [@ETPV07](https://github.com/ETPV07) | 
 
 ### Research & Community
 
