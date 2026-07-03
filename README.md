@@ -180,21 +180,19 @@ v7.3 Combatch Update brings **Swordfare GUI (ImGui-based vector overlay)**, **Ho
 
 Swordigo Desktop supports **two parallel modding approaches:**
 
-#### 1️⃣ **KiwiAPI / Mini API (Primary — Active Development)**
-- **Status:** Beta (actively developed, primary focus for new mods)
+#### 1️⃣ **KiwiAPI / Mini API Capaitablity (Primary — Active Development)**
+- **Status:** Actively developed, primary focus 
 - **Framework:** SwKiwi/SwMini modloader hooks into SRE
-- **Capabilities:** Full game hooks, custom entities, audio, GUI, saves
-- **Examples:** RLSwordigo, Phonkdigo, KiwiAPI button mods
-- **Recommendation:** Use this for new mods — it's the future of Swordigo modding
+- **Capabilities:** Full game hooks, custom contents, audio, GUI, lua table expansions.
+- **Examples:** RLSwordigo, Phonkdigo, Combatch , Mason mod etc (SwordiForge mods support)
+- **Recommendation:** This acts as a *potential* future PC implementation of libmini.
 
-#### 2️⃣ **SDMOD (Lightweight Custom — Maintained, Not Expanded)**
-- **Status:** Early beta (lightweight, not actively expanded)
-- **Framework:** Direct binary patching + simple Lua tweaks
-- **Capabilities:** Cosmetics, lightweight behavior changes, simple tweaks
-- **Limitations:** Fragile, no advanced hooks, breaks on game updates
+#### 2️⃣ **SDMOD (Lightweight Custom Mods)**
+- **Status:** Lightweight, not actively expanded
+- **Framework:** Direct Asset replacement at runtime + simple Lua tweaks(in future)
+- **Capabilities:** Cosmetics, lightweight visual changes, simple tweaks
+- **Limitations:** Fragile, not advanced and no community.
 - **Note:** Useful for quick tweaks, but superseded by KiwiAPI for complex work
-
-**Bottom line:** Use **KiwiAPI** for serious modding. Use **SDMOD** only for lightweight adjustments.
 
 ---
 
@@ -235,13 +233,15 @@ cd SwordigoDesktop
 |----------|--------|---------|
 | **Vanilla Swordigo 1.4.12 ARM64** | ✅ Fully stable | Beatable end-to-end, all bosses accessible, all progression paths verified |
 | **RLSwordigo 6.6** | 🟡 Near stable | Gameplay stable; some RogueSpells mod features incomplete |
+| **Combatch v3** | 🟡 Nearly stable | Mostly functional; Kiwi Buttons are currently buggy |
 | **Mason Mod** | 🟡 Near stable | Core mechanics work; cosmetic features untested |
+
+*Note:- During CUSTOM GUI , the game's on screen touch controls are not disabled, we are currently working on it*
 
 ### ❌ Not Supported (No Bug Reports)
 
 | Instance | Status | Reason |
 |----------|--------|--------|
-| **Combatch v3** | Works, unstable | Partially functional; crashes on certain mod combinations |
 | **ARM32 instances** | Deprecated | No SRE support, not actively maintained (ARM64 is the future) |
 | **Other custom mods** | As-is | Use KiwiAPI framework for new mod development |
 
@@ -290,8 +290,7 @@ All controls are fully remappable — press **F2** to open the Controls Editor. 
 ### ARM64 (arm64-v8a) — Primary Target
 | Issue | Severity | Details |
 |-------|----------|---------|
-| Bolt/timer misbehavior | 🟡 Medium | Timing misalignment causes certain bosses, bolt-shooting enemies, and bolt traps to fire at abnormal rates. Will be patched. |
-| Text input crash | 🟡 Medium | Typing into certain UI fields can crash — avoid F7 in menus |
+| Text input crash | 🟡 Medium | Typing into certain UI fields can crash — avoid it |
 
 ### ARM32 (armeabi-v7a) — Deprecated
 | Issue | Severity | Details |
@@ -301,36 +300,12 @@ All controls are fully remappable — press **F2** to open the Controls Editor. 
 | No SRE | 🔴 High | libsre.so is ARM64 only — ARM32 runs without engine hooks |
 | **Not actively maintained** | ⚠️ Design | Focus is 100% on ARM64 for best performance. ARM32 is effectively deprecated. |
 
----
 
-## 🆕 What's New in v7.2
-
-### ⚡ Dynarmic JIT (v7.0 foundation, still present)
-- **ARM64 JIT compiler** — near-native execution
-- **60fps stable framerate** — smooth gameplay
-- **Instant input response** — zero perceptible latency
-
-### 🎵 v7.2 NEW: Custom Music Format Support
-- MP3, OGG, WAV unified support via direct libmpg123
-- **10× faster music loading**
-- Modular search algorithm — all directories checked for all formats
-- Fixed RLSwordigo MP3 loading
-
-### 📁 v7.2 NEW: Decentralized Configuration
-- Per-instance `.ini` files (like PolyMC/Prism)
-- Eliminated centralized JSON manifests
-- Each instance self-contained
-
-### 💨 v7.2 NEW: I/O Optimization
-- Suppressed verbose file operation logs
-- Reduced console spam by 95%
-- Memory leak fixes
-
-### 🔧 v7.2 NEW: KiwiAPI Buttons & Touchables (Beta)
+### 🔧 v7.3 NEW: KiwiAPI Buttons & Touchables (Beta)
 - Experimental interactive GUI elements
 - Full backward compatibility with existing mods
 
-> See [v7.2 Release Notes](RELEASE_NOTES_v7.2.md) for comprehensive details.
+> See [v7.3 Release Notes](RELEASE_NOTES_v7.3.md) for comprehensive details.
 
 ---
 
