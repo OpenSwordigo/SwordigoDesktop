@@ -68,7 +68,7 @@ struct PostFXState {
     float outline_depth_threshold = 0.002f; // depth difference to detect an edge
     
     // Preset name (for display)
-    const char* preset_name = "Off";
+    const char* preset_name = "Low";
 };
 
 enum class PostFXPreset : int {

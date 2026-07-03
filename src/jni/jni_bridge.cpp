@@ -3,6 +3,7 @@
 #include "platform/io_thread.h"
 #include "platform/data_path.h"
 #include "android/asset_manager.h"
+#include "platform/video_background.h"
 #include <iostream>
 #include <cstring>
 #include <cmath>
@@ -3049,15 +3050,23 @@ void bridge_glClearStencil(void* emu_ptr) {
 void bridge_gl_clear(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     g_frame_stats.clear_calls++;
-    GL_DIAG("glClear(0x%x)", emu->get_reg(0));
+    uint32_t mask = emu->get_reg(0);
+    GL_DIAG("glClear(0x%x)", mask);
 #ifdef VULKAN_BACKEND
     if (g_graphics_api == GraphicsAPI::VULKAN) {
-        g_vk_backend.clear(emu->get_reg(0));
+        g_vk_backend.clear(mask);
         return;
     }
 #endif
     if (g_display_active) {
-        glClear(emu->get_reg(0));
+        if (g_void_fill_color.active && (mask & GL_COLOR_BUFFER_BIT)) {
+            float current_clear_color[4];
+            glGetFloatv(GL_COLOR_CLEAR_VALUE, current_clear_color);
+            if (current_clear_color[0] < 0.05f && current_clear_color[1] < 0.05f && current_clear_color[2] < 0.05f) {
+                glClearColor(g_void_fill_color.r, g_void_fill_color.g, g_void_fill_color.b, 1.0f);
+            }
+        }
+        glClear(mask);
     }
 }
 
@@ -3069,6 +3078,13 @@ void bridge_gl_clear_color(void* emu_ptr) {
     float fr, fg, fb, fa;
     memcpy(&fr, &r, 4); memcpy(&fg, &g, 4);
     memcpy(&fb, &b, 4); memcpy(&fa, &a, 4);
+    
+    if (g_void_fill_color.active && fr < 0.01f && fg < 0.01f && fb < 0.01f) {
+        fr = g_void_fill_color.r;
+        fg = g_void_fill_color.g;
+        fb = g_void_fill_color.b;
+    }
+
 #ifdef VULKAN_BACKEND
     if (g_graphics_api == GraphicsAPI::VULKAN) {
         g_vk_backend.clear_color(fr, fg, fb, fa);
@@ -3774,6 +3790,10 @@ void bridge_gl_bind_texture(void* emu_ptr) {
             }
             return;
         }
+        // Video background: upload next video frame before rendering if registered
+        if (tex_id != 0) {
+            VideoBackground::update_texture_maybe(tex_id);
+        }
         glBindTexture(target, tex_id);
         if (g_gl_force_white) {
             if (tex_id == 0) {
@@ -3825,6 +3845,11 @@ void bridge_gl_tex_image_2d(void* emu_ptr) {
             // Create the modified copy with control regions zeroed out
             create_hidden_controls_atlas(target, level, internalformat,
                                           width, height, border, format, type, pixels);
+        }
+        // Video background: register texture if a .mp4 video version exists
+        if (g_last_opened_asset[0] != '\0') {
+            VideoBackground::register_texture_maybe(
+                g_frame_stats.last_bound_texture, g_last_opened_asset, width, height);
         }
     }
 }

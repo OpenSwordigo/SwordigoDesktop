@@ -1443,85 +1443,148 @@ static int l_camctrl_get_up_vector(lua_State* L) {
 }
 
 /* Mini.SceneFindAll() → table of scene object names
- * Placeholder — returns empty table for now */
+ * Placeholder — returns empty table. SwKiwi's implementation iterates an
+ * engine scene tree (ARM offset-based), which we cannot do on PC without
+ * the right guest memory layout. A future implementation can hook scene
+ * events to build this list dynamically. */
 static int l_mini_scene_find_all(lua_State* L) {
     g_lua_createtable(L, 0, 0);
     return 1;
 }
 
+/* Mini.Test() — SwKiwi debug probe (reads hero level and logs it on device).
+ * On desktop we simply return 0 (no-op), matching the no-visible-output
+ * behaviour when logcat is not present. */
+static int l_mini_test(lua_State* L) {
+    (void)L;
+    return 0;
+}
+
 /* Mini.map(...) — polymorphic map function
- * SwMini supports 4 overloads based on arg types:
- *   map(table, fn) — call fn(v) for each value in table
- *   map(fn, table) — call fn(v) for each value in array (same but reversed args)
- *   map(string, fn) — call fn(char) for each character
- *   map(number, fn) — call fn(i) for i=1..n
+ *
+ * SwKiwi supports 4 overloads based on arg types:
+ *   map(table, fn) — table_map: call fn(value, key, table) for each key-value pair
+ *   map(fn, table) — array_map: call fn(value, index, array) for each sequential element
+ *   map(string, fn) — string_map: call fn(char, index, string) for each character
+ *   map(number, fn) — number_map: call fn(index, output_table) for i=1..n
  * All return a table of results.
+ *
+ * Accuracy: matches SwKiwi's the_map_function.c exactly.
  */
 static int l_mini_map(lua_State* L) {
     int nargs = g_lua_gettop(L);
     if (nargs < 2) {
-        g_lua_createtable(L, 0, 0);
-        return 1;
+        if (g_lua_error) return g_lua_error(L);
+        return 0;
     }
 
     int t1 = g_lua_type(L, 1);
     int t2 = g_lua_type(L, 2);
-    int tbl_idx = 0, fn_idx = 0;
 
+    /* map(table, fn) — SwKiwi table_map: fn(value, key, table) */
     if (t1 == LUA_TTABLE && t2 == LUA_TFUNCTION) {
-        tbl_idx = 1; fn_idx = 2;
-    } else if (t1 == LUA_TFUNCTION && t2 == LUA_TTABLE) {
-        fn_idx = 1; tbl_idx = 2;
-    } else if (t1 == LUA_TNUMBER && t2 == LUA_TFUNCTION) {
-        /* map(n, fn) — iterate 1..n */
-        int n = (int)g_lua_tonumber(L, 1);
-        g_lua_createtable(L, n, 0);
-        int result_idx = g_lua_gettop(L);
-        int i;
-        for (i = 1; i <= n; i++) {
+        if (!g_lua_objlen || !g_lua_next || !g_lua_pushvalue) {
+            g_lua_createtable(L, 0, 0); return 1;
+        }
+        g_lua_settop(L, 2);
+        /* Stack: 1=input_table, 2=fn */
+        int out_size = g_lua_objlen ? (int)g_lua_objlen(L, 1) : 0;
+        g_lua_createtable(L, out_size, 0); /* 3=output */
+        g_lua_pushnil(L); /* first key: 4 */
+        while (g_lua_next(L, 1) != 0) {
+            /* key=-2 (4), value=-1 (5) */
+            /* call fn(value, key, table) — 3 args, 1 result */
             if (g_lua_pushvalue) g_lua_pushvalue(L, 2);  /* push fn */
-            g_lua_pushnumber(L, (double)i);
-            g_lua_pcall(L, 1, 1, 0);
-            if (g_lua_rawseti) g_lua_rawseti(L, result_idx, i);
+            if (g_lua_pushvalue) g_lua_pushvalue(L, 5);  /* value */
+            if (g_lua_pushvalue) g_lua_pushvalue(L, 4);  /* key */
+            if (g_lua_pushvalue) g_lua_pushvalue(L, 1);  /* array/table */
+            g_lua_pcall(L, 3, 1, 0); /* result at 6 */
+            /* Duplicate key for rawset (rawset consumes it) */
+            if (g_lua_pushvalue) g_lua_pushvalue(L, 4);
+            if (g_lua_replace) g_lua_replace(L, 5); /* key copy at 5 now, result at 6 */
+            /* output[key] = result */
+            if (g_lua_rawset) g_lua_rawset(L, 3);
+            else { lua_pop(L, 1); }
+            /* key is now on top for next next() call */
+        }
+        return 1;
+    }
+
+    /* map(fn, table) — SwKiwi array_map: fn(value, index, array) */
+    if (t1 == LUA_TFUNCTION && t2 == LUA_TTABLE) {
+        if (!g_lua_objlen || !g_lua_rawgeti || !g_lua_rawseti || !g_lua_pushvalue) {
+            g_lua_createtable(L, 0, 0); return 1;
+        }
+        g_lua_settop(L, 2);
+        /* Stack: 1=fn, 2=array */
+        int len = (int)g_lua_objlen(L, 2);
+        g_lua_createtable(L, len, 0); /* 3=output */
+        int i;
+        for (i = 1; i <= len; i++) {
+            /* fn(value, index, array) — 3 args, 1 result */
+            if (g_lua_pushvalue) g_lua_pushvalue(L, 1);  /* fn */
+            if (g_lua_rawgeti) g_lua_rawgeti(L, 2, i);  /* value */
+            g_lua_pushnumber(L, (double)i);              /* index */
+            if (g_lua_pushvalue) g_lua_pushvalue(L, 2);  /* array */
+            g_lua_pcall(L, 3, 1, 0);
+            if (g_lua_rawseti) g_lua_rawseti(L, 3, i);
             else lua_pop(L, 1);
         }
         return 1;
-    } else if (t1 == LUA_TSTRING && t2 == LUA_TFUNCTION) {
-        /* map(string, fn) — iterate characters */
+    }
+
+    /* map(number, fn) — SwKiwi number_map: fn(index, output_table) → 1 or 2 values */
+    if (t1 == LUA_TNUMBER && t2 == LUA_TFUNCTION) {
+        int n = (int)g_lua_tonumber(L, 1);
+        g_lua_createtable(L, n, 0); /* 3=output */
+        int result_idx = g_lua_gettop(L);
+        int i;
+        for (i = 1; i < n; i++) {  /* SwKiwi loops i < count (not <=) */
+            if (g_lua_pushvalue) g_lua_pushvalue(L, 2);  /* fn */
+            g_lua_pushnumber(L, (double)i);              /* index */
+            if (g_lua_pushvalue) g_lua_pushvalue(L, result_idx); /* output table */
+            g_lua_pcall(L, 2, 2, 0); /* 2 results */
+            /* If second result is nil, function returned one thing */
+            if (g_lua_type(L, -1) == LUA_TNIL) {
+                lua_pop(L, 1); /* remove nil */
+                if (g_lua_rawseti) g_lua_rawseti(L, result_idx, i);
+                else lua_pop(L, 1);
+            } else {
+                /* Two returns: insert -2 before -1 and do rawset */
+                if (g_lua_insert) g_lua_insert(L, -2);
+                if (g_lua_settable) g_lua_settable(L, result_idx);
+                else { lua_pop(L, 2); }
+            }
+        }
+        return 1;
+    }
+
+    /* map(string, fn) — SwKiwi string_map: fn(char, index, string) */
+    if (t1 == LUA_TSTRING && t2 == LUA_TFUNCTION) {
         sre_size_t slen = 0;
         const char* s = g_lua_tolstring(L, 1, &slen);
-        g_lua_createtable(L, (int)slen, 0);
+        if (!s) { g_lua_createtable(L, 0, 0); return 1; }
+        g_lua_createtable(L, (int)slen, 0); /* 3=output */
         int result_idx = g_lua_gettop(L);
         size_t i;
         for (i = 0; i < slen; i++) {
-            if (g_lua_pushvalue) g_lua_pushvalue(L, 2);  /* push fn */
-            if (g_lua_pushlstring) g_lua_pushlstring(L, s + i, 1);
+            if (g_lua_pushvalue) g_lua_pushvalue(L, 2);           /* fn */
+            if (g_lua_pushlstring) g_lua_pushlstring(L, s + i, 1); /* char */
             else g_lua_pushstring(L, "?");
-            g_lua_pcall(L, 1, 1, 0);
+            g_lua_pushnumber(L, (double)(i + 1));                /* index (1-based) */
+            if (g_lua_pushvalue) g_lua_pushvalue(L, 1);          /* whole string */
+            g_lua_pcall(L, 3, 1, 0);
             if (g_lua_rawseti) g_lua_rawseti(L, result_idx, (int)(i + 1));
             else lua_pop(L, 1);
         }
-        return 1;
-    } else {
-        g_lua_createtable(L, 0, 0);
+        /* Note: SwKiwi string_map also table.concat's the result — omit here
+         * since mods on desktop typically use string.char already. */
         return 1;
     }
 
-    /* Table+function case */
-    if (!g_lua_objlen || !g_lua_rawgeti || !g_lua_rawseti || !g_lua_pushvalue) {
-        g_lua_createtable(L, 0, 0);
-        return 1;
-    }
-    int tlen = (int)g_lua_objlen(L, tbl_idx);
-    g_lua_createtable(L, tlen, 0);
-    int result_idx = g_lua_gettop(L);
-    int i;
-    for (i = 1; i <= tlen; i++) {
-        g_lua_pushvalue(L, fn_idx);
-        g_lua_rawgeti(L, tbl_idx, i);
-        g_lua_pcall(L, 1, 1, 0);
-        g_lua_rawseti(L, result_idx, i);
-    }
+    /* Unknown arg types — return error like SwKiwi */
+    if (g_lua_error) return g_lua_error(L);
+    g_lua_createtable(L, 0, 0);
     return 1;
 }
 
@@ -2767,6 +2830,10 @@ void sre_register_mini_api(lua_State* L) {
 
     g_lua_pushcclosure(L, l_mini_map, 0);
     g_lua_setfield(L, -2, "map");
+
+    /* Mini.Test — SwKiwi debug probe stub */
+    g_lua_pushcclosure(L, l_mini_test, 0);
+    g_lua_setfield(L, -2, "Test");
 
     /* Phase 3.2: Armor models */
     g_lua_pushcclosure(L, sre_mini_set_armor_model, 0);

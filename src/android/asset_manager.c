@@ -33,6 +33,11 @@ AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
     
     printf("OPEN: %s\n", filename);
     
+    if (strstr(filename, ".scene") != NULL) {
+        extern void reset_void_fill_color(void);
+        reset_void_fill_color();
+    }
+    
     if (strstr(filename, "swordigo_title_2x.pvr") != NULL) {
         printf("\n***************************\n");
         printf("* RENDERING PHASE REACHED *\n");

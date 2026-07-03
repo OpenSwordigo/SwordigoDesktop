@@ -1901,9 +1901,9 @@ LaunchConfig show_launcher(BinarySelector& selector) {
             ImGui::Text("Game Type");
             ImGui::SameLine(160);
             ImGui::SetNextItemWidth(-1);
-            const char* game_types[] = { "Swordigo", "RLSwordigo", "Custom" };
+            const char* game_types[] = { "Swordigo", "RLSwordigo", "Combatch", "Custom" };
             static int gt_sel = 0;
-            if (ImGui::Combo("##game_type", &gt_sel, game_types, 3)) {
+            if (ImGui::Combo("##game_type", &gt_sel, game_types, 4)) {
                 strncpy(g_add_game_type, game_types[gt_sel], sizeof(g_add_game_type) - 1);
             }
 

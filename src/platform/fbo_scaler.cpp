@@ -1611,7 +1611,20 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
     
     switch (p) {
         case PostFXPreset::OFF:
-            s.preset_name = "Off";
+            s.enabled = true;
+            s.shadows = true;
+            s.shadow_intensity = 0.35f;
+            s.shadow_softness = 0.002f;
+            s.shadow_light_x = 0.3f;
+            s.shadow_light_y = -0.8f;
+            s.color_adjust = true;
+            s.warmth = 0.08f;
+            s.contrast = 1.03f;
+            s.saturation = 1.05f;
+            s.brightness = 0.02f;
+            s.vignette = true;
+            s.vignette_intensity = 0.15f;
+            s.preset_name = "Low";
             break;
         case PostFXPreset::SW_PLUS:
             s.enabled = true;
@@ -1705,7 +1718,7 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
 
 const char* postfx_preset_name(PostFXPreset p) {
     switch (p) {
-        case PostFXPreset::OFF: return "Off";
+        case PostFXPreset::OFF: return "Low";
         case PostFXPreset::SW_PLUS: return "Sw+";
         case PostFXPreset::ATMOSPHERIC: return "Atmospheric";
         case PostFXPreset::ETHEREAL: return "Ethereal";

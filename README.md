@@ -9,8 +9,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/TheCorrectSynovian/SwordigoDesktop/blob/master/LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20x86__64-purple.svg)](#)
-[![Version](https://img.shields.io/badge/Version-v7.2-00e5ff.svg)](https://github.com/TheCorrectSynovian/SwordigoDesktop/releases)
-[![Engine](https://img.shields.io/badge/Engine-SRT%20v7.2-8b3dff.svg)](#-srt-architecture)
+[![Version](https://img.shields.io/badge/Version-v7.3-00e5ff.svg)](https://github.com/TheCorrectSynovian/SwordigoDesktop/releases)
+[![Engine](https://img.shields.io/badge/Engine-SRT%20v7.3-8b3dff.svg)](#-srt-architecture)
 
 [Website](https://thecorrectsynovian.github.io/SwordigoDesktop/web/) · [Download](https://github.com/TheCorrectSynovian/SwordigoDesktop/releases) · [Research](https://thecorrectsynovian.github.io/SwordigoDesktop/web/research.html) · [Changelog](https://thecorrectsynovian.github.io/SwordigoDesktop/web/changelog.html)
 
@@ -20,33 +20,47 @@
 
 **Swordigo Desktop** is a native Linux port of the beloved mobile action-adventure platformer by Touch Foo. Rather than running through Android emulation layers, this project uses the **Swordigo Runtime (SRT)** — a layered runtime architecture that treats `libswordigo.so` as a gameplay kernel while progressively replacing subsystems with clean, native reimplementations.
 
-v7.2 Hotfix II brings **I/O optimization, decentralized per-instance configuration**, and **MP3 music support** — all while maintaining the **60fps Dynarmic JIT performance** from v7.0. Combined with **KiwiAPI beta support** for custom buttons and experimental features, this release focuses on stability and modding ecosystem expansion.
+v7.3 Combatch Update brings **Swordfare GUI (ImGui-based vector overlay)**, **Host-side Coin Limit Breakers**, **UI Input Swallowing**, **custom video background support**, **dynamic edge clear void correction**, a default-on **Low-end PC PostFX preset**, and full system vertical sync (VSync) — building on top of the decentralized instance architecture and libmpg123 music decoding from v7.2.
 
 ---
 
-## 🎯 What's New in v7.2
+## 🎯 What's New in v7.3
 
-### 🎵 MP3 Music Support
-- Direct libmpg123 decoding (no temp files, no shell ffmpeg)
-- Supports MP3, OGG, WAV with unified modular search
-- **10× faster music loading**, drastically reduced I/O
+### 🖥️ Swordfare GUI & Vector Overlay
+- Replaces legacy raw-text panels with a sleek dark-themed ImGui overlay.
+- High-DPI support with dynamic vector scaling and custom Swordfare typography.
+- Remastered F3 Debug panel with collapsible tray metrics (Resolutions, Frametimes graph, Render calls, PostFX state, CPU delta).
 
-### 📁 Decentralized `.ini` Configuration
-- Migrated from centralized JSON manifests (like modern launchers: PolyMC, Prism)
-- Each instance self-contained with `instance.ini` config
-- Build time simplified by ~80 lines (manifest generation deprecated)
+### 🪙 9999 Coin Limit Breaker
+- Host-side JNI memory patches for both ARM32 and ARM64 engines to bypass the hard-coded 999 coin limit.
 
-### 💨 I/O & Logging Optimization
-- Suppressed high-volume file operation logs
-- Reduced typical session console output by 95%
-- Memory leak fixes in music system
+### 🔒 UI Control Lockout
+- Native touch event swallowing when `UI.SetControlsDisabled` is active. Prevents gameplay movements while custom UI buttons or settings menus are open.
 
-### 🔧 KiwiAPI Buttons & Touchables (Early Beta)
-- Experimental interactive GUI elements
-- Full backward compatibility with existing mods
-- Primary modding framework going forward
+### 🎥 Video Background Support (F7 Toggle)
+- Dynamic frame-by-frame background loop playback (0.4x speed)
+- Shell-based FFmpeg extraction keeps host memory safe and stable
+- Toggle dynamic backgrounds on/off with `F7` (instantly falls back to vanilla assets, no freezing)
 
-> See [v7.2 Release Notes](RELEASE_NOTES_v7.2.md) for full details.
+### 🎨 Background Border Void Correction
+- Samples boundary edge colors of vanilla backgrounds and video frames
+- Dynamically overrides `glClearColor` if a screen clear is black/dark
+- Eliminates the ugly black void underneath levels when jumping or falling
+
+### 💨 Default-On Optimized "Low" PostFX Preset
+- Configures default-on color correction, vignette, and screen-space shadows
+- SSAO, Bloom, and God rays are disabled for a fast, lag-free experience on low-end GPUs
+- Requires zero extra rendering passes, compiling to a single composite pass
+
+### ⌨️ Re-allocated Hotkeys
+- `F7` is now dedicated to toggling video backgrounds
+- `\` (Backslash) toggles manual keyboard typing mode
+
+### 📦 Modular Packaging Updates
+- RPM and DEB packages exclude heavy video files (`.mp4`) automatically
+- Users grab `vbg.zip` separately and unpack it to their local assets folder
+
+> See [v7.3 Release Notes](RELEASE_NOTES_v7.3.md) for full details.
 
 ---
 
@@ -146,7 +160,8 @@ v7.2 Hotfix II brings **I/O optimization, decentralized per-instance configurati
 | **F4** | Cycle scaling modes |
 | **F5** | Camera override toggle |
 | **F6** | Cycle PostFX presets |
-| **F7** | Typing mode |
+| **F7** | Toggle video background playback (ON/OFF) |
+| **\\** | Toggle keyboard typing mode |
 | **F10** | Toggle native on-screen controls |
 | **F12** | Fullscreen toggle |
 

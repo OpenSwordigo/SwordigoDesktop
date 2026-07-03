@@ -36,6 +36,7 @@ namespace fs = std::filesystem;
 #include <GL/glext.h>
 #include <sys/stat.h>
 
+#include "platform/video_background.h"
 #include "platform/gui.h"
 #include "platform/vulkan_backend.h"
 #include "platform/fbo_scaler.h"
@@ -44,6 +45,8 @@ namespace fs = std::filesystem;
 #include "platform/launcher_ui.h"
 #include "platform/srt_overlay.h"
 #include "platform/save_editor.h"
+#include "platform/swordfare_gui.h"  /* Swordfare: ImGui-based in-game overlay */
+#include "imgui/imgui.h"
 
 extern bool g_display_active;
 extern int g_win_w;
@@ -59,8 +62,8 @@ const uint32_t GUEST_MEM_SIZE = 0xE0000000; // 3.5GB — ARM64 needs >3GB for ar
 // Defaults to 1920×1080, but dynamically updated after display init to match
 // the display's physical pixel dimensions and native aspect ratio.
 // Touch coordinates are kept in legacy 960×544 space and auto-scaled.
-static int GAME_W = 1920;
-static int GAME_H = 1080;
+int GAME_W = 1920;
+int GAME_H = 1080;
 static float TOUCH_SCALE_X = (float)GAME_W / 960.0f;
 // Which game binary to load (switchable via launcher or --lib flag)
 static std::string g_lib_name = "engine/v1.4.12/arm64-v8a/libswordigo.so";
@@ -95,6 +98,7 @@ FBOScale g_fbo_mode = FBOScale::SHARP_BILINEAR;
 PostFXState g_postfx;
 PostFXPreset g_postfx_preset = PostFXPreset::OFF;
 SkyRenderer g_sky;
+SwordfareGUI g_swordfare_gui;  /* Swordfare: ImGui in-game overlay */
 
 // Graphics API selection (enum defined in vulkan_backend.h)
 GraphicsAPI g_graphics_api = GraphicsAPI::OPENGL;
@@ -227,10 +231,13 @@ int g_sre_viewport_y = 0;
 int g_sre_viewport_w = 960;
 int g_sre_viewport_h = 544;
 
+int g_sre_coin_limit = 9999; // Global coin limit variable referenced by loader patches
+volatile int g_sre_controls_disabled = 0; // Global controls disabled flag set by Lua UI API
+
 // PostFX auto-disable state — tracks what the user chose so we can restore
 static bool postfx_suppressed_by_menu = false;
 static PostFXPreset postfx_user_preset = PostFXPreset::OFF;
-static bool postfx_user_enabled = false;
+static bool postfx_user_enabled = true;
 
 // SRE Music Host API — declared in jni_bridge_arm64.cpp
 extern bool sre_music_host_load(const std::string& name);
@@ -269,6 +276,12 @@ std::string g_cache_dir;
 
 void call_handle_touch_event(uint32_t addr, uint32_t env, uint32_t obj, int action, int id, double time_val, float x, float y, float old_x, float old_y, int tap_count) {
     if (addr == 0) return;
+    
+    // Check if touch input is disabled globally by Lua scripts (e.g. UI active)
+    extern volatile int g_sre_controls_disabled;
+    if (g_sre_controls_disabled) {
+        return;
+    }
     
     // Auto-scale from legacy 960×544 touch space to actual game resolution
     x     *= TOUCH_SCALE_X;  y     *= TOUCH_SCALE_Y;
@@ -428,6 +441,9 @@ void init_all() {
     if (g_display_active) {
         fbo_init(GAME_W, GAME_H);
         draw_batcher_init();
+        postfx_apply_preset(g_postfx, g_postfx_preset);
+        postfx_user_preset = g_postfx_preset;
+        postfx_user_enabled = g_postfx.enabled;
     }
     
     // Open any connected gamepad
@@ -773,11 +789,42 @@ void load_and_boot() {
                       << " -> bx lr" << std::dec << std::endl;
         }
 
-        // NOTE: BLX NOP approach REVERTED — NOPing ARM-mode function calls breaks
-        // textures because those functions compute transform data that other code
-        // reads via VLDR. The functions MUST run. The root cause is Unicorn's 
-        // ARM-mode VFP emulation producing NaN. Fix must be at the VFP level.
-        // The glLoadMatrixf NaN sanitizer handles the rendering side.
+        // Coin limit patches (ARM32)
+        // Lua coin limit: offset 0x27fce0
+        // Game event limit: offset 0x27e656
+        // Too rich check: offset 0x27e666
+        {
+            uint32_t base_addr = g_main_mod.base_addr;
+            if (base_addr) {
+                extern int g_sre_coin_limit;
+                uint16_t limit = (uint16_t)g_sre_coin_limit;
+                
+                // movw r1, limit (instruction: 0xf2400100 | (imm4 << 16) | (val << 12) | (imm3 << 12) | imm8)
+                // For simplified inline patch, let's assemble Thumb2 MOVW:
+                // format: 1111 0 i 10 0100 imm4 0 imm3 rd imm8
+                // We can construct it precisely:
+                auto emit_movw_thumb = [](uint8_t reg, uint16_t val) -> uint32_t {
+                    uint32_t imm4 = (val >> 12) & 0xF;
+                    uint32_t i = (val >> 11) & 0x1;
+                    uint32_t imm3 = (val >> 8) & 0x7;
+                    uint32_t imm8 = val & 0xFF;
+                    uint16_t inst1 = 0xF240 | (i << 10) | imm4;
+                    uint16_t inst2 = (imm3 << 12) | (reg << 8) | imm8;
+                    return inst1 | (inst2 << 16);
+                };
+                
+                uint32_t inst_lua = emit_movw_thumb(1, limit);  // movw r1, #limit
+                *(uint32_t*)(memory + base_addr + 0x27fce0) = inst_lua;
+                
+                uint32_t inst_event = emit_movw_thumb(0, limit); // movw r0, #limit
+                *(uint32_t*)(memory + base_addr + 0x27e656) = inst_event;
+                
+                uint32_t inst_rich = emit_movw_thumb(1, limit - 1); // movw r1, #(limit - 1)
+                *(uint32_t*)(memory + base_addr + 0x27e666) = inst_rich;
+                
+                std::cout << "[CoinLimit] Applied ARM32 coin limit patches (limit=" << limit << ")" << std::endl;
+            }
+        }
     }
 
     // Resolve adVisibilityChanged (kept for death detection countdown fallback)
@@ -1073,7 +1120,7 @@ void load_and_boot() {
             }
             
             // Render F3 debug overlay
-            if (g_display_active && debug_visible) {
+            if (g_display_active && debug_visible && g_graphics_api != GraphicsAPI::OPENGL) {
                 glPushAttrib(GL_ALL_ATTRIB_BITS);
                 glViewport(0, 0, g_draw_w, g_draw_h);
                 glMatrixMode(GL_PROJECTION);
@@ -1121,7 +1168,7 @@ void load_and_boot() {
 
                 snprintf(dbg, sizeof(dbg), "Speed: %s  %s", mod_speed_label(), g_game_paused ? "|| PAUSED" : "");
                 g_gui.draw_string(dbg, 20, g_win_h - 185, 1.2f, 255, 180, 50, 255);
-                snprintf(dbg, sizeof(dbg), "F1:GUI F2:Ctrl F3:Dbg F4:Scale F5:Cam F6:PostFX F7:Type F10:HUD");
+                snprintf(dbg, sizeof(dbg), "F1:GUI F2:Ctrl F3:Dbg F4:Scale F5:Cam F6:PostFX F7:Video \\\\:Type F10:HUD");
                 g_gui.draw_string(dbg, 20, g_win_h - 202, 1.1f, 100, 100, 120, 200);
                 if (g_typing_mode) {
                     g_gui.draw_string("TYPING MODE ACTIVE", 20, g_win_h - 218, 1.2f, 255, 100, 100, 255);
@@ -1223,6 +1270,52 @@ void load_and_boot() {
                 glPopAttrib();
             }
             
+            // Draw Swordfare GUI F3 Overlay if visible
+            if (g_display_active && g_graphics_api == GraphicsAPI::OPENGL) {
+                g_swordfare_gui.begin_frame();
+                if (g_swordfare_gui.is_visible()) {
+                    SwordfareDebugStats st;
+                    st.fps           = fps;
+                    st.dt_seconds    = dt_seconds;
+                    st.frame_count   = completed_frames;
+                    st.draw_calls    = g_frame_stats.draw_calls;
+                    st.tex_binds     = g_frame_stats.texture_binds;
+                    st.vertices      = g_frame_stats.vertices_submitted;
+                    st.matrix_ops    = g_frame_stats.matrix_ops;
+                    st.state_changes = g_frame_stats.state_changes;
+                    st.tex_uploads   = g_frame_stats.tex_uploads;
+                    st.win_w         = g_win_w;
+                    st.win_h         = g_win_h;
+                    st.draw_w        = g_draw_w;
+                    st.draw_h        = g_draw_h;
+                    st.mouse_x       = mouse_x;
+                    st.mouse_y       = mouse_y;
+                    st.cam_x         = g_cam_off_x;
+                    st.cam_y         = g_cam_off_y;
+                    st.cam_z         = g_cam_off_z;
+                    st.cam_zoom      = 1.0f;
+                    st.cam_active    = g_cam_active;
+                    st.typing_mode   = g_typing_mode;
+                    st.game_paused   = g_game_paused;
+                    st.postfx_on     = g_postfx.enabled;
+                    st.postfx_preset = g_postfx.preset_name;
+                    if (g_fbo_mode == FBOScale::SHARP_BILINEAR) st.scale_mode = "Sharp-Bilinear";
+                    else if (g_fbo_mode == FBOScale::NEAREST) st.scale_mode = "Nearest";
+                    else if (g_fbo_mode == FBOScale::CRT_SCANLINE) st.scale_mode = "CRT Scanline";
+                    else if (g_fbo_mode == FBOScale::FSR) st.scale_mode = "FSR 1.0";
+                    st.binary_name    = g_lib_name.c_str();
+                    st.speed_label    = mod_speed_label();
+                    st.graphics_api   = "OpenGL";
+                    g_swordfare_gui.draw_debug(st);
+                }
+                
+                // Draw SRE LUA buttons if present
+                if (sre_btn_array_addr && g_guest_memory) {
+                    g_swordfare_gui.draw_buttons(g_guest_memory + sre_btn_array_addr);
+                }
+                g_swordfare_gui.end_frame();
+            }
+
             extern int g_gl_diag_frame;
             g_gl_diag_frame++;
             
@@ -1250,6 +1343,9 @@ void load_and_boot() {
                 // Poll and process SDL window and input events
                 SDL_Event event;
                 while (SDL_PollEvent(&event)) {
+                    if (g_graphics_api == GraphicsAPI::OPENGL && g_swordfare_gui.process_event(event)) {
+                        continue;
+                    }
                     switch (event.type) {
                         case SDL_EVENT_QUIT:
                             running = false;
@@ -1370,12 +1466,23 @@ void load_and_boot() {
                                             break;
                                     }
                                 } else {
-                                    click_swallowed_by_gui = false;
-                                    float x = event.button.x * 960.0f / (float)g_win_w;
-                                    float y = 544.0f - (event.button.y * 544.0f / (float)g_win_h);
-                                    last_mouse_x = x;
-                                    last_mouse_y = y;
-                                    call_handle_touch_event(handleTouchEvent, env_ptr, 0, 1, 1, accumulated_time, x, y, x, y, 1);
+                                    bool btn_hit = false;
+                                    if (g_graphics_api == GraphicsAPI::OPENGL) {
+                                        ImGuiIO& io = ImGui::GetIO();
+                                        if (io.WantCaptureMouse) {
+                                            btn_hit = true;
+                                        }
+                                    }
+                                    if (btn_hit) {
+                                        click_swallowed_by_gui = true;
+                                    } else {
+                                        click_swallowed_by_gui = false;
+                                        float x = event.button.x * 960.0f / (float)g_win_w;
+                                        float y = 544.0f - (event.button.y * 544.0f / (float)g_win_h);
+                                        last_mouse_x = x;
+                                        last_mouse_y = y;
+                                        call_handle_touch_event(handleTouchEvent, env_ptr, 0, 1, 1, accumulated_time, x, y, x, y, 1);
+                                    }
                                 }
                             }
                             break;
@@ -1417,6 +1524,9 @@ void load_and_boot() {
                             }
                             break;
                         case SDL_EVENT_KEY_DOWN:
+                            if (g_graphics_api == GraphicsAPI::OPENGL && g_swordfare_gui.process_event(event)) {
+                                break;
+                            }
                             if (event.key.key == SDLK_F1 && !event.key.repeat) {
                                 gui_visible = !gui_visible;
                                 std::cout << "[GUI] " << (gui_visible ? "ON" : "OFF") << std::endl;
@@ -1433,6 +1543,9 @@ void load_and_boot() {
                             }
                             if (event.key.key == SDLK_F3 && !event.key.repeat) {
                                 debug_visible = !debug_visible;
+                                if (g_graphics_api == GraphicsAPI::OPENGL) {
+                                    g_swordfare_gui.toggle_visible();
+                                }
                                 std::cout << "[Debug] " << (debug_visible ? "ON" : "OFF") << std::endl;
                                 break;
                             }
@@ -1485,7 +1598,7 @@ void load_and_boot() {
                                 std::cout << "[PostFX] Preset: " << g_postfx.preset_name << std::endl;
                                 break;
                             }
-                            if (event.key.key == SDLK_F7 && !event.key.repeat) {
+                            if (event.key.key == SDLK_BACKSLASH && !event.key.repeat) {
                                 g_typing_mode = !g_typing_mode;
                                 if (g_typing_mode) {
                                     SDL_StartTextInput(g_display_ptr->get_window());
@@ -1494,6 +1607,11 @@ void load_and_boot() {
                                     SDL_StopTextInput(g_display_ptr->get_window());
                                     std::cout << "[Keyboard] Typing mode OFF — keyboard sends touch events" << std::endl;
                                 }
+                                break;
+                            }
+                            if (event.key.key == SDLK_F7 && !event.key.repeat) {
+                                g_video_background_enabled = !g_video_background_enabled;
+                                std::cout << "[VideoBackground] Video playback: " << (g_video_background_enabled ? "ENABLED" : "DISABLED") << std::endl;
                                 break;
                             }
                             if (event.key.key == SDLK_F10 && !event.key.repeat) {
@@ -3255,6 +3373,48 @@ void load_and_boot_arm64() {
             std::cout << "[Fix64] Patched AndroidShowInterstitialAd at 0x" << std::hex << showAd2
                       << " -> ret" << std::dec << std::endl;
         }
+
+        // Coin limit patches (ARM64)
+        // Lua coin limit check 1 & 2: offsets 0x35e25c, 0x35e260
+        // Game event limit check 3 & 4: offsets 0x3597a0, 0x3597a4
+        // Too rich patch: 0x3597ac, 0x3597b4, 0x3597b8
+        {
+            uint64_t base_addr = g_main_mod_64.base_addr;
+            if (base_addr) {
+                extern int g_sre_coin_limit;
+                uint16_t limit = (uint16_t)g_sre_coin_limit;
+
+                // Instruction helper functions inlined
+                auto emit_mov_wide_immediate = [](uint16_t imm16, uint8_t rd) -> uint32_t {
+                    // mov w[rd], #imm16
+                    return 0x52800000 | (imm16 << 5) | rd;
+                };
+                auto emit_cmp_shifted_register = [](uint8_t rn, uint8_t rm) -> uint32_t {
+                    // cmp w[rn], w[rm] -> subs wzr, w[rn], w[rm]
+                    return 0x6B00001F | (rm << 16) | (rn << 5);
+                };
+
+                // Lua path:
+                // mov w8, #limit -> cmp w0, w8
+                *(uint32_t*)(memory + base_addr + 0x35e25c) = emit_mov_wide_immediate(limit, 8);
+                *(uint32_t*)(memory + base_addr + 0x35e260) = emit_cmp_shifted_register(0, 8);
+
+                // Game event path:
+                // mov w10, #limit -> cmp w8, w10
+                *(uint32_t*)(memory + base_addr + 0x3597a0) = emit_mov_wide_immediate(limit, 10);
+                *(uint32_t*)(memory + base_addr + 0x3597a4) = emit_cmp_shifted_register(8, 10);
+
+                // Too rich achievement threshold patch:
+                // NOP at 0x3597ac
+                // mov w11, #(limit - 1) at 0x3597b4
+                // cmp w8, w11 at 0x3597b8
+                *(uint32_t*)(memory + base_addr + 0x3597ac) = 0xD503201F; // NOP
+                *(uint32_t*)(memory + base_addr + 0x3597b4) = emit_mov_wide_immediate(limit - 1, 11);
+                *(uint32_t*)(memory + base_addr + 0x3597b8) = emit_cmp_shifted_register(8, 11);
+
+                std::cout << "[CoinLimit64] Applied ARM64 coin limit patches (limit=" << limit << ")" << std::endl;
+            }
+        }
     }
 
     // Resolve adVisibilityChanged (kept for death detection countdown fallback)
@@ -3359,6 +3519,12 @@ void load_and_boot_arm64() {
             static int touch_debug_count = 0;
             auto call_touch_64 = [&](int action, int id, double time_val, float x, float y, float old_x, float old_y, int tap_count) {
                 if (!handleTouchEvent) return;
+                
+                // Check if touch input is disabled globally by Lua scripts
+                extern volatile int g_sre_controls_disabled;
+                if (g_sre_controls_disabled) {
+                    return;
+                }
                 
                 // Scale from legacy 960×544 touch space to actual game resolution
                 // (same as ARM32 call_handle_touch_event)
@@ -3747,7 +3913,7 @@ void load_and_boot_arm64() {
             }
             
             // Render F3 debug overlay
-            if (g_display_active && debug_visible) {
+            if (g_display_active && debug_visible && g_graphics_api != GraphicsAPI::OPENGL) {
                 glPushAttrib(GL_ALL_ATTRIB_BITS);
                 glViewport(0, 0, g_draw_w, g_draw_h);
                 glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
@@ -3889,7 +4055,7 @@ void load_and_boot_arm64() {
                 // ── Hotkey legend ──
                 y -= 2;
                 g_gui.draw_string("F1:GUI F2:Ctrl F3:Debug F4:Scale F5:Cam F6:PostFX", x, y, 1.0f, 80, 80, 100, 180); y -= 14;
-                g_gui.draw_string("F7:Type F8:Pause F10:HUD F12:Fullscreen", x, y, 1.0f, 80, 80, 100, 180);
+                g_gui.draw_string("F7:Video \\\\:Type F8:Pause F10:HUD F12:Fullscreen", x, y, 1.0f, 80, 80, 100, 180);
 
                 if (g_typing_mode) {
                     g_gui.draw_string("TYPING MODE", 350, g_win_h - 30, 1.2f, 255, 80, 80, 255);
@@ -3971,397 +4137,6 @@ void load_and_boot_arm64() {
                     }
                 }
                 
-                // ---- ButtonController overlay ----
-                if (sre_btn_array_addr) {
-                    int btn_globally_hidden = 0;
-                    if (sre_btn_globally_hidden_addr)
-                        btn_globally_hidden = *(int32_t*)(g_guest_memory + sre_btn_globally_hidden_addr);
-                    
-                    int menu_active = sre_menu_active_addr ? *(int32_t*)(g_guest_memory + sre_menu_active_addr) : 0;
-                    // Only hide buttons if a main menu (0x01) or alert/popup (0x02) is active.
-                    // Do NOT hide buttons for sliders (0x04) which can be drawn as HUD.
-                    int menu_hidden = ((menu_active & 0x03) != 0) ? 1 : 0;
-                    
-                    static int glob_cooldown = 0;
-                    if (glob_cooldown++ % 120 == 0) {
-                        std::cout << "[SRE/Host] Overlay check: globally_hidden=" << btn_globally_hidden
-                                  << " menu_active=" << menu_active
-                                  << " menu_hidden=" << menu_hidden
-                                  << std::endl;
-                    }
-                    
-                    if (!btn_globally_hidden && !menu_hidden) {
-                        // ---- Compute game viewport in LOGICAL pixels (matching this glOrtho) ----
-                        // The glOrtho above is (0, g_win_w, 0, g_win_h) with Y=0 at BOTTOM.
-                        // g_sre_viewport_* is in draw/physical pixels — do NOT use it here.
-                        // Re-derive the letterbox bounds in logical pixels directly.
-                        extern int GAME_W, GAME_H;
-                        float game_asp = (float)GAME_W / (float)GAME_H;
-                        float win_asp  = (float)g_win_w / (float)g_win_h;
-                        int vp_x, vp_y_gl, vp_w, vp_h; // vp_y_gl = GL bottom of viewport
-                        if (win_asp > game_asp) {
-                            // Pillarbox: black bars left/right
-                            vp_h = g_win_h;
-                            vp_w = (int)(g_win_h * game_asp);
-                            vp_x = (g_win_w - vp_w) / 2;
-                            vp_y_gl = 0;
-                        } else {
-                            // Letterbox: black bars top/bottom
-                            vp_w = g_win_w;
-                            vp_h = (int)(g_win_w / game_asp);
-                            vp_x = 0;
-                            vp_y_gl = (g_win_h - vp_h) / 2; // GL-space bottom of viewport
-                        }
-                        int base = std::min(vp_w, vp_h);
-
-                        auto draw_vector_char = [](char c, float x, float y, float w, float h, float line_width) {
-                            glLineWidth(line_width);
-                            glBegin(GL_LINES);
-                            #define VX(gx) (x + ((gx) / 6.0f) * w)
-                            #define VY(gy) (y + ((gy) / 10.0f) * h)
-                            #define LINE(x1, y1, x2, y2) { glVertex2f(VX(x1), VY(y1)); glVertex2f(VX(x2), VY(y2)); }
-
-                            char upper_c = toupper(c);
-                            switch (upper_c) {
-                                case 'A':
-                                    LINE(0,0, 0,6); LINE(0,6, 3,10); LINE(3,10, 6,6); LINE(6,6, 6,0);
-                                    LINE(0,4, 6,4);
-                                    LINE(-1,0, 1,0); LINE(5,0, 7,0);
-                                    break;
-                                case 'B':
-                                    LINE(0,0, 0,10); LINE(0,10, 4,10); LINE(4,10, 6,8); LINE(6,8, 4,5);
-                                    LINE(4,5, 0,5); LINE(4,5, 6,2); LINE(6,2, 4,0); LINE(4,0, 0,0);
-                                    LINE(-1,10, 1,10); LINE(-1,0, 1,0);
-                                    break;
-                                case 'C':
-                                    LINE(6,10, 1,10); LINE(1,10, 0,8); LINE(0,8, 0,2); LINE(0,2, 1,0); LINE(1,0, 6,0);
-                                    LINE(6,10, 6,8.5); LINE(6,0, 6,1.5);
-                                    break;
-                                case 'D':
-                                    LINE(0,0, 0,10); LINE(0,10, 4,10); LINE(4,10, 6,7); LINE(6,7, 6,3); LINE(6,3, 4,0); LINE(4,0, 0,0);
-                                    LINE(-1,10, 1,10); LINE(-1,0, 1,0);
-                                    break;
-                                case 'E':
-                                    LINE(6,10, 0,10); LINE(0,10, 0,0); LINE(0,0, 6,0);
-                                    LINE(0,5, 4,5);
-                                    LINE(6,10, 6,8.5); LINE(6,0, 6,1.5); LINE(4,5, 4,4);
-                                    break;
-                                case 'F':
-                                    LINE(6,10, 0,10); LINE(0,10, 0,0);
-                                    LINE(0,5, 4,5);
-                                    LINE(6,10, 6,8.5); LINE(-1,0, 1,0); LINE(4,5, 4,4);
-                                    break;
-                                case 'G':
-                                    LINE(6,10, 1,10); LINE(1,10, 0,8); LINE(0,8, 0,2); LINE(0,2, 1,0); LINE(1,0, 6,0);
-                                    LINE(6,0, 6,4); LINE(6,4, 3,4);
-                                    LINE(6,10, 6,8.5); LINE(3,4, 3,2.5);
-                                    break;
-                                case 'H':
-                                    LINE(0,0, 0,10); LINE(6,0, 6,10);
-                                    LINE(0,5, 6,5);
-                                    LINE(-1,10, 1,10); LINE(-1,0, 1,0);
-                                    LINE(5,10, 7,10); LINE(5,0, 7,0);
-                                    break;
-                                case 'I':
-                                    LINE(1,10, 5,10); LINE(3,10, 3,0); LINE(1,0, 5,0);
-                                    break;
-                                case 'J':
-                                    LINE(1,2, 3,0); LINE(3,0, 5,0); LINE(5,0, 5,10); LINE(3,10, 5,10);
-                                    LINE(2,10, 4,10);
-                                    break;
-                                case 'K':
-                                    LINE(0,0, 0,10); LINE(0,4, 5,10); LINE(0,4, 5,0);
-                                    LINE(-1,10, 1,10); LINE(-1,0, 1,0);
-                                    LINE(4,10, 6,10); LINE(4,0, 6,0);
-                                    break;
-                                case 'L':
-                                    LINE(0,10, 0,0); LINE(0,0, 6,0);
-                                    LINE(-1,10, 1,10); LINE(6,0, 6,1.5);
-                                    break;
-                                case 'M':
-                                    LINE(0,0, 0,10); LINE(0,10, 3,4); LINE(3,4, 6,10); LINE(6,10, 6,0);
-                                    LINE(-1,10, 1,10); LINE(5,10, 7,10);
-                                    LINE(-1,0, 1,0); LINE(5,0, 7,0);
-                                    break;
-                                case 'N':
-                                    LINE(0,0, 0,10); LINE(0,10, 6,0); LINE(6,0, 6,10);
-                                    LINE(-1,10, 1,10); LINE(5,0, 7,0);
-                                    LINE(-1,0, 1,0); LINE(5,10, 7,10);
-                                    break;
-                                case 'O':
-                                    LINE(1,10, 5,10); LINE(5,10, 6,8); LINE(6,8, 6,2); LINE(6,2, 5,0);
-                                    LINE(5,0, 1,0); LINE(1,0, 0,2); LINE(0,2, 0,8); LINE(0,8, 1,10);
-                                    break;
-                                case 'P':
-                                    LINE(0,0, 0,10); LINE(0,10, 4,10); LINE(4,10, 6,8); LINE(6,8, 4,5); LINE(4,5, 0,5);
-                                    LINE(-1,10, 1,10); LINE(-1,0, 1,0);
-                                    break;
-                                case 'Q':
-                                    LINE(1,10, 5,10); LINE(5,10, 6,8); LINE(6,8, 6,2); LINE(6,2, 5,0);
-                                    LINE(5,0, 1,0); LINE(1,0, 0,2); LINE(0,2, 0,8); LINE(0,8, 1,10);
-                                    LINE(4,2, 6,0);
-                                    break;
-                                case 'R':
-                                    LINE(0,0, 0,10); LINE(0,10, 4,10); LINE(4,10, 6,8); LINE(6,8, 4,5); LINE(4,5, 0,5);
-                                    LINE(3,5, 6,0);
-                                    LINE(-1,10, 1,10); LINE(-1,0, 1,0); LINE(5,0, 7,0);
-                                    break;
-                                case 'S':
-                                    LINE(6,9, 5,10); LINE(5,10, 1,10); LINE(1,10, 0,9); LINE(0,9, 0,6);
-                                    LINE(0,6, 1,5); LINE(1,5, 5,5); LINE(5,5, 6,4); LINE(6,4, 6,1);
-                                    LINE(6,1, 5,0); LINE(5,0, 1,0); LINE(1,0, 0,1);
-                                    break;
-                                case 'T':
-                                    LINE(0,10, 6,10); LINE(3,10, 3,0);
-                                    LINE(0,10, 0,8.5); LINE(6,10, 6,8.5); LINE(1,0, 5,0);
-                                    break;
-                                case 'U':
-                                    LINE(0,10, 0,2); LINE(0,2, 2,0); LINE(2,0, 4,0); LINE(4,0, 6,2); LINE(6,2, 6,10);
-                                    LINE(-1,10, 1,10); LINE(5,10, 7,10);
-                                    break;
-                                case 'V':
-                                    LINE(0,10, 3,0); LINE(3,0, 6,10);
-                                    LINE(-1,10, 1,10); LINE(5,10, 7,10);
-                                    break;
-                                case 'W':
-                                    LINE(0,10, 1,0); LINE(1,0, 3,4); LINE(3,4, 5,0); LINE(5,0, 6,10);
-                                    LINE(-1,10, 1,10); LINE(5,10, 7,10);
-                                    break;
-                                case 'X':
-                                    LINE(0,10, 6,0); LINE(0,0, 6,10);
-                                    LINE(-1,10, 1,10); LINE(5,10, 7,10);
-                                    LINE(-1,0, 1,0); LINE(5,0, 7,0);
-                                    break;
-                                case 'Y':
-                                    LINE(0,10, 3,5); LINE(6,10, 3,5); LINE(3,5, 3,0);
-                                    LINE(-1,10, 1,10); LINE(5,10, 7,10); LINE(1,0, 5,0);
-                                    break;
-                                case 'Z':
-                                    LINE(0,10, 6,10); LINE(6,10, 0,0); LINE(0,0, 6,0);
-                                    LINE(0,10, 0,8.5); LINE(6,0, 6,1.5);
-                                    break;
-                                case '0':
-                                    LINE(0,0, 0,10); LINE(0,10, 6,10); LINE(6,10, 6,0); LINE(6,0, 0,0);
-                                    LINE(0,0, 6,10);
-                                    break;
-                                case '1':
-                                    LINE(1,8, 3,10); LINE(3,10, 3,0); LINE(1,0, 5,0);
-                                    break;
-                                case '2':
-                                    LINE(0,8, 1,10); LINE(1,10, 5,10); LINE(5,10, 6,8); LINE(6,8, 0,0); LINE(0,0, 6,0);
-                                    break;
-                                case '3':
-                                    LINE(0,10, 6,10); LINE(6,10, 3,5); LINE(3,5, 5,5); LINE(5,5, 6,4); LINE(6,4, 6,1); LINE(6,1, 5,0); LINE(5,0, 0,0);
-                                    break;
-                                case '4':
-                                    LINE(4,0, 4,10); LINE(4,10, 0,3); LINE(0,3, 6,3);
-                                    break;
-                                case '5':
-                                    LINE(6,10, 0,10); LINE(0,10, 0,5); LINE(0,5, 5,5); LINE(5,5, 6,4); LINE(6,4, 6,1); LINE(6,1, 5,0); LINE(5,0, 0,0);
-                                    break;
-                                case '6':
-                                    LINE(6,9, 5,10); LINE(5,10, 1,10); LINE(1,10, 0,8); LINE(0,8, 0,0); LINE(0,0, 6,0); LINE(6,0, 6,5); LINE(6,5, 0,5);
-                                    break;
-                                case '7':
-                                    LINE(0,10, 6,10); LINE(6,10, 2,0);
-                                    break;
-                                case '8':
-                                    LINE(1,10, 5,10); LINE(5,10, 6,8); LINE(6,8, 5,5); LINE(5,5, 1,5); LINE(1,5, 0,8); LINE(0,8, 1,10);
-                                    LINE(1,5, 5,5); LINE(5,5, 6,2); LINE(6,2, 5,0); LINE(5,0, 1,0); LINE(1,0, 0,2); LINE(0,2, 1,5);
-                                    break;
-                                case '9':
-                                    LINE(0,5, 6,5); LINE(6,5, 6,10); LINE(6,10, 0,10); LINE(0,10, 0,5); LINE(6,5, 6,0); LINE(6,0, 1,0); LINE(1,0, 0,1);
-                                    break;
-                                case '-':
-                                    LINE(1,5, 5,5);
-                                    break;
-                                case '+':
-                                    LINE(1,5, 5,5); LINE(3,2.5, 3,7.5);
-                                    break;
-                                case '!':
-                                    LINE(3,10, 3,3); LINE(3,1, 3,0);
-                                    break;
-                                case '.':
-                                    LINE(2.5,0, 3.5,0); LINE(3.5,0, 3.5,1); LINE(3.5,1, 2.5,1); LINE(2.5,1, 2.5,0);
-                                    break;
-                                case ':':
-                                    LINE(2.5,1, 3.5,1); LINE(3.5,1, 3.5,2); LINE(3.5,2, 2.5,2); LINE(2.5,2, 2.5,1);
-                                    LINE(2.5,6, 3.5,6); LINE(3.5,6, 3.5,7); LINE(3.5,7, 2.5,7); LINE(2.5,7, 2.5,6);
-                                    break;
-                                case '/':
-                                    LINE(0,0, 6,10);
-                                    break;
-                                case '_':
-                                    LINE(0,0, 6,0);
-                                    break;
-                                case '?':
-                                    LINE(1,8, 3,10); LINE(3,10, 5,8); LINE(5,8, 5,6); LINE(5,6, 3,4); LINE(3,4, 3,3);
-                                    LINE(3,1, 3,0);
-                                    break;
-                                default:
-                                    break;
-                            }
-                            glEnd();
-                            #undef VX
-                            #undef VY
-                            #undef LINE
-                        };
-
-                        for (int i = 0; i < SRE_BTN_MAX; i++) {
-                            SreBtnSlot* btn = (SreBtnSlot*)(g_guest_memory + sre_btn_array_addr + i * sizeof(SreBtnSlot));
-                            if (btn->active) {
-                                static int print_cooldown = 0;
-                                if (print_cooldown++ % 60 == 0) {
-                                    std::cout << "[SRE/Host] ACTIVE Button " << i
-                                              << ": label='" << btn->label << "'"
-                                              << " x=" << btn->x << " y=" << btn->y
-                                              << " w=" << btn->w << " h=" << btn->h
-                                              << " hidden=" << btn->hidden
-                                              << " active=" << btn->active
-                                              << std::endl;
-                                }
-                            }
-                            if (!btn->active || btn->hidden) continue;
-
-                            // cur_x, cur_y are 0..1 fractions within the game viewport.
-                            // cur_y=0 → top of game area, cur_y=1 → bottom.
-                            // In this glOrtho Y=0-bottom space:
-                            //   GL_y_of_top    = vp_y_gl + vp_h
-                            //   GL_y_of_bottom = vp_y_gl
-                            // So GL_y = vp_y_gl + vp_h * (1 - cur_y)  (cur_y=0 → top GL = vp_y_gl+vp_h)
-                            int pw = (int)(base * btn->w * btn->scale_x);
-                            int ph = (int)(base * btn->h * btn->scale_y);
-                            int px = vp_x   + (int)(vp_w * btn->cur_x) - pw / 2;
-                            int py = vp_y_gl + (int)(vp_h * (1.0f - btn->cur_y)) - ph / 2;
-
-                            float a  = btn->alpha / 255.0f;
-                            int   ba = (int)(btn->bg_alpha * a);
-
-                            bool hover = (mouse_x >= px && mouse_x <= px + pw && mouse_y >= py && mouse_y <= py + ph);
-
-                            glEnable(GL_BLEND);
-                            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-                            // Draw a semi-transparent gradient glassmorphic background
-                            glBegin(GL_QUADS);
-                            if (btn->pressed) {
-                                glColor4ub(40, 90, 150, (int)(180 * a));
-                            } else if (hover) {
-                                glColor4ub(35, 65, 105, ba);
-                            } else {
-                                glColor4ub(20, 35, 55, ba);
-                            }
-                            glVertex2i(px,      py);
-                            glVertex2i(px + pw, py);
-                            
-                            if (btn->pressed) {
-                                glColor4ub(30, 70, 120, (int)(180 * a));
-                            } else if (hover) {
-                                glColor4ub(25, 45, 75, ba);
-                            } else {
-                                glColor4ub(12, 22, 38, ba);
-                            }
-                            glVertex2i(px + pw, py + ph);
-                            glVertex2i(px,      py + ph);
-                            glEnd();
-
-                            // Chamfered sci-fi border
-                            int c = std::min(6, std::min(pw, ph) / 6);
-                            glLineWidth(hover ? 2.0f : 1.2f);
-                            glBegin(GL_LINE_LOOP);
-                            if (btn->pressed) {
-                                glColor4ub(100, 200, 255, (int)(230 * a));
-                            } else if (hover) {
-                                glColor4ub(90, 160, 255, (int)(220 * a));
-                            } else {
-                                glColor4ub(65, 105, 170, (int)(160 * a));
-                            }
-                            glVertex2i(px + c,      py);
-                            glVertex2i(px + pw - c, py);
-                            glVertex2i(px + pw,     py + c);
-                            glVertex2i(px + pw,     py + ph - c);
-                            glVertex2i(px + pw - c, py + ph);
-                            glVertex2i(px + c,      py + ph);
-                            glVertex2i(px,          py + ph - c);
-                            glVertex2i(px,          py + c);
-                            glEnd();
-
-                            // Corner accents for that sleek PC UI feel
-                            glBegin(GL_LINES);
-                            if (btn->pressed) {
-                                glColor4ub(120, 220, 255, (int)(255 * a));
-                            } else if (hover) {
-                                glColor4ub(100, 180, 255, (int)(255 * a));
-                            } else {
-                                glColor4ub(80, 130, 210, (int)(180 * a));
-                            }
-                            // Top-left accent bracket
-                            glVertex2i(px, py + ph - c - 4);
-                            glVertex2i(px, py + ph - c);
-                            glVertex2i(px, py + ph - c);
-                            glVertex2i(px + c, py + ph);
-                            glVertex2i(px + c, py + ph);
-                            glVertex2i(px + c + 4, py + ph);
-
-                            // Bottom-right accent bracket
-                            glVertex2i(px + pw, py + c + 4);
-                            glVertex2i(px + pw, py + c);
-                            glVertex2i(px + pw, py + c);
-                            glVertex2i(px + pw - c, py);
-                            glVertex2i(px + pw - c, py);
-                            glVertex2i(px + pw - c - 4, py);
-                            glEnd();
-
-                            if (btn->label[0]) {
-                                int tr = (btn->text_color >> 16) & 0xFF;
-                                int tg = (btn->text_color >> 8)  & 0xFF;
-                                int tb =  btn->text_color        & 0xFF;
-                                int ta = (int)(((btn->text_color >> 24) & 0xFF) * a);
-                                if (ta == 0) ta = (int)(255 * a);
-                                
-                                if (hover && !btn->pressed) {
-                                    tr = std::min(tr + 40, 255);
-                                    tg = std::min(tg + 40, 255);
-                                    tb = std::min(tb + 55, 255);
-                                } else if (btn->pressed) {
-                                    tr = 255;
-                                    tg = 255;
-                                    tb = 255;
-                                }
-
-                                float char_h = ph * 0.38f; // scale relative to button height
-                                float line_w = hover ? 2.2f : 1.6f;
-                                
-                                // Calculate total width of string to center it
-                                float total_w = 0.0f;
-                                std::string lbl = btn->label;
-                                for (char chr : lbl) {
-                                    float w_c = char_h * 0.6f;
-                                    total_w += w_c + char_h * 0.15f;
-                                }
-                                if (!lbl.empty()) {
-                                    total_w -= char_h * 0.15f;
-                                }
-                                
-                                float text_start_x = px + (pw - total_w) / 2.0f;
-                                float text_start_y = py + (ph - char_h) / 2.0f;
-                                
-                                glEnable(GL_LINE_SMOOTH);
-                                glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
-                                
-                                float cur_tx = text_start_x;
-                                for (char chr : lbl) {
-                                    float w_c = char_h * 0.6f;
-                                    glColor4ub(tr, tg, tb, ta);
-                                    draw_vector_char(chr, cur_tx, text_start_y, w_c, char_h, line_w);
-                                    cur_tx += w_c + char_h * 0.15f;
-                                }
-                                glDisable(GL_LINE_SMOOTH);
-                            }
-                        }
-                    }
-                }
-                
                 glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
                 glPopAttrib();
             }
@@ -4388,6 +4163,52 @@ void load_and_boot_arm64() {
                                       overlay_click, dt_seconds);
                 glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
                 glPopAttrib();
+            }
+            
+            // Draw Swordfare GUI F3 Overlay if visible
+            if (g_display_active && g_graphics_api == GraphicsAPI::OPENGL) {
+                g_swordfare_gui.begin_frame();
+                if (g_swordfare_gui.is_visible()) {
+                    SwordfareDebugStats st;
+                    st.fps           = fps;
+                    st.dt_seconds    = dt_seconds;
+                    st.frame_count   = completed_frames;
+                    st.draw_calls    = g_frame_stats.draw_calls;
+                    st.tex_binds     = g_frame_stats.texture_binds;
+                    st.vertices      = g_frame_stats.vertices_submitted;
+                    st.matrix_ops    = g_frame_stats.matrix_ops;
+                    st.state_changes = g_frame_stats.state_changes;
+                    st.tex_uploads   = g_frame_stats.tex_uploads;
+                    st.win_w         = g_win_w;
+                    st.win_h         = g_win_h;
+                    st.draw_w        = g_draw_w;
+                    st.draw_h        = g_draw_h;
+                    st.mouse_x       = mouse_x;
+                    st.mouse_y       = mouse_y;
+                    st.cam_x         = g_cam_off_x;
+                    st.cam_y         = g_cam_off_y;
+                    st.cam_z         = g_cam_off_z;
+                    st.cam_zoom      = 1.0f;
+                    st.cam_active    = g_cam_active;
+                    st.typing_mode   = g_typing_mode;
+                    st.game_paused   = g_game_paused;
+                    st.postfx_on     = g_postfx.enabled;
+                    st.postfx_preset = g_postfx.preset_name;
+                    if (g_fbo_mode == FBOScale::SHARP_BILINEAR) st.scale_mode = "Sharp-Bilinear";
+                    else if (g_fbo_mode == FBOScale::NEAREST) st.scale_mode = "Nearest";
+                    else if (g_fbo_mode == FBOScale::CRT_SCANLINE) st.scale_mode = "CRT Scanline";
+                    else if (g_fbo_mode == FBOScale::FSR) st.scale_mode = "FSR 1.0";
+                    st.binary_name    = g_lib_name.c_str();
+                    st.speed_label    = mod_speed_label();
+                    st.graphics_api   = "OpenGL";
+                    g_swordfare_gui.draw_debug(st);
+                }
+                
+                // Draw SRE LUA buttons if present
+                if (sre_btn_array_addr && g_guest_memory) {
+                    g_swordfare_gui.draw_buttons(g_guest_memory + sre_btn_array_addr);
+                }
+                g_swordfare_gui.end_frame();
             }
             
             // Present the frame
@@ -4464,6 +4285,10 @@ void load_and_boot_arm64() {
 
                 SDL_Event event;
                 while (SDL_PollEvent(&event)) {
+                    if (g_graphics_api == GraphicsAPI::OPENGL && g_swordfare_gui.process_event(event)) {
+                        // ImGui consumed the event
+                        continue;
+                    }
                     switch (event.type) {
                         case SDL_EVENT_QUIT:
                             running = false;
@@ -4497,7 +4322,13 @@ void load_and_boot_arm64() {
                                 // Capture key for rebinding
                                 if (g_input_config.editor_handle_key(event.key.scancode)) break;
                             }
-                            if (event.key.key == SDLK_F3 && !event.key.repeat) { debug_visible = !debug_visible; break; }
+                            if (event.key.key == SDLK_F3 && !event.key.repeat) {
+                                debug_visible = !debug_visible;
+                                if (g_graphics_api == GraphicsAPI::OPENGL) {
+                                    g_swordfare_gui.toggle_visible();
+                                }
+                                break;
+                            }
                             if (event.key.key == SDLK_F4 && !event.key.repeat) {
                                 g_fbo_mode = static_cast<FBOScale>((static_cast<int>(g_fbo_mode) + 1) % 4);
                                 const char* m_name = "Unknown";
@@ -4521,7 +4352,7 @@ void load_and_boot_arm64() {
                                 std::cout << "[PostFX] Preset: " << g_postfx.preset_name << std::endl;
                                 break;
                             }
-                            if (event.key.key == SDLK_F7 && !event.key.repeat) {
+                            if (event.key.key == SDLK_BACKSLASH && !event.key.repeat) {
                                 g_typing_mode = !g_typing_mode;
                                 if (g_typing_mode) {
                                     SDL_StartTextInput(g_display_ptr->get_window());
@@ -4530,6 +4361,11 @@ void load_and_boot_arm64() {
                                     SDL_StopTextInput(g_display_ptr->get_window());
                                     std::cout << "[Keyboard] Typing mode OFF" << std::endl;
                                 }
+                                break;
+                            }
+                            if (event.key.key == SDLK_F7 && !event.key.repeat) {
+                                g_video_background_enabled = !g_video_background_enabled;
+                                std::cout << "[VideoBackground] Video playback: " << (g_video_background_enabled ? "ENABLED" : "DISABLED") << std::endl;
                                 break;
                             }
                             if (event.key.key == SDLK_F8 && !event.key.repeat) { mod_toggle_pause(); break; }
@@ -4905,51 +4741,11 @@ void load_and_boot_arm64() {
                                     // Overlay is open — swallow click, don't send to game
                                     click_swallowed_by_gui = true;
                                 } else {
-                                    // ButtonController hit-test (before game touch)
                                     bool btn_hit = false;
-                                    if (sre_btn_array_addr) {
-                                        int mx = event.button.x;
-                                        int my = event.button.y;
-                                        int globally_hidden = sre_btn_globally_hidden_addr ?
-                                            *(int32_t*)(g_guest_memory + sre_btn_globally_hidden_addr) : 0;
-                                        int menu_active = sre_menu_active_addr ? *(int32_t*)(g_guest_memory + sre_menu_active_addr) : 0;
-                                        int menu_hidden = ((menu_active & 0x03) != 0) ? 1 : 0;
-                                        
-                                        if (!globally_hidden && !menu_hidden) {
-                                            extern int GAME_W, GAME_H;
-                                            float game_asp = (float)GAME_W / (float)GAME_H;
-                                            float win_asp  = (float)g_win_w / (float)g_win_h;
-                                            int vp_x, vp_y_gl, vp_w, vp_h;
-                                            if (win_asp > game_asp) {
-                                                vp_h = g_win_h;
-                                                vp_w = (int)(g_win_h * game_asp);
-                                                vp_x = (g_win_w - vp_w) / 2;
-                                                vp_y_gl = 0;
-                                            } else {
-                                                vp_w = g_win_w;
-                                                vp_h = (int)(g_win_w / game_asp);
-                                                vp_x = 0;
-                                                vp_y_gl = (g_win_h - vp_h) / 2;
-                                            }
-                                            int base = std::min(vp_w, vp_h);
-                                            int vp_top_sdl = g_win_h - vp_y_gl - vp_h;
-
-                                            for (int i = SRE_BTN_MAX - 1; i >= 0; i--) {
-                                                SreBtnSlot* btn = (SreBtnSlot*)(g_guest_memory + sre_btn_array_addr + i * sizeof(SreBtnSlot));
-                                                if (!btn->active || btn->hidden || !btn->clickable) continue;
-                                                
-                                                int pw = (int)(base * btn->w * btn->scale_x);
-                                                int ph = (int)(base * btn->h * btn->scale_y);
-                                                int bx = vp_x + (int)(vp_w * btn->cur_x) - pw / 2;
-                                                int by = vp_top_sdl + (int)(vp_h * btn->cur_y) - ph / 2;
-
-                                                if (mx >= bx && mx <= bx + pw && my >= by && my <= by + ph) {
-                                                    btn->pressed = 1;
-                                                    if (btn->movable) btn->dragging = 1;
-                                                    btn_hit = true;
-                                                    break; // Top-most button wins
-                                                }
-                                            }
+                                    if (g_graphics_api == GraphicsAPI::OPENGL) {
+                                        ImGuiIO& io = ImGui::GetIO();
+                                        if (io.WantCaptureMouse) {
+                                            btn_hit = true;
                                         }
                                     }
                                     if (btn_hit) {
@@ -4967,32 +4763,6 @@ void load_and_boot_arm64() {
                         case SDL_EVENT_MOUSE_MOTION:
                             mouse_x = event.motion.x;
                             mouse_y = g_win_h - event.motion.y;
-                            // ButtonController drag tracking
-                            if (sre_btn_array_addr) {
-                                extern int GAME_W, GAME_H;
-                                float game_asp = (float)GAME_W / (float)GAME_H;
-                                float win_asp  = (float)g_win_w / (float)g_win_h;
-                                int vp_x, vp_y_gl, vp_w, vp_h;
-                                if (win_asp > game_asp) {
-                                    vp_h = g_win_h;
-                                    vp_w = (int)(g_win_h * game_asp);
-                                    vp_x = (g_win_w - vp_w) / 2;
-                                    vp_y_gl = 0;
-                                } else {
-                                    vp_w = g_win_w;
-                                    vp_h = (int)(g_win_w / game_asp);
-                                    vp_x = 0;
-                                    vp_y_gl = (g_win_h - vp_h) / 2;
-                                }
-                                int vp_top_sdl = g_win_h - vp_y_gl - vp_h;
-
-                                for (int i = 0; i < SRE_BTN_MAX; i++) {
-                                    SreBtnSlot* btn = (SreBtnSlot*)(g_guest_memory + sre_btn_array_addr + i * sizeof(SreBtnSlot));
-                                    if (!btn->active || !btn->dragging) continue;
-                                    btn->cur_x = (float)(event.motion.x - vp_x) / vp_w;
-                                    btn->cur_y = (float)(event.motion.y - vp_top_sdl) / vp_h;
-                                }
-                            }
                             if (g_input_config.is_editing() && mouse_pressed) {
                                 float gx = event.motion.x * 960.0f / (float)g_win_w;
                                 float gy = 544.0f - (event.motion.y * 544.0f / (float)g_win_h);
@@ -5009,22 +4779,6 @@ void load_and_boot_arm64() {
                                 mouse_pressed = false;
                                 mouse_x = event.button.x;
                                 mouse_y = g_win_h - event.button.y;
-                                // ButtonController release + snapback
-                                if (sre_btn_array_addr) {
-                                    for (int i = 0; i < SRE_BTN_MAX; i++) {
-                                        SreBtnSlot* btn = (SreBtnSlot*)(g_guest_memory + sre_btn_array_addr + i * sizeof(SreBtnSlot));
-                                        if (!btn->active) continue;
-                                        if (btn->dragging && btn->snapback) {
-                                            btn->cur_x = btn->home_x;
-                                            btn->cur_y = btn->home_y;
-                                        }
-                                        if (btn->pressed) {
-                                            btn->released = 1;
-                                        }
-                                        btn->pressed = 0;
-                                        btn->dragging = 0;
-                                    }
-                                }
                                 if (g_input_config.is_editing()) {
                                     g_input_config.editor_mouse_up();
                                 } else if (!click_swallowed_by_gui && !g_srt_overlay.is_visible()) {
@@ -5468,6 +5222,9 @@ int main(int argc, char* argv[]) {
                       << " | render: " << GAME_W << "x" << GAME_H
                       << " | aspect: " << std::fixed << std::setprecision(3)
                       << ((float)GAME_W / GAME_H) << std::endl;
+            if (g_graphics_api == GraphicsAPI::OPENGL) {
+                g_swordfare_gui.init(display.get_window(), SDL_GL_GetCurrentContext());
+            }
         } else {
             std::cerr << "[Main] Display init failed, falling back to headless" << std::endl;
         }
@@ -5516,6 +5273,7 @@ int main(int argc, char* argv[]) {
         } else
 #endif
         {
+            g_swordfare_gui.shutdown();
             fbo_destroy();
         }
     }

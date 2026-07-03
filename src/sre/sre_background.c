@@ -54,8 +54,8 @@ float   g_sre_bg_tint_a = 1.0f;
 float   g_sre_bg_brightness = 1.0f; /* Overall brightness multiplier */
 
 /* === Position control (host writes, SRE reads) === */
-float   g_sre_bg_parallax_x = 0.0f; /* Extra parallax offset */
-float   g_sre_bg_parallax_y = 0.7f; /* Tuned sky height */
+float   g_sre_bg_parallax_x = 0.1f; /* Extra parallax offset */
+float   g_sre_bg_parallax_y = 0.32f; /* Tuned sky height */
 
 /* === Data extraction (SRE writes each frame, host reads for shaders) === */
 float   g_sre_bg_sprite_w = 0.0f;  /* Sprite texture width (pixels) */
@@ -150,7 +150,7 @@ void sre_BackgroundComponent_Draw(void* self, void* ctx, void* camera) {
     
     /* Scale: how many "world units per pixel" at the background distance */
     float pixel_scale = 0.5f / (depth * fov_tan);
-    float scale = pixel_scale * 20.0f * (1024.0f / spr_w);
+    float scale = pixel_scale * 20.0f * (1024.0f / spr_w) * 1.1f;
     
     /* === Export data for host FBO shaders === */
     g_sre_bg_sprite_w = spr_w;
