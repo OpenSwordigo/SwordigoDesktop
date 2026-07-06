@@ -3,8 +3,8 @@
 
 CXX     := g++
 CC      := gcc
-CXXFLAGS := -std=c++17 -g -O1 -Isrc -Isrc/imgui -Iinclude -MMD -MP
-CFLAGS   := -g -O1 -Isrc -Iinclude -MMD -MP
+CXXFLAGS := -std=c++17 -g -O3 -Isrc -Isrc/imgui -Iinclude -MMD -MP
+CFLAGS   := -g -O3 -Isrc -Iinclude -MMD -MP
 
 # pkg-config queries
 SDL3_CFLAGS  := $(shell pkg-config --cflags sdl3 2>/dev/null)
@@ -13,14 +13,16 @@ SDL3I_CFLAGS := $(shell pkg-config --cflags SDL3_image 2>/dev/null || pkg-config
 SDL3I_LIBS   := $(shell pkg-config --libs SDL3_image 2>/dev/null || pkg-config --libs sdl3-image 2>/dev/null || echo "-lSDL3_image")
 VORB_CFLAGS  := $(shell pkg-config --cflags vorbisfile 2>/dev/null)
 VORB_LIBS    := $(shell pkg-config --libs vorbisfile 2>/dev/null)
+MP3_CFLAGS   := $(shell pkg-config --cflags libmpg123 2>/dev/null)
+MP3_LIBS     := $(shell pkg-config --libs libmpg123 2>/dev/null)
 ZLIB_LIBS    := $(shell pkg-config --libs zlib 2>/dev/null || echo "-lz")
 OAL_LIBS     := $(shell pkg-config --libs openal 2>/dev/null || echo "-lopenal")
 
-ALL_CXXFLAGS := $(CXXFLAGS) $(SDL3_CFLAGS) $(SDL3I_CFLAGS) $(VORB_CFLAGS)
+ALL_CXXFLAGS := $(CXXFLAGS) $(SDL3_CFLAGS) $(SDL3I_CFLAGS) $(VORB_CFLAGS) $(MP3_CFLAGS)
 ALL_CFLAGS   := $(CFLAGS) $(SDL3_CFLAGS)
 
-LIBS := $(SDL3_LIBS) $(SDL3I_LIBS) $(VORB_LIBS) $(ZLIB_LIBS) $(OAL_LIBS) \
-        -lunicorn -lGL -lpthread -lm
+LIBS := $(SDL3_LIBS) $(SDL3I_LIBS) $(VORB_LIBS) $(MP3_LIBS) $(ZLIB_LIBS) $(OAL_LIBS) \
+        -lunicorn -lGL -lpthread -lm -ldl
 
 # ========== Dynarmic JIT backend (optional) ==========
 # Build with: make DYNARMIC=1
@@ -59,7 +61,10 @@ CXX_SRCS := \
     src/platform/binary_selector.cpp \
     src/platform/launcher_ui.cpp \
     src/platform/save_editor.cpp \
+    src/platform/scl_parser.cpp \
     src/platform/srt_overlay.cpp \
+    src/platform/video_background.cpp \
+    src/platform/swordfare_gui.cpp \
     src/imgui/imgui.cpp \
     src/imgui/imgui_draw.cpp \
     src/imgui/imgui_tables.cpp \
@@ -95,12 +100,99 @@ swordigo_boot: $(ALL_OBJS)
 # This is a guest-side library loaded into the Unicorn emulator.
 # It replaces problematic functions in libswordigo.so with clean C code.
 AARCH64_CC := aarch64-linux-gnu-gcc
-SRE_SRCS   := src/sre/sre_init.c src/sre/sre_string.c src/sre/sre_lua.c src/sre/sre_background.c src/sre/sre_effects.c src/sre/sre_music.c src/sre/sre_gui.c src/sre/sre_gui_native.c src/sre/sre_scene_update.c src/sre/sre_setjmp.S src/sre/sre_mini_api.c src/sre/sre_vfs.c src/sre/sre_lua_libs.c src/sre/sre_mod.c
-SRE_CFLAGS := -shared -fPIC -O2 -nostdlib -fno-builtin -Isrc/sre
+SRE_LUA_SRCS := \
+    src/sre/lua/src/lapi.c \
+    src/sre/lua/src/lcode.c \
+    src/sre/lua/src/ldebug.c \
+    src/sre/lua/src/ldo.c \
+    src/sre/lua/src/ldump.c \
+    src/sre/lua/src/lfunc.c \
+    src/sre/lua/src/lgc.c \
+    src/sre/lua/src/llex.c \
+    src/sre/lua/src/lmem.c \
+    src/sre/lua/src/lobject.c \
+    src/sre/lua/src/lopcodes.c \
+    src/sre/lua/src/lparser.c \
+    src/sre/lua/src/lstate.c \
+    src/sre/lua/src/lstring.c \
+    src/sre/lua/src/ltable.c \
+    src/sre/lua/src/ltm.c \
+    src/sre/lua/src/lundump.c \
+    src/sre/lua/src/lvm.c \
+    src/sre/lua/src/lzio.c \
+    src/sre/lua/src/lauxlib.c \
+    src/sre/lua/src/lbaselib.c \
+    src/sre/lua/src/ldblib.c \
+    src/sre/lua/src/liolib.c \
+    src/sre/lua/src/lmathlib.c \
+    src/sre/lua/src/loslib.c \
+    src/sre/lua/src/lstrlib.c \
+    src/sre/lua/src/ltablib.c \
+    src/sre/lua/src/loadlib.c \
+    src/sre/lua/src/linit.c
 
-libsre.so: $(SRE_SRCS) src/sre/sre.h src/sre/sre_lua.h src/sre/sre_setjmp.h src/sre/sre_gui.h
-	@echo "[SRE]  Building libsre.so (ARM64)"
-	@$(AARCH64_CC) $(SRE_CFLAGS) -o $@ $(SRE_SRCS)
+SRE_CORE_SRCS := \
+    src/sre/sre_init.c \
+    src/sre/sre_string.c \
+    src/sre/sre_lua.c \
+    src/sre/sre_background.c \
+    src/sre/sre_effects.c \
+    src/sre/sre_music.c \
+    src/sre/sre_gui.c \
+    src/sre/sre_gui_native.c \
+    src/sre/sre_scene_update.c \
+    src/sre/sre_setjmp.S \
+    src/sre/sre_mini_api.c \
+    src/sre/sre_vfs.c \
+    src/sre/sre_lua_libs.c \
+    src/sre/sre_mod.c \
+    src/sre/sre_config.c \
+    src/sre/toml-c/toml.c \
+    src/sre/luafilesystem/src/lfs.c \
+    src/sre/luasocket/src/auxiliar.c \
+    src/sre/luasocket/src/buffer.c \
+    src/sre/luasocket/src/except.c \
+    src/sre/luasocket/src/inet.c \
+    src/sre/luasocket/src/io.c \
+    src/sre/luasocket/src/luasocket.c \
+    src/sre/luasocket/src/mime.c \
+    src/sre/luasocket/src/options.c \
+    src/sre/luasocket/src/select.c \
+    src/sre/luasocket/src/tcp.c \
+    src/sre/luasocket/src/timeout.c \
+    src/sre/luasocket/src/udp.c \
+    src/sre/luasocket/src/usocket.c
+
+SRE_LUA_OBJS := $(patsubst src/sre/%.c, build/sre/%.o, $(SRE_LUA_SRCS))
+SRE_CORE_OBJS := $(patsubst src/sre/%.c, build/sre/%.o, $(patsubst src/sre/%.S, build/sre/%.o, $(SRE_CORE_SRCS)))
+
+SRE_LUA_CFLAGS := -shared -fPIC -O2 -nostdlib -fno-builtin \
+    -Isrc/sre/include \
+    -Isrc/sre/lua/src
+
+SRE_SRE_CFLAGS := $(SRE_LUA_CFLAGS) \
+    -Isrc/sre/toml-c \
+    -Isrc/sre/lua/luasocket/src \
+    -include src/sre/sre_lua_compat.h
+
+build/sre/lua/src/%.o: src/sre/lua/src/%.c
+	@mkdir -p $(dir $@)
+	@echo "[CC/SRE-LUA] $<"
+	@$(AARCH64_CC) $(SRE_LUA_CFLAGS) -c $< -o $@
+
+build/sre/%.o: src/sre/%.c
+	@mkdir -p $(dir $@)
+	@echo "[CC/SRE] $<"
+	@$(AARCH64_CC) $(SRE_SRE_CFLAGS) -c $< -o $@
+
+build/sre/%.o: src/sre/%.S
+	@mkdir -p $(dir $@)
+	@echo "[ASM/SRE] $<"
+	@$(AARCH64_CC) $(SRE_SRE_CFLAGS) -c $< -o $@
+
+libsre.so: $(SRE_LUA_OBJS) $(SRE_CORE_OBJS)
+	@echo "[SRE]  Linking libsre.so (ARM64)"
+	@$(AARCH64_CC) -shared -fPIC -nostdlib -o $@ $^
 	@echo "[SRE]  Built libsre.so (ARM64) — ready for emulator loading"
 
 # Install libsre.so alongside libswordigo.so
@@ -159,6 +251,7 @@ dynarmic-build:
 		-DDYNARMIC_FRONTENDS=A64 \
 		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
 		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+		-DDYNARMIC_IGNORE_ASSERTS=ON \
 		-Wno-dev
 	@cd $(DYNARMIC_BUILD) && make -j$$(nproc) dynarmic
 	@echo "[DYN]  Dynarmic built successfully!"

@@ -1,0 +1,11 @@
+prefix=%%PREFIX%%
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: libtoml
+URL: https://github.com/arp242/toml-c/
+Description: TOML C library
+Version: v1.0
+Libs: -L${libdir} -ltoml
+Cflags: -I${includedir}

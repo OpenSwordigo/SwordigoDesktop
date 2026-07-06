@@ -25,8 +25,6 @@
  */
 
 /* No libc in guest SRE code */
-typedef unsigned long long sre_u64;
-typedef unsigned int       sre_u32;
 
 /* ========== Music Command Interface ==========
  * SRE writes these globals. Host reads them each frame.
@@ -47,6 +45,12 @@ float g_sre_music_volume = 1.0f;        /* Current effective volume */
 int   g_sre_music_volume_dirty = 0;     /* 1 = volume changed, host should apply */
 int   g_sre_music_looping = 1;          /* Loop flag */
 int   g_sre_music_looping_dirty = 0;    /* 1 = looping changed */
+
+/* ========== LNI Command Interface ========== */
+extern volatile char g_sre_lni_command[64];
+extern volatile char g_sre_lni_arg1[512];
+extern volatile char g_sre_lni_arg2[512];
+extern volatile int  g_sre_lni_pending;
 
 /* ========== Internal State ========== */
 static float s_master_volume = 1.0f;     /* Engine-set master volume */
@@ -72,6 +76,15 @@ static void sre_strcpy(char* dst, const char* src, int max) {
 static int sre_strcmp(const char* a, const char* b) {
     while (*a && *b && *a == *b) { a++; b++; }
     return *a - *b;
+}
+
+static int sre_strncmp(const char* s1, const char* s2, int n) {
+    int i;
+    for (i = 0; i < n; i++) {
+        if (s1[i] != s2[i]) return s1[i] - s2[i];
+        if (s1[i] == '\0') break;
+    }
+    return 0;
 }
 
 /* ========== Pending track — for fade transitions ========== */
@@ -138,7 +151,79 @@ void sre_PlayMusicWithName(void* self, void* name_ref, int restart) {
         new_name[i] = data[i];
     }
     new_name[i] = 0;
-    
+
+    /* Intercept LNI commands */
+    if (new_name[0] == 'L' && new_name[1] == 'N' && new_name[2] == 'I' && new_name[3] == ':') {
+        const char* cmd = new_name + 4;
+        if (sre_strncmp(cmd, "openURL(", 8) == 0 || sre_strncmp(cmd, "openUrl(", 8) == 0) {
+            const char* start = cmd;
+            while (*start && *start != '\"' && *start != '\'') start++;
+            if (*start) {
+                start++;
+                const char* end = start;
+                while (*end && *end != '\"' && *end != '\'') end++;
+                if (*end) {
+                    int url_len = end - start;
+                    if (url_len < 511) {
+                        int j;
+                        for (j = 0; j < url_len; j++) g_sre_lni_arg1[j] = start[j];
+                        g_sre_lni_arg1[url_len] = '\0';
+                        sre_strcpy((char*)g_sre_lni_command, "openUrl", 64);
+                        g_sre_lni_pending = 1;
+                    }
+                }
+            }
+        }
+        else if (sre_strncmp(cmd, "SetSpeed(", 9) == 0 || sre_strncmp(cmd, "setSpeed(", 9) == 0) {
+            const char* start = cmd + 9;
+            int arg_len = 0;
+            while (start[arg_len] && start[arg_len] != ')') arg_len++;
+            if (arg_len < 511) {
+                int j;
+                for (j = 0; j < arg_len; j++) g_sre_lni_arg1[j] = start[j];
+                g_sre_lni_arg1[arg_len] = '\0';
+                sre_strcpy((char*)g_sre_lni_command, "setSpeed", 64);
+                g_sre_lni_pending = 1;
+            }
+        }
+        else if (sre_strncmp(cmd, "copyToClipboard(", 16) == 0) {
+            const char* s1 = cmd;
+            while (*s1 && *s1 != '\"' && *s1 != '\'') s1++;
+            if (*s1) {
+                s1++;
+                const char* e1 = s1;
+                while (*e1 && *e1 != '\"' && *e1 != '\'') e1++;
+                if (*e1) {
+                    const char* s2 = e1 + 1;
+                    while (*s2 && *s2 != '\"' && *s2 != '\'') s2++;
+                    if (*s2) {
+                        s2++;
+                        const char* e2 = s2;
+                        while (*e2 && *e2 != '\"' && *e2 != '\'') e2++;
+                        if (*e2) {
+                            int l1 = e1 - s1;
+                            int l2 = e2 - s2;
+                            if (l1 < 511 && l2 < 511) {
+                                int j;
+                                for (j = 0; j < l1; j++) g_sre_lni_arg1[j] = s1[j];
+                                g_sre_lni_arg1[l1] = '\0';
+                                for (j = 0; j < l2; j++) g_sre_lni_arg2[j] = s2[j];
+                                g_sre_lni_arg2[l2] = '\0';
+                                sre_strcpy((char*)g_sre_lni_command, "copyToClipboard", 64);
+                                g_sre_lni_pending = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else if (sre_strncmp(cmd, "quit()", 6) == 0 || sre_strncmp(cmd, "Quit()", 6) == 0) {
+            sre_strcpy((char*)g_sre_lni_command, "quit", 64);
+            g_sre_lni_pending = 1;
+        }
+        return;
+    }
+
     /* === MOD API: Check for music replacement === */
     extern const char* sre_mod_get_music_replacement(const char*);
     const char* mod_repl = sre_mod_get_music_replacement(new_name);

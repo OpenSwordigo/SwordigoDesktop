@@ -222,6 +222,7 @@ private:
                            uint8_t r, uint8_t g, uint8_t b);
     bool is_hover(float x, float y, float w, float h, int mx, int my);
 
+public:
     // Save file I/O
     void scan_saves();
     bool load_save(const std::string& path);

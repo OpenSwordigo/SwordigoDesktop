@@ -1,9 +1,12 @@
 #include "emulator_dynarmic64.h"
+#include "platform/binary_selector.h"
 #include "jni/jni_bridge_arm64.h"
 #include <iostream>
 #include <cstring>
 #include <chrono>
 #include <iomanip>
+
+extern "C" const char* sre_resolve_symbol(uint64_t addr);
 
 #include "dynarmic/interface/A64/a64.h"
 #include "dynarmic/interface/A64/config.h"
@@ -94,11 +97,19 @@ public:
     }
 
     // Read-only optimization: code section is read-only
+    // EXCEPTION: RLSwordigo requires writable text segments for modded game data
     bool IsReadOnlyMemory(Dynarmic::A64::VAddr vaddr) override {
-        // libswordigo.so .text: 0x1000000 - 0x16B0000
-        // libsre.so .text: 0x2000000 - 0x2010000
-        if (vaddr >= 0x1000000 && vaddr < 0x16B0000) return true;
-        if (vaddr >= 0x2000000 && vaddr < 0x2010000) return true;
+        // Check if this is RLSwordigo by looking at the loaded binary info
+        extern BinarySelector g_binary_selector;
+        const BinaryInfo* binfo = g_binary_selector.get_loaded_info();
+        bool is_rlsw = (binfo && binfo->game_type == "RLSwordigo");
+        
+        if (!is_rlsw) {
+            // libswordigo.so .text: 0x1000000 - 0x16B0000
+            // libsre.so .text: 0x2000000 - 0x2010000
+            if (vaddr >= 0x1000000 && vaddr < 0x16B0000) return true;
+            if (vaddr >= 0x2000000 && vaddr < 0x2010000) return true;
+        }
         return false;
     }
 
@@ -141,15 +152,19 @@ public:
         }
         // Dynarmic can't JIT this instruction — skip past it to avoid infinite loop.
         // This happens with some system register instructions (MRS/MSR/etc).
-        std::cerr << "[Dynarmic] InterpreterFallback at 0x" << std::hex << pc
-                  << " for " << std::dec << num_instructions << " instructions — skipping" << std::endl;
+        if (!emu->quiet_mode) {
+            std::cerr << "[Dynarmic] InterpreterFallback at 0x" << std::hex << pc
+                      << " for " << std::dec << num_instructions << " instructions — skipping" << std::endl;
+        }
         emu->get_jit()->SetPC(pc + num_instructions * 4);
     }
 
     void CallSVC(std::uint32_t swi) override {
         // SVC in our guest code — skip and continue
-        std::cerr << "[Dynarmic] SVC #" << swi << " at PC=0x" << std::hex
-                  << emu->get_jit()->GetPC() << std::dec << " — skipping" << std::endl;
+        if (!emu->quiet_mode) {
+            std::cerr << "[Dynarmic] SVC #" << swi << " at PC=0x" << std::hex
+                      << emu->get_jit()->GetPC() << std::dec << " — skipping" << std::endl;
+        }
     }
 
     void ExceptionRaised(Dynarmic::A64::VAddr pc, Dynarmic::A64::Exception exception) override {
@@ -192,6 +207,56 @@ public:
         // All other exceptions — log and halt to prevent hangs
         std::cerr << "[Dynarmic] Exception at 0x" << std::hex << pc
                   << " type=" << static_cast<int>(exception) << std::dec << " — halting" << std::endl;
+        std::cerr << "=== REGISTERS ===" << std::endl;
+        for (int r = 0; r < 31; r++) {
+            uint64_t val = emu->get_reg(r);
+            const char* sym = sre_resolve_symbol(val);
+            std::cerr << "  X" << r << " = 0x" << std::hex << val;
+            if (sym) std::cerr << " [" << sym << "]";
+            std::cerr << std::dec << std::endl;
+        }
+        std::cerr << "  SP = 0x" << std::hex << emu->get_jit()->GetSP() << std::dec << std::endl;
+        std::cerr << "  PC = 0x" << std::hex << pc << std::dec << std::endl;
+
+        uint8_t* mem = emu->get_memory_base();
+        uint64_t active_state_ptr = *(uint64_t*)(mem + 0x16e9c20);
+        std::cerr << "=== CAUGHT ACTIVE STATE ===" << std::endl;
+        std::cerr << "  DAT_007e9c20 (0x16e9c20) = 0x" << std::hex << active_state_ptr << std::dec << std::endl;
+        if (active_state_ptr && active_state_ptr < 0xE0000000) {
+            uint64_t vtable = *(uint64_t*)(mem + active_state_ptr);
+            std::cerr << "  Object vtable pointer = 0x" << std::hex << vtable << std::dec << std::endl;
+            if (vtable && vtable < 0xE0000000) {
+                for (int i = 0; i < 20; i++) {
+                    uint64_t entry = *(uint64_t*)(mem + vtable + i * 8);
+                    const char* sym = sre_resolve_symbol(entry);
+                    std::cerr << "    vtable[0x" << std::hex << i * 8 << "] = 0x" << entry;
+                    if (sym) std::cerr << " [" << sym << "]";
+                    std::cerr << std::dec << std::endl;
+                }
+            }
+        }
+
+        std::cerr << "=== CODE AT PC ===" << std::endl;
+        for (int i = -4; i < 4; i++) {
+            uint64_t target_pc = pc + i * 4;
+            if (target_pc < 0xE0000000) {
+                uint32_t insn = *(uint32_t*)(mem + target_pc);
+                std::cerr << "  " << (i == 0 ? "=> " : "   ") << "0x" << std::hex << target_pc << ": 0x" << insn << std::dec << std::endl;
+            }
+        }
+
+        std::cerr << "=== GUEST STACK ===" << std::endl;
+        uint64_t sp = emu->get_jit()->GetSP();
+        for (int i = 0; i < 20; i++) {
+            uint64_t target_sp = sp + i * 8;
+            if (target_sp < 0xE0000000) {
+                uint64_t val = *(uint64_t*)(mem + target_sp);
+                const char* sym = sre_resolve_symbol(val);
+                std::cerr << "  SP+0x" << std::hex << i * 8 << " (0x" << target_sp << ") = 0x" << val;
+                if (sym) std::cerr << " [" << sym << "]";
+                std::cerr << std::dec << std::endl;
+            }
+        }
         emu->get_jit()->HaltExecution(Dynarmic::HaltReason::UserDefined2);
     }
 
@@ -247,13 +312,8 @@ EmulatorDynarmic64::EmulatorDynarmic64(uint8_t* guest_mem, uint64_t size)
     Dynarmic::A64::UserConfig config;
     config.callbacks = g_dyn_memory;
 
-    // Disable BlockLinking: it bypasses the halt-flag check between linked
-    // blocks, making HaltExecution() unreliable. Without block linking,
-    // Dynarmic returns to the dispatcher after each block, where it checks
-    // the halt flag and tick budget. This is essential for our bridge dispatch
-    // and function return detection to work.
-    config.optimizations = Dynarmic::all_safe_optimizations
-                         & ~Dynarmic::OptimizationFlag::BlockLinking;
+    // Enable BlockLinking optimization for maximum emulation performance.
+    config.optimizations = Dynarmic::all_safe_optimizations;
 
     // IMPORTANT: Do NOT enable fastmem. Our guest memory is 3.5GB (0xE0000000)
     // but the bridge trampoline region is at 0xFF000000 which is beyond the
@@ -350,6 +410,26 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
     static const uint64_t TICK_BUDGET = 10000000ULL;
     static const int MAX_CHUNKS = 50000;  // Was 500 — too low for boot functions
 
+    // Guard: reject calls into string/data area (0x10000–0x80000).
+    // The files_dir string sits at 0x20000; branching there means a corrupted
+    // function pointer was passed to call(). Log it and bail out immediately
+    // so we can see which address is bad.
+    if (start_pc >= 0x10000 && start_pc < 0x80000) {
+        static int bad_pc_count = 0;
+        if (bad_pc_count < 10) {
+            std::cerr << "[BAD-PC] call() to 0x" << std::hex << start_pc
+                      << " — likely a corrupted function pointer! (call #"
+                      << std::dec << ++bad_pc_count << ")" << std::endl;
+            // Print registers to help identify the variable
+            std::cerr << "  X0=0x" << std::hex << jit->GetRegister(0)
+                      << " X1=0x" << jit->GetRegister(1)
+                      << " X2=0x" << jit->GetRegister(2)
+                      << " SP=0x" << jit->GetSP() << std::dec << std::endl;
+        }
+        function_returned = true;
+        return;
+    }
+
     // Set LR to magic sentinel (function return detection)
     jit->SetRegister(30, MAGIC_LR);
     jit->SetPC(start_pc);
@@ -380,14 +460,20 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
 
     // Wall clock time limit per function call
     auto wall_start = std::chrono::steady_clock::now();
-    static const int WALL_LIMIT_MS = 30000;  // 30 seconds max per call (boot funcs can be slow)
+    
+    // RLSwordigo has some slow functions that need more time
+    // Check if we're running RLSW and increase limit accordingly
+    extern BinarySelector g_binary_selector;
+    const BinaryInfo* binfo = g_binary_selector.get_loaded_info();
+    bool is_rlsw = (binfo && binfo->game_type == "RLSwordigo");
+    int wall_limit_ms = is_rlsw ? 120000 : 30000;  // 2 min for RLSW, 30s for vanilla
 
     for (chunk = 0; chunk < MAX_CHUNKS; chunk++) {
         // Wall clock safety check
         auto now = std::chrono::steady_clock::now();
         int elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - wall_start).count();
-        if (elapsed_ms > WALL_LIMIT_MS) {
-            std::cerr << "[Dynarmic] Wall clock limit (" << WALL_LIMIT_MS
+        if (elapsed_ms > wall_limit_ms) {
+            std::cerr << "[Dynarmic] Wall clock limit (" << wall_limit_ms
                       << "ms) hit for 0x" << std::hex << start_pc << std::dec
                       << " — force-returning" << std::endl;
             jit->SetPC(MAGIC_LR);
@@ -404,16 +490,19 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
         bridge_halt_requested = false;
         function_returned = false;
 
+        /*
         if (verbose && chunk == 0) {
             std::cerr << "[Dynarmic/dbg] About to call jit->Run() PC=0x"
                       << std::hex << jit->GetPC() << " LR=0x" << jit->GetRegister(30)
                       << " SP=0x" << jit->GetSP() << std::dec << std::endl;
         }
+        */
 
         // Run!
         Dynarmic::HaltReason hr = jit->Run();
         curr_pc = jit->GetPC();
 
+        /*
         if (verbose && chunk < 5) {
             std::cerr << "[Dynarmic/dbg] chunk=" << chunk
                       << " PC=0x" << std::hex << curr_pc
@@ -421,6 +510,7 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
                       << std::dec << " bridge_halt=" << bridge_halt_requested
                       << " ticks=" << g_dyn_memory->GetTicksElapsed() << std::endl;
         }
+        */
 
         // Check for bridge call (UserDefined1)
         if (bridge_halt_requested && Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined1)) {
@@ -446,10 +536,12 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
                 continue;
             }
 
+            /*
             if (verbose && bridge_calls <= 10) {
                 std::cerr << "[Dynarmic/dbg] Bridge call #" << bridge_calls
                           << " addr=0x" << std::hex << bridge_halt_address << std::dec << std::endl;
             }
+            */
             handle_bridge_call(bridge_halt_address);
             bridge_halt_requested = false;
 
@@ -465,9 +557,11 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
 
         // Check for function return (UserDefined2 + function_returned flag)
         if (function_returned && Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined2)) {
+            /*
             if (verbose) {
                 std::cerr << "[Dynarmic/dbg] Function returned cleanly (bridge_calls=" << bridge_calls << ")" << std::endl;
             }
+            */
             break;
         }
 

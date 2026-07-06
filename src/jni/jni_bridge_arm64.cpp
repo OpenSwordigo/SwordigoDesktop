@@ -37,6 +37,15 @@ namespace fs = std::filesystem;
 #include <unistd.h>
 #include <thread>
 #include <cerrno>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <sys/select.h>
+#include <poll.h>
+#include <sys/uio.h>
+#include <sys/ioctl.h>
 #define GL_GLEXT_PROTOTYPES
 #include "platform/gl_inc.h"
 #include <GL/glext.h>
@@ -255,15 +264,62 @@ static uint32_t float_to_uint(float f) {
 
 
 // --- Memory Allocator Bridges ---
+struct DeferredBlock {
+    uint32_t addr;
+    uint32_t size;
+    uint64_t alloc_index;
+};
 static uint32_t g_guest_heap_ptr = 0x20000000; // Start heap at 512MB
 static std::unordered_map<uint32_t, uint32_t> g_guest_allocs;
+static std::vector<DeferredBlock> g_deferred_free_list;
+static uint64_t g_alloc_counter = 0;
+static std::mutex g_heap_mutex;
+
+static uint32_t host_malloc_locked(uint32_t size) {
+    size = (size + 7) & ~7;
+    // Only recycle if heap size exceeds 3080MB (fast path O(1) bump allocator under 580MB)
+    if (g_guest_heap_ptr - 0x20000000 > 3080ULL * 1024 * 1024) {
+        size_t search_limit = std::min(g_deferred_free_list.size(), (size_t)50);
+        for (size_t i = 0; i < search_limit; i++) {
+            const auto& db = g_deferred_free_list[i];
+            // Chronological list: if the oldest elements aren't ready yet, none are!
+            if (g_alloc_counter - db.alloc_index <= 15000) {
+                break; // Stop searching completely
+            }
+            if (db.size >= size && db.size <= size + 128) {
+                uint32_t addr = db.addr;
+                g_guest_allocs[addr] = size;
+                g_deferred_free_list.erase(g_deferred_free_list.begin() + i);
+                g_alloc_counter++;
+                return addr;
+            }
+        }
+    }
+    uint32_t addr = g_guest_heap_ptr;
+    g_guest_heap_ptr += size;
+    g_guest_allocs[addr] = size;
+    g_alloc_counter++;
+    return addr;
+}
+
+static void host_free_locked(uint32_t ptr) {
+    if (ptr == 0) return;
+    if (g_guest_allocs.count(ptr)) {
+        uint32_t size = g_guest_allocs[ptr];
+        DeferredBlock db;
+        db.addr = ptr;
+        db.size = (size + 7) & ~7;
+        db.alloc_index = g_alloc_counter;
+        g_deferred_free_list.push_back(db);
+        g_guest_allocs.erase(ptr);
+    }
+}
 
 static void bridge_malloc(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t size = emu->get_reg(0);
-    uint32_t addr = g_guest_heap_ptr;
-    g_guest_heap_ptr += (size + 7) & ~7;
-    g_guest_allocs[addr] = size;
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
+    uint32_t addr = host_malloc_locked(size);
     emu->set_reg(0, addr);
 }
 
@@ -272,9 +328,8 @@ static void bridge_calloc(void* emu_ptr) {
     uint32_t num = emu->get_reg(0);
     uint32_t size = emu->get_reg(1);
     uint32_t total = num * size;
-    uint32_t addr = g_guest_heap_ptr;
-    g_guest_heap_ptr += (total + 7) & ~7;
-    g_guest_allocs[addr] = total;
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
+    uint32_t addr = host_malloc_locked(total);
     std::memset(emu->get_memory_base() + addr, 0, total);
     emu->set_reg(0, addr);
 }
@@ -283,46 +338,58 @@ static void bridge_realloc(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t ptr = emu->get_reg(0);
     uint32_t size = emu->get_reg(1);
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
     if (ptr == 0) {
-        // realloc(NULL, size) == malloc(size)
-        uint32_t addr = g_guest_heap_ptr;
-        g_guest_heap_ptr += (size + 7) & ~7;
-        g_guest_allocs[addr] = size;
+        uint32_t addr = host_malloc_locked(size);
         emu->set_reg(0, addr);
         return;
     }
     if (size == 0) {
-        // realloc(ptr, 0) == free(ptr)
-        g_guest_allocs.erase(ptr);
+        host_free_locked(ptr);
         emu->set_reg(0, 0);
         return;
     }
-    // If ptr is unregistered (allocated before our tracking), register it
-    // with the requested size as a conservative estimate for copy
-    uint32_t old_size = 0;
+    
     if (g_guest_allocs.count(ptr)) {
-        old_size = g_guest_allocs[ptr];
+        uint32_t old_size = g_guest_allocs[ptr];
+        uint32_t aligned_old_size = (old_size + 7) & ~7;
+        uint32_t aligned_new_size = (size + 7) & ~7;
+        
+        if (aligned_new_size <= aligned_old_size) {
+            g_guest_allocs[ptr] = size;
+            emu->set_reg(0, ptr);
+            return;
+        }
+        
+        if (ptr + aligned_old_size == g_guest_heap_ptr) {
+            g_guest_heap_ptr = ptr + aligned_new_size;
+            g_guest_allocs[ptr] = size;
+            emu->set_reg(0, ptr);
+            return;
+        }
+        
+        uint32_t addr = host_malloc_locked(size);
+        uint32_t copy_size = (old_size < size) ? old_size : size;
+        if (copy_size > 0) {
+            std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, copy_size);
+        }
+        host_free_locked(ptr);
+        emu->set_reg(0, addr);
     } else {
-        // Unregistered pointer — use requested size as old_size estimate
-        // (we'll copy at most 'size' bytes, which is safe)
-        old_size = size;
+        uint32_t addr = host_malloc_locked(size);
+        if (size > 0) {
+            std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, size);
+        }
+        emu->set_reg(0, addr);
     }
-    uint32_t addr = g_guest_heap_ptr;
-    g_guest_heap_ptr += (size + 7) & ~7;
-    g_guest_allocs[addr] = size;
-    g_guest_allocs.erase(ptr);  // clean up old entry
-    uint32_t copy_size = (old_size < size) ? old_size : size;
-    if (copy_size > 0) {
-        std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, copy_size);
-    }
-    emu->set_reg(0, addr);
 }
 
 static void bridge_free(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t ptr = emu->get_reg(0);
     if (ptr) {
-        g_guest_allocs.erase(ptr);
+        std::lock_guard<std::mutex> lock(g_heap_mutex);
+        host_free_locked(ptr);
     }
 }
 
@@ -358,6 +425,13 @@ static void bridge_getenv(void* emu_ptr) {
     env_cache[name] = addr;
     
     emu->set_reg(0, addr);
+}
+
+static void bridge_signal(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    // signal(int sig, void (*func)(int))
+    // Stub: return success/SIG_DFL (0)
+    emu->set_reg(0, 0);
 }
 
 
@@ -499,6 +573,12 @@ static void bridge_fmod(void* emu_ptr) {
 static void bridge_fabs(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     emu->set_dreg(0, std::fabs(emu->get_dreg(0)));
+}
+
+static void bridge_abs(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int64_t val = (int64_t)emu->get_reg(0);
+    emu->set_reg(0, (uint64_t)std::abs(val));
 }
 
 static void bridge_log(void* emu_ptr) {
@@ -2592,6 +2672,11 @@ static void bridge_fopen(void* emu_ptr) {
     bool is_write = (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'));
     if (is_write) {
         // std::cout << "[File] fopen(\"" << path << "\", \"" << mode << "\") [WRITE]" << std::endl;
+        try {
+            fs::create_directories(fs::path(path).parent_path());
+        } catch (...) {
+            // Ignore failure
+        }
     } else if (!emu->quiet_mode) {
         // std::cout << "[File] fopen(\"" << path << "\", \"" << mode << "\")" << std::endl;
     }
@@ -3435,46 +3520,96 @@ static void bridge_exit(void* emu_ptr) {
 
 static void bridge_read(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    // Stub — we don't support raw fd reads from guest
-    emu->set_reg(0, (uint64_t)-1);
+    int fd = emu->get_reg(0);
+    uint64_t buf_g = emu->get_reg(1);
+    size_t count = emu->get_reg(2);
+    void* buf = buf_g ? (void*)(emu->get_memory_base() + buf_g) : nullptr;
+    ssize_t ret = read(fd, buf, count);
+    emu->set_reg(0, ret);
 }
 
 static void bridge_write(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int fd = emu->get_reg(0);
+    uint64_t buf_g = emu->get_reg(1);
+    size_t count = emu->get_reg(2);
+    const void* buf = buf_g ? (const void*)(emu->get_memory_base() + buf_g) : nullptr;
+    ssize_t ret = write(fd, buf, count);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_writev(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
-    uint32_t fd = emu->get_reg(0);
-    uint32_t buf_ptr = emu->get_reg(1);
-    uint32_t count = emu->get_reg(2);
-    if (fd == 1 || fd == 2) { // stdout/stderr
-        std::string s((char*)(memory + buf_ptr), count);
-        if (fd == 1) std::cout << s;
-        else std::cerr << s;
-        emu->set_reg(0, count);
+    int fd = emu->get_reg(0);
+    uint64_t iov_g = emu->get_reg(1);
+    int iovcnt = emu->get_reg(2);
+    
+    if (iov_g && iovcnt > 0) {
+        struct iovec* host_iov = (struct iovec*)alloca(sizeof(struct iovec) * iovcnt);
+        for (int i = 0; i < iovcnt; i++) {
+            uint64_t guest_iov_base = *(uint64_t*)(memory + iov_g + i * 16);
+            uint64_t guest_iov_len = *(uint64_t*)(memory + iov_g + i * 16 + 8);
+            host_iov[i].iov_base = guest_iov_base ? (void*)(memory + guest_iov_base) : nullptr;
+            host_iov[i].iov_len = guest_iov_len;
+        }
+        ssize_t ret = writev(fd, host_iov, iovcnt);
+        emu->set_reg(0, ret);
     } else {
         emu->set_reg(0, (uint64_t)-1);
     }
 }
 
-static void bridge_writev(void* emu_ptr) {
-    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    // Stub
-    emu->set_reg(0, (uint64_t)-1);
-}
-
 static void bridge_fstat(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    // Stub — return error
-    emu->set_reg(0, (uint64_t)-1);
+    uint8_t* memory = emu->get_memory_base();
+    int fd = emu->get_reg(0);
+    uint64_t statbuf_g = emu->get_reg(1);
+    
+    struct stat host_stat;
+    int ret = fstat(fd, &host_stat);
+    if (ret == 0 && statbuf_g) {
+        memset(memory + statbuf_g, 0, 128);
+        *(uint64_t*)(memory + statbuf_g + 0) = host_stat.st_dev;
+        *(uint64_t*)(memory + statbuf_g + 8) = host_stat.st_ino;
+        *(uint32_t*)(memory + statbuf_g + 16) = host_stat.st_mode;
+        *(uint32_t*)(memory + statbuf_g + 20) = host_stat.st_nlink;
+        *(uint32_t*)(memory + statbuf_g + 24) = host_stat.st_uid;
+        *(uint32_t*)(memory + statbuf_g + 28) = host_stat.st_gid;
+        *(uint64_t*)(memory + statbuf_g + 32) = host_stat.st_rdev;
+        *(uint64_t*)(memory + statbuf_g + 48) = host_stat.st_size;
+        *(uint32_t*)(memory + statbuf_g + 56) = host_stat.st_blksize;
+        *(uint64_t*)(memory + statbuf_g + 64) = host_stat.st_blocks;
+        *(uint64_t*)(memory + statbuf_g + 72) = host_stat.st_atim.tv_sec;
+        *(uint64_t*)(memory + statbuf_g + 80) = host_stat.st_atim.tv_nsec;
+        *(uint64_t*)(memory + statbuf_g + 88) = host_stat.st_mtim.tv_sec;
+        *(uint64_t*)(memory + statbuf_g + 96) = host_stat.st_mtim.tv_nsec;
+        *(uint64_t*)(memory + statbuf_g + 104) = host_stat.st_ctim.tv_sec;
+        *(uint64_t*)(memory + statbuf_g + 112) = host_stat.st_ctim.tv_nsec;
+    }
+    emu->set_reg(0, ret);
 }
 
 static void bridge_poll(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    emu->set_reg(0, 0); // no events
+    uint8_t* memory = emu->get_memory_base();
+    uint64_t fds_g = emu->get_reg(0);
+    nfds_t nfds = emu->get_reg(1);
+    int timeout = emu->get_reg(2);
+    struct pollfd* fds = fds_g ? (struct pollfd*)(memory + fds_g) : nullptr;
+    int ret = poll(fds, nfds, timeout);
+    emu->set_reg(0, ret);
 }
 
 static void bridge_ioctl(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    emu->set_reg(0, 0); // success no-op
+    uint8_t* memory = emu->get_memory_base();
+    int fd = emu->get_reg(0);
+    uint64_t request = emu->get_reg(1);
+    uint64_t argp_g = emu->get_reg(2);
+    void* argp = argp_g ? (void*)(memory + argp_g) : nullptr;
+    int ret = ioctl(fd, request, argp);
+    emu->set_reg(0, ret);
 }
 
 static void bridge_perror(void* emu_ptr) {
@@ -6200,12 +6335,363 @@ static void bridge_gettimeofday(void* emu_ptr) {
     emu->set_reg(0, 0);
 }
 
+static void bridge_socket(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int domain = emu->get_reg(0);
+    int type = emu->get_reg(1);
+    int protocol = emu->get_reg(2);
+    int ret = socket(domain, type, protocol);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_connect(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    uint64_t addr_g = emu->get_reg(1);
+    socklen_t addrlen = emu->get_reg(2);
+    const struct sockaddr* addr = addr_g ? (const struct sockaddr*)(emu->get_memory_base() + addr_g) : nullptr;
+    int ret = connect(sockfd, addr, addrlen);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_bind(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    uint64_t addr_g = emu->get_reg(1);
+    socklen_t addrlen = emu->get_reg(2);
+    const struct sockaddr* addr = addr_g ? (const struct sockaddr*)(emu->get_memory_base() + addr_g) : nullptr;
+    int ret = bind(sockfd, addr, addrlen);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_listen(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    int backlog = emu->get_reg(1);
+    int ret = listen(sockfd, backlog);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_accept(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    uint64_t addr_g = emu->get_reg(1);
+    uint64_t addrlen_g = emu->get_reg(2);
+    struct sockaddr* addr = addr_g ? (struct sockaddr*)(emu->get_memory_base() + addr_g) : nullptr;
+    socklen_t* addrlen = addrlen_g ? (socklen_t*)(emu->get_memory_base() + addrlen_g) : nullptr;
+    int ret = accept(sockfd, addr, addrlen);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_send(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    uint64_t buf_g = emu->get_reg(1);
+    size_t len = emu->get_reg(2);
+    int flags = emu->get_reg(3);
+    const void* buf = buf_g ? (const void*)(emu->get_memory_base() + buf_g) : nullptr;
+    ssize_t ret = send(sockfd, buf, len, flags);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_recv(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    uint64_t buf_g = emu->get_reg(1);
+    size_t len = emu->get_reg(2);
+    int flags = emu->get_reg(3);
+    void* buf = buf_g ? (void*)(emu->get_memory_base() + buf_g) : nullptr;
+    ssize_t ret = recv(sockfd, buf, len, flags);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_sendto(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    uint64_t buf_g = emu->get_reg(1);
+    size_t len = emu->get_reg(2);
+    int flags = emu->get_reg(3);
+    uint64_t dest_g = emu->get_reg(4);
+    socklen_t addrlen = emu->get_reg(5);
+    const void* buf = buf_g ? (const void*)(emu->get_memory_base() + buf_g) : nullptr;
+    const struct sockaddr* dest = dest_g ? (const struct sockaddr*)(emu->get_memory_base() + dest_g) : nullptr;
+    ssize_t ret = sendto(sockfd, buf, len, flags, dest, addrlen);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_recvfrom(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    uint64_t buf_g = emu->get_reg(1);
+    size_t len = emu->get_reg(2);
+    int flags = emu->get_reg(3);
+    uint64_t src_g = emu->get_reg(4);
+    uint64_t addrlen_g = emu->get_reg(5);
+    void* buf = buf_g ? (void*)(emu->get_memory_base() + buf_g) : nullptr;
+    struct sockaddr* src = src_g ? (struct sockaddr*)(emu->get_memory_base() + src_g) : nullptr;
+    socklen_t* addrlen = addrlen_g ? (socklen_t*)(emu->get_memory_base() + addrlen_g) : nullptr;
+    ssize_t ret = recvfrom(sockfd, buf, len, flags, src, addrlen);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_setsockopt(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    int level = emu->get_reg(1);
+    int optname = emu->get_reg(2);
+    uint64_t optval_g = emu->get_reg(3);
+    socklen_t optlen = emu->get_reg(4);
+    const void* optval = optval_g ? (const void*)(emu->get_memory_base() + optval_g) : nullptr;
+    int ret = setsockopt(sockfd, level, optname, optval, optlen);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_getsockopt(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    int level = emu->get_reg(1);
+    int optname = emu->get_reg(2);
+    uint64_t optval_g = emu->get_reg(3);
+    uint64_t optlen_g = emu->get_reg(4);
+    void* optval = optval_g ? (void*)(emu->get_memory_base() + optval_g) : nullptr;
+    socklen_t* optlen = optlen_g ? (socklen_t*)(emu->get_memory_base() + optlen_g) : nullptr;
+    int ret = getsockopt(sockfd, level, optname, optval, optlen);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_getsockname(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    uint64_t addr_g = emu->get_reg(1);
+    uint64_t addrlen_g = emu->get_reg(2);
+    struct sockaddr* addr = addr_g ? (struct sockaddr*)(emu->get_memory_base() + addr_g) : nullptr;
+    socklen_t* addrlen = addrlen_g ? (socklen_t*)(emu->get_memory_base() + addrlen_g) : nullptr;
+    int ret = getsockname(sockfd, addr, addrlen);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_getpeername(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    uint64_t addr_g = emu->get_reg(1);
+    uint64_t addrlen_g = emu->get_reg(2);
+    struct sockaddr* addr = addr_g ? (struct sockaddr*)(emu->get_memory_base() + addr_g) : nullptr;
+    socklen_t* addrlen = addrlen_g ? (socklen_t*)(emu->get_memory_base() + addrlen_g) : nullptr;
+    int ret = getpeername(sockfd, addr, addrlen);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_shutdown(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int sockfd = emu->get_reg(0);
+    int how = emu->get_reg(1);
+    int ret = shutdown(sockfd, how);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_fcntl(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int fd = emu->get_reg(0);
+    int cmd = emu->get_reg(1);
+    uint64_t arg = emu->get_reg(2);
+    int ret = fcntl(fd, cmd, arg);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_select(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int nfds = emu->get_reg(0);
+    uint64_t r_g = emu->get_reg(1);
+    uint64_t w_g = emu->get_reg(2);
+    uint64_t e_g = emu->get_reg(3);
+    uint64_t t_g = emu->get_reg(4);
+    fd_set* readfds = r_g ? (fd_set*)(emu->get_memory_base() + r_g) : nullptr;
+    fd_set* writefds = w_g ? (fd_set*)(emu->get_memory_base() + w_g) : nullptr;
+    fd_set* exceptfds = e_g ? (fd_set*)(emu->get_memory_base() + e_g) : nullptr;
+    struct timeval* timeout = t_g ? (struct timeval*)(emu->get_memory_base() + t_g) : nullptr;
+    int ret = select(nfds, readfds, writefds, exceptfds, timeout);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_close(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int fd = emu->get_reg(0);
+    int ret = close(fd);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_gethostbyname(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    uint64_t name_g = emu->get_reg(0);
+    if (!name_g) {
+        emu->set_reg(0, 0);
+        return;
+    }
+    const char* name = (const char*)(memory + name_g);
+    struct hostent* he = gethostbyname(name);
+    if (!he) {
+        emu->set_reg(0, 0);
+        return;
+    }
+    uint64_t base = 0x5D000;
+    *(uint64_t*)(memory + base) = base + 0x100;
+    *(uint64_t*)(memory + base + 8) = base + 0x180;
+    *(uint64_t*)(memory + base + 0x180) = 0;
+    *(int32_t*)(memory + base + 16) = he->h_addrtype;
+    *(int32_t*)(memory + base + 20) = he->h_length;
+    *(uint64_t*)(memory + base + 24) = base + 0x190;
+    *(uint64_t*)(memory + base + 0x190) = base + 0x1A0;
+    *(uint64_t*)(memory + base + 0x198) = 0;
+    if (he->h_name) {
+        strncpy((char*)(memory + base + 0x100), he->h_name, 127);
+        memory[base + 0x100 + 127] = 0;
+    } else {
+        *(char*)(memory + base + 0x100) = 0;
+    }
+    if (he->h_addr_list[0]) {
+        memcpy(memory + base + 0x1A0, he->h_addr_list[0], he->h_length);
+    }
+    emu->set_reg(0, base);
+}
+
+static void bridge_getaddrinfo(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    uint64_t node_g = emu->get_reg(0);
+    uint64_t service_g = emu->get_reg(1);
+    uint64_t hints_g = emu->get_reg(2);
+    uint64_t res_g = emu->get_reg(3);
+    const char* node = node_g ? (const char*)(memory + node_g) : nullptr;
+    const char* service = service_g ? (const char*)(memory + service_g) : nullptr;
+    const struct addrinfo* hints = hints_g ? (const struct addrinfo*)(memory + hints_g) : nullptr;
+    struct addrinfo* host_res = nullptr;
+    int ret = getaddrinfo(node, service, hints, &host_res);
+    if (ret != 0) {
+        emu->set_reg(0, ret);
+        return;
+    }
+    if (res_g && host_res) {
+        uint64_t base = 0x5E000;
+        *(int32_t*)(memory + base + 0) = host_res->ai_flags;
+        *(int32_t*)(memory + base + 4) = host_res->ai_family;
+        *(int32_t*)(memory + base + 8) = host_res->ai_socktype;
+        *(int32_t*)(memory + base + 12) = host_res->ai_protocol;
+        *(uint32_t*)(memory + base + 16) = host_res->ai_addrlen;
+        *(uint64_t*)(memory + base + 24) = base + 0x100;
+        memcpy(memory + base + 0x100, host_res->ai_addr, host_res->ai_addrlen);
+        if (host_res->ai_canonname) {
+            *(uint64_t*)(memory + base + 32) = base + 0x200;
+            strncpy((char*)(memory + base + 0x200), host_res->ai_canonname, 127);
+            memory[base + 0x200 + 127] = 0;
+        } else {
+            *(uint64_t*)(memory + base + 32) = 0;
+        }
+        *(uint64_t*)(memory + base + 40) = 0;
+        *(uint64_t*)(memory + res_g) = base;
+        freeaddrinfo(host_res);
+    }
+    emu->set_reg(0, 0);
+}
+
+static void bridge_freeaddrinfo(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    emu->set_reg(0, 0);
+}
+
+static void bridge_gai_strerror(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    int errcode = emu->get_reg(0);
+    const char* err = gai_strerror(errcode);
+    uint64_t base = 0x5E300;
+    uint8_t* memory = emu->get_memory_base();
+    if (err) {
+        strncpy((char*)(memory + base), err, 127);
+        memory[base + 127] = 0;
+    } else {
+        *(char*)(memory + base) = 0;
+    }
+    emu->set_reg(0, base);
+}
+
+static void bridge_htons(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint16_t val = emu->get_reg(0);
+    emu->set_reg(0, htons(val));
+}
+static void bridge_htonl(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint32_t val = emu->get_reg(0);
+    emu->set_reg(0, htonl(val));
+}
+static void bridge_ntohs(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint16_t val = emu->get_reg(0);
+    emu->set_reg(0, ntohs(val));
+}
+static void bridge_ntohl(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint32_t val = emu->get_reg(0);
+    emu->set_reg(0, ntohl(val));
+}
+
+static void bridge_inet_ntoa(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    struct in_addr in;
+    in.s_addr = emu->get_reg(0);
+    char* res = inet_ntoa(in);
+    uint64_t base = 0x5E400;
+    uint8_t* memory = emu->get_memory_base();
+    if (res) {
+        strncpy((char*)(memory + base), res, 31);
+        memory[base + 31] = 0;
+    } else {
+        *(char*)(memory + base) = 0;
+    }
+    emu->set_reg(0, base);
+}
+
+static void bridge_inet_pton(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    int af = emu->get_reg(0);
+    uint64_t src_g = emu->get_reg(1);
+    uint64_t dst_g = emu->get_reg(2);
+    const char* src = src_g ? (const char*)(memory + src_g) : nullptr;
+    void* dst = dst_g ? (void*)(memory + dst_g) : nullptr;
+    int ret = inet_pton(af, src, dst);
+    emu->set_reg(0, ret);
+}
+
+static void bridge_inet_ntop(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    int af = emu->get_reg(0);
+    uint64_t src_g = emu->get_reg(1);
+    uint64_t dst_g = emu->get_reg(2);
+    socklen_t size = emu->get_reg(3);
+    const void* src = src_g ? (const void*)(memory + src_g) : nullptr;
+    char* dst = dst_g ? (char*)(memory + dst_g) : nullptr;
+    const char* ret = inet_ntop(af, src, dst, size);
+    emu->set_reg(0, ret ? dst_g : 0);
+}
+
+static void bridge_inet_addr(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    uint64_t cp_g = emu->get_reg(0);
+    const char* cp = cp_g ? (const char*)(memory + cp_g) : nullptr;
+    in_addr_t ret = inet_addr(cp);
+    emu->set_reg(0, ret);
+}
+
 void JniBridge64::init_standard_bridges() {
     register_handler("malloc", bridge_malloc);
     register_handler("calloc", bridge_calloc);
     register_handler("realloc", bridge_realloc);
     register_handler("free", bridge_free);
     register_handler("getenv", bridge_getenv);
+    register_handler("signal", bridge_signal);
 
     register_handler("memcpy", bridge_memcpy);
     register_handler("memset", bridge_memset);
@@ -6327,6 +6813,7 @@ void JniBridge64::init_standard_bridges() {
     register_handler("sqrt", bridge_sqrt);
     register_handler("fmod", bridge_fmod);
     register_handler("fabs", bridge_fabs);
+    register_handler("abs", bridge_abs);
     register_handler("log", bridge_log);
     register_handler("log10", bridge_log10);
     register_handler("log2", bridge_log2);
@@ -6651,12 +7138,42 @@ void JniBridge64::init_standard_bridges() {
     register_handler("eglSwapBuffers", bridge_gl_noop);
     register_handler("eglGetProcAddress", bridge_eglGetProcAddress);
 
-    // Renderbuffers — NOOPed for now (game FBOs are bypassed)
     // register_handler("glGenRenderbuffers", bridge_gl_gen_renderbuffers);
     // register_handler("glBindRenderbuffer", bridge_gl_bind_renderbuffer);
     // register_handler("glRenderbufferStorage", bridge_gl_renderbuffer_storage);
     // register_handler("glFramebufferRenderbuffer", bridge_gl_framebuffer_renderbuffer);
     // register_handler("glDeleteRenderbuffers", bridge_gl_delete_renderbuffers);
+
+    // Luasocket support
+    register_handler("socket", bridge_socket);
+    register_handler("connect", bridge_connect);
+    register_handler("bind", bridge_bind);
+    register_handler("listen", bridge_listen);
+    register_handler("accept", bridge_accept);
+    register_handler("send", bridge_send);
+    register_handler("recv", bridge_recv);
+    register_handler("sendto", bridge_sendto);
+    register_handler("recvfrom", bridge_recvfrom);
+    register_handler("setsockopt", bridge_setsockopt);
+    register_handler("getsockopt", bridge_getsockopt);
+    register_handler("getsockname", bridge_getsockname);
+    register_handler("getpeername", bridge_getpeername);
+    register_handler("shutdown", bridge_shutdown);
+    register_handler("fcntl", bridge_fcntl);
+    register_handler("select", bridge_select);
+    register_handler("close", bridge_close);
+    register_handler("gethostbyname", bridge_gethostbyname);
+    register_handler("getaddrinfo", bridge_getaddrinfo);
+    register_handler("freeaddrinfo", bridge_freeaddrinfo);
+    register_handler("gai_strerror", bridge_gai_strerror);
+    register_handler("htons", bridge_htons);
+    register_handler("htonl", bridge_htonl);
+    register_handler("ntohs", bridge_ntohs);
+    register_handler("ntohl", bridge_ntohl);
+    register_handler("inet_ntoa", bridge_inet_ntoa);
+    register_handler("inet_pton", bridge_inet_pton);
+    register_handler("inet_ntop", bridge_inet_ntop);
+    register_handler("inet_addr", bridge_inet_addr);
 }
 
 // ======================= DRAW BATCHER API =======================

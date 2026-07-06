@@ -18,6 +18,32 @@
 extern uint64_t g_swordigo_base;
 
 /* =========================================================================
+ * sre_GUIView_Update — safe no-op
+ * =========================================================================
+ * GUIView::Update iterates child animations using boost::shared_ptr refcounts
+ * with STXR/LDXR spin loops. It also dereferences animation list pointers
+ * that may point into the files_dir string area (0x20010), causing a jump
+ * into string data and a ReservedValue exception.
+ * Safe to skip: gameplay, rendering, and input are all unaffected.
+ */
+void sre_GUIView_Update(void* self, float deltaTime) {
+    (void)self; (void)deltaTime;
+    /* Intentional no-op: animation system bypassed */
+}
+
+/* =========================================================================
+ * sre_AchievementsManager_Update — safe no-op
+ * =========================================================================
+ * Contains STXR/LDXR loops for boost::shared_ptr notification queue.
+ * Desktop has no achievement backend — safe to skip entirely.
+ */
+void sre_AchievementsManager_Update(void* self, float deltaTime) {
+    (void)self; (void)deltaTime;
+    /* Intentional no-op: no achievement backend on desktop */
+}
+
+
+/* =========================================================================
  * Function pointer types — matching ARM64 ABI calling convention
  * ========================================================================= */
 
@@ -266,14 +292,6 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
             uint64_t skill_px = *(uint64_t*)(gamestate + 0x68);
             void*    skill_pn = *(void**)(gamestate + 0x70);
             
-            /* Release stale skill shared_ptr if use_count dropped to 0 */
-            if (skill_pn != NULL) {
-                int64_t* use_ct = (int64_t*)((char*)skill_pn + 0x08);
-                if (*use_ct == 0) {
-                    sp_release(skill_pn);
-                }
-            }
-            
             if (skill_px != 0) {
                 /* Build a local shared_ptr on the stack for CanCastSkill */
                 uint64_t skill2_px = *(uint64_t*)(gamestate + 0x68);
@@ -446,7 +464,8 @@ do_effects:
             FN(fn_void_self_float, OFF_GUIEffect_Update)((void*)dmg_flash, deltaTime);
         }
     }
-    
-    /* ---- 8. BASE GUIView::Update (animation system) ---- */
+        /* ---- 8. BASE GUIView::Update (animation system) ---- */
     FN(fn_void_self_float, OFF_GUIView_Update)(self, deltaTime);
+    /* GUIView::Update (animation system) is now hooked as sre_GUIView_Update
+     * (safe no-op) — no direct call needed here. */
 }

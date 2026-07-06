@@ -14,17 +14,15 @@
 
 #include "sre.h"
 #include "sre_lua.h"
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 
 /* Avoid relying on system headers (cross-build). Provide minimal externs */
-extern size_t fread(void* ptr, size_t size, size_t nmemb, void* fp);
-extern void* malloc(size_t size);
-extern void* realloc(void* ptr, size_t size);
-extern void free(void* ptr);
 extern void sre_log_lua_error(const char* source, const char* err_msg);
-extern int printf(const char* format, ...);
-extern size_t strlen(const char* s);
-extern char* strcat(char* dest, const char* src);
+
 
 /* =========================================================================
  * External globals from sre_scene_update.c — player stats
@@ -51,6 +49,9 @@ char g_sre_mod_profile_id[64] = {0};       /* Mini.GetProfileID() */
 /* Game speed — readable/writable from Lua, host polls this */
 float g_sre_game_speed = 1.0f;
 
+/* Resolved dynamically by host JIT */
+void* g_OverlayTextComponent_Interface_addr = NULL;
+
 /* Controls visibility flag */
 int g_sre_controls_hidden = 0;
 
@@ -61,9 +62,10 @@ int g_sre_coin_limit = 9999;
 int g_sre_debug_active = 0;
 
 /* LNI command buffer — for commands that need host action */
-char g_sre_lni_command[64] = {0};
-char g_sre_lni_arg[256] = {0};
-int  g_sre_lni_pending = 0;
+volatile char g_sre_lni_command[64] = {0};
+volatile char g_sre_lni_arg1[512] = {0};
+volatile char g_sre_lni_arg2[512] = {0};
+volatile int  g_sre_lni_pending = 0;
 
 /* Character modification requests — host polls these */
 volatile int g_sre_char_set_pending = 0;
@@ -162,12 +164,7 @@ volatile int   g_sre_has_taken_damage = 0;
 /* =========================================================================
  * fs API — file I/O for guest
  * ========================================================================= */
-typedef void SRE_FS_FILE;
-extern SRE_FS_FILE* fopen(const char* path, const char* mode);
-extern int fclose(SRE_FS_FILE* fp);
-extern int fwrite(const void* ptr, int size, int count, SRE_FS_FILE* fp);
-extern int mkdir(const char* path, uint32_t mode);
-extern int rmdir(const char* path);
+#define SRE_FS_FILE FILE
 
 extern char g_sre_vfs_path_external[512];
 extern char g_sre_vfs_path_files[512];
@@ -177,7 +174,7 @@ extern char g_sre_vfs_path_assets[512];
 
 
 /* ======== ButtonController ======== */
-#define SRE_BTN_MAX       32
+#define SRE_BTN_MAX       128
 #define SRE_BTN_ID_LEN    32
 #define SRE_BTN_LABEL_LEN 64
 
@@ -198,6 +195,8 @@ typedef struct {
     float    home_x, home_y;           /* Original position (for snapback) */
     int      padding_l, padding_t, padding_r, padding_b;
     int      alignment;                /* Text alignment / gravity */
+    char     overlay_id[SRE_BTN_ID_LEN]; /* Belongs to overlay */
+    int      confined;                  /* Confined to overlay bounds */
     /* ---- STATE (written by host, read by SRE) ---- */
     volatile int pressed;              /* Host writes: 1=down, 0=up */
     volatile int released;             /* Host writes: 1 on release */
@@ -207,11 +206,73 @@ typedef struct {
     int      dirty;                    /* 1 = needs visual update by host */
 } SreBtnSlot;
 
+#define SRE_OVERLAY_MAX 8
+typedef struct {
+    char     id[SRE_BTN_ID_LEN];
+    float    x, y;
+    float    w, h;
+    int      bg_color;
+    int      bg_alpha;
+    float    corner_radius;
+    int      hidden;
+    int      movable;
+    int      pinchable;
+    float    scale_factor;
+    int      pinching;
+    /* Separators inside overlay */
+    float    separators[8];
+    int      separator_count;
+    int      active;
+    int      dirty;
+} SreOverlaySlot;
+
 volatile SreBtnSlot g_sre_buttons[SRE_BTN_MAX] = {{0}};
+volatile SreOverlaySlot g_sre_overlays[SRE_OVERLAY_MAX] = {{0}};
 volatile int g_sre_btn_count = 0;
 volatile int g_sre_btn_dirty = 0;
 volatile int g_sre_btn_delete_all = 0;
 volatile int g_sre_btn_globally_hidden = 0;
+
+/* ======== Animation State Tracking (Phase 1.5A) ======== */
+#define SRE_MAX_ENTITIES 256
+
+char g_sre_entity_anim[SRE_MAX_ENTITIES][128] = {{0}};  /* animation name per entity */
+int  g_sre_entity_anim_playing[SRE_MAX_ENTITIES] = {0};  /* is animation playing? */
+
+/* ======== Physics State Tracking (Phase 1.5A) ======== */
+typedef struct {
+    double x, y, z;           /* position */
+    double vx, vy, vz;        /* velocity */
+    double ax, ay, az;        /* acceleration */
+    int is_grounded;          /* on ground? */
+    double width, height;     /* collision bounds */
+    double mass;              /* entity mass */
+    double friction;          /* friction factor */
+    int is_kinematic;         /* physics type (0=dynamic, 1=kinematic, 2=static) */
+} SrePhysicsState;
+
+SrePhysicsState g_sre_physics[SRE_MAX_ENTITIES] = {{0}};
+
+/* ======== Entity State Tracking (Phase 1.5A) ======== */
+typedef struct {
+    char name[64];            /* entity name */
+    int type;                 /* entity type (0=unknown, 1=enemy, 2=npc, 3=item, etc) */
+    int health;               /* current HP */
+    int max_health;           /* max HP */
+    int active;               /* is alive? (1=yes, 0=no) */
+    int visible;              /* is visible? (1=yes, 0=no) */
+    int can_move;             /* movement enabled? (1=yes, 0=no) */
+    double speed;             /* movement speed */
+    double direction;         /* facing direction (radians, 0=right) */
+} SreEntityState;
+
+SreEntityState g_sre_entities[SRE_MAX_ENTITIES] = {{0}};
+
+/* ======== KeyboardController Globals ======== */
+volatile char g_sre_keyboard_text[256] = {0};
+volatile int  g_sre_keyboard_open = 0;
+volatile int  g_sre_keyboard_done = 0;
+
 
 /* =========================================================================
  * String helper (no libc)
@@ -714,17 +775,78 @@ static int l_comp_health_set_value(lua_State* L) {
     return 0;
 }
 
-/* Components.Physics.GetValue(entity, fieldName) — stub */
+/* Components.Physics.GetValue(entity, fieldName) → value */
 static int l_comp_physics_get_value(lua_State* L) {
-    (void)L;
-    g_lua_pushnumber(L, 0.0);
+    /* Extract entity as userdata (NOT integer ID) */
+    void* entity_ptr = NULL;
+    if (g_lua_touserdata) {
+        entity_ptr = (void*)g_lua_touserdata(L, 1);
+    }
+    
+    const char* field = NULL;
+    if (g_lua_tolstring) {
+        size_t len = 0;
+        field = g_lua_tolstring(L, 2, &len);
+    }
+    
+    if (!entity_ptr || !field) {
+        g_lua_pushnumber(L, 0.0);
+        return 1;
+    }
+    
+    /* Return sensible defaults for common physics properties
+     * These are safe defaults that won't break the game */
+    if (sre_streq(field, "x") || sre_streq(field, "y") || sre_streq(field, "z")) {
+        g_lua_pushnumber(L, 0.0);  /* Position defaults to origin */
+    } else if (sre_streq(field, "vx") || sre_streq(field, "vy") || sre_streq(field, "vz")) {
+        g_lua_pushnumber(L, 0.0);  /* Velocity defaults to zero */
+    } else if (sre_streq(field, "IsGrounded")) {
+        g_lua_pushboolean(L, 1);   /* Default to grounded */
+    } else if (sre_streq(field, "Width") || sre_streq(field, "Height")) {
+        g_lua_pushnumber(L, 10.0); /* Default size */
+    } else {
+        g_lua_pushnumber(L, 0.0);
+    }
+    
     return 1;
 }
 
-/* Components.Entity.GetValue(entity, fieldName) — stub */
+/* Components.Entity.GetValue(entity, fieldName) → value */
 static int l_comp_entity_get_value(lua_State* L) {
-    (void)L;
-    g_lua_pushnumber(L, 0.0);
+    /* Extract entity as userdata (NOT integer ID) */
+    void* entity_ptr = NULL;
+    if (g_lua_touserdata) {
+        entity_ptr = (void*)g_lua_touserdata(L, 1);
+    }
+    
+    const char* field = NULL;
+    if (g_lua_tolstring) {
+        size_t len = 0;
+        field = g_lua_tolstring(L, 2, &len);
+    }
+    
+    if (!entity_ptr || !field) {
+        g_lua_pushnumber(L, 0.0);
+        return 1;
+    }
+    
+    /* Return sensible defaults for common entity properties */
+    if (sre_streq(field, "Name")) {
+        g_lua_pushstring(L, "");
+    } else if (sre_streq(field, "Health")) {
+        g_lua_pushnumber(L, 100.0);  /* Default health */
+    } else if (sre_streq(field, "MaxHealth")) {
+        g_lua_pushnumber(L, 100.0);
+    } else if (sre_streq(field, "Active")) {
+        g_lua_pushboolean(L, 1);  /* Assume active */
+    } else if (sre_streq(field, "Visible")) {
+        g_lua_pushboolean(L, 1);  /* Assume visible */
+    } else if (sre_streq(field, "Speed") || sre_streq(field, "Direction")) {
+        g_lua_pushnumber(L, 0.0);
+    } else {
+        g_lua_pushnumber(L, 0.0);
+    }
+    
     return 1;
 }
 
@@ -811,22 +933,78 @@ static int l_skeleton_get_bone_index(lua_State* L) {
  * CharAnimController.* Lua Functions (stubs)
  * ========================================================================= */
 
-/* CharAnimController.Play(entity, animName) → no-op */
+/* CharAnimController.Play(entity, animName) → success bool */
 static int l_charanim_play(lua_State* L) {
-    (void)L;
-    return 0;
+    /* Extract entity as userdata (NOT integer ID) */
+    void* entity_ptr = NULL;
+    if (g_lua_touserdata) {
+        entity_ptr = (void*)g_lua_touserdata(L, 1);
+    }
+    
+    const char* anim_name = NULL;
+    if (g_lua_tolstring) {
+        size_t len = 0;
+        anim_name = g_lua_tolstring(L, 2, &len);
+    }
+    
+    /* If we can't extract both, fail gracefully */
+    if (!entity_ptr || !anim_name) {
+        g_lua_pushboolean(L, 0);
+        return 1;
+    }
+    
+    /* For now, just indicate success - the actual animation 
+     * should be handled by the game's own AnimationController */
+    g_lua_pushboolean(L, 1);
+    return 1;
 }
 
-/* CharAnimController.Stop(entity) → no-op */
+/* CharAnimController.Stop(entity) → success */
 static int l_charanim_stop(lua_State* L) {
-    (void)L;
+    void* entity_ptr = NULL;
+    if (g_lua_touserdata) {
+        entity_ptr = (void*)g_lua_touserdata(L, 1);
+    }
+    
+    if (!entity_ptr) {
+        return 0;
+    }
+    
+    /* Successfully stopped (no-op for now) */
     return 0;
 }
 
-/* CharAnimController.GetCurrent(entity) → "" */
+/* CharAnimController.GetCurrent(entity) → animation name */
 static int l_charanim_get_current(lua_State* L) {
-    (void)L;
+    void* entity_ptr = NULL;
+    if (g_lua_touserdata) {
+        entity_ptr = (void*)g_lua_touserdata(L, 1);
+    }
+    
+    if (!entity_ptr) {
+        g_lua_pushstring(L, "");
+        return 1;
+    }
+    
+    /* Return empty string - we don't track this yet */
     g_lua_pushstring(L, "");
+    return 1;
+}
+
+/* CharAnimController.IsPlaying(entity) → is animation playing? */
+static int l_charanim_is_playing(lua_State* L) {
+    void* entity_ptr = NULL;
+    if (g_lua_touserdata) {
+        entity_ptr = (void*)g_lua_touserdata(L, 1);
+    }
+    
+    if (!entity_ptr) {
+        g_lua_pushboolean(L, 0);
+        return 1;
+    }
+    
+    /* Default to false */
+    g_lua_pushboolean(L, 0);
     return 1;
 }
 
@@ -934,8 +1112,6 @@ static int l_btn_new(lua_State* L) {
     float bw = (float)g_lua_tonumber(L, 5);
     float bh = (float)g_lua_tonumber(L, 6);
 
-    printf("[SRE/Guest] l_btn_new: id='%s' label='%s' x=%.3f y=%.3f w=%.3f h=%.3f\n", id, label, bx, by, bw, bh);
-
     /* Find existing or allocate new */
     volatile SreBtnSlot* btn = sre_find_btn(id);
     if (!btn) {
@@ -964,6 +1140,8 @@ static int l_btn_new(lua_State* L) {
     btn->padding_l = 0; btn->padding_t = 0;
     btn->padding_r = 0; btn->padding_b = 0;
     btn->alignment = 0;
+    btn->overlay_id[0] = '\0';  /* Clear any stale overlay association from previous slot use */
+    btn->confined = 0;
     btn->pressed = 0;
     btn->released = 0;
     btn->dragging = 0;
@@ -1223,7 +1401,7 @@ static int l_btn_set_text_color(lua_State* L) {
         btn->text_color = (a << 24) | (r << 16) | (g << 8) | b;
     } else {
         /* (id, packed_int) form */
-        btn->text_color = (int)g_lua_tonumber(L, 2);
+        btn->text_color = (int)(unsigned int)g_lua_tonumber(L, 2);
     }
     btn->dirty = 1;
     g_sre_btn_dirty = 1;
@@ -1273,6 +1451,274 @@ static int l_btn_set_bg_alpha(lua_State* L) {
         g_sre_btn_dirty = 1;
     }
     return 0;
+}
+
+
+
+/* Find overlay slot by string ID */
+static volatile SreOverlaySlot* sre_find_overlay(const char* id) {
+    int i;
+    if (!id) return 0;
+    for (i = 0; i < SRE_OVERLAY_MAX; i++) {
+        if (g_sre_overlays[i].active) {
+            int j;
+            int match = 1;
+            for (j = 0; id[j] && g_sre_overlays[i].id[j]; j++) {
+                if (id[j] != g_sre_overlays[i].id[j]) { match = 0; break; }
+            }
+            if (match && id[j] == g_sre_overlays[i].id[j]) return &g_sre_overlays[i];
+        }
+    }
+    return 0;
+}
+
+/* ButtonController.NewOverlay(id, x, y, w, h) */
+static int l_btn_new_overlay(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    if (!id) return 0;
+    float ox = (float)g_lua_tonumber(L, 2);
+    float oy = (float)g_lua_tonumber(L, 3);
+    float ow = (float)g_lua_tonumber(L, 4);
+    float oh = (float)g_lua_tonumber(L, 5);
+
+    volatile SreOverlaySlot* ovr = sre_find_overlay(id);
+    if (!ovr) {
+        int i;
+        for (i = 0; i < SRE_OVERLAY_MAX; i++) {
+            if (!g_sre_overlays[i].active) { ovr = &g_sre_overlays[i]; break; }
+        }
+    }
+    if (!ovr) return 0;
+
+    sre_btn_strcpy(ovr->id, id, SRE_BTN_ID_LEN);
+    ovr->x = ox; ovr->y = oy;
+    ovr->w = ow; ovr->h = oh;
+    ovr->bg_color = 0x000000;
+    ovr->bg_alpha = 204;
+    ovr->corner_radius = 12.0f;
+    ovr->hidden = 0;
+    ovr->movable = 0;
+    ovr->pinchable = 0;
+    ovr->scale_factor = 1.0f;
+    ovr->pinching = 0;
+    ovr->separator_count = 0;
+    ovr->active = 1;
+    ovr->dirty = 1;
+    g_sre_btn_dirty = 1;
+    return 0;
+}
+
+/* ButtonController.SetOverlayMovable(id, movable) */
+static int l_btn_set_overlay_movable(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    volatile SreOverlaySlot* ovr = sre_find_overlay(id);
+    if (ovr) {
+        ovr->movable = g_lua_toboolean(L, 2);
+        ovr->dirty = 1;
+        g_sre_btn_dirty = 1;
+    }
+    return 0;
+}
+
+/* ButtonController.SetOverlayPinchable(id, pinchable) */
+static int l_btn_set_overlay_pinchable(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    volatile SreOverlaySlot* ovr = sre_find_overlay(id);
+    if (ovr) {
+        ovr->pinchable = g_lua_toboolean(L, 2);
+        ovr->dirty = 1;
+        g_sre_btn_dirty = 1;
+    }
+    return 0;
+}
+
+/* ButtonController.SetOverlayBackgroundColor(id, color) */
+static int l_btn_set_overlay_bg_color(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    volatile SreOverlaySlot* ovr = sre_find_overlay(id);
+    if (ovr) {
+        ovr->bg_color = (int)(unsigned int)g_lua_tonumber(L, 2);
+        ovr->dirty = 1;
+        g_sre_btn_dirty = 1;
+    }
+    return 0;
+}
+
+/* ButtonController.SetOverlayBackgroundAlpha(id, alpha) */
+static int l_btn_set_overlay_bg_alpha(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    volatile SreOverlaySlot* ovr = sre_find_overlay(id);
+    if (ovr) {
+        ovr->bg_alpha = (int)g_lua_tonumber(L, 2);
+        ovr->dirty = 1;
+        g_sre_btn_dirty = 1;
+    }
+    return 0;
+}
+
+/* ButtonController.SetOverlayCornerRadius(id, radiusDp) */
+static int l_btn_set_overlay_corner_radius(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    volatile SreOverlaySlot* ovr = sre_find_overlay(id);
+    if (ovr) {
+        ovr->corner_radius = (float)g_lua_tonumber(L, 2);
+        ovr->dirty = 1;
+        g_sre_btn_dirty = 1;
+    }
+    return 0;
+}
+
+/* ButtonController.RemoveOverlay(id) */
+static int l_btn_remove_overlay(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    volatile SreOverlaySlot* ovr = sre_find_overlay(id);
+    if (ovr) {
+        ovr->active = 0;
+        ovr->dirty = 1;
+        g_sre_btn_dirty = 1;
+        /* Fully deactivate all buttons owned by this overlay so slots are freed */
+        int i;
+        for (i = 0; i < SRE_BTN_MAX; i++) {
+            if (g_sre_buttons[i].active && sre_streq((const char*)g_sre_buttons[i].overlay_id, id)) {
+                g_sre_buttons[i].active = 0;
+                g_sre_buttons[i].id[0] = '\0';
+                g_sre_buttons[i].overlay_id[0] = '\0';
+                g_sre_buttons[i].dirty = 1;
+            }
+        }
+    }
+    return 0;
+}
+
+
+
+/* ButtonController.OverlayAddButton(overlayId, btnId) */
+static int l_btn_overlay_add_button(lua_State* L) {
+    const char* overlayId = lua_tostring(L, 1);
+    const char* btnId = lua_tostring(L, 2);
+    volatile SreBtnSlot* btn = sre_find_btn(btnId);
+    if (btn && overlayId) {
+        sre_btn_strcpy(btn->overlay_id, overlayId, SRE_BTN_ID_LEN);
+        btn->dirty = 1;
+        g_sre_btn_dirty = 1;
+    }
+    return 0;
+}
+
+/* ButtonController.OverlayAddSeparator(overlayId, ny) */
+static int l_btn_overlay_add_separator(lua_State* L) {
+    const char* overlayId = lua_tostring(L, 1);
+    volatile SreOverlaySlot* ovr = sre_find_overlay(overlayId);
+    if (ovr) {
+        float ny = (float)g_lua_tonumber(L, 2);
+        if (ovr->separator_count < 8) {
+            ovr->separators[ovr->separator_count++] = ny;
+            ovr->dirty = 1;
+            g_sre_btn_dirty = 1;
+        }
+    }
+    return 0;
+}
+
+/* ButtonController.SetOverlayHidden(id, hidden) */
+static int l_btn_set_overlay_hidden(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    volatile SreOverlaySlot* ovr = sre_find_overlay(id);
+    if (ovr) {
+        ovr->hidden = g_lua_toboolean(L, 2);
+        ovr->dirty = 1;
+        g_sre_btn_dirty = 1;
+    }
+    return 0;
+}
+
+/* ButtonController.SetOverlayPosition(id, nx, ny) */
+static int l_btn_set_overlay_position(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    volatile SreOverlaySlot* ovr = sre_find_overlay(id);
+    if (ovr) {
+        ovr->x = (float)g_lua_tonumber(L, 2);
+        ovr->y = (float)g_lua_tonumber(L, 3);
+        ovr->dirty = 1;
+        g_sre_btn_dirty = 1;
+    }
+    return 0;
+}
+
+/* ButtonController.GetOverlayPosition(id) → x, y */
+static int l_btn_get_overlay_position(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    volatile SreOverlaySlot* ovr = sre_find_overlay(id);
+    if (ovr) {
+        g_lua_pushnumber(L, (double)ovr->x);
+        g_lua_pushnumber(L, (double)ovr->y);
+    } else {
+        g_lua_pushnumber(L, 0.0);
+        g_lua_pushnumber(L, 0.0);
+    }
+    return 2;
+}
+
+/* ButtonController.GetOverlayScaleFactor(id) → scale */
+static int l_btn_get_overlay_scale_factor(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    volatile SreOverlaySlot* ovr = sre_find_overlay(id);
+    g_lua_pushnumber(L, ovr ? (double)ovr->scale_factor : 1.0);
+    return 1;
+}
+
+/* ButtonController.IsOverlayPinching(id) → bool */
+static int l_btn_is_overlay_pinching(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    volatile SreOverlaySlot* ovr = sre_find_overlay(id);
+    g_lua_pushboolean(L, ovr ? ovr->pinching : 0);
+    return 1;
+}
+
+/* ButtonController.SetButtonConfined(id, confined) */
+static int l_btn_set_button_confined(lua_State* L) {
+    const char* id = lua_tostring(L, 1);
+    volatile SreBtnSlot* btn = sre_find_btn(id);
+    if (btn) {
+        btn->confined = g_lua_toboolean(L, 2);
+        btn->dirty = 1;
+        g_sre_btn_dirty = 1;
+    }
+    return 0;
+}
+
+/* ======== Keyboard API ======== */
+static int l_kbd_open(lua_State* L) {
+    const char* initial = lua_tostring(L, 1);
+    if (!initial) initial = "";
+    int i;
+    for (i = 0; i < 255 && initial[i]; i++) g_sre_keyboard_text[i] = initial[i];
+    g_sre_keyboard_text[i] = '\0';
+    g_sre_keyboard_open = 1;
+    g_sre_keyboard_done = 0;
+    return 0;
+}
+
+static int l_kbd_close(lua_State* L) {
+    (void)L;
+    g_sre_keyboard_open = 0;
+    g_sre_keyboard_done = 0;
+    return 0;
+}
+
+static int l_kbd_get_text(lua_State* L) {
+    g_lua_pushstring(L, (const char*)g_sre_keyboard_text);
+    return 1;
+}
+
+static int l_kbd_is_done(lua_State* L) {
+    g_lua_pushboolean(L, g_sre_keyboard_done);
+    return 1;
+}
+
+static int l_kbd_is_open(lua_State* L) {
+    g_lua_pushboolean(L, g_sre_keyboard_open);
+    return 1;
 }
 
 
@@ -1588,9 +2034,17 @@ static int l_mini_map(lua_State* L) {
     return 1;
 }
 
-/* Mini.ExecuteLNI(funcName, ...) — bridge to host LNI system */
 static int l_mini_execute_lni(lua_State* L) {
-    const char* func = lua_tostring(L, 1);
+    const char* func = NULL;
+    int is_bound = 0;
+    
+    /* Check if called as a bound closure (upvalue 1 is function name) */
+    if (g_lua_type && g_lua_type(L, lua_upvalueindex(1)) == LUA_TSTRING) {
+        func = lua_tostring(L, lua_upvalueindex(1));
+        is_bound = 1;
+    } else {
+        func = lua_tostring(L, 1);
+    }
     if (!func) return 0;
 
     /* Copy function name to LNI command buffer */
@@ -1600,17 +2054,37 @@ static int l_mini_execute_lni(lua_State* L) {
     }
     g_sre_lni_command[i] = '\0';
 
+    /* Retrieve arguments:
+     * If bound: arg1 is at index 1, arg2 is at index 2.
+     * If not bound (direct Execute): arg1 is at index 2, arg2 is at index 3.
+     */
+    int arg1_idx = is_bound ? 1 : 2;
+    int arg2_idx = is_bound ? 2 : 3;
+
     /* If there's a string argument, copy it too */
-    if (g_lua_gettop(L) >= 2 && g_lua_type(L, 2) == LUA_TSTRING) {
-        const char* arg = lua_tostring(L, 2);
+    if (g_lua_gettop(L) >= arg1_idx && g_lua_type(L, arg1_idx) == LUA_TSTRING) {
+        const char* arg = lua_tostring(L, arg1_idx);
         if (arg) {
-            for (i = 0; i < 255 && arg[i]; i++) {
-                g_sre_lni_arg[i] = arg[i];
+            for (i = 0; i < 511 && arg[i]; i++) {
+                g_sre_lni_arg1[i] = arg[i];
             }
-            g_sre_lni_arg[i] = '\0';
+            g_sre_lni_arg1[i] = '\0';
         }
     } else {
-        g_sre_lni_arg[0] = '\0';
+        g_sre_lni_arg1[0] = '\0';
+    }
+
+    /* If there's a second string argument, copy it to arg2 */
+    if (g_lua_gettop(L) >= arg2_idx && g_lua_type(L, arg2_idx) == LUA_TSTRING) {
+        const char* arg = lua_tostring(L, arg2_idx);
+        if (arg) {
+            for (i = 0; i < 511 && arg[i]; i++) {
+                g_sre_lni_arg2[i] = arg[i];
+            }
+            g_sre_lni_arg2[i] = '\0';
+        }
+    } else {
+        g_sre_lni_arg2[0] = '\0';
     }
 
     g_sre_lni_pending = 1;
@@ -1657,7 +2131,12 @@ static int l_lni_quit(lua_State* L) {
 
 /* LNI.copyToClipboard(text) — signal host */
 static int l_lni_copy_to_clipboard(lua_State* L) {
-    const char* text = lua_tostring(L, 1);
+    const char* label = lua_tostring(L, 1);
+    const char* text = lua_tostring(L, 2);
+    if (!text) {
+        text = label;
+        label = "Clipboard";
+    }
     if (!text) return 0;
 
     /* Copy function name */
@@ -1666,9 +2145,12 @@ static int l_lni_copy_to_clipboard(lua_State* L) {
     for (i = 0; cmd[i]; i++) g_sre_lni_command[i] = cmd[i];
     g_sre_lni_command[i] = '\0';
 
-    /* Copy argument */
-    for (i = 0; i < 255 && text[i]; i++) g_sre_lni_arg[i] = text[i];
-    g_sre_lni_arg[i] = '\0';
+    /* Copy arguments */
+    for (i = 0; i < 511 && label[i]; i++) g_sre_lni_arg1[i] = label[i];
+    g_sre_lni_arg1[i] = '\0';
+
+    for (i = 0; i < 511 && text[i]; i++) g_sre_lni_arg2[i] = text[i];
+    g_sre_lni_arg2[i] = '\0';
 
     g_sre_lni_pending = 1;
     return 0;
@@ -1684,8 +2166,9 @@ static int l_lni_open_url(lua_State* L) {
     for (i = 0; cmd[i]; i++) g_sre_lni_command[i] = cmd[i];
     g_sre_lni_command[i] = '\0';
 
-    for (i = 0; i < 255 && url[i]; i++) g_sre_lni_arg[i] = url[i];
-    g_sre_lni_arg[i] = '\0';
+    for (i = 0; i < 511 && url[i]; i++) g_sre_lni_arg1[i] = url[i];
+    g_sre_lni_arg1[i] = '\0';
+    g_sre_lni_arg2[0] = '\0';
 
     g_sre_lni_pending = 1;
     return 0;
@@ -2564,6 +3047,25 @@ static int l_ui_set_controls_disabled(lua_State* L) {
     /* Store globally; host input system should check this flag */
     extern volatile int g_sre_controls_disabled;
     g_sre_controls_disabled = disabled;
+
+    /* Walk the gameController pointer to set native hidden flag if available */
+    if (g_lua_getfield && g_lua_type && g_lua_touserdata && g_lua_settop) {
+        g_lua_getfield(L, LUA_GLOBALSINDEX, "gameController");
+        if (g_lua_type(L, -1) == 2) {
+            const void* gameController = g_lua_touserdata(L, -1);
+            if (gameController) {
+                int is_64bit = (g_sre_mod_arch[3] == '6');
+                void* gameSceneView = *(void**)((char*)gameController + (is_64bit ? 0xd8 : 0x70));
+                if (gameSceneView) {
+                    void* gameOverlayView = *(void**)((char*)gameSceneView + (is_64bit ? 0x100 : 0xcc));
+                    if (gameOverlayView) {
+                        *(char*)((char*)gameOverlayView + (is_64bit ? 0xe4 : 0xbc)) = (char)(disabled != 0);
+                    }
+                }
+            }
+        }
+        g_lua_settop(L, -2); /* Pop gameController */
+    }
     return 0;
 }
 
@@ -2756,6 +3258,195 @@ static int l_fs_attributes(lua_State* L) {
     g_lua_setfield(L, -2, "mode");
     g_lua_pushnumber(L, 0);
     g_lua_setfield(L, -2, "size");
+    return 1;
+}
+
+/* =========================================================================
+ * C-Backed TOML Parser Module for Lua
+ * ========================================================================= */
+#include "toml.h"
+
+static void push_toml_value(lua_State* L, toml_value_t val, char type_char) {
+    if (type_char == 's') {
+        g_lua_pushstring(L, val.u.s);
+        free(val.u.s);
+    } else if (type_char == 'b') {
+        g_lua_pushboolean(L, val.u.b);
+    } else if (type_char == 'i') {
+        g_lua_pushnumber(L, (double)val.u.i);
+    } else if (type_char == 'd') {
+        g_lua_pushnumber(L, val.u.d);
+    } else if (type_char == 't') {
+        char ts_buf[64];
+        snprintf(ts_buf, sizeof(ts_buf), "%04d-%02d-%02d %02d:%02d:%02d",
+                 val.u.ts.year, val.u.ts.month, val.u.ts.day,
+                 val.u.ts.hour, val.u.ts.minute, val.u.ts.second);
+        g_lua_pushstring(L, ts_buf);
+    } else {
+        g_lua_pushnil(L);
+    }
+}
+
+static void push_toml_array(lua_State* L, toml_array_t* arr);
+
+static void push_toml_table(lua_State* L, toml_table_t* tab) {
+    if (!g_lua_createtable || !g_lua_pushstring || !g_lua_settable || !g_lua_pushnil) return;
+    g_lua_createtable(L, 0, toml_table_len(tab));
+    
+    int len = toml_table_len(tab);
+    for (int i = 0; i < len; i++) {
+        int key_len;
+        const char* key = toml_table_key(tab, i, &key_len);
+        if (!key) continue;
+        
+        g_lua_pushstring(L, key);
+        
+        toml_value_t val = toml_table_string(tab, key);
+        if (val.ok) {
+            push_toml_value(L, val, 's');
+            g_lua_settable(L, -3);
+            continue;
+        }
+        val = toml_table_bool(tab, key);
+        if (val.ok) {
+            push_toml_value(L, val, 'b');
+            g_lua_settable(L, -3);
+            continue;
+        }
+        val = toml_table_int(tab, key);
+        if (val.ok) {
+            push_toml_value(L, val, 'i');
+            g_lua_settable(L, -3);
+            continue;
+        }
+        val = toml_table_double(tab, key);
+        if (val.ok) {
+            push_toml_value(L, val, 'd');
+            g_lua_settable(L, -3);
+            continue;
+        }
+        val = toml_table_timestamp(tab, key);
+        if (val.ok) {
+            push_toml_value(L, val, 't');
+            g_lua_settable(L, -3);
+            continue;
+        }
+        
+        toml_table_t* sub_tab = toml_table_table(tab, key);
+        if (sub_tab) {
+            push_toml_table(L, sub_tab);
+            g_lua_settable(L, -3);
+            continue;
+        }
+        
+        toml_array_t* sub_arr = toml_table_array(tab, key);
+        if (sub_arr) {
+            push_toml_array(L, sub_arr);
+            g_lua_settable(L, -3);
+            continue;
+        }
+        
+        g_lua_pushnil(L);
+        g_lua_settable(L, -3);
+    }
+}
+
+static void push_toml_array(lua_State* L, toml_array_t* arr) {
+    if (!g_lua_createtable || !g_lua_pushnumber || !g_lua_settable || !g_lua_pushnil) return;
+    int len = toml_array_len(arr);
+    g_lua_createtable(L, len, 0);
+    
+    for (int i = 0; i < len; i++) {
+        g_lua_pushnumber(L, i + 1);
+        
+        toml_value_t val = toml_array_string(arr, i);
+        if (val.ok) {
+            push_toml_value(L, val, 's');
+            g_lua_settable(L, -3);
+            continue;
+        }
+        val = toml_array_bool(arr, i);
+        if (val.ok) {
+            push_toml_value(L, val, 'b');
+            g_lua_settable(L, -3);
+            continue;
+        }
+        val = toml_array_int(arr, i);
+        if (val.ok) {
+            push_toml_value(L, val, 'i');
+            g_lua_settable(L, -3);
+            continue;
+        }
+        val = toml_array_double(arr, i);
+        if (val.ok) {
+            push_toml_value(L, val, 'd');
+            g_lua_settable(L, -3);
+            continue;
+        }
+        val = toml_array_timestamp(arr, i);
+        if (val.ok) {
+            push_toml_value(L, val, 't');
+            g_lua_settable(L, -3);
+            continue;
+        }
+        
+        toml_table_t* sub_tab = toml_array_table(arr, i);
+        if (sub_tab) {
+            push_toml_table(L, sub_tab);
+            g_lua_settable(L, -3);
+            continue;
+        }
+        
+        toml_array_t* sub_arr = toml_array_array(arr, i);
+        if (sub_arr) {
+            push_toml_array(L, sub_arr);
+            g_lua_settable(L, -3);
+            continue;
+        }
+        
+        g_lua_pushnil(L);
+        g_lua_settable(L, -3);
+    }
+}
+
+static int l_toml_parse(lua_State* L) {
+    if (!g_lua_pushnil || !g_lua_pushstring) return 0;
+    const char* toml_str = lua_tostring(L, 1);
+    if (!toml_str) {
+        g_lua_pushnil(L);
+        g_lua_pushstring(L, "toml string expected");
+        return 2;
+    }
+    
+    char errbuf[256];
+    size_t len = strlen(toml_str);
+    char* toml_copy = (char*)malloc(len + 1);
+    if (!toml_copy) {
+        g_lua_pushnil(L);
+        g_lua_pushstring(L, "out of memory");
+        return 2;
+    }
+    strcpy(toml_copy, toml_str);
+    
+    toml_table_t* tab = toml_parse(toml_copy, errbuf, sizeof(errbuf));
+    free(toml_copy);
+    
+    if (!tab) {
+        g_lua_pushnil(L);
+        g_lua_pushstring(L, errbuf);
+        return 2;
+    }
+    
+    push_toml_table(L, tab);
+    toml_free(tab);
+    return 1;
+}
+
+static int luaopen_toml(lua_State* L) {
+    if (!g_lua_createtable || !g_lua_pushcclosure || !g_lua_setfield) return 0;
+    g_lua_createtable(L, 0, 1);
+    g_lua_pushcclosure(L, l_toml_parse, 0);
+    g_lua_setfield(L, -2, "parse");
     return 1;
 }
 
@@ -3052,6 +3743,19 @@ void sre_register_mini_api(lua_State* L) {
     g_lua_pushcclosure(L, l_lni_open_url, 0);
     g_lua_setfield(L, -2, "OpenURL");
 
+    g_lua_pushcclosure(L, l_mini_execute_lni, 0);
+    g_lua_setfield(L, -2, "Execute");
+    g_lua_pushcclosure(L, l_mini_execute_lni, 0);
+    g_lua_setfield(L, -2, "execute");
+    g_lua_pushcclosure(L, l_mini_execute_lni, 0);
+    g_lua_setfield(L, -2, "ExecuteLNI");
+    g_lua_pushcclosure(L, l_mini_bind_lni, 0);
+    g_lua_setfield(L, -2, "Bind");
+    g_lua_pushcclosure(L, l_mini_bind_lni, 0);
+    g_lua_setfield(L, -2, "bind");
+    g_lua_pushcclosure(L, l_mini_bind_lni, 0);
+    g_lua_setfield(L, -2, "BindLNI");
+
     g_lua_setfield(L, LUA_GLOBALSINDEX, "LNI");  /* _G.LNI = table */
 
     /* ---- Components table ---- */
@@ -3157,70 +3861,203 @@ void sre_register_mini_api(lua_State* L) {
     g_lua_setfield(L, LUA_GLOBALSINDEX, "EdgeTest");
 
     /* ---- ButtonController table ---- */
-    g_lua_createtable(L, 0, 32);
+    g_lua_createtable(L, 0, 64);
     g_lua_pushcclosure(L, l_btn_new, 0);
     g_lua_setfield(L, -2, "New");
-    /* Alias for convenience: Add */
+    g_lua_pushcclosure(L, l_btn_new, 0);
+    g_lua_setfield(L, -2, "new");
+    /* Alias for convenience: Add/addButton */
     g_lua_pushcclosure(L, l_btn_new, 0);
     g_lua_setfield(L, -2, "Add");
+    g_lua_pushcclosure(L, l_btn_new, 0);
+    g_lua_setfield(L, -2, "addButton");
     g_lua_pushcclosure(L, l_btn_delete, 0);
     g_lua_setfield(L, -2, "Delete");
-    /* Alias: Remove */
+    g_lua_pushcclosure(L, l_btn_delete, 0);
+    g_lua_setfield(L, -2, "delete");
+    /* Alias: Remove/remove/removeButton */
     g_lua_pushcclosure(L, l_btn_delete, 0);
     g_lua_setfield(L, -2, "Remove");
+    g_lua_pushcclosure(L, l_btn_delete, 0);
+    g_lua_setfield(L, -2, "remove");
+    g_lua_pushcclosure(L, l_btn_delete, 0);
+    g_lua_setfield(L, -2, "removeButton");
     g_lua_pushcclosure(L, l_btn_delete_all, 0);
     g_lua_setfield(L, -2, "DeleteAll");
-    /* Alias: RemoveAll */
+    g_lua_pushcclosure(L, l_btn_delete_all, 0);
+    g_lua_setfield(L, -2, "deleteAll");
+    /* Alias: RemoveAll/removeAll */
     g_lua_pushcclosure(L, l_btn_delete_all, 0);
     g_lua_setfield(L, -2, "RemoveAll");
+    g_lua_pushcclosure(L, l_btn_delete_all, 0);
+    g_lua_setfield(L, -2, "removeAll");
     g_lua_pushcclosure(L, l_btn_set_hidden, 0);
     g_lua_setfield(L, -2, "SetHidden");
+    g_lua_pushcclosure(L, l_btn_set_hidden, 0);
+    g_lua_setfield(L, -2, "setHidden");
     g_lua_pushcclosure(L, l_btn_set_hidden_all, 0);
     g_lua_setfield(L, -2, "SetHiddenAll");
+    g_lua_pushcclosure(L, l_btn_set_hidden_all, 0);
+    g_lua_setfield(L, -2, "setHiddenAll");
     g_lua_pushcclosure(L, l_btn_is_pressed, 0);
     g_lua_setfield(L, -2, "IsPressed");
+    g_lua_pushcclosure(L, l_btn_is_pressed, 0);
+    g_lua_setfield(L, -2, "isPressed");
     g_lua_pushcclosure(L, l_btn_is_dragging, 0);
     g_lua_setfield(L, -2, "IsDragging");
+    g_lua_pushcclosure(L, l_btn_is_dragging, 0);
+    g_lua_setfield(L, -2, "isDragging");
     g_lua_pushcclosure(L, l_btn_exists, 0);
     g_lua_setfield(L, -2, "Exists");
+    g_lua_pushcclosure(L, l_btn_exists, 0);
+    g_lua_setfield(L, -2, "exists");
     g_lua_pushcclosure(L, l_btn_set_text, 0);
     g_lua_setfield(L, -2, "SetText");
+    g_lua_pushcclosure(L, l_btn_set_text, 0);
+    g_lua_setfield(L, -2, "setText");
     g_lua_pushcclosure(L, l_btn_set_position, 0);
     g_lua_setfield(L, -2, "SetPosition");
+    g_lua_pushcclosure(L, l_btn_set_position, 0);
+    g_lua_setfield(L, -2, "setPosition");
     g_lua_pushcclosure(L, l_btn_get_position, 0);
     g_lua_setfield(L, -2, "GetPosition");
+    g_lua_pushcclosure(L, l_btn_get_position, 0);
+    g_lua_setfield(L, -2, "getPosition");
     g_lua_pushcclosure(L, l_btn_get_position_x, 0);
     g_lua_setfield(L, -2, "GetPositionX");
     g_lua_pushcclosure(L, l_btn_get_position_y, 0);
     g_lua_setfield(L, -2, "GetPositionY");
     g_lua_pushcclosure(L, l_btn_set_alpha, 0);
     g_lua_setfield(L, -2, "SetAlpha");
+    g_lua_pushcclosure(L, l_btn_set_alpha, 0);
+    g_lua_setfield(L, -2, "setAlpha");
     g_lua_pushcclosure(L, l_btn_set_scaling, 0);
     g_lua_setfield(L, -2, "SetScaling");
+    g_lua_pushcclosure(L, l_btn_set_scaling, 0);
+    g_lua_setfield(L, -2, "setScaling");
     g_lua_pushcclosure(L, l_btn_set_dimensions, 0);
     g_lua_setfield(L, -2, "SetDimensions");
+    g_lua_pushcclosure(L, l_btn_set_dimensions, 0);
+    g_lua_setfield(L, -2, "setDimensions");
     g_lua_pushcclosure(L, l_btn_make_movable, 0);
     g_lua_setfield(L, -2, "MakeMovable");
+    g_lua_pushcclosure(L, l_btn_make_movable, 0);
+    g_lua_setfield(L, -2, "makeMovable");
     g_lua_pushcclosure(L, l_btn_set_clickable, 0);
     g_lua_setfield(L, -2, "SetClickable");
+    g_lua_pushcclosure(L, l_btn_set_clickable, 0);
+    g_lua_setfield(L, -2, "setClickable");
     g_lua_pushcclosure(L, l_btn_set_text_font, 0);
     g_lua_setfield(L, -2, "SetTextFont");
+    g_lua_pushcclosure(L, l_btn_set_text_font, 0);
+    g_lua_setfield(L, -2, "setTextFont");
     g_lua_pushcclosure(L, l_btn_set_text_scale, 0);
     g_lua_setfield(L, -2, "SetTextScale");
+    g_lua_pushcclosure(L, l_btn_set_text_scale, 0);
+    g_lua_setfield(L, -2, "setTextScale");
     g_lua_pushcclosure(L, l_btn_set_text_color, 0);
     g_lua_setfield(L, -2, "SetTextColor");
+    g_lua_pushcclosure(L, l_btn_set_text_color, 0);
+    g_lua_setfield(L, -2, "setTextColor");
     g_lua_pushcclosure(L, l_btn_set_padding, 0);
     g_lua_setfield(L, -2, "SetPadding");
+    g_lua_pushcclosure(L, l_btn_set_padding, 0);
+    g_lua_setfield(L, -2, "setPadding");
     g_lua_pushcclosure(L, l_btn_set_alignment, 0);
     g_lua_setfield(L, -2, "SetAlignment");
+    g_lua_pushcclosure(L, l_btn_set_alignment, 0);
+    g_lua_setfield(L, -2, "setAlignment");
     g_lua_pushcclosure(L, l_btn_set_bg_resource, 0);
     g_lua_setfield(L, -2, "SetBackgroundResource");
+    g_lua_pushcclosure(L, l_btn_set_bg_resource, 0);
+    g_lua_setfield(L, -2, "setBackgroundResource");
     g_lua_pushcclosure(L, l_btn_set_bg_alpha, 0);
     g_lua_setfield(L, -2, "SetBackgroundAlpha");
+    g_lua_pushcclosure(L, l_btn_set_bg_alpha, 0);
+    g_lua_setfield(L, -2, "setBackgroundAlpha");
+
+    /* New Overlay API */
+    g_lua_pushcclosure(L, l_btn_new_overlay, 0);
+    g_lua_setfield(L, -2, "newOverlay");
+    g_lua_pushcclosure(L, l_btn_new_overlay, 0);
+    g_lua_setfield(L, -2, "NewOverlay");
+    g_lua_pushcclosure(L, l_btn_set_overlay_movable, 0);
+    g_lua_setfield(L, -2, "setOverlayMovable");
+    g_lua_pushcclosure(L, l_btn_set_overlay_movable, 0);
+    g_lua_setfield(L, -2, "SetOverlayMovable");
+    g_lua_pushcclosure(L, l_btn_set_overlay_pinchable, 0);
+    g_lua_setfield(L, -2, "setOverlayPinchable");
+    g_lua_pushcclosure(L, l_btn_set_overlay_pinchable, 0);
+    g_lua_setfield(L, -2, "SetOverlayPinchable");
+    g_lua_pushcclosure(L, l_btn_set_overlay_bg_color, 0);
+    g_lua_setfield(L, -2, "setOverlayBackgroundColor");
+    g_lua_pushcclosure(L, l_btn_set_overlay_bg_color, 0);
+    g_lua_setfield(L, -2, "SetOverlayBackgroundColor");
+    g_lua_pushcclosure(L, l_btn_set_overlay_bg_alpha, 0);
+    g_lua_setfield(L, -2, "setOverlayBackgroundAlpha");
+    g_lua_pushcclosure(L, l_btn_set_overlay_bg_alpha, 0);
+    g_lua_setfield(L, -2, "SetOverlayBackgroundAlpha");
+    g_lua_pushcclosure(L, l_btn_set_overlay_corner_radius, 0);
+    g_lua_setfield(L, -2, "setOverlayCornerRadius");
+    g_lua_pushcclosure(L, l_btn_set_overlay_corner_radius, 0);
+    g_lua_setfield(L, -2, "SetOverlayCornerRadius");
+    g_lua_pushcclosure(L, l_btn_remove_overlay, 0);
+    g_lua_setfield(L, -2, "removeOverlay");
+    g_lua_pushcclosure(L, l_btn_remove_overlay, 0);
+    g_lua_setfield(L, -2, "RemoveOverlay");
+    g_lua_pushcclosure(L, l_btn_overlay_add_button, 0);
+    g_lua_setfield(L, -2, "overlayAddButton");
+    g_lua_pushcclosure(L, l_btn_overlay_add_button, 0);
+    g_lua_setfield(L, -2, "OverlayAddButton");
+
+    g_lua_pushcclosure(L, l_btn_overlay_add_separator, 0);
+    g_lua_setfield(L, -2, "overlayAddSeparator");
+    g_lua_pushcclosure(L, l_btn_overlay_add_separator, 0);
+    g_lua_setfield(L, -2, "OverlayAddSeparator");
+    g_lua_pushcclosure(L, l_btn_set_overlay_hidden, 0);
+    g_lua_setfield(L, -2, "setOverlayHidden");
+    g_lua_pushcclosure(L, l_btn_set_overlay_hidden, 0);
+    g_lua_setfield(L, -2, "SetOverlayHidden");
+    g_lua_pushcclosure(L, l_btn_set_overlay_position, 0);
+    g_lua_setfield(L, -2, "setOverlayPosition");
+    g_lua_pushcclosure(L, l_btn_set_overlay_position, 0);
+    g_lua_setfield(L, -2, "SetOverlayPosition");
+    g_lua_pushcclosure(L, l_btn_get_overlay_position, 0);
+    g_lua_setfield(L, -2, "getOverlayPosition");
+    g_lua_pushcclosure(L, l_btn_get_overlay_position, 0);
+    g_lua_setfield(L, -2, "GetOverlayPosition");
+    g_lua_pushcclosure(L, l_btn_get_overlay_scale_factor, 0);
+    g_lua_setfield(L, -2, "getOverlayScaleFactor");
+    g_lua_pushcclosure(L, l_btn_get_overlay_scale_factor, 0);
+    g_lua_setfield(L, -2, "GetOverlayScaleFactor");
+    g_lua_pushcclosure(L, l_btn_is_overlay_pinching, 0);
+    g_lua_setfield(L, -2, "isOverlayPinching");
+    g_lua_pushcclosure(L, l_btn_is_overlay_pinching, 0);
+    g_lua_setfield(L, -2, "IsOverlayPinching");
+    g_lua_pushcclosure(L, l_btn_set_button_confined, 0);
+    g_lua_setfield(L, -2, "setButtonConfined");
+    g_lua_pushcclosure(L, l_btn_set_button_confined, 0);
+    g_lua_setfield(L, -2, "SetButtonConfined");
+
     g_lua_setfield(L, LUA_GLOBALSINDEX, "ButtonController");
     /* Alias Button to ButtonController */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "ButtonController");
     g_lua_setfield(L, LUA_GLOBALSINDEX, "Button");
+
+    /* ---- Keyboard table ---- */
+    g_lua_createtable(L, 0, 8);
+    g_lua_pushcclosure(L, l_kbd_open, 0);
+    g_lua_setfield(L, -2, "open");
+    g_lua_pushcclosure(L, l_kbd_close, 0);
+    g_lua_setfield(L, -2, "close");
+    g_lua_pushcclosure(L, l_kbd_get_text, 0);
+    g_lua_setfield(L, -2, "getText");
+    g_lua_pushcclosure(L, l_kbd_is_done, 0);
+    g_lua_setfield(L, -2, "isDone");
+    g_lua_pushcclosure(L, l_kbd_is_open, 0);
+    g_lua_setfield(L, -2, "isOpen");
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "Keyboard");
+
 
     /* ---- CameraController table (SwKiwi alias for Mini.Camera) ---- */
     g_lua_createtable(L, 0, 6);
@@ -3471,6 +4308,20 @@ void sre_register_mini_api(lua_State* L) {
     g_lua_setfield(L, -2, "exists");
     g_lua_setfield(L, LUA_GLOBALSINDEX, "fs");
 
+    /* ---- lfs alias to fs ---- */
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "fs");
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "lfs");
+
+    /* ---- broken_socket (luasocket core) ---- */
+    extern int luaopen_socket_core(lua_State* L);
+    g_lua_pushcclosure(L, (lua_CFunction)luaopen_socket_core, 0);
+    if (g_lua_pcall) {
+        g_lua_pcall(L, 0, 1, 0);
+    } else if (g_lua_call) {
+        g_lua_call(L, 0, 1);
+    }
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "broken_socket");
+
     /* ---- Game table ---- */
     /* Only create stub Game table if the engine hasn't already registered one.
      * The engine's RegisterProgramLibrary provides Game with real C++
@@ -3706,14 +4557,16 @@ static int stub_return_false_or_zero(lua_State* L) {
 
 static void create_universal_stub_table(lua_State* L, const char* name) {
     g_lua_getfield(L, LUA_GLOBALSINDEX, name);
-    if (g_lua_type(L, -1) != LUA_TTABLE) {
-        g_lua_settop(L, -2); /* pop nil or non-table */
-        g_lua_createtable(L, 0, 8); /* stub table — stack: [stub] */
-        g_lua_pushvalue(L, -1);
-        g_lua_setfield(L, LUA_GLOBALSINDEX, name);
+    int type = g_lua_type(L, -1);
+    if (type != LUA_TNIL) {
+        g_lua_settop(L, -2); /* pop existing value and return immediately without modifying it */
+        return;
     }
-    /* Now stack[-1] is guaranteed to be the global table */
-
+    g_lua_settop(L, -2); /* pop nil */
+    g_lua_createtable(L, 0, 8); /* stub table — stack: [stub] */
+    g_lua_pushvalue(L, -1);
+    g_lua_setfield(L, LUA_GLOBALSINDEX, name);
+    
     /* Attach direct stub functions for known critical methods ONLY IF THEY ARE NIL */
 #define SAFE_STUB(fname, fn) \
     g_lua_getfield(L, -1, fname); \
@@ -3748,6 +4601,148 @@ static void create_universal_stub_table(lua_State* L, const char* name) {
     g_lua_settop(L, -2); /* pop table */
 }
 
+extern uint64_t g_swordigo_base;
+
+/* Mangled C++ Component virtual lookups and class method bindings */
+typedef void* (*pfn_ComponentWithInterface)(void* scene_obj, long interface_id);
+typedef long (*pfn_Touchable_Interface)(void);
+typedef long (*pfn_TextBubble_Interface)(void);
+typedef void (*pfn_TextBubble_ShowText)(void* text_bubble_comp, SreString* text, float maxWidth);
+typedef void (*pfn_TextBubble_SetHandleTouches)(void* text_bubble_comp, int enabled);
+typedef int (*pfn_TextBubble_IsTextFinishedShowing)(void* text_bubble_comp);
+
+extern void sre_CppString_from_char_p(SreString* self, const char* src);
+extern void sre_CppString_release(SreString* self);
+
+static void* get_scene_object(lua_State* L, int idx) {
+    if (!g_lua_touserdata) return NULL;
+    void* ud = g_lua_touserdata(L, idx);
+    if (!ud) return NULL;
+    return *(void**)ud;
+}
+
+/* Touchable.SetTouchRadius(bubble, radius) */
+static int l_touchable_set_touch_radius(lua_State* L) {
+    void* bubble = get_scene_object(L, 1);
+    double radius = 0.0;
+    if (g_lua_type(L, 2) == LUA_TNUMBER) {
+        radius = g_lua_tonumber(L, 2);
+    }
+    
+    if (bubble && g_swordigo_base) {
+        pfn_ComponentWithInterface comp_with_iface = (pfn_ComponentWithInterface)(g_swordigo_base + 0x47462c);
+        pfn_Touchable_Interface touch_iface = (pfn_Touchable_Interface)(g_swordigo_base + 0x23e174);
+        
+        long iface_id = touch_iface();
+        void* component = comp_with_iface(bubble, iface_id);
+        if (component) {
+            *(float*)((char*)component + 0x70) = (float)radius;
+        }
+    }
+    return 0;
+}
+
+/* TextBubble.SetTouchHandlingEnabled(bubble, enabled) */
+static int l_textbubble_set_touch_handling_enabled(lua_State* L) {
+    void* bubble = get_scene_object(L, 1);
+    int enabled = 0;
+    if (g_lua_type(L, 2) == LUA_TBOOLEAN) {
+        enabled = g_lua_toboolean(L, 2);
+    } else if (g_lua_type(L, 2) == LUA_TNUMBER) {
+        enabled = (g_lua_tonumber(L, 2) != 0.0);
+    }
+    
+    if (bubble && g_swordigo_base) {
+        pfn_ComponentWithInterface comp_with_iface = (pfn_ComponentWithInterface)(g_swordigo_base + 0x47462c);
+        pfn_TextBubble_Interface bubble_iface = (pfn_TextBubble_Interface)(g_swordigo_base + 0x23dd48);
+        pfn_TextBubble_SetHandleTouches set_handle = (pfn_TextBubble_SetHandleTouches)(g_swordigo_base + 0x23d4bc);
+        
+        long iface_id = bubble_iface();
+        void* component = comp_with_iface(bubble, iface_id);
+        if (component) {
+            set_handle(component, enabled);
+        }
+    }
+    return 0;
+}
+
+/* TextBubble.IsTextFinished(bubble) */
+static int l_textbubble_is_text_finished(lua_State* L) {
+    void* bubble = get_scene_object(L, 1);
+    int finished = 1; /* Default to finished to prevent infinite wait loops on invalid bubble */
+    
+    if (bubble && g_swordigo_base) {
+        pfn_ComponentWithInterface comp_with_iface = (pfn_ComponentWithInterface)(g_swordigo_base + 0x47462c);
+        pfn_TextBubble_Interface bubble_iface = (pfn_TextBubble_Interface)(g_swordigo_base + 0x23dd48);
+        pfn_TextBubble_IsTextFinishedShowing is_finished = (pfn_TextBubble_IsTextFinishedShowing)(g_swordigo_base + 0x23d270);
+        
+        long iface_id = bubble_iface();
+        void* component = comp_with_iface(bubble, iface_id);
+        if (component) {
+            finished = is_finished(component);
+        }
+    }
+    g_lua_pushboolean(L, finished);
+    return 1;
+}
+
+/* TextBubble.ShowText(bubble, text, maxWidth) */
+static int l_textbubble_show_text(lua_State* L) {
+    void* bubble = get_scene_object(L, 1);
+    const char* text = "";
+    if (g_lua_type(L, 2) == LUA_TSTRING && g_lua_tolstring) {
+        size_t len = 0;
+        text = g_lua_tolstring(L, 2, &len);
+    }
+    double maxWidth = 0.0;
+    if (g_lua_gettop(L) >= 3 && g_lua_type(L, 3) == LUA_TNUMBER) {
+        maxWidth = g_lua_tonumber(L, 3);
+    }
+    
+    if (bubble && g_swordigo_base && text) {
+        pfn_ComponentWithInterface comp_with_iface = (pfn_ComponentWithInterface)(g_swordigo_base + 0x47462c);
+        pfn_TextBubble_Interface bubble_iface = (pfn_TextBubble_Interface)(g_swordigo_base + 0x23dd48);
+        pfn_TextBubble_ShowText show_text = (pfn_TextBubble_ShowText)(g_swordigo_base + 0x23cea0);
+        
+        long iface_id = bubble_iface();
+        void* component = comp_with_iface(bubble, iface_id);
+        if (component) {
+            SreString str;
+            sre_CppString_from_char_p(&str, text);
+            show_text(component, &str, (float)maxWidth);
+            sre_CppString_release(&str);
+        }
+    }
+    return 0;
+}
+
+/* OverlayText.SetText(obj, text) */
+static int l_overlaytext_set_text(lua_State* L) {
+    void* obj = get_scene_object(L, 1);
+    const char* text_val = "";
+    if (g_lua_type(L, 2) == LUA_TSTRING) {
+        text_val = g_lua_tolstring(L, 2, NULL);
+    }
+    
+    extern void* g_OverlayTextComponent_Interface_addr;
+    if (obj && g_swordigo_base && g_OverlayTextComponent_Interface_addr) {
+        pfn_ComponentWithInterface comp_with_iface = (pfn_ComponentWithInterface)(g_swordigo_base + 0x47462c);
+        
+        typedef void* (*pfn_Interface)(void);
+        pfn_Interface iface_fn = (pfn_Interface)g_OverlayTextComponent_Interface_addr;
+        
+        void* iface_id = iface_fn();
+        void* component = comp_with_iface(obj, (long)iface_id);
+        if (component) {
+            SreString* text_str = (SreString*)((char*)component + 0x70);
+            sre_CppString_release(text_str);
+            sre_CppString_from_char_p(text_str, text_val);
+            *(char*)((char*)component + 0x80) = 1; // Mark dirty
+        }
+    }
+    return 0;
+}
+
 /*
  * sre_register_rlsw_stubs — register Character and ItemDrop stub tables
  * into the Lua global table, but ONLY if those globals are currently nil.
@@ -3758,8 +4753,8 @@ static void sre_register_rlsw_stubs(lua_State* L) {
     /* ---- Character ---- */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "Character");
     int char_type = g_lua_type(L, -1);
-    if (char_type != LUA_TTABLE) {
-        g_lua_settop(L, -2);  /* pop non-table */
+    if (char_type == LUA_TNIL) {
+        g_lua_settop(L, -2);  /* pop nil */
         g_lua_createtable(L, 0, 25);
         g_lua_setfield(L, LUA_GLOBALSINDEX, "Character");
         g_lua_getfield(L, LUA_GLOBALSINDEX, "Character");
@@ -3821,8 +4816,8 @@ static void sre_register_rlsw_stubs(lua_State* L) {
     /* ---- ItemDrop ---- */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "ItemDrop");
     int drop_type = g_lua_type(L, -1);
-    if (drop_type != LUA_TTABLE) {
-        g_lua_settop(L, -2);  /* pop non-table */
+    if (drop_type == LUA_TNIL) {
+        g_lua_settop(L, -2);  /* pop nil */
         g_lua_createtable(L, 0, 8);
         g_lua_setfield(L, LUA_GLOBALSINDEX, "ItemDrop");
         g_lua_getfield(L, LUA_GLOBALSINDEX, "ItemDrop");
@@ -3884,8 +4879,32 @@ static void sre_register_rlsw_stubs(lua_State* L) {
     create_universal_stub_table(L, "Bauble");
     create_universal_stub_table(L, "Is");
     create_universal_stub_table(L, "Touchable");
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "Touchable");
+    if (g_lua_type(L, -1) == LUA_TTABLE) {
+        g_lua_pushcclosure(L, l_touchable_set_touch_radius, 0);
+        g_lua_setfield(L, -2, "SetTouchRadius");
+    }
+    g_lua_settop(L, -2); /* pop Touchable */
+
     create_universal_stub_table(L, "TextBubble");
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "TextBubble");
+    if (g_lua_type(L, -1) == LUA_TTABLE) {
+        g_lua_pushcclosure(L, l_textbubble_show_text, 0);
+        g_lua_setfield(L, -2, "ShowText");
+        g_lua_pushcclosure(L, l_textbubble_set_touch_handling_enabled, 0);
+        g_lua_setfield(L, -2, "SetTouchHandlingEnabled");
+        g_lua_pushcclosure(L, l_textbubble_is_text_finished, 0);
+        g_lua_setfield(L, -2, "IsTextFinished");
+    }
+    g_lua_settop(L, -2); /* pop TextBubble */
+
     create_universal_stub_table(L, "OverlayText");
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "OverlayText");
+    if (g_lua_type(L, -1) == LUA_TTABLE) {
+        g_lua_pushcclosure(L, l_overlaytext_set_text, 0);
+        g_lua_setfield(L, -2, "SetText");
+    }
+    g_lua_settop(L, -2); /* pop OverlayText */
 }
 
 /* =========================================================================
@@ -3918,11 +4937,7 @@ static void sre_eval_lua(lua_State* L, const char* code) {
 static lua_State* g_injected_states[MAX_INJECTED_STATES] = {0};
 static int g_injected_count = 0;
 
-extern int fseek(void* stream, long int offset, int whence);
-extern long int ftell(void* stream);
-extern char* getenv(const char* name);
-extern char* strstr(const char* haystack, const char* needle);
-extern int snprintf(char* s, size_t n, const char* format, ...);
+
 
 static void sre_load_edgetest_scl(lua_State* L) {
     const char* home = getenv("HOME");
@@ -3958,9 +4973,278 @@ static void sre_load_edgetest_scl(lua_State* L) {
     }
 }
 
+/*
+ * sre_load_srlz_lua — Load and register Srlz (serialization) library
+ *
+ * Creates the Srlz table with serialize() and deserialize() functions.
+ * Called from sre_mini_ensure_injected() during state initialization.
+ */
+static void sre_load_srlz_lua(lua_State* L) {
+    if (!L || !g_lua_createtable) return;
+
+    /* Inline the Srlz library (small enough to embed) */
+    sre_eval_lua(L,
+        "local specialNums = {\n"
+        "    [tostring(1/0)] = '1/0 --[[math.huge]]',\n"
+        "    [tostring(-1/0)] = '-1/0 --[[-math.huge]]',\n"
+        "    [tostring(0/0)] = '0/0'\n"
+        "}\n"
+        "local rawpairs = function(t) return next, t end\n"
+        "local function toStr(obj)\n"
+        "    local s1 = tostring(tostring(obj))\n"
+        "    if type(s1) == 'string' then return s1 end\n"
+        "    local mt = getmetatable(obj)\n"
+        "    if mt then\n"
+        "        local ts = mt.__tostring\n"
+        "        mt.__tostring = nil\n"
+        "        local s2 = tostring(obj)\n"
+        "        mt.__tostring = ts\n"
+        "        return s2\n"
+        "    end\n"
+        "    return 'unknown'\n"
+        "end\n"
+        "local function insertionSort(arr, func)\n"
+        "    local n = #arr\n"
+        "    for i = 2, n do\n"
+        "        local key = arr[i]\n"
+        "        local j = i - 1\n"
+        "        if func then\n"
+        "            while j >= 1 and func(arr[j], key) do\n"
+        "                arr[j + 1] = arr[j]; j = j - 1\n"
+        "            end\n"
+        "        else\n"
+        "            while j >= 1 and tostring(arr[j]) > tostring(key) do\n"
+        "                arr[j + 1] = arr[j]; j = j - 1\n"
+        "            end\n"
+        "        end\n"
+        "        arr[j + 1] = key\n"
+        "    end\n"
+        "    return arr\n"
+        "end\n"
+        "local sort = (table and table.sort) or insertionSort\n"
+        "local function serialize(data, options)\n"
+        "    local o = {comments = true, stringifyNumberKeys = false,\n"
+        "        space = ' ', newLine = '\\n', indent = '  ', lineLength = 30,\n"
+        "        fixradix = false, multilineStrings = true, functionMarker = nil,\n"
+        "        sortMarker = nil, omitMarker = nil, noHuge = false,\n"
+        "        numFormat = '%.17g', positional = true, positionalMaxNils = 2,\n"
+        "        metatables = true, full = false}\n"
+        "    for k, v in rawpairs(options or {}) do o[k] = v end\n"
+        "    local function process(d, depth, chain)\n"
+        "        local t = type(d)\n"
+        "        if d == nil then return 'nil'\n"
+        "        elseif t == 'boolean' then return tostring(d)\n"
+        "        elseif t == 'string' then return string.format('%q', d)\n"
+        "        elseif t == 'number' then\n"
+        "            if not o.noHuge then\n"
+        "                local special = specialNums[toStr(d)]\n"
+        "                if special then return special end\n"
+        "            end\n"
+        "            return o.numFormat:format(d)\n"
+        "        elseif t == 'table' then\n"
+        "            if chain[d] then return 'nil' end\n"
+        "            chain[d] = true\n"
+        "            local out = {'{'}\n"
+        "            for k, v in pairs(d) do\n"
+        "                if k ~= '__metatable' then\n"
+        "                    local key = (type(k) == 'string' and k:match('^%a[%w_]*$') and k) or\n"
+        "                               ('[' .. process(k, depth+1, chain) .. ']')\n"
+        "                    table.insert(out, key .. ' = ' .. process(v, depth+1, chain) .. ',')\n"
+        "                end\n"
+        "            end\n"
+        "            table.insert(out, '}')\n"
+        "            chain[d] = nil\n"
+        "            return table.concat(out)\n"
+        "        else\n"
+        "            return 'nil'\n"
+        "        end\n"
+        "    end\n"
+        "    return process(data, 0, {})\n"
+        "end\n"
+        "local function deserialize(data, opts)\n"
+        "    local is_safe = not (opts and opts.safe == false)\n"
+        "    local env = is_safe and setmetatable({}, {__index = function() return nil end}) or _G\n"
+        "    local chunk, err = loadstring('return ' .. data)\n"
+        "    if not chunk then chunk, err = loadstring(data) end\n"
+        "    if not chunk then return false, err end\n"
+        "    if is_safe and setfenv then setfenv(chunk, env) end\n"
+        "    return pcall(chunk)\n"
+        "end\n"
+        "Srlz = {serialize = serialize, deserialize = deserialize}\n"
+        "_G.Srlz = Srlz\n");
+}
+
+/*
+ * sre_load_db_lua — Load and register DB (database) library
+ *
+ * Provides db.init(), db.save(), db.load() for character persistence.
+ * Called from sre_mini_ensure_injected() during state initialization.
+ */
+static void sre_load_db_lua(lua_State* L) {
+    if (!L || !g_lua_createtable) return;
+
+    sre_eval_lua(L,
+        "DB = {Inventory = {}, SS = 0, Created = os.time(), Music = {},\n"
+        "      Enchants = {}, Chests = {}, Weapons = {}, Baubles = {}, Flags = {}}\n"
+        "db = {}\n"
+        "local function read_file(path)\n"
+        "    if DB and DB.read then return DB.read(path) end\n"
+        "    if io and io.open then\n"
+        "        local f = io.open(path, 'r')\n"
+        "        if f then local c = f:read('*a'); f:close(); return c end\n"
+        "    end\n"
+        "    return nil\n"
+        "end\n"
+        "local function write_file(path, content)\n"
+        "    if DB and DB.write then return DB.write(path, content) end\n"
+        "    if io and io.open then\n"
+        "        local f = io.open(path, 'w')\n"
+        "        if f then f:write(content); f:close(); return true end\n"
+        "    end\n"
+        "    return false\n"
+        "end\n"
+        "local function mkdir(path)\n"
+        "    if fs and fs.mkdir then return fs.mkdir(path) end\n"
+        "    return false\n"
+        "end\n"
+        "local function get_profile_id()\n"
+        "    if Mini and Mini.GetProfileID then return Mini.GetProfileID() end\n"
+        "    return 'default'\n"
+        "end\n"
+        "local function get_save_path()\n"
+        "    local pid = get_profile_id()\n"
+        "    mkdir('/Files/Documents')\n"
+        "    return '/Files/Documents/' .. pid .. '.lua'\n"
+        "end\n"
+        "local function db_load()\n"
+        "    local path = get_save_path()\n"
+        "    local content = read_file(path)\n"
+        "    if not content or content == '' then return nil end\n"
+        "    if not Srlz then return nil end\n"
+        "    local success, result = Srlz.deserialize(content, {safe = true})\n"
+        "    return success and result or nil\n"
+        "end\n"
+        "local function db_save()\n"
+        "    local path = get_save_path()\n"
+        "    if not Srlz then return false end\n"
+        "    local serialized = Srlz.serialize(DB)\n"
+        "    return write_file(path, serialized)\n"
+        "end\n"
+        "function db.init()\n"
+        "    if Program and Program.Wait then Program.Wait(0.05) end\n"
+        "    if Game and Game.CurrentLevelName then\n"
+        "        local level = Game.CurrentLevelName()\n"
+        "        if level == 'menu' or level == 'hero' then return 0 end\n"
+        "    end\n"
+        "    mkdir('/Files/Documents')\n"
+        "    local loaded = db_load()\n"
+        "    if loaded then DB = loaded else\n"
+        "        DB = {Inventory = {}, SS = 0, Created = os.time(), Music = {},\n"
+        "              Enchants = {}, Chests = {}, Weapons = {}, Baubles = {}, Flags = {}}\n"
+        "    end\n"
+        "    if Character and Character.SetNumCoins then\n"
+        "        Character.SetNumCoins(DB.SS or 0)\n"
+        "    end\n"
+        "    print('DB initialized')\n"
+        "    if Program and Program.NewThread then\n"
+        "        Program.NewThread('db_sync_loop', function()\n"
+        "            while true do\n"
+        "                if Character and Character.NumCoins then\n"
+        "                    DB.SS = Character.NumCoins()\n"
+        "                end\n"
+        "                db_save()\n"
+        "                if Program and Program.Wait then Program.Wait(0.1) end\n"
+        "            end\n"
+        "        end)\n"
+        "    end\n"
+        "    return 1\n"
+        "end\n"
+        "function db.save() return db_save() end\n"
+        "function db.load() local l = db_load(); if l then DB = l end; return l end\n"
+        "function db.get() return DB end\n"
+        "function db.set(new_db) if new_db and type(new_db) == 'table' then DB = new_db; return true end; return false end\n"
+        "_G.db = db\n");
+}
+
 void sre_mini_ensure_injected(lua_State* L) {
     if (!L) return;
     if (!g_lua_createtable) return;  /* Lua API not ready */
+
+
+    /* Install sre_hook_obj helper function — only defines the function,
+     * does NOT wrap any global Scene.* methods to avoid breaking vanilla
+     * game portals/level transitions. Mods that need per-object side-tables
+     * can call sre_hook_obj() explicitly via Mini.HookObj() if needed.
+     * The __sre_so_hooked guard ensures this runs only once per Lua state. */
+    sre_eval_lua(L,
+        "if not _G.__sre_so_hooked then\n"
+        "  _G.__sre_so_hooked = true\n"
+        "  local get_mt = (debug and debug.getmetatable) or getmetatable\n"
+        "  _G.sre_hook_obj = function(obj)\n"
+        "    if not obj then return obj end\n"
+        "    local mt = get_mt and get_mt(obj)\n"
+        "    if mt and type(mt) == 'table' and not mt.__sre_hooked then\n"
+        "      mt.__sre_hooked = true\n"
+        "      mt.__sre_sidetable = mt.__sre_sidetable or {}\n"
+        "      local envs = mt.__sre_sidetable\n"
+        "      local og_index = mt.__index\n"
+        "      local og_newindex = mt.__newindex\n"
+        "      mt.__index = function(self_obj, key)\n"
+        "        local addr\n"
+        "        local id_fn\n"
+        "        if type(og_index) == 'function' then\n"
+        "          id_fn = og_index(self_obj, 'identifier')\n"
+        "        elseif type(og_index) == 'table' then\n"
+        "          id_fn = og_index['identifier']\n"
+        "        end\n"
+        "        if type(id_fn) == 'function' then\n"
+        "          local ok, res = pcall(id_fn, self_obj)\n"
+        "          if ok and type(res) == 'string' and res ~= '' then addr = res end\n"
+        "        end\n"
+        "        if not addr then addr = tostring(self_obj) end\n"
+        "        local env = envs[addr]\n"
+        "        if env and env[key] ~= nil then return env[key] end\n"
+        "        if key == 'setAlwaysActive' then\n"
+        "          return function(self_act, active)\n"
+        "            if SceneObject and SceneObject.SetAlwaysActive then\n"
+        "              SceneObject.SetAlwaysActive(self_act, active)\n"
+        "            end\n"
+        "          end\n"
+        "        end\n"
+        "        if type(og_index) == 'function' then\n"
+        "          return og_index(self_obj, key)\n"
+        "        elseif type(og_index) == 'table' then\n"
+        "          return og_index[key]\n"
+        "        end\n"
+        "      end\n"
+        "      mt.__newindex = function(self_obj, key, val)\n"
+        "        if og_newindex then\n"
+        "          pcall(function()\n"
+        "            if type(og_newindex) == 'function' then og_newindex(self_obj, key, val)\n"
+        "            elseif type(og_newindex) == 'table' then og_newindex[key] = val end\n"
+        "          end)\n"
+        "        end\n"
+        "        local addr\n"
+        "        local id_fn\n"
+        "        if type(og_index) == 'function' then\n"
+        "          id_fn = og_index(self_obj, 'identifier')\n"
+        "        elseif type(og_index) == 'table' then\n"
+        "          id_fn = og_index['identifier']\n"
+        "        end\n"
+        "        if type(id_fn) == 'function' then\n"
+        "          local ok, res = pcall(id_fn, self_obj)\n"
+        "          if ok and type(res) == 'string' and res ~= '' then addr = res end\n"
+        "        end\n"
+        "        if not addr then addr = tostring(self_obj) end\n"
+        "        local env = envs[addr]\n"
+        "        if not env then env = {}; envs[addr] = env end\n"
+        "        env[key] = val\n"
+        "      end\n"
+        "    end\n"
+        "    return obj\n"
+        "  end\n"
+        "end\n"
+    );
 
     /* Check if already injected for this state */
     int i;
@@ -3968,63 +5252,91 @@ void sre_mini_ensure_injected(lua_State* L) {
         if (g_injected_states[i] == L) {
             /* Re-patch C stubs (cheap, no-op if already set) */
             sre_register_rlsw_stubs(L);
-            /* Also apply Lua-level safety net: ItemDrop proxy + coin guardian.
-             * Pure-Lua tables survive engine overwrites better than C stubs. */
-            sre_eval_lua(L,
-                /* ItemDrop proxy: wraps engine table, guarantees NumItems etc. */
-                "if not _G.__sre_itemdrop_proxy then\n"
-                "  _G.__sre_itemdrop_proxy = true\n"
-                "  local _o = rawget(_G,'ItemDrop') or {}\n"
-                "  local _p = {}\n"
-                "  local _fb = {\n"
-                "    NumItems=function(o) local f=_o.NumItems; return f and f(o) or 0 end,\n"
-                "    ItemIdentifier=function(o,i) local f=_o.ItemIdentifier; return f and f(o,i) or '' end,\n"
-                "    SetItemIdentifier=function(o,i,v) local f=_o.SetItemIdentifier; if f then f(o,i,v) end end,\n"
-                "    AllItemsCollected=function(o) local f=_o.AllItemsCollected; return f and f(o) or false end,\n"
-                "    GetItem=function(o,i) local f=_o.GetItem; return f and f(o,i) or nil end,\n"
-                "    Drop=function(...) local f=_o.Drop; if f then f(...) end end,\n"
-                "    Trigger=function(...) local f=_o.Trigger; if f then f(...) end end,\n"
-                "  }\n"
-                "  setmetatable(_p,{\n"
-                "    __index=function(t,k) return _fb[k] or _o[k] end,\n"
-                "    __newindex=function(t,k,v) _o[k]=v end\n"
-                "  })\n"
-                "  rawset(_G,'ItemDrop',_p)\n"
-                "end\n"
-                /* Coin guardian: cache last known non-zero coins, block zero resets */
-                "if not _G.__sre_coin_guard then\n"
-                "  _G.__sre_coin_guard = true\n"
-                "  _G.__last_coins = 0\n"
-                "  if Character then\n"
-                "    if Character.SetNumCoins then\n"
-                "      local _os=Character.SetNumCoins\n"
-                "      Character.SetNumCoins=function(n)\n"
-                "        if type(n)=='number' then\n"
-                "          if n>0 then _G.__last_coins=n; _os(n)\n"
-                "          elseif _G.__last_coins<=0 then _os(n) end\n"
-                "        else _os(n) end\n"
-                "      end\n"
-                "    end\n"
-                "    if Character.SetNumCoin then\n"
-                "      local _os=Character.SetNumCoin\n"
-                "      Character.SetNumCoin=function(n)\n"
-                "        if type(n)=='number' then\n"
-                "          if n>0 then _G.__last_coins=n; _os(n)\n"
-                "          elseif _G.__last_coins<=0 then _os(n) end\n"
-                "        else _os(n) end\n"
-                "      end\n"
-                "    end\n"
-                "    if Character.NumCoins then\n"
-                "      local _og=Character.NumCoins\n"
-                "      Character.NumCoins=function() local c=_og(); if (not c or c==0) and _G.__last_coins>0 then return _G.__last_coins end; if c and c>0 then _G.__last_coins=c end; return c end\n"
-                "    end\n"
-                "    if Character.NumCoin then\n"
-                "      local _og=Character.NumCoin\n"
-                "      Character.NumCoin=function() local c=_og(); if (not c or c==0) and _G.__last_coins>0 then return _G.__last_coins end; if c and c>0 then _G.__last_coins=c end; return c end\n"
-                "    end\n"
-                "  end\n"
-                "end\n"
-            );
+
+            /* Check if ItemDrop needs proxy installation */
+            int need_proxy = 1;
+            if (g_lua_getfield && g_lua_type && g_lua_settop) {
+                g_lua_getfield(L, LUA_GLOBALSINDEX, "ItemDrop");
+                if (g_lua_type(L, -1) == LUA_TTABLE) {
+                    g_lua_getfield(L, -1, "__is_sre_proxy");
+                    if (g_lua_type(L, -1) != LUA_TNIL) {
+                        need_proxy = 0;
+                    }
+                    g_lua_settop(L, -2);
+                }
+                g_lua_settop(L, -2);
+            }
+
+            /* Check if Character needs guarding */
+            int need_guard = 1;
+            if (g_lua_getfield && g_lua_type && g_lua_settop) {
+                g_lua_getfield(L, LUA_GLOBALSINDEX, "Character");
+                if (g_lua_type(L, -1) == LUA_TTABLE) {
+                    g_lua_getfield(L, -1, "__is_sre_guarded");
+                    if (g_lua_type(L, -1) != LUA_TNIL) {
+                        need_guard = 0;
+                    }
+                    g_lua_settop(L, -2);
+                }
+                g_lua_settop(L, -2);
+            }
+
+            if (need_proxy) {
+                sre_eval_lua(L,
+                    "local _o = rawget(_G,'ItemDrop') or {}\n"
+                    "local _p = {}\n"
+                    "local _fb = {\n"
+                    "  NumItems=function(o) local f=_o.NumItems; return f and f(o) or 0 end,\n"
+                    "  ItemIdentifier=function(o,i) local f=_o.ItemIdentifier; return f and f(o,i) or '' end,\n"
+                    "  SetItemIdentifier=function(o,i,v) local f=_o.SetItemIdentifier; if f then f(o,i,v) end end,\n"
+                    "  AllItemsCollected=function(o) local f=_o.AllItemsCollected; return f and f(o) or false end,\n"
+                    "  GetItem=function(o,i) local f=_o.GetItem; return f and f(o,i) or nil end,\n"
+                    "  Drop=function(...) local f=_o.Drop; if f then f(...) end end,\n"
+                    "  Trigger=function(...) local f=_o.Trigger; if f then f(...) end end,\n"
+                    "  __is_sre_proxy=true\n"
+                    "}\n"
+                    "setmetatable(_p,{\n"
+                    "  __index=function(t,k) return _fb[k] or _o[k] end,\n"
+                    "  __newindex=function(t,k,v) _o[k]=v end\n"
+                    "})\n"
+                    "rawset(_G,'ItemDrop',_p)\n"
+                );
+            }
+
+            if (need_guard) {
+                sre_eval_lua(L,
+                    "if Character then\n"
+                    "  Character.__is_sre_guarded = true\n"
+                    "  _G.__last_coins = _G.__last_coins or 0\n"
+                    "  if Character.SetNumCoins then\n"
+                    "    local _os=Character.SetNumCoins\n"
+                    "    Character.SetNumCoins=function(n)\n"
+                    "      if type(n)=='number' then\n"
+                    "        if n>0 then _G.__last_coins=n; _os(n)\n"
+                    "        elseif _G.__last_coins<=0 then _os(n) end\n"
+                    "      else _os(n) end\n"
+                    "    end\n"
+                    "  end\n"
+                    "  if Character.SetNumCoin then\n"
+                    "    local _os=Character.SetNumCoin\n"
+                    "    Character.SetNumCoin=function(n)\n"
+                    "      if type(n)=='number' then\n"
+                    "        if n>0 then _G.__last_coins=n; _os(n)\n"
+                    "        elseif _G.__last_coins<=0 then _os(n) end\n"
+                    "      else _os(n) end\n"
+                    "    end\n"
+                    "  end\n"
+                    "  if Character.NumCoins then\n"
+                    "    local _og=Character.NumCoins\n"
+                    "    Character.NumCoins=function() local c=_og(); if (not c or c==0) and _G.__last_coins>0 then return _G.__last_coins end; if c and c>0 then _G.__last_coins=c end; return c end\n"
+                    "  end\n"
+                    "  if Character.NumCoin then\n"
+                    "    local _og=Character.NumCoin\n"
+                    "    Character.NumCoin=function() local c=_og(); if (not c or c==0) and _G.__last_coins>0 then return _G.__last_coins end; if c and c>0 then _G.__last_coins=c end; return c end\n"
+                    "  end\n"
+                    "end\n"
+                );
+            }
             return;
         }
     }
@@ -4041,13 +5353,43 @@ void sre_mini_ensure_injected(lua_State* L) {
         "        __sub = function(a, b) return (a or 0) - (b or 0) end,\n"
         "        __mul = function(a, b) return (a or 0) * (b or 0) end,\n"
         "        __div = function(a, b) return (a or 0) / (b or 1) end,\n"
-        "        __unm = function(a) return -(a or 0) end\n"
+        "        __unm = function(a) return -(a or 0) end,\n"
+        "        __lt = function(a, b) return (a or 0) < (b or 0) end,\n"
+        "        __le = function(a, b) return (a or 0) <= (b or 0) end\n"
         "    })\n"
         "end"
     );
 
     /* Inject Mini.*, LNI.*, Components.*, Game.*, Health.*, fs tables */
     sre_register_mini_api(L);
+
+    /* Register luasocket, luamime, luafilesystem, and toml in package.preload */
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "package");
+    if (g_lua_type && g_lua_type(L, -1) == 5) {  /* 5 = LUA_TTABLE */
+        g_lua_getfield(L, -1, "preload");
+        if (g_lua_type(L, -1) == 5) {  /* 5 = LUA_TTABLE */
+            /* preload["socket.core"] = luaopen_socket_core */
+            extern int luaopen_socket_core(lua_State* L);
+            g_lua_pushcclosure(L, (lua_CFunction)luaopen_socket_core, 0);
+            g_lua_setfield(L, -2, "socket.core");
+            
+            /* preload["mime.core"] = luaopen_mime_core */
+            extern int luaopen_mime_core(lua_State* L);
+            g_lua_pushcclosure(L, (lua_CFunction)luaopen_mime_core, 0);
+            g_lua_setfield(L, -2, "mime.core");
+
+            /* preload["lfs"] = luaopen_lfs */
+            extern int luaopen_lfs(lua_State* L);
+            g_lua_pushcclosure(L, (lua_CFunction)luaopen_lfs, 0);
+            g_lua_setfield(L, -2, "lfs");
+
+            /* preload["toml"] = luaopen_toml */
+            g_lua_pushcclosure(L, (lua_CFunction)luaopen_toml, 0);
+            g_lua_setfield(L, -2, "toml");
+        }
+        g_lua_settop(L, -2); /* pop preload */
+    }
+    g_lua_settop(L, -2); /* pop package */
 
     /* Inject RLSW compat stubs (Character, ItemDrop) — prevents nil-index
      * crashes during db.init() before native RegisterProgramLibrary fires */
@@ -4082,8 +5424,219 @@ void sre_mini_ensure_injected(lua_State* L) {
         "})\n"
     );
 
+    /* RLSW Compat Layer: OverlayController, MiniButton, MiniOverlay and fallback stubs */
+    sre_eval_lua(L,
+        "Is = Is or {}\n"
+        "Is.IsWearing = Is.IsWearing or function(name) return Bauble.IsWearing(name) end\n"
+        "Is.Wearing = Is.Wearing or function(name) return Bauble.IsWearing(name) end\n"
+        "IsWearing = IsWearing or function(name) return Bauble.IsWearing(name) end\n"
+        "\n"
+        "Bauble = Bauble or {}\n"
+        "Bauble.IsWearing = Bauble.IsWearing or function(name) return false end\n"
+        "Bauble.Equip = Bauble.Equip or function() end\n"
+        "Bauble.Unequip = Bauble.Unequip or function() end\n"
+        "Bauble.GetLevel = Bauble.GetLevel or function() return 0 end\n"
+        "Bauble.IncLevel = Bauble.IncLevel or function() end\n"
+        "Bauble.HideAll = Bauble.HideAll or function() end\n"
+        "Bauble.Find = Bauble.Find or function() end\n"
+        "\n"
+        "DB = DB or {}\n"
+        "DB.Inventory = DB.Inventory or {}\n"
+        "db = db or {}\n"
+        "db.Inventory = db.Inventory or {}\n"
+        "Save = Save or {}\n"
+        "Save.Inventory = Save.Inventory or {}\n"
+        "Player = Player or {}\n"
+        "Player.Inventory = Player.Inventory or {}\n"
+        "Character = Character or {}\n"
+        "Character.Inventory = Character.Inventory or {}\n"
+        "Mini = Mini or {}\n"
+        "Mini.Inventory = Mini.Inventory or {}\n"
+        "Mini.Character = Mini.Character or {}\n"
+        "Mini.Character.Inventory = Mini.Character.Inventory or {}\n"
+        "\n"
+        "_G.__sre_btn_counter = _G.__sre_btn_counter or 0\n"
+        "_G.__sre_ovr_counter = _G.__sre_ovr_counter or 0\n"
+        "\n"
+        "MiniButton = {}\n"
+        "MiniButton.__index = MiniButton\n"
+        "\n"
+        "function MiniButton.new(id)\n"
+        "    local self = setmetatable({}, MiniButton)\n"
+        "    self.id = id\n"
+        "    return self\n"
+        "end\n"
+        "\n"
+        "function MiniButton:getID() return self.id end\n"
+        "function MiniButton:isPressed() return ButtonController.IsPressed(self.id) end\n"
+        "function MiniButton:isDragging() return ButtonController.IsDragging(self.id) end\n"
+        "function MiniButton:setPosition(x, y) ButtonController.SetPosition(self.id, x, y); return self end\n"
+        "function MiniButton:getPosition() return ButtonController.GetPosition(self.id) end\n"
+        "function MiniButton:setHidden(hidden) ButtonController.SetHidden(self.id, hidden); return self end\n"
+        "function MiniButton:setClickable(clickable) ButtonController.SetClickable(self.id, clickable); return self end\n"
+        "function MiniButton:setScaling(x, y) ButtonController.SetScaling(self.id, x, y); return self end\n"
+        "function MiniButton:setDimensions(width, height) ButtonController.SetDimensions(self.id, width, height); return self end\n"
+        "function MiniButton:setAlpha(alpha) ButtonController.SetAlpha(self.id, alpha); return self end\n"
+        "function MiniButton:setBackgroundAlpha(alpha) ButtonController.SetBackgroundAlpha(self.id, alpha); return self end\n"
+        "function MiniButton:setBackgroundResource(resource) ButtonController.SetBackgroundResource(self.id, resource); return self end\n"
+        "function MiniButton:setText(text) ButtonController.SetText(self.id, text); return self end\n"
+        "function MiniButton:setTextFont(font) ButtonController.SetTextFont(self.id, font); return self end\n"
+        "function MiniButton:setTextScale(scale) ButtonController.SetTextScale(self.id, scale); return self end\n"
+        "function MiniButton:setTextColor(color) ButtonController.SetTextColor(self.id, color); return self end\n"
+        "function MiniButton:makeMovable(movable) ButtonController.MakeMovable(self.id, movable); return self end\n"
+        "function MiniButton:setConfined(confined) ButtonController.SetButtonConfined(self.id, confined); return self end\n"
+        "function MiniButton:setPadding(left, top, right, bottom) ButtonController.SetPadding(self.id, left, top, right, bottom); return self end\n"
+        "function MiniButton:setAlignment(gravity) ButtonController.SetAlignment(self.id, gravity); return self end\n"
+        "function MiniButton:setAlwaysActive(active) return self end\n"
+        "function MiniButton:remove() ButtonController.Delete(self.id); self._deleted = true end\n"
+        "function MiniButton:delete() ButtonController.Delete(self.id); self._deleted = true end\n"
+        "function MiniButton:isDeleted() return not not self._deleted end\n"
+        "\n"
+        "MiniOverlay = {}\n"
+        "MiniOverlay.__index = MiniOverlay\n"
+        "\n"
+        "function MiniOverlay.new(id)\n"
+        "    local self = setmetatable({}, MiniOverlay)\n"
+        "    self.id = id\n"
+        "    return self\n"
+        "end\n"
+        "\n"
+        "function MiniOverlay:addButton(button)\n"
+        "    local bid = type(button) == 'table' and button.id or button\n"
+        "    ButtonController.OverlayAddButton(self.id, bid)\n"
+        "    return button\n"
+        "end\n"
+        "\n"
+        "function MiniOverlay:separator(y) ButtonController.OverlayAddSeparator(self.id, y); return self end\n"
+        "function MiniOverlay:setHidden(hidden) ButtonController.SetOverlayHidden(self.id, hidden); return self end\n"
+        "function MiniOverlay:setPosition(x, y) ButtonController.SetOverlayPosition(self.id, x, y); return self end\n"
+        "function MiniOverlay:getPosition() return ButtonController.GetOverlayPosition(self.id) end\n"
+        "function MiniOverlay:makeMovable(movable) ButtonController.SetOverlayMovable(self.id, movable); return self end\n"
+        "function MiniOverlay:makePinchable(pinchable) ButtonController.SetOverlayPinchable(self.id, pinchable); return self end\n"
+        "function MiniOverlay:setBackgroundColor(color) ButtonController.SetOverlayBackgroundColor(self.id, color); return self end\n"
+        "function MiniOverlay:setBackgroundAlpha(alpha) ButtonController.SetOverlayBackgroundAlpha(self.id, alpha); return self end\n"
+        "function MiniOverlay:setCornerRadius(radius) ButtonController.SetOverlayCornerRadius(self.id, radius); return self end\n"
+        "function MiniOverlay:getPinchFactor() return ButtonController.GetOverlayScaleFactor(self.id) end\n"
+        "function MiniOverlay:isPinching() return ButtonController.IsOverlayPinching(self.id) end\n"
+        "function MiniOverlay:setAlwaysActive(active) return self end\n"
+        "function MiniOverlay:remove() ButtonController.RemoveOverlay(self.id); self._deleted = true end\n"
+        "function MiniOverlay:isDeleted() return not not self._deleted end\n"
+        "\n"
+        "OverlayController = {}\n"
+        "\n"
+        "function OverlayController.NewButton(label, x, y, width, height)\n"
+        "    _G.__sre_btn_counter = _G.__sre_btn_counter + 1\n"
+        "    local id = 'btn_' .. tostring(_G.__sre_btn_counter)\n"
+        "    ButtonController.New(id, label or '', x or 0.5, y or 0.5, width or 0.1, height or 0.05)\n"
+        "    return MiniButton.new(id)\n"
+        "end\n"
+        "\n"
+        "function OverlayController.NewOverlay(x, y, width, height)\n"
+        "    _G.__sre_ovr_counter = _G.__sre_ovr_counter + 1\n"
+        "    local id = 'overlay_' .. tostring(_G.__sre_ovr_counter)\n"
+        "    ButtonController.NewOverlay(id, x or 0.5, y or 0.5, width or 0.3, height or 0.4)\n"
+        "    return MiniOverlay.new(id)\n"
+        "end\n"
+        "\n"
+        "function OverlayController.RemoveAll() ButtonController.DeleteAll() end\n"
+        "function OverlayController.HideAll(hidden) ButtonController.SetHiddenAll(hidden) end\n"
+        "\n"    );
+
+    /* ---- Portal API safety wrapper ----
+     * The game engine registers a native 'Portal' table via ProgramState::RegisterLibrary.
+     * RLSW 7 scripts call Portal.Activate(self) and Portal.Deactivate(self) from portalHook2.
+     * If the engine's Portal table is nil or its methods crash, the script thread dies silently.
+     * We wrap the native Portal table in a safe proxy that:
+     *   1. Forwards to native Portal.Activate / Portal.Deactivate if they exist and work
+     *   2. Falls back to a no-crash stub if native methods are unavailable (pre-scene load)
+     *   3. Tracks activation state so Lua scripts can query it
+     * We use 'or' guards to avoid overwriting a correctly-registered native table. */
+    sre_eval_lua(L,
+        /* Only wrap once per state */
+        "if not _G.__sre_portal_wrapped then\n"
+        "  _G.__sre_portal_wrapped = true\n"
+        "\n"
+        "  -- Capture whatever the engine registered (may be nil if called before scene init)\n"
+        "  local _native_portal = rawget(_G, 'Portal')\n"
+        "\n"
+        "  -- Helper: safely call a native portal method\n"
+        "  local function _safe_portal_call(method_name, self_obj)\n"
+        "    local np = rawget(_G, '__sre_native_portal') or _native_portal\n"
+        "    if not np then return false, 'Portal table not registered by engine' end\n"
+        "    local fn = np[method_name]\n"
+        "    if type(fn) ~= 'function' then return false, 'Portal.' .. method_name .. ' is not a function' end\n"
+        "    local ok, err = pcall(fn, self_obj)\n"
+        "    return ok, err\n"
+        "  end\n"
+        "\n"
+        "  -- Build the safe Portal wrapper table\n"
+        "  local _portal_proxy = {}\n"
+        "\n"
+        "  function _portal_proxy.Activate(self_obj)\n"
+        "    local ok, err = _safe_portal_call('Activate', self_obj)\n"
+        "    if not ok then\n"
+        "      print('[SRE/Portal] Portal.Activate failed: ' .. tostring(err))\n"
+        "    end\n"
+        "  end\n"
+        "\n"
+        "  function _portal_proxy.Deactivate(self_obj)\n"
+        "    local ok, err = _safe_portal_call('Deactivate', self_obj)\n"
+        "    if not ok then\n"
+        "      print('[SRE/Portal] Portal.Deactivate failed: ' .. tostring(err))\n"
+        "    end\n"
+        "  end\n"
+        "\n"
+        "  -- Proxy metatable: if a script accesses Portal.SomeOtherMethod,\n"
+        "  -- forward to native Portal table transparently\n"
+        "  setmetatable(_portal_proxy, {\n"
+        "    __index = function(t, k)\n"
+        "      local np = rawget(_G, '__sre_native_portal') or _native_portal\n"
+        "      if np then return np[k] end\n"
+        "      return nil\n"
+        "    end,\n"
+        "    __newindex = function(t, k, v)\n"
+        "      local np = rawget(_G, '__sre_native_portal') or _native_portal\n"
+        "      if np then np[k] = v end\n"
+        "    end\n"
+        "  })\n"
+        "\n"
+        "  -- Store the native Portal reference so the proxy can re-query it\n"
+        "  -- after the engine's RegisterProgramLibrary fires and overwrites Portal\n"
+        "  _G.__sre_native_portal = _native_portal\n"
+        "\n"
+        "  -- Override the global Portal with our safe proxy\n"
+        "  rawset(_G, 'Portal', _portal_proxy)\n"
+        "\n"
+        "  -- Watch Portal overwrites: if engine re-registers Portal,\n"
+        "  -- capture the new native table so our proxy picks it up\n"
+        "  -- (uses a no-op setmetatable on _G which Lua 5.1 supports via debug)\n"
+        "  if debug and debug.setmetatable then\n"
+        "    local _env_mt = debug.getmetatable(_G) or {}\n"
+        "    local _old_newindex = _env_mt.__newindex\n"
+        "    _env_mt.__newindex = function(env, k, v)\n"
+        "      if k == 'Portal' and v ~= _portal_proxy then\n"
+        "        -- Engine just registered its native Portal table — save reference\n"
+        "        rawset(_G, '__sre_native_portal', v)\n"
+        "        -- Keep our proxy in place (do NOT overwrite with native)\n"
+        "        return\n"
+        "      end\n"
+        "      if _old_newindex then\n"
+        "        return _old_newindex(env, k, v)\n"
+        "      else\n"
+        "        rawset(env, k, v)\n"
+        "      end\n"
+        "    end\n"
+        "    debug.setmetatable(_G, _env_mt)\n"
+        "  end\n"
+        "end\n"
+    );
+
     /* Load edgetest.scl dynamically if present */
     sre_load_edgetest_scl(L);
+
+    /* Load serialization and database libraries */
+    sre_load_srlz_lua(L);
+    sre_load_db_lua(L);
 
     /* Cache this state */
     if (g_injected_count < MAX_INJECTED_STATES) {

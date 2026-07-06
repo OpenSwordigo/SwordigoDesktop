@@ -16,6 +16,8 @@
 #include "sre.h"
 #include "sre_lua.h"
 
+extern void sre_log_lua_error(const char* source, const char* err_msg);
+
 /* =========================================================================
  * Additional Lua API function pointers needed by standard libs
  * Types and externs are declared in sre_lua.h.
@@ -569,30 +571,7 @@ static const SreLuaReg tablib[] = {
 /* libc time/date functions — resolved at load time via the bridge.
  * We don't #include <time.h> because the ARM64 cross-compiler uses -nostdlib.
  * These are resolved at load time just like the FILE* functions above. */
-typedef long time_t;
-typedef long clock_t;
-#define CLOCKS_PER_SEC 1000000L
 
-struct tm {
-    int tm_sec;
-    int tm_min;
-    int tm_hour;
-    int tm_mday;
-    int tm_mon;
-    int tm_year;
-    int tm_wday;
-    int tm_yday;
-    int tm_isdst;
-    long tm_gmtoff;
-    const char* tm_zone;
-};
-
-extern time_t time(time_t* tloc);
-extern clock_t clock(void);
-extern struct tm* localtime(const time_t* timep);
-extern struct tm* gmtime(const time_t* timep);
-extern size_t strftime(char* s, size_t max, const char* format, const struct tm* tm);
-extern int remove(const char* path);
 
 static int os_time(lua_State* L) {
     g_lua_pushnumber(L, (double)time(NULL));
@@ -713,12 +692,35 @@ static int os_remove(lua_State* L) {
     }
 }
 
+static int os_rename(lua_State* L) {
+    const char* old_path = lua_tostring(L, 1);
+    const char* new_path = lua_tostring(L, 2);
+    if (!old_path || !new_path) {
+        g_lua_pushnil(L);
+        g_lua_pushstring(L, "os.rename: filenames expected");
+        return 2;
+    }
+    char real_old[512];
+    char real_new[512];
+    old_path = sre_minipath_translate(old_path, real_old, 512);
+    new_path = sre_minipath_translate(new_path, real_new, 512);
+    if (rename(old_path, new_path) == 0) {
+        g_lua_pushboolean(L, 1);
+        return 1;
+    } else {
+        g_lua_pushnil(L);
+        g_lua_pushstring(L, "cannot rename file");
+        return 2;
+    }
+}
+
 static const SreLuaReg oslib[] = {
     {"clock",    os_clock},
     {"date",     os_date},
     {"difftime", os_difftime},
     {"exit",     os_exit},
     {"remove",   os_remove},
+    {"rename",   os_rename},
     {"time",     os_time},
     {NULL, NULL}
 };
@@ -771,21 +773,7 @@ static const SreLuaReg dblib[] = {
 /* Forward declarations for C stdio/stdlib functions — we don't #include <stdio.h>
  * because the ARM64 cross-compiler sysroot uses -nostdlib.
  * These are resolved at load time via the bridge (bridge_fopen, bridge_malloc, etc.). */
-typedef void FILE;
-extern FILE* fopen(const char* path, const char* mode);
-extern int fclose(FILE* fp);
-extern size_t fread(void* ptr, size_t size, size_t nmemb, FILE* fp);
-extern size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* fp);
-extern long ftell(FILE* fp);
-extern int fseek(FILE* fp, long offset, int whence);
-extern int fflush(FILE* fp);
-extern char* fgets(char* s, int size, FILE* fp);
-extern int fscanf(FILE* fp, const char* fmt, ...);
-extern void* malloc(size_t size);
-extern void free(void* ptr);
-#define SEEK_SET 0
-#define SEEK_CUR 1
-#define SEEK_END 2
+
 
 /* Track open files for cleanup (max 32 simultaneous) */
 static FILE* g_sre_open_files[32] = {0};
@@ -1145,21 +1133,64 @@ static const SreLuaReg iolib[] = {
  * Flow: read file into buffer → loadstring(contents, chunkname)
  * ========================================================================= */
 
-/* VFS path helper — translates virtual path, returns pointer to use.
- * out_buf must be at least 512 bytes. */
-static const char* sre_vfs_resolve_path(const char* path, char* out_buf) {
+const char* sre_vfs_resolve_path(const char* path, char* out_buf) {
     if (!g_sre_vfs_active || !path) return path;
-    int i;
-    for (i = 0; i < 511 && path[i]; i++)
-        g_sre_vfs_lua_input_path[i] = path[i];
-    g_sre_vfs_lua_input_path[i] = '\0';
-    g_sre_vfs_lua_translate_pending = 1;
-    if (g_sre_vfs_lua_output_path[0]) {
-        for (i = 0; i < 511 && g_sre_vfs_lua_output_path[i]; i++)
-            out_buf[i] = g_sre_vfs_lua_output_path[i];
-        out_buf[i] = '\0';
-        return out_buf;
+
+    /* Handle MiniPaths first */
+    if (path[0] == '/') {
+        return sre_minipath_translate(path, out_buf, 512);
     }
+
+    /* Handle resources/ paths using the 5-level search hierarchy */
+    if (strncmp(path, "resources/", 10) == 0) {
+        extern char g_sre_vfs_data_dir[512];
+        extern char g_sre_vfs_mod_name[128];
+        extern char g_sre_vfs_profile_id[64];
+        extern char g_sre_vfs_path_assets[512];
+        const char* subpath = path + 10;
+        FILE* f;
+
+        // 1. <data_dir>/mods/<active_mod>/resources/<profile_id>/<subpath>
+        if (g_sre_vfs_data_dir[0] && g_sre_vfs_mod_name[0] && g_sre_vfs_profile_id[0]) {
+            snprintf(out_buf, 512, "%s/mods/%s/resources/%s/%s", 
+                     g_sre_vfs_data_dir, g_sre_vfs_mod_name, g_sre_vfs_profile_id, subpath);
+            f = fopen(out_buf, "rb");
+            if (f) { fclose(f); return out_buf; }
+        }
+
+        // 2. <data_dir>/mods/<active_mod>/resources/<subpath>
+        if (g_sre_vfs_data_dir[0] && g_sre_vfs_mod_name[0]) {
+            snprintf(out_buf, 512, "%s/mods/%s/resources/%s", 
+                     g_sre_vfs_data_dir, g_sre_vfs_mod_name, subpath);
+            f = fopen(out_buf, "rb");
+            if (f) { fclose(f); return out_buf; }
+        }
+
+        // 3. <data_dir>/resources/<profile_id>/<subpath>
+        if (g_sre_vfs_data_dir[0] && g_sre_vfs_profile_id[0]) {
+            snprintf(out_buf, 512, "%s/resources/%s/%s", 
+                     g_sre_vfs_data_dir, g_sre_vfs_profile_id, subpath);
+            f = fopen(out_buf, "rb");
+            if (f) { fclose(f); return out_buf; }
+        }
+
+        // 4. <data_dir>/resources/<subpath>
+        if (g_sre_vfs_data_dir[0]) {
+            snprintf(out_buf, 512, "%s/resources/%s", 
+                     g_sre_vfs_data_dir, subpath);
+            f = fopen(out_buf, "rb");
+            if (f) { fclose(f); return out_buf; }
+        }
+
+        // 5. <assets_dir>/resources/<subpath>
+        if (g_sre_vfs_path_assets[0]) {
+            snprintf(out_buf, 512, "%s/resources/%s", 
+                     g_sre_vfs_path_assets, subpath);
+            f = fopen(out_buf, "rb");
+            if (f) { fclose(f); return out_buf; }
+        }
+    }
+
     return path;
 }
 
@@ -1244,6 +1275,19 @@ static int sre_scl_extract_lua(const char* buf, size_t size, const char** out_lu
     return 0;
 }
 
+static void sre_patch_bc_scl(const char* chunk_buf, size_t chunk_len) {
+    char* data = (char*)chunk_buf;
+    for (size_t i = 0; i + 8 <= chunk_len; i++) {
+        if (memcmp(&data[i], "i < 0.2", 7) == 0 && (i + 7 == chunk_len || data[i+7] != '5')) {
+            data[i+4] = '2'; // replace '0' with '2' -> "i < 2.2" or "i < 2.0"
+        }
+        if (memcmp(&data[i], "i < 0.25", 8) == 0) {
+            data[i+4] = '2'; // replace '0' with '2' -> "i < 2.25"
+        }
+    }
+    fprintf(stderr, "[SRE-VFS] Patched bc.scl click/drag thresholds to 2.0s in-place!\n");
+}
+
 /* loadfile(filename) — reads file, compiles via loadstring, returns chunk.
  * Returns: function on success, or nil + errmsg on failure. */
 static int sre_loadfile(lua_State* L) {
@@ -1301,6 +1345,10 @@ static int sre_loadfile(lua_State* L) {
     size_t chunk_len = nread;
     sre_scl_extract_lua(buf, nread, &chunk_buf, &chunk_len);
 
+    if (filename && strstr(filename, "bc.scl")) {
+        sre_patch_bc_scl(chunk_buf, chunk_len);
+    }
+
     /* Use loadstring(contents, chunkname) from Lua globals to compile */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "loadstring");
     if (g_lua_type(L, -1) != LUA_TFUNCTION) {
@@ -1332,6 +1380,14 @@ static int sre_loadfile(lua_State* L) {
         return 1;
     } else {
         /* Compilation failed: (nil, errmsg) already on stack */
+        if (g_lua_tolstring) {
+            const char* errmsg = g_lua_tolstring(L, -1, NULL);
+            if (errmsg) {
+                char err_buf[512];
+                snprintf(err_buf, sizeof(err_buf), "Compile error in '%s': %s", filename, errmsg);
+                sre_log_lua_error("loadfile", err_buf);
+            }
+        }
         return 2;
     }
 }
@@ -1381,6 +1437,15 @@ static int sre_dofile(lua_State* L) {
     fclose(fp);
     buf[nread] = '\0';
 
+    /* If it's a Protobuf .scl file, extract the Lua Source/CompiledCode from it. */
+    const char* chunk_buf = buf;
+    size_t chunk_len = nread;
+    sre_scl_extract_lua(buf, nread, &chunk_buf, &chunk_len);
+
+    if (filename && strstr(filename, "bc.scl")) {
+        sre_patch_bc_scl(chunk_buf, chunk_len);
+    }
+
     /* Compile via loadstring */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "loadstring");
     if (g_lua_type(L, -1) != LUA_TFUNCTION) {
@@ -1391,7 +1456,7 @@ static int sre_dofile(lua_State* L) {
         return 0;
     }
 
-    g_lua_pushlstring(L, buf, nread);
+    g_lua_pushlstring(L, chunk_buf, chunk_len);
     free(buf);
     g_lua_pushstring(L, filename);
 
@@ -1405,6 +1470,14 @@ static int sre_dofile(lua_State* L) {
     /* Check if loadstring succeeded */
     if (g_lua_type(L, -2) != LUA_TFUNCTION) {
         /* (nil, errmsg) — push the error message */
+        if (g_lua_tolstring) {
+            const char* errmsg = g_lua_tolstring(L, -1, NULL);
+            if (errmsg) {
+                char err_buf[512];
+                snprintf(err_buf, sizeof(err_buf), "Compile error in '%s': %s", filename, errmsg);
+                sre_log_lua_error("dofile", err_buf);
+            }
+        }
         if (g_lua_error) return g_lua_error(L);  /* error with errmsg on top */
         return 0;
     }
@@ -1431,56 +1504,7 @@ static int sre_dofile(lua_State* L) {
  * Real implementations using POSIX opendir/readdir/stat/mkdir/rmdir.
  * ========================================================================= */
 
-/* POSIX directory and stat functions — resolved at load time via the bridge */
-typedef void DIR;
-typedef unsigned long ino_t;
-typedef long off_t;
 
-/* dirent structure — matches Linux AArch64 layout */
-struct dirent {
-    ino_t          d_ino;
-    off_t          d_off;
-    unsigned short d_reclen;
-    unsigned char  d_type;
-    char           d_name[256];
-};
-
-/* stat structure — we only need a few fields, use a compatible layout */
-struct stat {
-    uint64_t st_dev;
-    uint64_t st_ino;
-    uint32_t st_mode;
-    uint32_t st_nlink;
-    uint32_t st_uid;
-    uint32_t st_gid;
-    uint64_t st_rdev;
-    uint64_t __pad1;
-    int64_t  st_size;
-    int32_t  st_blksize;
-    int32_t  __pad2;
-    int64_t  st_blocks;
-    int64_t  st_atime_sec;
-    int64_t  st_atime_nsec;
-    int64_t  st_mtime_sec;
-    int64_t  st_mtime_nsec;
-    int64_t  st_ctime_sec;
-    int64_t  st_ctime_nsec;
-    int32_t  __unused[2];
-};
-
-/* Mode bits from sys/stat.h */
-#define S_IFMT   0170000
-#define S_IFDIR  0040000
-#define S_IFREG  0100000
-#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
-#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
-
-extern DIR* opendir(const char* name);
-extern struct dirent* readdir(DIR* dirp);
-extern int closedir(DIR* dirp);
-extern int stat(const char* path, struct stat* buf);
-extern int mkdir(const char* path, uint32_t mode);
-extern int rmdir(const char* path);
 
 /* fs.dir iterator — reads entries from a DIR* stored as lightuserdata upvalue */
 static int lfs_dir_next(lua_State* L) {
@@ -1659,39 +1683,23 @@ static const SreLuaReg fslib[] = {
 void sre_open_std_libs(lua_State* L) {
     if (!g_luaL_register || !g_lua_pushnumber || !g_lua_setfield) return;
 
-    /* Register math library */
-    g_luaL_register(L, "math", (const void*)mathlib);
-    g_lua_pushnumber(L, PI);
-    g_lua_setfield(L, -2, "pi");
-    g_lua_pushnumber(L, sre_huge);
-    g_lua_setfield(L, -2, "huge");
-    lua_pop(L, 1);
-
-    /* Register table library */
-    g_luaL_register(L, "table", (const void*)tablib);
-    lua_pop(L, 1);
-
-    /* Register os library */
+    /* 1. Register custom VFS-aware os library */
     g_luaL_register(L, "os", (const void*)oslib);
     lua_pop(L, 1);
 
-    /* Register debug library */
-    g_luaL_register(L, "debug", (const void*)dblib);
-    lua_pop(L, 1);
-
-    /* Register io library */
+    /* 2. Register custom VFS-aware io library */
     g_luaL_register(L, "io", (const void*)iolib);
     lua_pop(L, 1);
 
-    /* Also register unpack as global (Lua 5.1 compat) */
+    /* 3. Also register unpack as global (Lua 5.1 compat) */
     g_lua_pushcclosure(L, table_unpack, 0);
     g_lua_setfield(L, LUA_GLOBALSINDEX, "unpack");
 
-    /* Register fs (LuaFileSystem) library */
+    /* 4. Register fs (LuaFileSystem) library */
     g_luaL_register(L, "fs", (const void*)fslib);
     lua_pop(L, 1);
 
-    /* Override loadfile/dofile with VFS-aware versions */
+    /* 5. Override loadfile/dofile with VFS-aware versions */
     g_lua_pushcclosure(L, sre_loadfile, 0);
     g_lua_setfield(L, LUA_GLOBALSINDEX, "loadfile");
 

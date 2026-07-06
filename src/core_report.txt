@@ -1,0 +1,297 @@
+   6942 lines |     262470 chars |    262668 bytes | ./jni/jni_bridge_arm64.cpp
+   5600 lines |     325964 chars |    326374 bytes | ./main.cpp
+   5449 lines |     197661 chars |    197999 bytes | ./sre/sre_mini_api.c
+   5062 lines |     185702 chars |    185782 bytes | ./jni/jni_bridge.cpp
+   2145 lines |      53483 chars |     53483 bytes | ./sre/toml-c/header/toml-c.h
+   2122 lines |      88693 chars |     88824 bytes | ./platform/launcher_ui.cpp
+   2107 lines |      88015 chars |     88146 bytes | ./launcher_ui.cpp
+   2096 lines |      86881 chars |     86909 bytes | ./platform/vulkan_backend.cpp
+   2007 lines |      48528 chars |     48528 bytes | ./sre/toml-c/toml.c
+   1835 lines |      77522 chars |     77600 bytes | ./platform/fbo_scaler.cpp
+   1621 lines |      51733 chars |     51825 bytes | ./sre/sre_lua_libs.c
+   1566 lines |      64059 chars |     64153 bytes | ./platform/gui.cpp
+   1444 lines |      70279 chars |     70297 bytes | ./platform/launcher.cpp
+   1381 lines |      55483 chars |     55647 bytes | ./sre/sre_gui_native.c
+   1269 lines |      47547 chars |     48630 bytes | ./tools/asset_viewer.cpp
+   1164 lines |      39859 chars |     39889 bytes | ./platform/srt_overlay.cpp
+   1134 lines |      44020 chars |     44060 bytes | ./platform/binary_selector.cpp
+   1088 lines |      45453 chars |     45473 bytes | ./platform/swordfare_gui.cpp
+    827 lines |      30730 chars |     30844 bytes | ./sre/sre_lua.c
+    789 lines |      25450 chars |     25484 bytes | ./tools/av_renderer.cpp
+    751 lines |      27299 chars |     27321 bytes | ./platform/input_config.cpp
+    718 lines |      32431 chars |     32489 bytes | ./platform/emulator_arm64.cpp
+    656 lines |      25420 chars |     25430 bytes | ./platform/vulkan_backend.h
+    603 lines |      22596 chars |     22658 bytes | ./platform/emulator_dynarmic64.cpp
+    526 lines |      19340 chars |     19418 bytes | ./sre/sre_vfs.c
+    480 lines |      17316 chars |     17364 bytes | ./sre/sre_music.c
+    449 lines |      17910 chars |     17912 bytes | ./platform/save_editor.cpp
+    449 lines |      15716 chars |     16588 bytes | ./tools/pod_loader.cpp
+    444 lines |      18451 chars |     18509 bytes | ./sre/sre_scene_update.c
+    409 lines |      40113 chars |     40117 bytes | ./platform/vulkan_shaders_spirv.h
+    400 lines |      13006 chars |     13022 bytes | ./tools/av_audio.cpp
+    394 lines |      17773 chars |     17841 bytes | ./sre/sre_init.c
+    391 lines |      12368 chars |     12418 bytes | ./sre/sre_string.c
+    389 lines |      16442 chars |     16446 bytes | ./sre/sre_gui.c
+    355 lines |      16895 chars |     16901 bytes | ./platform/video_background.cpp
+    355 lines |      13290 chars |     13302 bytes | ./platform/vulkan_shaders.glsl.h
+    335 lines |      12117 chars |     12135 bytes | ./platform/emulator.cpp
+    333 lines |      13036 chars |     13086 bytes | ./sre/sre_effects.c
+    319 lines |      11094 chars |     11102 bytes | ./platform/draw_batcher.h
+    310 lines |      10774 chars |     10789 bytes | ./platform/pvr_loader.cpp
+    299 lines |      13784 chars |     13794 bytes | ./jni/jni_layer_arm64.h
+    296 lines |      12429 chars |     12435 bytes | ./loader/elf_loader_arm64.cpp
+    288 lines |      10279 chars |     10289 bytes | ./tools/scene_loader.cpp
+    261 lines |       8569 chars |      8573 bytes | ./game/mod_tools.cpp
+    249 lines |      10096 chars |     10108 bytes | ./loader/elf_loader.cpp
+    246 lines |       9376 chars |      9398 bytes | ./game/mod_config.cpp
+    238 lines |       7366 chars |      7370 bytes | ./platform/srt_overlay.h
+    238 lines |      11730 chars |     11745 bytes | ./sre/sre_gui.h
+    236 lines |       9067 chars |      9102 bytes | ./sre/sre_background.c
+    235 lines |       8160 chars |      8178 bytes | ./sre/sre_mod.c
+    229 lines |       7384 chars |      7384 bytes | ./platform/protobuf_reader.h
+    210 lines |       7161 chars |      7171 bytes | ./platform/data_path.cpp
+    207 lines |       8456 chars |      8487 bytes | ./game/sky_renderer.h
+    200 lines |       5066 chars |      5066 bytes | ./sre/toml-c/toml2json.c
+    198 lines |       6985 chars |      6985 bytes | ./game/save_editor_logic.cpp
+    181 lines |       6138 chars |      6140 bytes | ./game/camera_override.cpp
+    178 lines |       5902 chars |      5906 bytes | ./platform/display.cpp
+    177 lines |       5290 chars |      5290 bytes | ./sre/toml-c/toml-c-test.c
+    171 lines |       5838 chars |      5838 bytes | ./jni/jni_layer.h
+    163 lines |       6002 chars |      6002 bytes | ./loader/loader.c
+    161 lines |       5088 chars |      5090 bytes | ./platform/gui.h
+    153 lines |       6461 chars |      6465 bytes | ./sre/sre_lua.h
+    148 lines |       6033 chars |      6049 bytes | ./platform/binary_selector.h
+    143 lines |       4207 chars |      4207 bytes | ./platform/io_thread.cpp
+    142 lines |       5956 chars |      5963 bytes | ./tools/av_renderer.h
+    141 lines |       3376 chars |      3376 bytes | ./loader/elf_types_arm64.h
+    137 lines |       4938 chars |      4938 bytes | ./sre/toml-c/toml.h
+    136 lines |       4455 chars |      4455 bytes | ./android/asset_manager.c
+    135 lines |       5528 chars |      5538 bytes | ./platform/input_config.h
+    125 lines |       4814 chars |      4837 bytes | ./platform/swordfare_gui.h
+    114 lines |       4495 chars |      4518 bytes | ./game/camera_override.h
+    110 lines |       2993 chars |      2995 bytes | ./platform/save_editor.h
+    109 lines |       4157 chars |      4175 bytes | ./sre/sre.h
+    103 lines |       3884 chars |      3896 bytes | ./platform/emulator_dynarmic64.h
+    101 lines |       3542 chars |      3546 bytes | ./platform/fbo_scaler.h
+     97 lines |       1947 chars |      1947 bytes | ./loader/elf_types.h
+     90 lines |       2799 chars |      2805 bytes | ./tools/av_audio.h
+     89 lines |       3141 chars |      3143 bytes | ./platform/emulator_arm64.h
+     83 lines |       2732 chars |      2734 bytes | ./jni/jni_bridge.h
+     81 lines |       2620 chars |      2626 bytes | ./platform/i_emulator_arm64.h
+     81 lines |       2298 chars |      2298 bytes | ./sre/sre_lua_compat.h
+     71 lines |       1709 chars |      1711 bytes | ./loader/elf_loader_arm64.h
+     70 lines |       1538 chars |      1538 bytes | ./loader/elf_loader.h
+     70 lines |       1401 chars |      1401 bytes | ./sre/include/netinet/in.h
+     67 lines |       3422 chars |      3426 bytes | ./platform/IconsFontAwesome6.h
+     66 lines |       2104 chars |      2104 bytes | ./prototype/loader_arm.c
+     65 lines |       2483 chars |      2487 bytes | ./tools/scene_loader.h
+     64 lines |       2338 chars |      2338 bytes | ./main/main.c
+     63 lines |       1905 chars |      1905 bytes | ./sre/sre_config.c
+     62 lines |       1921 chars |      1921 bytes | ./jni/jni_shim.c
+     61 lines |       1890 chars |      1916 bytes | ./game/mod_config.h
+     61 lines |       1461 chars |      1461 bytes | ./sre/include/netdb.h
+     61 lines |       1454 chars |      1454 bytes | ./sre/toml-c/example/array.c
+     60 lines |       1431 chars |      1431 bytes | ./sre/include/sys/stat.h
+     59 lines |       1878 chars |      2080 bytes | ./tools/pod_loader.h
+     59 lines |       1752 chars |      1752 bytes | ./sre/include/sys/socket.h
+     59 lines |       1699 chars |      1699 bytes | ./platform/scl_parser.cpp
+     58 lines |       2499 chars |      2503 bytes | ./game/mod_tools.h
+     58 lines |       1566 chars |      1566 bytes | ./sre/include/stdio.h
+     57 lines |       2701 chars |      2709 bytes | ./platform/test_save_editor.cpp
+     55 lines |       1476 chars |      1480 bytes | ./jni/jni_bridge_arm64.h
+     54 lines |       1140 chars |      1140 bytes | ./loader/loader.h
+     49 lines |        975 chars |       975 bytes | ./sre/include/math.h
+     49 lines |       1495 chars |      1497 bytes | ./loader/arch_detect.h
+     46 lines |       1218 chars |      1218 bytes | ./sre/toml-c/example/table.c
+     45 lines |       1063 chars |      1063 bytes | ./platform/emulator.h
+     43 lines |       1391 chars |      1391 bytes | ./loader_test.cpp
+     42 lines |       1589 chars |      1603 bytes | ./platform/io_thread.h
+     41 lines |       1592 chars |      1592 bytes | ./jni/jni_marshaller.cpp
+     40 lines |        851 chars |       851 bytes | ./android/asset_manager.h
+     40 lines |        820 chars |       820 bytes | ./sre/include/time.h
+     36 lines |        782 chars |       782 bytes | ./platform/display.h
+     35 lines |        679 chars |       679 bytes | ./jni/jni_shim.h
+     32 lines |        972 chars |       972 bytes | ./sre/include/sys/select.h
+     32 lines |       1086 chars |      1086 bytes | ./game/save_editor_logic.h
+     32 lines |       1023 chars |      1031 bytes | ./sre/sre_setjmp.h
+     31 lines |        954 chars |       954 bytes | ./platform/video_background.h
+     30 lines |       1214 chars |      1214 bytes | ./sre/include/string.h
+     29 lines |        574 chars |       574 bytes | ./android/log.h
+     27 lines |        742 chars |       742 bytes | ./sre/include/stdlib.h
+     27 lines |        635 chars |       635 bytes | ./sre/include/net/if.h
+     27 lines |        382 chars |       382 bytes | ./sre/include/fcntl.h
+     26 lines |        452 chars |       452 bytes | ./sre/include/errno.h
+     24 lines |       1207 chars |      1207 bytes | ./platform/launcher_ui.h
+     23 lines |        764 chars |       768 bytes | ./platform/pvr_loader.h
+     22 lines |        821 chars |       825 bytes | ./platform/data_path.h
+     21 lines |        310 chars |       310 bytes | ./sre/include/sys/time.h
+     21 lines |       1015 chars |      1015 bytes | ./platform/launcher.h
+     20 lines |        450 chars |       450 bytes | ./sre/include/limits.h
+     20 lines |        352 chars |       352 bytes | ./sre/include/dirent.h
+     19 lines |        592 chars |       592 bytes | ./sre/include/unistd.h
+     19 lines |        415 chars |       415 bytes | ./android/log.c
+     18 lines |        310 chars |       310 bytes | ./sre/include/ctype.h
+     18 lines |        297 chars |       297 bytes | ./sre/include/locale.h
+     18 lines |        279 chars |       279 bytes | ./sre/include/sys/poll.h
+     17 lines |        346 chars |       346 bytes | ./sre/include/stdint.h
+     14 lines |        310 chars |       310 bytes | ./sre/include/sys/types.h
+     14 lines |        293 chars |       293 bytes | ./sre/sre_config.h
+     13 lines |        299 chars |       299 bytes | ./sre/include/setjmp.h
+     11 lines |        258 chars |       258 bytes | ./sre/include/arpa/inet.h
+     11 lines |        167 chars |       167 bytes | ./sre/include/utime.h
+     10 lines |        196 chars |       196 bytes | ./sre/include/signal.h
+      8 lines |        240 chars |       240 bytes | ./platform/scl_parser.h
+      8 lines |        147 chars |       147 bytes | ./platform/gl_inc.h
+      6 lines |         88 chars |        88 bytes | ./sre/include/assert.h
+      6 lines |         83 chars |        83 bytes | ./sre/include/netinet/tcp.h
+      6 lines |         81 chars |        81 bytes | ./sre/include/sys/param.h
+
+================ TOTALS ================
+   2107   88015   88146 ./launcher_ui.cpp
+     43    1391    1391 ./loader_test.cpp
+   5600  325964  326374 ./main.cpp
+   5062  185702  185782 ./jni/jni_bridge.cpp
+     83    2732    2734 ./jni/jni_bridge.h
+   6942  262470  262668 ./jni/jni_bridge_arm64.cpp
+     55    1476    1480 ./jni/jni_bridge_arm64.h
+    171    5838    5838 ./jni/jni_layer.h
+    299   13784   13794 ./jni/jni_layer_arm64.h
+     41    1592    1592 ./jni/jni_marshaller.cpp
+     62    1921    1921 ./jni/jni_shim.c
+     35     679     679 ./jni/jni_shim.h
+    181    6138    6140 ./game/camera_override.cpp
+    114    4495    4518 ./game/camera_override.h
+    246    9376    9398 ./game/mod_config.cpp
+     61    1890    1916 ./game/mod_config.h
+    261    8569    8573 ./game/mod_tools.cpp
+     58    2499    2503 ./game/mod_tools.h
+    198    6985    6985 ./game/save_editor_logic.cpp
+     32    1086    1086 ./game/save_editor_logic.h
+    207    8456    8487 ./game/sky_renderer.h
+     64    2338    2338 ./main/main.c
+     67    3422    3426 ./platform/IconsFontAwesome6.h
+   1134   44020   44060 ./platform/binary_selector.cpp
+    148    6033    6049 ./platform/binary_selector.h
+    210    7161    7171 ./platform/data_path.cpp
+     22     821     825 ./platform/data_path.h
+    178    5902    5906 ./platform/display.cpp
+     36     782     782 ./platform/display.h
+    319   11094   11102 ./platform/draw_batcher.h
+    335   12117   12135 ./platform/emulator.cpp
+     45    1063    1063 ./platform/emulator.h
+    718   32431   32489 ./platform/emulator_arm64.cpp
+     89    3141    3143 ./platform/emulator_arm64.h
+    603   22596   22658 ./platform/emulator_dynarmic64.cpp
+    103    3884    3896 ./platform/emulator_dynarmic64.h
+   1835   77522   77600 ./platform/fbo_scaler.cpp
+    101    3542    3546 ./platform/fbo_scaler.h
+      8     147     147 ./platform/gl_inc.h
+   1566   64059   64153 ./platform/gui.cpp
+    161    5088    5090 ./platform/gui.h
+     81    2620    2626 ./platform/i_emulator_arm64.h
+    751   27299   27321 ./platform/input_config.cpp
+    135    5528    5538 ./platform/input_config.h
+    143    4207    4207 ./platform/io_thread.cpp
+     42    1589    1603 ./platform/io_thread.h
+   1444   70279   70297 ./platform/launcher.cpp
+     21    1015    1015 ./platform/launcher.h
+   2122   88693   88824 ./platform/launcher_ui.cpp
+     24    1207    1207 ./platform/launcher_ui.h
+    229    7384    7384 ./platform/protobuf_reader.h
+    310   10774   10789 ./platform/pvr_loader.cpp
+     23     764     768 ./platform/pvr_loader.h
+    449   17910   17912 ./platform/save_editor.cpp
+    110    2993    2995 ./platform/save_editor.h
+     59    1699    1699 ./platform/scl_parser.cpp
+      8     240     240 ./platform/scl_parser.h
+   1164   39859   39889 ./platform/srt_overlay.cpp
+    238    7366    7370 ./platform/srt_overlay.h
+     57    2701    2709 ./platform/test_save_editor.cpp
+   2096   86881   86909 ./platform/vulkan_backend.cpp
+    656   25420   25430 ./platform/vulkan_backend.h
+    355   13290   13302 ./platform/vulkan_shaders.glsl.h
+    409   40113   40117 ./platform/vulkan_shaders_spirv.h
+     31     954     954 ./platform/video_background.h
+    355   16895   16901 ./platform/video_background.cpp
+    125    4814    4837 ./platform/swordfare_gui.h
+   1088   45453   45473 ./platform/swordfare_gui.cpp
+     66    2104    2104 ./prototype/loader_arm.c
+    109    4157    4175 ./sre/sre.h
+    236    9067    9102 ./sre/sre_background.c
+    333   13036   13086 ./sre/sre_effects.c
+    389   16442   16446 ./sre/sre_gui.c
+    238   11730   11745 ./sre/sre_gui.h
+   1381   55483   55647 ./sre/sre_gui_native.c
+    394   17773   17841 ./sre/sre_init.c
+    827   30730   30844 ./sre/sre_lua.c
+    153    6461    6465 ./sre/sre_lua.h
+   1621   51733   51825 ./sre/sre_lua_libs.c
+   5449  197661  197999 ./sre/sre_mini_api.c
+    235    8160    8178 ./sre/sre_mod.c
+    480   17316   17364 ./sre/sre_music.c
+    444   18451   18509 ./sre/sre_scene_update.c
+     32    1023    1031 ./sre/sre_setjmp.h
+    391   12368   12418 ./sre/sre_string.c
+    526   19340   19418 ./sre/sre_vfs.c
+     61    1454    1454 ./sre/toml-c/example/array.c
+     46    1218    1218 ./sre/toml-c/example/table.c
+   2145   53483   53483 ./sre/toml-c/header/toml-c.h
+    177    5290    5290 ./sre/toml-c/toml-c-test.c
+   2007   48528   48528 ./sre/toml-c/toml.c
+    137    4938    4938 ./sre/toml-c/toml.h
+    200    5066    5066 ./sre/toml-c/toml2json.c
+     58    1566    1566 ./sre/include/stdio.h
+     27     742     742 ./sre/include/stdlib.h
+     30    1214    1214 ./sre/include/string.h
+     18     310     310 ./sre/include/ctype.h
+     26     452     452 ./sre/include/errno.h
+     20     450     450 ./sre/include/limits.h
+     40     820     820 ./sre/include/time.h
+     19     592     592 ./sre/include/unistd.h
+     14     310     310 ./sre/include/sys/types.h
+     60    1431    1431 ./sre/include/sys/stat.h
+     32     972     972 ./sre/include/sys/select.h
+     59    1752    1752 ./sre/include/sys/socket.h
+     21     310     310 ./sre/include/sys/time.h
+      6      81      81 ./sre/include/sys/param.h
+     18     279     279 ./sre/include/sys/poll.h
+     70    1401    1401 ./sre/include/netinet/in.h
+      6      83      83 ./sre/include/netinet/tcp.h
+     11     258     258 ./sre/include/arpa/inet.h
+     61    1461    1461 ./sre/include/netdb.h
+     27     382     382 ./sre/include/fcntl.h
+     20     352     352 ./sre/include/dirent.h
+     17     346     346 ./sre/include/stdint.h
+      6      88      88 ./sre/include/assert.h
+     11     167     167 ./sre/include/utime.h
+     10     196     196 ./sre/include/signal.h
+     49     975     975 ./sre/include/math.h
+     27     635     635 ./sre/include/net/if.h
+     13     299     299 ./sre/include/setjmp.h
+     18     297     297 ./sre/include/locale.h
+     81    2298    2298 ./sre/sre_lua_compat.h
+     63    1905    1905 ./sre/sre_config.c
+     14     293     293 ./sre/sre_config.h
+   1269   47547   48630 ./tools/asset_viewer.cpp
+    400   13006   13022 ./tools/av_audio.cpp
+     90    2799    2805 ./tools/av_audio.h
+    789   25450   25484 ./tools/av_renderer.cpp
+    142    5956    5963 ./tools/av_renderer.h
+    449   15716   16588 ./tools/pod_loader.cpp
+     59    1878    2080 ./tools/pod_loader.h
+    288   10279   10289 ./tools/scene_loader.cpp
+     65    2483    2487 ./tools/scene_loader.h
+     49    1495    1497 ./loader/arch_detect.h
+    249   10096   10108 ./loader/elf_loader.cpp
+     70    1538    1538 ./loader/elf_loader.h
+    296   12429   12435 ./loader/elf_loader_arm64.cpp
+     71    1709    1711 ./loader/elf_loader_arm64.h
+     97    1947    1947 ./loader/elf_types.h
+    141    3376    3376 ./loader/elf_types_arm64.h
+    163    6002    6002 ./loader/loader.c
+     54    1140    1140 ./loader/loader.h
+    136    4455    4455 ./android/asset_manager.c
+     40     851     851 ./android/asset_manager.h
+     19     415     415 ./android/log.c
+     29     574     574 ./android/log.h
+  66119 2583038 2588188 total

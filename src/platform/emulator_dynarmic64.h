@@ -86,6 +86,10 @@ public:
     // Function return flag — set when PC hits MAGIC_LR (0xE0000000) HLT
     bool function_returned = false;
 
+    // Quiet mode — suppresses frequent InterpreterFallback log spam.
+    // Set to false only for deep debugging.
+    bool quiet_mode = true;
+
 private:
     uint8_t* memory;
     uint64_t mem_size;

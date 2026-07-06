@@ -24,6 +24,7 @@ typedef long               ptrdiff_t;
 
 /* Aliases used by other SRE headers */
 typedef uint64_t           sre_u64;
+typedef uint32_t           sre_u32;
 typedef unsigned long      sre_size_t;
 
 #ifndef NULL

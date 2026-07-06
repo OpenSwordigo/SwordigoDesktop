@@ -37,6 +37,7 @@ libsre.so
 # Build outputs directory
 build/
 out/
+BACKUPS/
 # OS files
 .DS_Store
 Thumbs.db

@@ -13,6 +13,7 @@
 
 #include "sre.h"
 
+#ifndef lua_h
 /* Lua 5.1 constants */
 #define LUA_MULTRET     (-1)
 #define LUA_YIELD       1
@@ -35,6 +36,7 @@
 
 /* Opaque types */
 typedef void lua_State;
+#endif
 
 /* Function pointer types for the Lua API functions we need */
 typedef int   (*pfn_lua_pcall)(lua_State* L, int nargs, int nresults, int errfunc);
@@ -126,10 +128,12 @@ extern pfn_lua_concat      g_lua_concat;
 extern pfn_lua_pushlstring g_lua_pushlstring;
 extern pfn_lua_setmetatable g_lua_setmetatable;
 
+#ifndef lua_h
 /* Convenience macros */
 #define lua_tostring(L, idx) g_lua_tolstring(L, idx, (sre_size_t*)0)
 #define lua_pop(L, n)        g_lua_settop(L, -(n)-1)
 #define lua_upvalueindex(i)  (LUA_GLOBALSINDEX - (i))
+#endif
 
 /* ProgramState layout (ARM64, v1.4.12) */
 #define PS_LUA_STATE     0x00  /* lua_State* L */

@@ -26,10 +26,6 @@
  * =====================================================================
  */
 
-/* We're ARM64 guest code — no libc, no stdlib */
-typedef unsigned long long sre_u64;
-typedef unsigned int       sre_u32;
-
 /* ========== Effect Data — exported to host ========== */
 
 /* Portal effect data (host reads for FBO portal glow shader) */

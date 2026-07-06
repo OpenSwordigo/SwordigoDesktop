@@ -184,15 +184,62 @@ void JniBridge::call_handler(uint32_t address, void* emu_ptr) {
 
 
 // --- Memory Allocator Bridges ---
+struct DeferredBlock {
+    uint32_t addr;
+    uint32_t size;
+    uint64_t alloc_index;
+};
 static uint32_t g_guest_heap_ptr = 0x20000000; // Start heap at 512MB
 static std::unordered_map<uint32_t, uint32_t> g_guest_allocs;
+static std::vector<DeferredBlock> g_deferred_free_list;
+static uint64_t g_alloc_counter = 0;
+static std::mutex g_heap_mutex;
+
+static uint32_t host_malloc_locked(uint32_t size) {
+    size = (size + 7) & ~7;
+    // Only recycle if heap size exceeds 580MB (fast path O(1) bump allocator under 580MB)
+    if (g_guest_heap_ptr - 0x20000000 > 580ULL * 1024 * 1024) {
+        size_t search_limit = std::min(g_deferred_free_list.size(), (size_t)50);
+        for (size_t i = 0; i < search_limit; i++) {
+            const auto& db = g_deferred_free_list[i];
+            // Chronological list: if the oldest elements aren't ready yet, none are!
+            if (g_alloc_counter - db.alloc_index <= 15000) {
+                break; // Stop searching completely
+            }
+            if (db.size >= size && db.size <= size + 128) {
+                uint32_t addr = db.addr;
+                g_guest_allocs[addr] = size;
+                g_deferred_free_list.erase(g_deferred_free_list.begin() + i);
+                g_alloc_counter++;
+                return addr;
+            }
+        }
+    }
+    uint32_t addr = g_guest_heap_ptr;
+    g_guest_heap_ptr += size;
+    g_guest_allocs[addr] = size;
+    g_alloc_counter++;
+    return addr;
+}
+
+static void host_free_locked(uint32_t ptr) {
+    if (ptr == 0) return;
+    if (g_guest_allocs.count(ptr)) {
+        uint32_t size = g_guest_allocs[ptr];
+        DeferredBlock db;
+        db.addr = ptr;
+        db.size = (size + 7) & ~7;
+        db.alloc_index = g_alloc_counter;
+        g_deferred_free_list.push_back(db);
+        g_guest_allocs.erase(ptr);
+    }
+}
 
 void bridge_malloc(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint32_t size = emu->get_reg(0);
-    uint32_t addr = g_guest_heap_ptr;
-    g_guest_heap_ptr += (size + 7) & ~7;
-    g_guest_allocs[addr] = size;
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
+    uint32_t addr = host_malloc_locked(size);
     emu->set_reg(0, addr);
 }
 
@@ -201,9 +248,8 @@ void bridge_calloc(void* emu_ptr) {
     uint32_t num = emu->get_reg(0);
     uint32_t size = emu->get_reg(1);
     uint32_t total = num * size;
-    uint32_t addr = g_guest_heap_ptr;
-    g_guest_heap_ptr += (total + 7) & ~7;
-    g_guest_allocs[addr] = total;
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
+    uint32_t addr = host_malloc_locked(total);
     std::memset(emu->get_memory_base() + addr, 0, total);
     emu->set_reg(0, addr);
 }
@@ -212,47 +258,58 @@ void bridge_realloc(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint32_t ptr = emu->get_reg(0);
     uint32_t size = emu->get_reg(1);
-    if (ptr != 0 && g_guest_allocs.count(ptr) == 0) {
-        static int realloc_warn_count = 0;
-        if (realloc_warn_count < 5) {
-            std::cout << "[ALLOC] WARNING: realloc called on unregistered pointer 0x" << std::hex << ptr 
-                      << " (requested size: " << std::dec << size << ")" << std::endl;
-            realloc_warn_count++;
-        } else if (realloc_warn_count == 5) {
-            std::cout << "[ALLOC] WARNING: further unregistered realloc warnings suppressed." << std::endl;
-            realloc_warn_count++;
-        }
-    }
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
     if (ptr == 0) {
-        uint32_t addr = g_guest_heap_ptr;
-        g_guest_heap_ptr += (size + 7) & ~7;
-        g_guest_allocs[addr] = size;
+        uint32_t addr = host_malloc_locked(size);
         emu->set_reg(0, addr);
         return;
     }
     if (size == 0) {
+        host_free_locked(ptr);
         emu->set_reg(0, 0);
         return;
     }
-    uint32_t old_size = 0;
+    
     if (g_guest_allocs.count(ptr)) {
-        old_size = g_guest_allocs[ptr];
+        uint32_t old_size = g_guest_allocs[ptr];
+        uint32_t aligned_old_size = (old_size + 7) & ~7;
+        uint32_t aligned_new_size = (size + 7) & ~7;
+        
+        if (aligned_new_size <= aligned_old_size) {
+            g_guest_allocs[ptr] = size;
+            emu->set_reg(0, ptr);
+            return;
+        }
+        
+        if (ptr + aligned_old_size == g_guest_heap_ptr) {
+            g_guest_heap_ptr = ptr + aligned_new_size;
+            g_guest_allocs[ptr] = size;
+            emu->set_reg(0, ptr);
+            return;
+        }
+        
+        uint32_t addr = host_malloc_locked(size);
+        uint32_t copy_size = (old_size < size) ? old_size : size;
+        if (copy_size > 0) {
+            std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, copy_size);
+        }
+        host_free_locked(ptr);
+        emu->set_reg(0, addr);
+    } else {
+        uint32_t addr = host_malloc_locked(size);
+        if (size > 0) {
+            std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, size);
+        }
+        emu->set_reg(0, addr);
     }
-    uint32_t addr = g_guest_heap_ptr;
-    g_guest_heap_ptr += (size + 7) & ~7;
-    g_guest_allocs[addr] = size;
-    uint32_t copy_size = (old_size < size) ? old_size : size;
-    if (copy_size > 0) {
-        std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, copy_size);
-    }
-    emu->set_reg(0, addr);
 }
 
 void bridge_free(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint32_t ptr = emu->get_reg(0);
     if (ptr) {
-        g_guest_allocs.erase(ptr);
+        std::lock_guard<std::mutex> lock(g_heap_mutex);
+        host_free_locked(ptr);
     }
 }
 
@@ -2026,6 +2083,11 @@ void bridge_fopen(void* emu_ptr) {
     bool is_write = (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'));
     if (is_write) {
         // std::cout << "[File] fopen(\"" << path << "\", \"" << mode << "\") [WRITE]" << std::endl;
+        try {
+            fs::create_directories(fs::path(path).parent_path());
+        } catch (...) {
+            // Ignore failure
+        }
     } else if (!emu->quiet_mode) {
         // std::cout << "[File] fopen(\"" << path << "\", \"" << mode << "\")" << std::endl;
     }

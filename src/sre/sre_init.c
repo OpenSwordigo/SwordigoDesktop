@@ -53,7 +53,9 @@ SreHookEntry sre_hook_table[] = {
      *
      * DISABLED FOR TESTING — let the native engine handle it to reduce
      * per-frame overhead. Lua resume errors will crash without this. */
-    /* { 0, "sre_ProgramState_Update"  }, */
+     { 0, "sre_ProgramState_Update" },
+    // { 0, "sre_updateApplication" }, (Problamatic, Makes the game bricked , broken GUI and other stuff)
+
 
     /* luaD_throw — ROOT of all Lua error handling. Every Lua error goes
      * through luaD_throw(L, errcode). Original calls __cxa_throw or
@@ -68,9 +70,17 @@ SreHookEntry sre_hook_table[] = {
     /* Background rendering — our own sky renderer
      * Addresses verified via: aarch64-linux-gnu-nm -D libswordigo.so | grep BackgroundComponent
      * Note: Draw is const (ZNK mangling) */
+    /* GUIView::Update and AchievementsManager::Update — both contain
+     * STXR/LDXR loops (boost::shared_ptr refcount) and bad pointer
+     * dereferences that branch into the files_dir string area (0x20010).
+     * We replace both with safe no-ops. */
+    //{ 0x49e55c, "sre_GUIView_Update"             },  /* GUIView::Update(float) */
+    { 0x37d8f4, "sre_AchievementsManager_Update" },  /* AchievementsManager::Update(float) */
+
     { 0x21ded4, "sre_BackgroundComponent_Draw"             },  /* BackgroundComponent::Draw (const) */
     { 0x2b6760, "sre_RotatingBackgroundComponent_Draw"     },  /* RotatingBackgroundComponent::Draw (const) */
     { 0x2b66f8, "sre_RotatingBackgroundComponent_Update"   },  /* RotatingBackgroundComponent::Update */
+
 
     /* Visual effects — DATA EXTRACTION ONLY (hooks disabled).
      * Vanilla rendering now works after STXR patches — let the game draw.
@@ -89,20 +99,21 @@ SreHookEntry sre_hook_table[] = {
      * works normally while we have total control. */
 
     /* Root window — top of the render tree */
-    { 0x4a28bc, "sre_GUIWindow_DrawRect"    },
+     { 0x4a28bc, "sre_GUIWindow_DrawRect"    },
 
     /* Core view classes */
-    { 0x49f310, "sre_GUIView_DrawRect"      },  /* base class: iterates subviews */
-    { 0x49565c, "sre_GUIButton_DrawRect"    },  /* buttons (title + bg) */
-    { 0x497aa0, "sre_GUILabel_DrawRect"     },  /* text labels */
-    { 0x497658, "sre_GUIFrameView_DrawRect" },  /* styled frames */
+     { 0x49f310, "sre_GUIView_DrawRect"      },  /* base class: iterates subviews */
+     { 0x49565c, "sre_GUIButton_DrawRect"    },  /* buttons (title + bg) */
+     { 0x497aa0, "sre_GUILabel_DrawRect"     },  /* text labels */
+     { 0x497658, "sre_GUIFrameView_DrawRect" },  /* styled frames */
 
     /* Interactive controls */
-    { 0x491b54, "sre_GUIAlertView_DrawRect" },  /* modal dialogs */
-    { 0x49cd40, "sre_GUISlider_DrawRect"    },  /* sliders */
+     { 0x491b54, "sre_GUIAlertView_DrawRect" },  /* modal dialogs */
+     { 0x49cd40, "sre_GUISlider_DrawRect"    },  /* sliders */
 
     /* Game-specific views */
-    { 0x42bae4, "sre_NewMenuView_DrawRect"  },  /* main menu */
+     { 0x42bae4, "sre_NewMenuView_DrawRect"  },  /* main menu */
+
 
     /* Options button — intercept Offers click at the delegate level.
      * When Offers is clicked, ButtonPressed calls the delegate method
@@ -130,14 +141,15 @@ SreHookEntry sre_hook_table[] = {
      *
      * Layer 3: Host maps a safety RET-page at 0x2d6ce4c to catch any
      *          remaining wild vtable jumps from the PRIMARY vtable. */
-    { 0x4792ac, "sre_StartTextInputWithDelegate" },  /* Caver::StartTextInputWithDelegate */
-    { 0x4793dc, "sre_StopTextInputWithDelegate"  },  /* Caver::StopTextInputWithDelegate  */
-    { 0x4790dc, "sre_textInputTextDidChange" },       /* Java_..._textInputTextDidChange   */
-    { 0x479290, "sre_textInputDidFinish"     },       /* Java_..._textInputDidFinish       */
+    // { 0x4792ac, "sre_StartTextInputWithDelegate" },  /* Caver::StartTextInputWithDelegate */
+    //{ 0x4793dc, "sre_StopTextInputWithDelegate"  },  /* Caver::StopTextInputWithDelegate  */
+    // { 0x4790dc, "sre_textInputTextDidChange" },       /* Java_..._textInputTextDidChange   */
+    // { 0x479290, "sre_textInputDidFinish"     },       /* Java_..._textInputDidFinish       */
+    // { 0x478f84, "sre_handleTouchEvent"      },       /* Java_..._handleTouchEvent (Disabled) */
 
     /* Lua error safety — wraps ALL lua_call with pcall
      * Installed as LATE trampoline in main.cpp (after sre_init_lua) */
-    /* { 0, "sre_lua_call_safe" }, */
+     { 0, "sre_lua_call_safe" }, 
 
     /* C++ exception handling — hook __cxa_throw to prevent broken unwind.
      * When a C++ exception is thrown (e.g. Lua error), the unwind machinery
@@ -150,19 +162,20 @@ SreHookEntry sre_hook_table[] = {
      * The original uses boost::shared_ptr + C++ exceptions for playlist
      * management, all of which break under Unicorn. Our SRE version
      * writes commands to shared globals, host executes via OpenAL. */
-    { 0x4811a0, "sre_PlayMusicWithName"                },  /* PlayMusicWithName(string&, bool) */
-    { 0x4814a8, "sre_MusicPlayer_FadeIn"               },  /* FadeIn(float) */
-    { 0x4815d8, "sre_MusicPlayer_FadeOut"               },  /* FadeOut(float) */
-    { 0x482090, "sre_MusicPlayer_Update"                },  /* Update(float) */
+     { 0x4811a0, "sre_PlayMusicWithName"                },  /* PlayMusicWithName(string&, bool) */
+     { 0x4814a8, "sre_MusicPlayer_FadeIn"               },  /* FadeIn(float) */
+     { 0x4815d8, "sre_MusicPlayer_FadeOut"               },  /* FadeOut(float) */
+     { 0x482090, "sre_MusicPlayer_Update"                },  /* Update(float) */
     /* NOTE: SetVolume(0x482064) and SetLooping(0x48206c) are only 8 bytes apart.
      * Our 16-byte trampoline would clobber one from the other. Leave originals —
      * they call MusicPlayerJNI via JNI bridge (safe). SRE Update handles fading.
      *
      * However, AudioSystem::SetMusicVolume (0x47f5f0) is the HIGH-LEVEL setter
      * called by the engine UI. We hook THIS to route slider changes to OpenAL. */
-    { 0x47f5f0, "sre_AudioSystem_SetMusicVolume" },
-    { 0x481e88, "sre_MusicPlayer_SetEnabled"            },  /* SetEnabled(bool) */
-    { 0x481fc0, "sre_MusicPlayer_SetSuspended"          },  /* SetSuspended(bool) */
+     { 0x47f5f0, "sre_AudioSystem_SetMusicVolume" },
+     { 0x481e88, "sre_MusicPlayer_SetEnabled"            },  /* SetEnabled(bool) */
+     { 0x481fc0, "sre_MusicPlayer_SetSuspended"          },  /* SetSuspended(bool) */
+
     /* NOTE: We do NOT hook AddPlaylist (0x48093c) or RegisterProgramLibrary (0x4821c8).
      * RegisterProgramLibrary registers Lua bindings ("MusicPlayer:PlayMusicWithName" etc.)
      * that scripts call. Those bindings invoke the C++ methods which we've already hooked.
@@ -182,20 +195,105 @@ SreHookEntry sre_hook_table[] = {
      * DISABLED: relay stubs crash because original function uses PC-relative
      * instructions (ADRP) that break when relocated to 0x3000000.
      * Mini.* injection is done via sre_lua_call_safe piggyback instead. */
-    /* { 0x4c0f18, "sre_RegisterProgramLibrary", 0 }, */
+    { 0x4c0f18, "sre_RegisterProgramLibrary", 0 },
 
     /* Virtual Filesystem — mod asset layering.
      * DISABLED: Same trampoline issue — replaces FileExistsAtPath entirely.
      * Our stub returns 1 optimistically, breaking actual file checks.
      * Re-enable after implementing host-side file check delegation. */
-    /* { 0x4b44b8, "sre_FileExistsAtPath" }, */
+     //{ 0x4b44b8, "sre_FileExistsAtPath" }, 
 
+    /* Unified Lua Interpreter Hooks */
+    /*
+    { 0, "lua_pcall" },
+    { 0, "lua_resume" },
+    { 0, "lua_settop" },
+    { 0, "lua_gettop" },
+    { 0, "lua_tolstring" },
+    { 0, "lua_call" },
+    { 0, "lua_pushstring" },
+    { 0, "lua_pushcclosure" },
+    { 0, "lua_setfield" },
+    { 0, "lua_getfield" },
+    { 0, "lua_createtable" },
+    { 0, "lua_pushnumber" },
+    { 0, "lua_pushboolean" },
+    { 0, "lua_pushnil" },
+    { 0, "lua_tonumber" },
+    { 0, "lua_toboolean" },
+    { 0, "lua_type" },
+    { 0, "luaL_register" },
+    { 0, "lua_touserdata" },
+    { 0, "lua_pushlightuserdata" },
+    { 0, "lua_error" },
+    { 0, "lua_pushvalue" },
+    { 0, "lua_remove" },
+    { 0, "lua_insert" },
+    { 0, "lua_replace" },
+    { 0, "lua_checkstack" },
+    { 0, "lua_rawget" },
+    { 0, "lua_rawset" },
+    { 0, "lua_rawgeti" },
+    { 0, "lua_rawseti" },
+    { 0, "lua_next" },
+    { 0, "lua_objlen" },
+    { 0, "lua_settable" },
+    { 0, "lua_gettable" },
+    { 0, "lua_isnumber" },
+    { 0, "lua_isstring" },
+    { 0, "lua_tointeger" },
+    { 0, "lua_pushinteger" },
+    { 0, "lua_concat" },
+    { 0, "lua_pushlstring" },
+    { 0, "lua_setmetatable" },
+    { 0, "luaL_newstate" },
+    { 0, "luaL_loadstring" },
+    { 0, "luaL_loadbuffer" },
+    { 0, "luaL_loadfile" },
+    { 0, "luaopen_base" },
+    { 0, "luaopen_package" },
+    { 0, "luaopen_table" },
+    { 0, "luaopen_io" },
+    { 0, "luaopen_os" },
+    { 0, "luaopen_string" },
+    { 0, "luaopen_math" },
+    { 0, "luaopen_debug" },
+    { 0, "luaL_openlibs" },
+    { 0, "lua_newthread" },
+    { 0, "lua_tothread" },
+    { 0, "lua_pushthread" },
+    { 0, "lua_status" },
+    { 0, "lua_gc" },
+    */
     /* Sentinel — end of table */
     { 0, 0, 0 }
 };
 
 /* Number of entries (excluding sentinel) */
 const int sre_hook_count = (sizeof(sre_hook_table) / sizeof(sre_hook_table[0])) - 1;
+
+/* Resolve a guest function address from the hook table by symbol name */
+uint64_t sre_get_hook_address(const char* symbol_name) {
+    if (!symbol_name) return 0;
+    for (int i = 0; i < sre_hook_count; i++) {
+        const char* sym = sre_hook_table[i].symbol_name;
+        if (sym) {
+            int match = 1;
+            int j = 0;
+            while (sym[j] || symbol_name[j]) {
+                if (sym[j] != symbol_name[j]) {
+                    match = 0;
+                    break;
+                }
+                j++;
+            }
+            if (match) {
+                return sre_hook_table[i].orig_func;
+            }
+        }
+    }
+    return 0;
+}
 
 /* =========================================================================
  * Initialization
@@ -244,4 +342,67 @@ void sre_init(uint64_t swordigo_base, uint64_t empty_bss_off) {
     uint64_t* itid_vtable = (uint64_t*)(swordigo_base + 0x7e1688);
     itid_vtable[0] = (uint64_t)&sre_TextInputTextDidChange_vtable;
     itid_vtable[1] = (uint64_t)&sre_TextInputDidFinish_vtable;
+
+    /* Load mod configuration from mini.toml */
+    extern char g_sre_mod_name[128];
+    extern char g_sre_mod_version[32];
+    extern char g_sre_mod_author[128];
+    extern float g_sre_game_speed;
+    extern int g_sre_coin_limit;
+    
+    #include "sre_config.h"
+    sre_config_t config;
+    int config_ret = sre_config_load_toml("/Assets/mini.toml", &config);
+    if (config_ret != 0) {
+        config_ret = sre_config_load_toml("/Assets/resources/mini.toml", &config);
+    }
+    
+    /* Diagnostic: scan the compiled is.scl to verify if the button strings exist in it */
+    FILE* f_scl = fopen("/home/quantumcreeper/.local/share/swordigo-desktop/rln_assets/resources/is.scl", "rb");
+    if (f_scl) {
+        fseek(f_scl, 0, SEEK_END);
+        long sz = ftell(f_scl);
+        fseek(f_scl, 0, SEEK_SET);
+        char* buf = (char*)malloc(sz);
+        if (buf) {
+            fread(buf, 1, sz, f_scl);
+            int has_settings = 0, has_armory = 0, has_keybinds = 0, has_inventory = 0, has_keybind_label = 0;
+            for (long i = 0; i < sz - 10; i++) {
+                if (memcmp(&buf[i], "Settings", 8) == 0) has_settings = 1;
+                if (memcmp(&buf[i], "Armory", 6) == 0) has_armory = 1;
+                if (memcmp(&buf[i], "Keybinds", 8) == 0) has_keybinds = 1;
+                if (memcmp(&buf[i], "Inventory", 9) == 0) has_inventory = 1;
+                if (memcmp(&buf[i], "+ Keybind", 9) == 0) has_keybind_label = 1;
+            }
+            FILE* f_diag = fopen("/home/quantumcreeper/SwordigoDesktop/sre_scan_diagnostic.txt", "w");
+            if (f_diag) {
+                fprintf(f_diag, "is.scl string scan results:\n");
+                fprintf(f_diag, "  Settings: %d | Armory: %d | Keybinds: %d | Inventory: %d | + Keybind: %d\n",
+                        has_settings, has_armory, has_keybinds, has_inventory, has_keybind_label);
+                fclose(f_diag);
+            }
+            free(buf);
+        }
+        fclose(f_scl);
+    } else {
+        FILE* f_diag = fopen("/home/quantumcreeper/SwordigoDesktop/sre_scan_diagnostic.txt", "w");
+        if (f_diag) {
+            fprintf(f_diag, "Failed to open is.scl for scanning!\n");
+            fclose(f_diag);
+        }
+    }
+
+    if (config_ret == 0) {
+        strncpy(g_sre_mod_name, config.mod_name, sizeof(g_sre_mod_name) - 1);
+        g_sre_mod_name[sizeof(g_sre_mod_name) - 1] = '\0';
+        
+        strncpy(g_sre_mod_version, config.mod_version, sizeof(g_sre_mod_version) - 1);
+        g_sre_mod_version[sizeof(g_sre_mod_version) - 1] = '\0';
+        
+        strncpy(g_sre_mod_author, config.mod_authors, sizeof(g_sre_mod_author) - 1);
+        g_sre_mod_author[sizeof(g_sre_mod_author) - 1] = '\0';
+        
+        g_sre_game_speed = config.engine_speed;
+        g_sre_coin_limit = config.coin_limit;
+    }
 }

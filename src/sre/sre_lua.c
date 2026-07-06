@@ -142,11 +142,6 @@ static int g_lua_call_safe_errors = 0;
 volatile char g_sre_last_lua_error[256] = {0};
 volatile int g_sre_lua_error_count = 0;
 
-/* File-based error logging — writes to /ExternalFiles/ (MiniPath translated) */
-typedef struct { int _dummy; } FILE;
-extern FILE* fopen(const char* path, const char* mode);
-extern int fwrite(const void* ptr, int size, int count, FILE* fp);
-extern int fclose(FILE* fp);
 extern char g_sre_vfs_path_external[512];
 
 static int sre_itoa(int val, char* buf) {
@@ -158,6 +153,7 @@ static int sre_itoa(int val, char* buf) {
 }
 
 void sre_log_lua_error(const char* source, const char* err_msg) {
+    fprintf(stderr, "[SRE-LUA-ERROR] Source: '%s' | Error: %s\n", source ? source : "unknown", err_msg ? err_msg : "none");
     static int log_counter = 0;
     log_counter++;
     
@@ -671,107 +667,196 @@ void sre_ProgramState_Resume(void* self, int stackIndex) {
 
 /* ========== ProgramState::Update replacement ==========
  * Symbol: _ZN5Caver12ProgramState6UpdateEf
- * 
- * This handles timer-based coroutine resumption.
- * Only hooked on ARM64 (on ARM32, Update calls Resume which we already hook).
+ *
+ * Accurately replicates the Ghidra decompilation of ProgramState::Update:
+ *
+ *   Ghidra (libswordigo_v1.4.12.so.c lines 551876–551949 / address 0x3198bd):
+ *
+ *   if ((this[0x51] != 0) || (this[0x52] != 0)) {          // condition1 || paused
+ *       if (this[0x20] != NULL)                             // has SceneObject?
+ *           scaledDelta = SceneObject::updateSpeedMultiplier(this[0x20]) * dt;
+ *       speedScaling = *(float*)(this + 0x54);
+ *
+ *       if (this[0x48] == 1) {                              // isSuspended?
+ *           this[0x4c] -= scaledDelta * speedScaling;       // tick timer
+ *           if (this[0x4c] < 0) {
+ *               this[0x48] = 0;                             // clear suspended
+ *               result = lua_resume(L, 0);
+ *               if (result != 1) this[0x53] = 1;           // mark completed
+ *           }
+ *       }
+ *       // iterate child list (original code handles this)
+ *   }
+ *
+ * KEY CORRECTNESS FIX:
+ *   The relay stub calls the ORIGINAL Update for child iteration.
+ *   If we leave PS_IS_SUSPENDED=1 when the timer is still counting down,
+ *   the original ALSO ticks the timer → double-speed timers (bolts fire
+ *   2x fast, sleep() durations halved). Fix: always clear PS_IS_SUSPENDED
+ *   before calling original so the original's inner timer branch is skipped
+ *   for *this* state. Children hit our hook recursively — correct behavior.
  */
-
-/* We need the original ProgramState::Update for the second half of the function.
- * The host stores the original entry point here. */
 typedef void (*pfn_orig_Update)(void* self, float deltaTime);
 pfn_orig_Update g_orig_ProgramState_Update = 0;
 
 void sre_ProgramState_Update(void* self, float deltaTime) {
-    /* Capture lua_State and check console EVERY frame */
+    /* Capture lua_State and service the Lua console every frame */
     lua_State* L = PS_GET(self, PS_LUA_STATE, lua_State*);
     if (L) {
         g_sre_last_lua_state = L;
-        if (g_lua_console_pending) {
+        if (__builtin_expect(g_lua_console_pending, 0)) {
             g_lua_console_pending = 0;
             sre_run_console(L);
         }
     }
-    
+
+    /* Ghidra line 332: outer guard — skip entire body if both flags are zero.
+     * (Constructor sets condition1=1 so active states always enter.) */
     char condition1 = PS_GET(self, PS_CONDITION1, char);
-    char paused = PS_GET(self, PS_PAUSED, char);
-    
-    /* Fast path: if no timer/coroutine work needed, skip the expensive
-     * SRE logic but STILL call the original for child iteration.
-     * Previously this returned early, which starved children of updates
-     * and broke effects (portals, rifts, particles). */
-    if (!condition1 && !paused) goto call_original;
-    
-    int isSuspended = PS_GET(self, PS_IS_SUSPENDED, int);
-    
-    if (isSuspended == 1) {
-        /* Only compute speed multiplier when we actually need it for the
-         * timer countdown. This avoids an expensive guest function call
-         * (g_getSpeedMultiplier) for every ProgramState node in the tree. */
-        void* thisObject = PS_GET(self, PS_SCENE_OBJECT, void*);
-        float speedScaling = PS_GET(self, PS_SPEED_SCALING, float);
-        
+    char paused     = PS_GET(self, PS_PAUSED,     char);
+
+    if (condition1 || paused) {
+        /* --- Apply SceneObject speed multiplier (Ghidra lines 333-336) --- */
         float scaledDelta = deltaTime;
-        if (thisObject != 0 && g_getSpeedMultiplier != 0) {
-            float mult = g_getSpeedMultiplier(thisObject);
-            scaledDelta = mult * deltaTime;
+        void* sceneObj = PS_GET(self, PS_SCENE_OBJECT, void*);
+        if (sceneObj != 0 && g_getSpeedMultiplier != 0) {
+            scaledDelta = g_getSpeedMultiplier(sceneObj) * deltaTime;
         }
-        float finalMultiplier = scaledDelta * speedScaling;
-        
-        /* Count down the sleep timer */
-        float currentTimer = PS_GET(self, PS_SLEEP_TIME, float);
-        float loweredTimer = currentTimer - finalMultiplier;
-        PS_SET(self, PS_SLEEP_TIME, float, loweredTimer);
-        
-        if (loweredTimer < 0.0f) {
-            /* Timer expired — resume the coroutine */
-            PS_SET(self, PS_IS_SUSPENDED, int, 0);
-            
-            lua_State* L = PS_GET(self, PS_LUA_STATE, lua_State*);
-            
-            /* Recovery for C++ exceptions from lua_resume */
-            int my_depth = recovery_push(L);
-            if (my_depth < 0) {
-                int result = g_lua_resume(L, 0);
-                if (result != LUA_YIELD) PS_SET(self, PS_COMPLETED, char, 1);
-            } else if (sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
-                recovery_pop(my_depth);
-                PS_SET(self, PS_COMPLETED, char, 1);
-            } else {
-                int result = g_lua_resume(L, 0);
-                recovery_pop(my_depth);
-                
-                if (result != LUA_YIELD) {
+
+        /* Ghidra line 337: speedScaling factor stored at +0x54 */
+        float speedScaling = PS_GET(self, PS_SPEED_SCALING, float);
+
+        /* Ghidra lines 339-350: timer countdown + coroutine resume */
+        int isSuspended = PS_GET(self, PS_IS_SUSPENDED, int);
+        if (isSuspended == 1) {
+            float timer = PS_GET(self, PS_SLEEP_TIME, float);
+            timer -= scaledDelta * speedScaling;
+            PS_SET(self, PS_SLEEP_TIME, float, timer);
+
+            if (timer < 0.0f) {
+                /* Timer fired — permanently clear isSuspended and resume.
+                 * After lua_resume, the Lua coroutine may call sleep() again
+                 * (setting isSuspended=1 with a new timer) or finish
+                 * (isSuspended stays 0, completed=1). Both are handled by
+                 * the save/restore around the original call below. */
+                PS_SET(self, PS_IS_SUSPENDED, int, 0);
+
+                int my_depth = recovery_push(L);
+                if (my_depth < 0) {
+                    int r = g_lua_resume(L, 0);
+                    if (r != LUA_YIELD) PS_SET(self, PS_COMPLETED, char, 1);
+                } else if (sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
+                    recovery_pop(my_depth);
                     PS_SET(self, PS_COMPLETED, char, 1);
+                } else {
+                    int r = g_lua_resume(L, 0);
+                    recovery_pop(my_depth);
+                    if (r != LUA_YIELD) PS_SET(self, PS_COMPLETED, char, 1);
                 }
             }
+            /* If timer still counting: do NOT touch isSuspended here.
+             * It stays 1 so next frame we keep counting down.
+             * The double-tick suppression is handled below via save/restore. */
         }
     }
-    
-call_original:
-    /* Call original for child ProgramState iteration + cleanup.
-     * We've already cleared isSuspended, so the original won't re-run the
-     * timer/resume for THIS state. Each child will hit the SRE hook via
-     * the trampoline, so they're properly handled too.
+
+    /* Call the original Update relay for child-state iteration + cleanup.
      *
-     * This MUST run unconditionally — child states drive effects (portals,
-     * rifts, particles). Removing this breaks all visual effects.
+     * KEY: temporarily zero PS_IS_SUSPENDED for *this* state before calling
+     * the original, then RESTORE it afterward. This prevents the original
+     * from double-ticking our timer (its isSuspended==1 branch is skipped),
+     * while preserving the countdown state across frames so bolts/timers fire
+     * at the correct time.
      *
-     * The child cleanup code (shared_ptr destructors, list unlink) can
-     * throw C++ exceptions, so wrap with recovery. */
+     * Saved after our timer logic above: may be 0 (timer fired, Lua finished)
+     * or 1 (timer still counting / Lua re-slept after resume). */
     if (g_orig_ProgramState_Update != 0) {
+        int saved_suspended = PS_GET(self, PS_IS_SUSPENDED, int);
+        PS_SET(self, PS_IS_SUSPENDED, int, 0);  /* suppress original's timer for *this* */
+
         lua_State* L2 = PS_GET(self, PS_LUA_STATE, lua_State*);
-        int orig_depth = recovery_push(L2);
-        if (orig_depth < 0) {
-            /* Stack full — call without protection */
-            g_orig_ProgramState_Update(self, deltaTime);
-        } else if (sre_setjmp(g_sre_recovery_stack[orig_depth].buf) != 0) {
-            /* Caught exception from child iteration/cleanup */
-            recovery_pop(orig_depth);
-            /* Mark this state as completed so it gets cleaned up */
-            PS_SET(self, PS_COMPLETED, char, 1);
+        if (L2 != NULL) {
+            int d = recovery_push(L2);
+            if (d < 0) {
+                g_orig_ProgramState_Update(self, deltaTime);
+            } else if (sre_setjmp(g_sre_recovery_stack[d].buf) != 0) {
+                recovery_pop(d);
+                PS_SET(self, PS_COMPLETED, char, 1);
+                saved_suspended = 0;  /* completed — don't restore suspended */
+            } else {
+                g_orig_ProgramState_Update(self, deltaTime);
+                recovery_pop(d);
+            }
         } else {
             g_orig_ProgramState_Update(self, deltaTime);
-            recovery_pop(orig_depth);
+        }
+
+        /* Restore: the original only iterates/cleans children, it never
+         * modifies isSuspended for *this* when we passed isSuspended=0.
+         * So restoring is always safe and correct. */
+        PS_SET(self, PS_IS_SUSPENDED, int, saved_suspended);
+    }
+}
+
+
+/* ========== updateApplication hook ==========
+ * Symbol: Java_com_touchfoo_swordigo_Native_updateApplication
+ * Address: 0x1478ccc (== updateApp in the game loop)
+ *
+ * Ghidra:
+ *   void Java_..._updateApplication(void) {
+ *       if (DAT_007f3c20 != NULL)
+ *           (**(code**)(*DAT_007f3c20 + 0x68))();   // vtable → ProgramState::Update
+ *   }
+ *
+ * We hook this outer JNI frame to:
+ *   1. Service any pending Lua console commands before the frame
+ *   2. Call-through to original so the game ticks normally
+ *
+ * The actual timer/coroutine logic is handled inside sre_ProgramState_Update
+ * which is called from within the original's vtable dispatch. */
+typedef void (*pfn_orig_updateApp)(void* env, void* obj);
+pfn_orig_updateApp g_orig_updateApplication = 0;
+
+void sre_updateApplication(void* env, void* obj) {
+    /* Service Lua console before the frame update */
+    if (g_lua_console_pending && g_sre_last_lua_state) {
+        g_lua_console_pending = 0;
+        sre_run_console(g_sre_last_lua_state);
+    }
+    /* Call-through to original */
+    if (g_orig_updateApplication) {
+        g_orig_updateApplication(env, obj);
+    }
+}
+
+/* ========== handleTouchEvent hook ==========
+ * Symbol: Java_com_touchfoo_swordigo_Native_handleTouchEvent
+ * Offset: 0x478f84
+ *
+ * Wraps the guest touch handler with exception recovery so that
+ * any script exceptions thrown by button click handlers do not
+ * result in unrecovered longjmps (which corrupt JIT states and hang).
+ */
+typedef void (*pfn_orig_handleTouchEvent)(void* env, void* obj, int action, int id, double time, float x, float y, float oldX, float oldY, int tapCount);
+pfn_orig_handleTouchEvent g_orig_handleTouchEvent = 0;
+
+void sre_handleTouchEvent(void* env, void* obj, int action, int id, double time, float x, float y, float oldX, float oldY, int tapCount) {
+    if (g_orig_handleTouchEvent) {
+        lua_State* L = g_sre_last_lua_state;
+        if (L != NULL) {
+            int d = recovery_push(L);
+            if (d < 0) {
+                g_orig_handleTouchEvent(env, obj, action, id, time, x, y, oldX, oldY, tapCount);
+            } else if (sre_setjmp(g_sre_recovery_stack[d].buf) != 0) {
+                recovery_pop(d);
+                sre_log_lua_error("handleTouchEvent", "Exception caught in handleTouchEvent!");
+            } else {
+                g_orig_handleTouchEvent(env, obj, action, id, time, x, y, oldX, oldY, tapCount);
+                recovery_pop(d);
+            }
+        } else {
+            g_orig_handleTouchEvent(env, obj, action, id, time, x, y, oldX, oldY, tapCount);
         }
     }
 }

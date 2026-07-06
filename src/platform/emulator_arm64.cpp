@@ -1,4 +1,5 @@
 #include "emulator_arm64.h"
+#include "platform/binary_selector.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -60,10 +61,16 @@ static bool hook_mem_unmapped_64(uc_engine *uc, uc_mem_type type, uint64_t addre
                 // Alias: high address → same physical memory as low address
                 // CRITICAL: if the aliased page falls in the .text section (code),
                 // map it READ-ONLY to prevent accidental code corruption.
+                // EXCEPTION: RLSwordigo requires writable text segments for modded game data.
                 // The .text segment is at load_addr(0x1000000) to 0x16af698.
                 uint32_t prot = UC_PROT_ALL;
-                if (guest_page >= 0x1000000 && guest_page < 0x16b0000) {
-                    prot = UC_PROT_READ;  // Code section: read-only alias
+                // Check if this is RLSwordigo by looking at the loaded binary info
+                extern BinarySelector g_binary_selector;
+                const BinaryInfo* binfo = g_binary_selector.get_loaded_info();
+                bool is_rlsw = (binfo && binfo->game_type == "RLSwordigo");
+                
+                if (!is_rlsw && guest_page >= 0x1000000 && guest_page < 0x16b0000) {
+                    prot = UC_PROT_READ;  // Code section: read-only alias (vanilla only)
                 }
                 map_err = uc_mem_map_ptr(uc, fault_page, 0x1000, prot, base + guest_page);
             } else {

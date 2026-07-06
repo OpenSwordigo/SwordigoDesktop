@@ -1,0 +1,14 @@
+*.o
+*.so
+*.a
+*.gch
+*.exe
+*.gcda
+*.gcno
+*.gcov
+*.dSYM
+/toml2json
+/toml-c-test
+/libtoml.so.1.0
+/example/array
+/example/table

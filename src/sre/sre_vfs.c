@@ -205,7 +205,7 @@ void sre_vfs_init_full(const char* data_dir, const char* mod_name, const char* p
     /* Build MiniPath base paths */
     if (data_dir && data_dir[0]) {
         vfs_path_join(g_sre_vfs_path_assets,   512, data_dir, "assets");
-        vfs_path_join(g_sre_vfs_path_files,    512, data_dir, "files");
+        vfs_path_join(g_sre_vfs_path_files,    512, data_dir, "save");
         vfs_path_join(g_sre_vfs_path_external, 512, data_dir, "external");
         vfs_path_join(g_sre_vfs_path_cache,    512, data_dir, "cache");
     }

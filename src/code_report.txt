@@ -1,0 +1,705 @@
+   18392 lines |     967022 chars |    97717 words |   948K | ./imgui/imgui.cpp
+   10992 lines |     551704 chars |    55970 words |   540K | ./imgui/imgui_widgets.cpp
+    6942 lines |     262470 chars |    27341 words |   260K | ./jni/jni_bridge_arm64.cpp
+    6809 lines |     381632 chars |    30941 words |   376K | ./imgui/imgui_draw.cpp
+    5600 lines |     325964 chars |    26292 words |   320K | ./main.cpp
+    5449 lines |     197661 chars |    20341 words |   196K | ./sre/sre_mini_api.c
+    5085 lines |     199503 chars |    24010 words |   196K | ./imgui/imstb_truetype.h
+    5062 lines |     185702 chars |    19530 words |   184K | ./jni/jni_bridge.cpp
+    4711 lines |     260330 chars |    25339 words |   256K | ./imgui/imgui_tables.cpp
+    4257 lines |     428082 chars |    51599 words |   420K | ./imgui/imgui.h
+    4042 lines |     305065 chars |    31097 words |   300K | ./imgui/imgui_internal.h
+    2145 lines |      53483 chars |     7944 words |    56K | ./sre/toml-c/header/toml-c.h
+    2122 lines |      88693 chars |     6953 words |    88K | ./platform/launcher_ui.cpp
+    2107 lines |      88015 chars |     6899 words |    88K | ./launcher_ui.cpp
+    2096 lines |      86881 chars |     7938 words |    88K | ./platform/vulkan_backend.cpp
+    2007 lines |      48528 chars |     7318 words |    48K | ./sre/toml-c/toml.c
+    1835 lines |      77522 chars |     7980 words |    76K | ./platform/fbo_scaler.cpp
+    1621 lines |      51733 chars |     6212 words |    52K | ./sre/sre_lua_libs.c
+    1566 lines |      64059 chars |     8419 words |    64K | ./platform/gui.cpp
+    1527 lines |      60111 chars |     6756 words |    60K | ./imgui/imstb_textedit.h
+    1444 lines |      70279 chars |     6570 words |    72K | ./platform/launcher.cpp
+    1381 lines |      55483 chars |     6844 words |    56K | ./sre/sre_gui_native.c
+    1336 lines |      36568 chars |     4722 words |    36K | ./sre/lua/src/lparser.c
+    1269 lines |      47547 chars |     4197 words |    48K | ./tools/asset_viewer.cpp
+    1167 lines |      26658 chars |     3448 words |    28K | ./sre/luafilesystem/src/lfs.c
+    1164 lines |      39859 chars |     4492 words |    40K | ./platform/srt_overlay.cpp
+    1159 lines |      59727 chars |     5617 words |    60K | ./imgui/backends/imgui_impl_opengl3.cpp
+    1134 lines |      44020 chars |     4626 words |    44K | ./platform/binary_selector.cpp
+    1088 lines |      45453 chars |     4232 words |    48K | ./platform/swordfare_gui.cpp
+    1077 lines |      22380 chars |     2859 words |    24K | ./sre/lua/src/lapi.c
+     958 lines |      41175 chars |     3831 words |    44K | ./imgui/backends/imgui_impl_opengl3_loader.h
+     887 lines |      44711 chars |     3969 words |    44K | ./imgui/backends/imgui_impl_sdl3.cpp
+     863 lines |      23172 chars |     3192 words |    24K | ./sre/lua/src/lstrlib.c
+     827 lines |      30730 chars |     3728 words |    32K | ./sre/sre_lua.c
+     825 lines |      21164 chars |     2857 words |    24K | ./sre/lua/src/lcode.c
+     801 lines |      22707 chars |     2311 words |    24K | ./sre/luasocket/test/testclnt.lua
+     789 lines |      25450 chars |     2848 words |    28K | ./tools/av_renderer.cpp
+     762 lines |      23041 chars |     2876 words |    24K | ./sre/lua/src/lvm.c
+     762 lines |      21022 chars |     2783 words |    24K | ./sre/lua/src/lauxlib.c
+     751 lines |      27299 chars |     2935 words |    28K | ./platform/input_config.cpp
+     736 lines |      21584 chars |     3133 words |    24K | ./sre/lua/src/luaconf.h
+     728 lines |      26403 chars |     3101 words |    28K | ./sre/luasocket/src/mime.c
+     718 lines |      32431 chars |     3806 words |    32K | ./platform/emulator_arm64.cpp
+     707 lines |      19967 chars |     2466 words |    20K | ./sre/lua/src/lgc.c
+     667 lines |      19125 chars |     2418 words |    20K | ./sre/lua/src/loadlib.c
+     656 lines |      25420 chars |     2260 words |    28K | ./platform/vulkan_backend.h
+     644 lines |      18346 chars |     1860 words |    20K | ./sre/luasocket/test/utestclnt.lua
+     643 lines |      16654 chars |     2157 words |    20K | ./sre/lua/src/lbaselib.c
+     635 lines |      17349 chars |     1632 words |    20K | ./sre/luasocket/test/urltest.lua
+     627 lines |      20346 chars |     2735 words |    20K | ./imgui/imstb_rectpack.h
+     620 lines |      15998 chars |     2139 words |    16K | ./sre/lua/src/ldebug.c
+     603 lines |      22596 chars |     2434 words |    24K | ./platform/emulator_dynarmic64.cpp
+     588 lines |      16264 chars |     2507 words |    16K | ./sre/lua/src/ltable.c
+     536 lines |      18010 chars |     1697 words |    20K | ./sre/luasocket/src/inet.c
+     532 lines |      13002 chars |     1798 words |    16K | ./sre/lua/src/liolib.c
+     526 lines |      19340 chars |     2231 words |    20K | ./sre/sre_vfs.c
+     515 lines |      14700 chars |     1921 words |    16K | ./sre/lua/src/ldo.c
+     489 lines |      17237 chars |     1541 words |    20K | ./sre/luasocket/src/tcp.c
+     480 lines |      17316 chars |     2172 words |    20K | ./sre/sre_music.c
+     460 lines |      12450 chars |     1475 words |    16K | ./sre/lua/src/llex.c
+     449 lines |      17910 chars |     1665 words |    20K | ./platform/save_editor.cpp
+     449 lines |      16059 chars |     1803 words |    16K | ./sre/luasocket/src/usocket.c
+     449 lines |      15716 chars |     1779 words |    20K | ./tools/pod_loader.cpp
+     444 lines |      18451 chars |     1905 words |    20K | ./sre/sre_scene_update.c
+     441 lines |      15792 chars |     1356 words |    16K | ./sre/luasocket/src/udp.c
+     441 lines |      11480 chars |     1365 words |    12K | ./sre/luasocket/test/httptest.lua
+     434 lines |      17049 chars |     1865 words |    20K | ./sre/luasocket/src/wsocket.c
+     409 lines |      40113 chars |     3222 words |    40K | ./platform/vulkan_shaders_spirv.h
+     400 lines |      13006 chars |     1537 words |    16K | ./tools/av_audio.cpp
+     397 lines |      10045 chars |     1229 words |    12K | ./sre/lua/src/ldblib.c
+     394 lines |      17773 chars |     2188 words |    20K | ./sre/sre_init.c
+     391 lines |      12368 chars |     1596 words |    16K | ./sre/sre_string.c
+     389 lines |      16442 chars |     1488 words |    20K | ./sre/sre_gui.c
+     384 lines |      11580 chars |     1463 words |    12K | ./sre/lua/src/lua.h
+     381 lines |       8495 chars |     1054 words |    12K | ./sre/lua/src/lobject.h
+     377 lines |       9835 chars |     1419 words |    12K | ./sre/lua/src/lua.c
+     364 lines |      11428 chars |     1195 words |    12K | ./sre/luasocket/src/options.c
+     355 lines |      16895 chars |     1713 words |    20K | ./platform/video_background.cpp
+     355 lines |      13290 chars |     1688 words |    16K | ./platform/vulkan_shaders.glsl.h
+     353 lines |      12330 chars |     1414 words |    16K | ./sre/luasocket/src/http.lua
+     346 lines |      12426 chars |     1094 words |    16K | ./sre/luasocket/src/unix.c
+     335 lines |      12117 chars |     1445 words |    12K | ./platform/emulator.cpp
+     333 lines |      13036 chars |     1695 words |    16K | ./sre/sre_effects.c
+     323 lines |      11516 chars |     1528 words |    12K | ./sre/luasocket/etc/lp.lua
+     319 lines |      11094 chars |     1221 words |    12K | ./platform/draw_batcher.h
+     310 lines |      10774 chars |     1589 words |    12K | ./platform/pvr_loader.cpp
+     307 lines |      11036 chars |     1216 words |    12K | ./sre/luasocket/src/url.lua
+     300 lines |      10215 chars |     1138 words |    12K | ./sre/luasocket/etc/dispatch.lua
+     299 lines |       8376 chars |      993 words |    12K | ./sre/luasocket/test/mimetest.lua
+     299 lines |      13784 chars |     1179 words |    16K | ./jni/jni_layer_arm64.h
+     298 lines |       8331 chars |      941 words |    12K | ./sre/luasocket/src/ltn12.lua
+     296 lines |      12429 chars |     1246 words |    16K | ./loader/elf_loader_arm64.cpp
+     288 lines |      10279 chars |      998 words |    12K | ./tools/scene_loader.cpp
+     284 lines |       9243 chars |      943 words |    12K | ./sre/luasocket/src/ftp.lua
+     278 lines |       7049 chars |     1047 words |   8.0K | ./sre/lua/src/ltablib.c
+     276 lines |      10452 chars |     1082 words |    12K | ./sre/luasocket/src/buffer.c
+     274 lines |       8625 chars |      998 words |    12K | ./sre/luasocket/test/ltn12test.lua
+     268 lines |       8083 chars |     1177 words |   8.0K | ./sre/lua/src/lopcodes.h
+     263 lines |       5827 chars |      699 words |   8.0K | ./sre/lua/src/lmathlib.c
+     261 lines |       8569 chars |      955 words |    12K | ./game/mod_tools.cpp
+     259 lines |       5376 chars |      734 words |   8.0K | ./sre/luasocket/test/smtptest.lua
+     255 lines |       8074 chars |      773 words |   8.0K | ./sre/luasocket/src/smtp.lua
+     249 lines |      10096 chars |     1009 words |    12K | ./loader/elf_loader.cpp
+     246 lines |       9376 chars |      907 words |    12K | ./game/mod_config.cpp
+     240 lines |       6026 chars |      737 words |   8.0K | ./sre/lua/src/loslib.c
+     238 lines |       7366 chars |      835 words |   8.0K | ./platform/srt_overlay.h
+     238 lines |      11730 chars |     1259 words |    12K | ./sre/sre_gui.h
+     236 lines |       9067 chars |     1236 words |    12K | ./sre/sre_background.c
+     235 lines |       8160 chars |      948 words |   8.0K | ./sre/sre_mod.c
+     229 lines |       7384 chars |      728 words |   8.0K | ./platform/protobuf_reader.h
+     226 lines |       6946 chars |      829 words |   8.0K | ./sre/luafilesystem/tests/test.lua
+     224 lines |       4871 chars |      490 words |   8.0K | ./sre/lua/src/print.c
+     223 lines |       4512 chars |      425 words |   8.0K | ./sre/lua/src/lundump.c
+     221 lines |       7062 chars |      738 words |   8.0K | ./sre/luasocket/src/timeout.c
+     220 lines |       6817 chars |      700 words |   8.0K | ./sre/luasocket/src/select.c
+     214 lines |       5638 chars |      696 words |   8.0K | ./sre/lua/src/lstate.c
+     214 lines |       5494 chars |      705 words |   8.0K | ./sre/lua/src/lobject.c
+     210 lines |       7161 chars |      733 words |   8.0K | ./platform/data_path.cpp
+     207 lines |       8456 chars |      999 words |    12K | ./game/sky_renderer.h
+     200 lines |       5066 chars |      609 words |   8.0K | ./sre/toml-c/toml2json.c
+     198 lines |       6985 chars |      732 words |   8.0K | ./game/save_editor_logic.cpp
+     196 lines |       4574 chars |      533 words |   8.0K | ./sre/lua/src/luac.c
+     188 lines |       6333 chars |      552 words |   8.0K | ./sre/luasocket/src/serial.c
+     181 lines |       6138 chars |      737 words |   8.0K | ./game/camera_override.cpp
+     178 lines |       5902 chars |      565 words |   8.0K | ./platform/display.cpp
+     177 lines |       5290 chars |      511 words |   8.0K | ./sre/toml-c/toml-c-test.c
+     174 lines |       4602 chars |      601 words |   8.0K | ./sre/lua/src/lfunc.c
+     172 lines |       5747 chars |      597 words |   8.0K | ./sre/lua/src/lauxlib.h
+     171 lines |       5838 chars |      574 words |   8.0K | ./jni/jni_layer.h
+     168 lines |       4932 chars |      695 words |   8.0K | ./sre/lua/src/lstate.h
+     164 lines |       3107 chars |      336 words |   4.0K | ./sre/lua/src/ldump.c
+     163 lines |       6002 chars |      659 words |   8.0K | ./loader/loader.c
+     161 lines |       5088 chars |      599 words |   8.0K | ./platform/gui.h
+     158 lines |       6329 chars |      544 words |   8.0K | ./sre/luasocket/src/auxiliar.c
+     154 lines |       4798 chars |      515 words |   8.0K | ./sre/luasocket/etc/tftp.lua
+     153 lines |       6461 chars |      681 words |   8.0K | ./sre/sre_lua.h
+     151 lines |       4666 chars |      467 words |   8.0K | ./sre/luasocket/etc/dict.lua
+     149 lines |       4451 chars |      447 words |   8.0K | ./sre/luasocket/src/socket.lua
+     149 lines |      12548 chars |     1480 words |    16K | ./imgui/imconfig.h
+     148 lines |       6033 chars |      642 words |   8.0K | ./platform/binary_selector.h
+     143 lines |       4207 chars |      382 words |   8.0K | ./platform/io_thread.cpp
+     142 lines |       5956 chars |      723 words |   8.0K | ./tools/av_renderer.h
+     141 lines |       4347 chars |      603 words |   8.0K | ./sre/luasocket/etc/get.lua
+     141 lines |       3376 chars |      371 words |   4.0K | ./loader/elf_types_arm64.h
+     137 lines |       4938 chars |      625 words |   8.0K | ./sre/toml-c/toml.h
+     136 lines |       4455 chars |      409 words |   8.0K | ./android/asset_manager.c
+     135 lines |       5528 chars |      616 words |   8.0K | ./platform/input_config.h
+     128 lines |       2345 chars |      304 words |   4.0K | ./sre/lua/src/llimits.h
+     126 lines |       4247 chars |      368 words |   8.0K | ./sre/luasocket/src/luasocket.c
+     125 lines |       4814 chars |      553 words |   8.0K | ./platform/swordfare_gui.h
+     125 lines |       3612 chars |      381 words |   4.0K | ./sre/luasocket/src/tp.lua
+     114 lines |       4495 chars |      481 words |   8.0K | ./game/camera_override.h
+     111 lines |       3363 chars |      396 words |   4.0K | ./sre/luasocket/etc/check-links.lua
+     111 lines |       3106 chars |      424 words |   4.0K | ./sre/lua/src/lstring.c
+     111 lines |       2633 chars |      330 words |   4.0K | ./sre/lua/test/life.lua
+     110 lines |       3156 chars |      395 words |   4.0K | ./sre/luasocket/test/ftptest.lua
+     110 lines |       3155 chars |      386 words |   4.0K | ./sre/lua/src/lgc.h
+     110 lines |       2993 chars |      292 words |   4.0K | ./platform/save_editor.h
+     109 lines |       4157 chars |      513 words |   8.0K | ./sre/sre.h
+     103 lines |       3884 chars |      423 words |   4.0K | ./platform/emulator_dynarmic64.h
+     103 lines |       3698 chars |      304 words |   4.0K | ./sre/luasocket/src/headers.lua
+     102 lines |       2880 chars |      402 words |   4.0K | ./sre/lua/src/lopcodes.c
+     101 lines |       3542 chars |      444 words |   4.0K | ./platform/fbo_scaler.h
+     101 lines |       2793 chars |      233 words |   4.0K | ./sre/luasocket/src/except.c
+      97 lines |       1947 chars |      197 words |   4.0K | ./loader/elf_types.h
+      96 lines |       2957 chars |      367 words |   4.0K | ./sre/luasocket/test/testmesg.lua
+      92 lines |       2648 chars |      311 words |   4.0K | ./sre/luasocket/src/mbox.lua
+      90 lines |       2799 chars |      379 words |   4.0K | ./tools/av_audio.h
+      89 lines |       3141 chars |      339 words |   4.0K | ./platform/emulator_arm64.h
+      89 lines |       2711 chars |      293 words |   4.0K | ./sre/luasocket/samples/tinyirc.lua
+      89 lines |       2487 chars |      275 words |   4.0K | ./sre/luasocket/src/mime.lua
+      88 lines |       2586 chars |      352 words |   4.0K | ./sre/luasocket/etc/cookie.lua
+      86 lines |       2168 chars |      336 words |   4.0K | ./sre/lua/src/lmem.c
+      83 lines |       2732 chars |      290 words |   4.0K | ./jni/jni_bridge.h
+      83 lines |       2277 chars |      373 words |   4.0K | ./sre/lua/src/lparser.h
+      82 lines |       1624 chars |      243 words |   4.0K | ./sre/lua/src/lzio.c
+      81 lines |       4577 chars |      557 words |   8.0K | ./imgui/backends/imgui_impl_opengl3.h
+      81 lines |       2620 chars |      325 words |   4.0K | ./platform/i_emulator_arm64.h
+      81 lines |       2298 chars |      213 words |   4.0K | ./sre/sre_lua_compat.h
+      81 lines |       2173 chars |      299 words |   4.0K | ./sre/lua/src/llex.h
+      78 lines |       3276 chars |      351 words |   4.0K | ./sre/luasocket/src/socket.h
+      77 lines |       2787 chars |      367 words |   4.0K | ./sre/lua/src/lcode.h
+      75 lines |       1646 chars |      210 words |   4.0K | ./sre/lua/src/ltm.c
+      71 lines |       1709 chars |      160 words |   4.0K | ./loader/elf_loader_arm64.h
+      70 lines |       1538 chars |      148 words |   4.0K | ./loader/elf_loader.h
+      70 lines |       1401 chars |      143 words |   4.0K | ./sre/include/netinet/in.h
+      67 lines |       3422 chars |      315 words |   4.0K | ./platform/IconsFontAwesome6.h
+      67 lines |       1552 chars |      196 words |   4.0K | ./sre/lua/src/lzio.h
+      66 lines |       2104 chars |      217 words |   4.0K | ./prototype/loader_arm.c
+      66 lines |       1494 chars |      190 words |   4.0K | ./sre/lua/test/sort.lua
+      65 lines |       2483 chars |      311 words |   4.0K | ./tools/scene_loader.h
+      65 lines |       2166 chars |      314 words |   4.0K | ./sre/luasocket/src/io.h
+      65 lines |       2066 chars |      231 words |   4.0K | ./sre/luasocket/etc/forward.lua
+      64 lines |       2338 chars |      179 words |   4.0K | ./main/main.c
+      63 lines |       1905 chars |      165 words |   4.0K | ./sre/sre_config.c
+      62 lines |       1921 chars |      210 words |   4.0K | ./jni/jni_shim.c
+      61 lines |       1890 chars |      239 words |   4.0K | ./game/mod_config.h
+      61 lines |       1461 chars |      177 words |   4.0K | ./sre/include/netdb.h
+      61 lines |       1454 chars |      208 words |   4.0K | ./sre/toml-c/example/array.c
+      60 lines |       2440 chars |      246 words |   4.0K | ./sre/luasocket/src/options.h
+      60 lines |       1431 chars |      179 words |   4.0K | ./sre/include/sys/stat.h
+      59 lines |       1878 chars |      257 words |   4.0K | ./tools/pod_loader.h
+      59 lines |       1752 chars |      219 words |   4.0K | ./sre/include/sys/socket.h
+      59 lines |       1699 chars |      154 words |   4.0K | ./platform/scl_parser.cpp
+      59 lines |       1678 chars |      167 words |   4.0K | ./sre/luasocket/src/usocket.h
+      58 lines |       2499 chars |      253 words |   4.0K | ./game/mod_tools.h
+      58 lines |       1566 chars |      209 words |   4.0K | ./sre/include/stdio.h
+      57 lines |       2701 chars |      277 words |   4.0K | ./platform/test_save_editor.cpp
+      57 lines |       1893 chars |      247 words |   4.0K | ./sre/lua/src/ldo.h
+      55 lines |       1476 chars |      148 words |   4.0K | ./jni/jni_bridge_arm64.h
+      54 lines |       3901 chars |      428 words |   4.0K | ./imgui/backends/imgui_impl_sdl3.h
+      54 lines |       1157 chars |      155 words |   4.0K | ./sre/luasocket/gem/gem.c
+      54 lines |       1140 chars |      116 words |   4.0K | ./loader/loader.h
+      54 lines |       1014 chars |      136 words |   4.0K | ./sre/lua/src/ltm.h
+      53 lines |       1022 chars |      118 words |   4.0K | ./sre/lua/src/lualib.h
+      51 lines |       1561 chars |      194 words |   4.0K | ./sre/luasocket/samples/lpr.lua
+      50 lines |       1823 chars |      224 words |   4.0K | ./sre/luasocket/src/inet.h
+      50 lines |       1253 chars |      190 words |   4.0K | ./sre/lua/etc/noparser.c
+      49 lines |        975 chars |      132 words |   4.0K | ./sre/include/math.h
+      49 lines |       1495 chars |      200 words |   4.0K | ./loader/arch_detect.h
+      49 lines |       1490 chars |      161 words |   4.0K | ./sre/lua/src/lmem.h
+      47 lines |       2215 chars |      302 words |   4.0K | ./sre/luasocket/src/auxiliar.h
+      46 lines |       1419 chars |      172 words |   4.0K | ./sre/luasocket/samples/cddb.lua
+      46 lines |       1218 chars |      173 words |   4.0K | ./sre/toml-c/example/table.c
+      46 lines |       1081 chars |      129 words |   4.0K | ./sre/luasocket/gem/test.lua
+      45 lines |       1733 chars |      235 words |   4.0K | ./sre/luasocket/src/buffer.h
+      45 lines |       1063 chars |      107 words |   4.0K | ./platform/emulator.h
+      43 lines |       1391 chars |      167 words |   4.0K | ./loader_test.cpp
+      42 lines |       1589 chars |      186 words |   4.0K | ./platform/io_thread.h
+      41 lines |       1592 chars |      185 words |   4.0K | ./jni/jni_marshaller.cpp
+      40 lines |        851 chars |       89 words |   4.0K | ./android/asset_manager.h
+      40 lines |        820 chars |      101 words |   4.0K | ./sre/include/time.h
+      40 lines |        605 chars |       80 words |   4.0K | ./sre/lua/test/fib.lua
+      40 lines |       1180 chars |      152 words |   4.0K | ./sre/lua/src/ltable.h
+      39 lines |        803 chars |       86 words |   4.0K | ./sre/lua/etc/min.c
+      38 lines |        768 chars |       96 words |   4.0K | ./sre/luafilesystem/src/lfs.h
+      38 lines |        761 chars |       83 words |   4.0K | ./sre/lua/src/linit.c
+      38 lines |        728 chars |       75 words |   4.0K | ./sre/lua/test/trace-globals.lua
+      38 lines |        678 chars |       76 words |   4.0K | ./sre/lua/etc/all.c
+      37 lines |        767 chars |      102 words |   4.0K | ./sre/luasocket/test/testsupport.lua
+      36 lines |        882 chars |      142 words |   4.0K | ./sre/lua/src/lundump.h
+      36 lines |        782 chars |       97 words |   4.0K | ./platform/display.h
+      36 lines |        417 chars |       55 words |   4.0K | ./sre/luasocket/gem/t2.lua
+      36 lines |       1155 chars |      140 words |   4.0K | ./sre/lua/src/lvm.h
+      35 lines |        986 chars |      134 words |   4.0K | ./sre/luasocket/src/tcp.h
+      35 lines |        679 chars |       80 words |   4.0K | ./jni/jni_shim.h
+      34 lines |        806 chars |      125 words |   4.0K | ./sre/lua/etc/strict.lua
+      34 lines |       1121 chars |      123 words |   4.0K | ./sre/lua/src/lfunc.h
+      34 lines |       1020 chars |      106 words |   4.0K | ./sre/luasocket/gem/ex12.lua
+      33 lines |        840 chars |       62 words |   4.0K | ./sre/luasocket/src/wsocket.h
+      33 lines |       1397 chars |      216 words |   4.0K | ./sre/luasocket/src/except.h
+      33 lines |       1057 chars |      119 words |   4.0K | ./sre/lua/src/ldebug.h
+      32 lines |        972 chars |      133 words |   4.0K | ./sre/include/sys/select.h
+      32 lines |        851 chars |      108 words |   4.0K | ./sre/luasocket/src/udp.h
+      32 lines |        749 chars |       74 words |   4.0K | ./sre/lua/test/trace-calls.lua
+      32 lines |        707 chars |       87 words |   4.0K | ./sre/lua/test/factorial.lua
+      32 lines |       1086 chars |      109 words |   4.0K | ./game/save_editor_logic.h
+      32 lines |       1023 chars |      145 words |   4.0K | ./sre/sre_setjmp.h
+      31 lines |        954 chars |      118 words |   4.0K | ./platform/video_background.h
+      31 lines |        810 chars |       89 words |   4.0K | ./sre/lua/src/lstring.h
+      31 lines |        700 chars |      101 words |   4.0K | ./sre/luasocket/test/test_socket_error.lua
+      30 lines |        637 chars |       70 words |   4.0K | ./sre/luasocket/src/unix.h
+      30 lines |        351 chars |       47 words |   4.0K | ./sre/luasocket/gem/t5.lua
+      30 lines |       1214 chars |      157 words |   4.0K | ./sre/include/string.h
+      30 lines |       1141 chars |       78 words |   4.0K | ./sre/luasocket/src/io.c
+      29 lines |        774 chars |      136 words |   4.0K | ./sre/lua/test/sieve.lua
+      29 lines |        574 chars |       55 words |   4.0K | ./android/log.h
+      29 lines |       1134 chars |       71 words |   4.0K | ./sre/luasocket/src/luasocket.h
+      29 lines |       1097 chars |       94 words |   4.0K | ./sre/luasocket/src/mime.h
+      28 lines |        975 chars |       95 words |   4.0K | ./sre/luasocket/src/timeout.h
+      28 lines |        836 chars |      111 words |   4.0K | ./sre/luasocket/samples/echosrvr.lua
+      27 lines |        742 chars |      100 words |   4.0K | ./sre/include/stdlib.h
+      27 lines |        645 chars |       82 words |   4.0K | ./sre/lua/test/bisect.lua
+      27 lines |        635 chars |       50 words |   4.0K | ./sre/include/net/if.h
+      27 lines |        382 chars |       55 words |   4.0K | ./sre/include/fcntl.h
+      26 lines |        452 chars |       62 words |   4.0K | ./sre/include/errno.h
+      25 lines |        756 chars |      109 words |   4.0K | ./sre/luasocket/samples/listener.lua
+      25 lines |        293 chars |       38 words |   4.0K | ./sre/luasocket/gem/t3.lua
+      25 lines |        292 chars |       38 words |   4.0K | ./sre/luasocket/gem/t1.lua
+      24 lines |       1207 chars |      158 words |   4.0K | ./platform/launcher_ui.h
+      23 lines |        964 chars |       98 words |   4.0K | ./sre/luasocket/etc/qp.lua
+      23 lines |        764 chars |      112 words |   4.0K | ./platform/pvr_loader.h
+      23 lines |        695 chars |       87 words |   4.0K | ./sre/luasocket/samples/echoclnt.lua
+      22 lines |        821 chars |      107 words |   4.0K | ./platform/data_path.h
+      22 lines |        698 chars |       85 words |   4.0K | ./sre/luasocket/samples/daytimeclnt.lua
+      21 lines |        529 chars |       56 words |   4.0K | ./sre/luasocket/test/stufftest.lua
+      21 lines |        310 chars |       35 words |   4.0K | ./sre/include/sys/time.h
+      21 lines |       1015 chars |      124 words |   4.0K | ./platform/launcher.h
+      20 lines |        708 chars |       95 words |   4.0K | ./sre/luasocket/samples/talker.lua
+      20 lines |        692 chars |       63 words |   4.0K | ./sre/luasocket/samples/mcsend.lua
+      20 lines |        539 chars |       71 words |   4.0K | ./sre/luasocket/test/tftptest.lua
+      20 lines |        526 chars |       55 words |   4.0K | ./sre/luasocket/test/testsrvr.lua
+      20 lines |        450 chars |       51 words |   4.0K | ./sre/include/limits.h
+      20 lines |        352 chars |       38 words |   4.0K | ./sre/include/dirent.h
+      19 lines |        671 chars |       67 words |   4.0K | ./sre/luasocket/etc/b64.lua
+      19 lines |        592 chars |       81 words |   4.0K | ./sre/include/unistd.h
+      19 lines |        578 chars |       69 words |   4.0K | ./sre/luasocket/test/udpconnectclnt.lua
+      19 lines |        415 chars |       50 words |   4.0K | ./android/log.c
+      18 lines |        743 chars |       48 words |   4.0K | ./sre/luasocket/samples/mclisten.lua
+      18 lines |        310 chars |       44 words |   4.0K | ./sre/include/ctype.h
+      18 lines |        297 chars |       38 words |   4.0K | ./sre/include/locale.h
+      18 lines |        279 chars |       36 words |   4.0K | ./sre/include/sys/poll.h
+      17 lines |        470 chars |       41 words |   4.0K | ./sre/luasocket/test/utestsrvr.lua
+      17 lines |        422 chars |       64 words |   4.0K | ./sre/luasocket/gem/ex10.lua
+      17 lines |        346 chars |       45 words |   4.0K | ./sre/include/stdint.h
+      17 lines |        310 chars |       32 words |   4.0K | ./sre/luasocket/etc/check-memory.lua
+      16 lines |        533 chars |       36 words |   4.0K | ./sre/luasocket/test/udpconnectsrvr.lua
+      16 lines |        293 chars |       30 words |   4.0K | ./sre/lua/test/cf.lua
+      16 lines |        258 chars |       38 words |   4.0K | ./sre/lua/src/lapi.h
+      16 lines |        230 chars |       36 words |   4.0K | ./sre/luasocket/gem/ex7.lua
+      15 lines |        571 chars |       68 words |   4.0K | ./sre/luasocket/src/select.h
+      15 lines |        394 chars |       37 words |   4.0K | ./sre/luasocket/test/test_getaddrinfo.lua
+      15 lines |        328 chars |       40 words |   4.0K | ./sre/luasocket/gem/ex5.lua
+      15 lines |        322 chars |       50 words |   4.0K | ./sre/luasocket/gem/ex3.lua
+      14 lines |        364 chars |       35 words |   4.0K | ./sre/lua/test/xd.lua
+      14 lines |        310 chars |       42 words |   4.0K | ./sre/include/sys/types.h
+      14 lines |        293 chars |       29 words |   4.0K | ./sre/sre_config.h
+      14 lines |        231 chars |       32 words |   4.0K | ./sre/luasocket/gem/ex6.lua
+      13 lines |        563 chars |       57 words |   4.0K | ./sre/luasocket/etc/eol.lua
+      13 lines |        418 chars |       61 words |   4.0K | ./sre/lua/test/globals.lua
+      13 lines |        299 chars |       26 words |   4.0K | ./sre/include/setjmp.h
+      13 lines |        254 chars |       39 words |   4.0K | ./sre/lua/test/fibfor.lua
+      12 lines |        283 chars |       41 words |   4.0K | ./sre/lua/test/table.lua
+      12 lines |        260 chars |       30 words |   4.0K | ./sre/lua/test/readonly.lua
+      11 lines |        258 chars |       30 words |   4.0K | ./sre/include/arpa/inet.h
+      11 lines |        233 chars |       25 words |   4.0K | ./sre/luasocket/gem/ex2.lua
+      11 lines |        167 chars |       21 words |   4.0K | ./sre/include/utime.h
+      10 lines |        196 chars |       20 words |   4.0K | ./sre/include/signal.h
+      10 lines |        109 chars |       19 words |   4.0K | ./sre/luasocket/gem/t4.lua
+       9 lines |        237 chars |       19 words |   4.0K | ./sre/luasocket/test/unixsrvr.lua
+       9 lines |        191 chars |       30 words |   4.0K | ./sre/lua/etc/lua.hpp
+       8 lines |        240 chars |       32 words |   4.0K | ./platform/scl_parser.h
+       8 lines |        185 chars |       21 words |   4.0K | ./sre/luasocket/test/unixclnt.lua
+       8 lines |        147 chars |       14 words |   4.0K | ./platform/gl_inc.h
+       7 lines |        234 chars |       19 words |   4.0K | ./sre/lua/test/luac.lua
+       7 lines |        197 chars |       16 words |   4.0K | ./sre/luasocket/gem/ex11.lua
+       7 lines |        181 chars |       21 words |   4.0K | ./sre/lua/test/env.lua
+       7 lines |        169 chars |       17 words |   4.0K | ./sre/lua/test/printf.lua
+       6 lines |         88 chars |        8 words |   4.0K | ./sre/include/assert.h
+       6 lines |         83 chars |        8 words |   4.0K | ./sre/include/netinet/tcp.h
+       6 lines |         81 chars |        8 words |   4.0K | ./sre/include/sys/param.h
+       6 lines |        149 chars |       15 words |   4.0K | ./sre/luasocket/test/excepttest.lua
+       5 lines |         80 chars |       10 words |   4.0K | ./sre/lua/test/echo.lua
+       5 lines |        290 chars |       34 words |   4.0K | ./sre/luasocket/test/test_bind.lua
+       5 lines |        212 chars |       17 words |   4.0K | ./sre/luasocket/gem/ex4.lua
+       5 lines |        162 chars |       16 words |   4.0K | ./sre/luasocket/gem/ex8.lua
+       5 lines |        151 chars |       12 words |   4.0K | ./sre/luasocket/test/dicttest.lua
+       4 lines |        151 chars |       15 words |   4.0K | ./sre/luasocket/gem/ex1.lua
+       3 lines |         86 chars |       11 words |   4.0K | ./sre/lua/test/hello.lua
+       3 lines |         60 chars |        7 words |   4.0K | ./sre/luasocket/gem/ex9.lua
+       3 lines |        135 chars |       21 words |   4.0K | ./sre/luasocket/test/hello.lua
+
+================ TOTALS ================
+   2107    6899   88015 ./launcher_ui.cpp
+     43     167    1391 ./loader_test.cpp
+   5600   26292  325964 ./main.cpp
+   5062   19530  185702 ./jni/jni_bridge.cpp
+     83     290    2732 ./jni/jni_bridge.h
+   6942   27341  262470 ./jni/jni_bridge_arm64.cpp
+     55     148    1476 ./jni/jni_bridge_arm64.h
+    171     574    5838 ./jni/jni_layer.h
+    299    1179   13784 ./jni/jni_layer_arm64.h
+     41     185    1592 ./jni/jni_marshaller.cpp
+     62     210    1921 ./jni/jni_shim.c
+     35      80     679 ./jni/jni_shim.h
+    181     737    6138 ./game/camera_override.cpp
+    114     481    4495 ./game/camera_override.h
+    246     907    9376 ./game/mod_config.cpp
+     61     239    1890 ./game/mod_config.h
+    261     955    8569 ./game/mod_tools.cpp
+     58     253    2499 ./game/mod_tools.h
+    198     732    6985 ./game/save_editor_logic.cpp
+     32     109    1086 ./game/save_editor_logic.h
+    207     999    8456 ./game/sky_renderer.h
+     64     179    2338 ./main/main.c
+     67     315    3422 ./platform/IconsFontAwesome6.h
+   1134    4626   44020 ./platform/binary_selector.cpp
+    148     642    6033 ./platform/binary_selector.h
+    210     733    7161 ./platform/data_path.cpp
+     22     107     821 ./platform/data_path.h
+    178     565    5902 ./platform/display.cpp
+     36      97     782 ./platform/display.h
+    319    1221   11094 ./platform/draw_batcher.h
+    335    1445   12117 ./platform/emulator.cpp
+     45     107    1063 ./platform/emulator.h
+    718    3806   32431 ./platform/emulator_arm64.cpp
+     89     339    3141 ./platform/emulator_arm64.h
+    603    2434   22596 ./platform/emulator_dynarmic64.cpp
+    103     423    3884 ./platform/emulator_dynarmic64.h
+   1835    7980   77522 ./platform/fbo_scaler.cpp
+    101     444    3542 ./platform/fbo_scaler.h
+      8      14     147 ./platform/gl_inc.h
+   1566    8419   64059 ./platform/gui.cpp
+    161     599    5088 ./platform/gui.h
+     81     325    2620 ./platform/i_emulator_arm64.h
+    751    2935   27299 ./platform/input_config.cpp
+    135     616    5528 ./platform/input_config.h
+    143     382    4207 ./platform/io_thread.cpp
+     42     186    1589 ./platform/io_thread.h
+   1444    6570   70279 ./platform/launcher.cpp
+     21     124    1015 ./platform/launcher.h
+   2122    6953   88693 ./platform/launcher_ui.cpp
+     24     158    1207 ./platform/launcher_ui.h
+    229     728    7384 ./platform/protobuf_reader.h
+    310    1589   10774 ./platform/pvr_loader.cpp
+     23     112     764 ./platform/pvr_loader.h
+    449    1665   17910 ./platform/save_editor.cpp
+    110     292    2993 ./platform/save_editor.h
+     59     154    1699 ./platform/scl_parser.cpp
+      8      32     240 ./platform/scl_parser.h
+   1164    4492   39859 ./platform/srt_overlay.cpp
+    238     835    7366 ./platform/srt_overlay.h
+     57     277    2701 ./platform/test_save_editor.cpp
+   2096    7938   86881 ./platform/vulkan_backend.cpp
+    656    2260   25420 ./platform/vulkan_backend.h
+    355    1688   13290 ./platform/vulkan_shaders.glsl.h
+    409    3222   40113 ./platform/vulkan_shaders_spirv.h
+     31     118     954 ./platform/video_background.h
+    355    1713   16895 ./platform/video_background.cpp
+    125     553    4814 ./platform/swordfare_gui.h
+   1088    4232   45453 ./platform/swordfare_gui.cpp
+     66     217    2104 ./prototype/loader_arm.c
+    109     513    4157 ./sre/sre.h
+    236    1236    9067 ./sre/sre_background.c
+    333    1695   13036 ./sre/sre_effects.c
+    389    1488   16442 ./sre/sre_gui.c
+    238    1259   11730 ./sre/sre_gui.h
+   1381    6844   55483 ./sre/sre_gui_native.c
+    394    2188   17773 ./sre/sre_init.c
+    827    3728   30730 ./sre/sre_lua.c
+    153     681    6461 ./sre/sre_lua.h
+   1621    6212   51733 ./sre/sre_lua_libs.c
+   5449   20341  197661 ./sre/sre_mini_api.c
+    235     948    8160 ./sre/sre_mod.c
+    480    2172   17316 ./sre/sre_music.c
+    444    1905   18451 ./sre/sre_scene_update.c
+     32     145    1023 ./sre/sre_setjmp.h
+    391    1596   12368 ./sre/sre_string.c
+    526    2231   19340 ./sre/sre_vfs.c
+     39      86     803 ./sre/lua/etc/min.c
+     38      76     678 ./sre/lua/etc/all.c
+      9      30     191 ./sre/lua/etc/lua.hpp
+     34     125     806 ./sre/lua/etc/strict.lua
+     50     190    1253 ./sre/lua/etc/noparser.c
+   1077    2859   22380 ./sre/lua/src/lapi.c
+     16      38     258 ./sre/lua/src/lapi.h
+    762    2783   21022 ./sre/lua/src/lauxlib.c
+    172     597    5747 ./sre/lua/src/lauxlib.h
+    643    2157   16654 ./sre/lua/src/lbaselib.c
+    825    2857   21164 ./sre/lua/src/lcode.c
+     77     367    2787 ./sre/lua/src/lcode.h
+    397    1229   10045 ./sre/lua/src/ldblib.c
+    620    2139   15998 ./sre/lua/src/ldebug.c
+     33     119    1057 ./sre/lua/src/ldebug.h
+    515    1921   14700 ./sre/lua/src/ldo.c
+     57     247    1893 ./sre/lua/src/ldo.h
+    174     601    4602 ./sre/lua/src/lfunc.c
+     34     123    1121 ./sre/lua/src/lfunc.h
+    707    2466   19967 ./sre/lua/src/lgc.c
+    110     386    3155 ./sre/lua/src/lgc.h
+     38      83     761 ./sre/lua/src/linit.c
+    532    1798   13002 ./sre/lua/src/liolib.c
+    460    1475   12450 ./sre/lua/src/llex.c
+     81     299    2173 ./sre/lua/src/llex.h
+    128     304    2345 ./sre/lua/src/llimits.h
+    263     699    5827 ./sre/lua/src/lmathlib.c
+     86     336    2168 ./sre/lua/src/lmem.c
+     49     161    1490 ./sre/lua/src/lmem.h
+    667    2418   19125 ./sre/lua/src/loadlib.c
+    214     705    5494 ./sre/lua/src/lobject.c
+    381    1054    8495 ./sre/lua/src/lobject.h
+    102     402    2880 ./sre/lua/src/lopcodes.c
+    268    1177    8083 ./sre/lua/src/lopcodes.h
+    240     737    6026 ./sre/lua/src/loslib.c
+   1336    4722   36568 ./sre/lua/src/lparser.c
+     83     373    2277 ./sre/lua/src/lparser.h
+    214     696    5638 ./sre/lua/src/lstate.c
+    168     695    4932 ./sre/lua/src/lstate.h
+    111     424    3106 ./sre/lua/src/lstring.c
+     31      89     810 ./sre/lua/src/lstring.h
+    863    3192   23172 ./sre/lua/src/lstrlib.c
+    588    2507   16264 ./sre/lua/src/ltable.c
+     40     152    1180 ./sre/lua/src/ltable.h
+    278    1047    7049 ./sre/lua/src/ltablib.c
+     75     210    1646 ./sre/lua/src/ltm.c
+     54     136    1014 ./sre/lua/src/ltm.h
+    377    1419    9835 ./sre/lua/src/lua.c
+    384    1463   11580 ./sre/lua/src/lua.h
+    736    3133   21584 ./sre/lua/src/luaconf.h
+     53     118    1022 ./sre/lua/src/lualib.h
+    762    2876   23041 ./sre/lua/src/lvm.c
+     36     140    1155 ./sre/lua/src/lvm.h
+     82     243    1624 ./sre/lua/src/lzio.c
+     67     196    1552 ./sre/lua/src/lzio.h
+    164     336    3107 ./sre/lua/src/ldump.c
+    196     533    4574 ./sre/lua/src/luac.c
+    223     425    4512 ./sre/lua/src/lundump.c
+     36     142     882 ./sre/lua/src/lundump.h
+    224     490    4871 ./sre/lua/src/print.c
+      5      10      80 ./sre/lua/test/echo.lua
+    111     330    2633 ./sre/lua/test/life.lua
+     40      80     605 ./sre/lua/test/fib.lua
+     32      87     707 ./sre/lua/test/factorial.lua
+      7      19     234 ./sre/lua/test/luac.lua
+     66     190    1494 ./sre/lua/test/sort.lua
+      3      11      86 ./sre/lua/test/hello.lua
+     27      82     645 ./sre/lua/test/bisect.lua
+     16      30     293 ./sre/lua/test/cf.lua
+     14      35     364 ./sre/lua/test/xd.lua
+     13      61     418 ./sre/lua/test/globals.lua
+     38      75     728 ./sre/lua/test/trace-globals.lua
+     32      74     749 ./sre/lua/test/trace-calls.lua
+     12      41     283 ./sre/lua/test/table.lua
+     13      39     254 ./sre/lua/test/fibfor.lua
+      7      17     169 ./sre/lua/test/printf.lua
+      7      21     181 ./sre/lua/test/env.lua
+     29     136     774 ./sre/lua/test/sieve.lua
+     12      30     260 ./sre/lua/test/readonly.lua
+     61     208    1454 ./sre/toml-c/example/array.c
+     46     173    1218 ./sre/toml-c/example/table.c
+   2145    7944   53483 ./sre/toml-c/header/toml-c.h
+    177     511    5290 ./sre/toml-c/toml-c-test.c
+   2007    7318   48528 ./sre/toml-c/toml.c
+    137     625    4938 ./sre/toml-c/toml.h
+    200     609    5066 ./sre/toml-c/toml2json.c
+    226     829    6946 ./sre/luafilesystem/tests/test.lua
+   1167    3448   26658 ./sre/luafilesystem/src/lfs.c
+     38      96     768 ./sre/luafilesystem/src/lfs.h
+     19      67     671 ./sre/luasocket/etc/b64.lua
+    111     396    3363 ./sre/luasocket/etc/check-links.lua
+     17      32     310 ./sre/luasocket/etc/check-memory.lua
+     88     352    2586 ./sre/luasocket/etc/cookie.lua
+    151     467    4666 ./sre/luasocket/etc/dict.lua
+    300    1138   10215 ./sre/luasocket/etc/dispatch.lua
+     13      57     563 ./sre/luasocket/etc/eol.lua
+     65     231    2066 ./sre/luasocket/etc/forward.lua
+    141     603    4347 ./sre/luasocket/etc/get.lua
+    323    1528   11516 ./sre/luasocket/etc/lp.lua
+     23      98     964 ./sre/luasocket/etc/qp.lua
+    154     515    4798 ./sre/luasocket/etc/tftp.lua
+      4      15     151 ./sre/luasocket/gem/ex1.lua
+     17      64     422 ./sre/luasocket/gem/ex10.lua
+      7      16     197 ./sre/luasocket/gem/ex11.lua
+     34     106    1020 ./sre/luasocket/gem/ex12.lua
+     11      25     233 ./sre/luasocket/gem/ex2.lua
+     15      50     322 ./sre/luasocket/gem/ex3.lua
+      5      17     212 ./sre/luasocket/gem/ex4.lua
+     15      40     328 ./sre/luasocket/gem/ex5.lua
+     14      32     231 ./sre/luasocket/gem/ex6.lua
+     16      36     230 ./sre/luasocket/gem/ex7.lua
+      5      16     162 ./sre/luasocket/gem/ex8.lua
+      3       7      60 ./sre/luasocket/gem/ex9.lua
+     54     155    1157 ./sre/luasocket/gem/gem.c
+     25      38     292 ./sre/luasocket/gem/t1.lua
+     36      55     417 ./sre/luasocket/gem/t2.lua
+     25      38     293 ./sre/luasocket/gem/t3.lua
+     10      19     109 ./sre/luasocket/gem/t4.lua
+     30      47     351 ./sre/luasocket/gem/t5.lua
+     46     129    1081 ./sre/luasocket/gem/test.lua
+     46     172    1419 ./sre/luasocket/samples/cddb.lua
+     22      85     698 ./sre/luasocket/samples/daytimeclnt.lua
+     23      87     695 ./sre/luasocket/samples/echoclnt.lua
+     28     111     836 ./sre/luasocket/samples/echosrvr.lua
+     25     109     756 ./sre/luasocket/samples/listener.lua
+     51     194    1561 ./sre/luasocket/samples/lpr.lua
+     18      48     743 ./sre/luasocket/samples/mclisten.lua
+     20      63     692 ./sre/luasocket/samples/mcsend.lua
+     20      95     708 ./sre/luasocket/samples/talker.lua
+     89     293    2711 ./sre/luasocket/samples/tinyirc.lua
+    158     544    6329 ./sre/luasocket/src/auxiliar.c
+     47     302    2215 ./sre/luasocket/src/auxiliar.h
+    276    1082   10452 ./sre/luasocket/src/buffer.c
+     45     235    1733 ./sre/luasocket/src/buffer.h
+    101     233    2793 ./sre/luasocket/src/except.c
+     33     216    1397 ./sre/luasocket/src/except.h
+    284     943    9243 ./sre/luasocket/src/ftp.lua
+    103     304    3698 ./sre/luasocket/src/headers.lua
+    353    1414   12330 ./sre/luasocket/src/http.lua
+    536    1697   18010 ./sre/luasocket/src/inet.c
+     50     224    1823 ./sre/luasocket/src/inet.h
+     30      78    1141 ./sre/luasocket/src/io.c
+     65     314    2166 ./sre/luasocket/src/io.h
+    298     941    8331 ./sre/luasocket/src/ltn12.lua
+    126     368    4247 ./sre/luasocket/src/luasocket.c
+     29      71    1134 ./sre/luasocket/src/luasocket.h
+     92     311    2648 ./sre/luasocket/src/mbox.lua
+    728    3101   26403 ./sre/luasocket/src/mime.c
+     29      94    1097 ./sre/luasocket/src/mime.h
+     89     275    2487 ./sre/luasocket/src/mime.lua
+    364    1195   11428 ./sre/luasocket/src/options.c
+     60     246    2440 ./sre/luasocket/src/options.h
+    220     700    6817 ./sre/luasocket/src/select.c
+     15      68     571 ./sre/luasocket/src/select.h
+    188     552    6333 ./sre/luasocket/src/serial.c
+    255     773    8074 ./sre/luasocket/src/smtp.lua
+     78     351    3276 ./sre/luasocket/src/socket.h
+    149     447    4451 ./sre/luasocket/src/socket.lua
+    489    1541   17237 ./sre/luasocket/src/tcp.c
+     35     134     986 ./sre/luasocket/src/tcp.h
+    221     738    7062 ./sre/luasocket/src/timeout.c
+     28      95     975 ./sre/luasocket/src/timeout.h
+    125     381    3612 ./sre/luasocket/src/tp.lua
+    441    1356   15792 ./sre/luasocket/src/udp.c
+     32     108     851 ./sre/luasocket/src/udp.h
+    346    1094   12426 ./sre/luasocket/src/unix.c
+     30      70     637 ./sre/luasocket/src/unix.h
+    307    1216   11036 ./sre/luasocket/src/url.lua
+    449    1803   16059 ./sre/luasocket/src/usocket.c
+     59     167    1678 ./sre/luasocket/src/usocket.h
+    434    1865   17049 ./sre/luasocket/src/wsocket.c
+     33      62     840 ./sre/luasocket/src/wsocket.h
+      5      12     151 ./sre/luasocket/test/dicttest.lua
+      6      15     149 ./sre/luasocket/test/excepttest.lua
+    110     395    3156 ./sre/luasocket/test/ftptest.lua
+      3      21     135 ./sre/luasocket/test/hello.lua
+    441    1365   11480 ./sre/luasocket/test/httptest.lua
+    274     998    8625 ./sre/luasocket/test/ltn12test.lua
+    299     993    8376 ./sre/luasocket/test/mimetest.lua
+    259     734    5376 ./sre/luasocket/test/smtptest.lua
+     21      56     529 ./sre/luasocket/test/stufftest.lua
+      5      34     290 ./sre/luasocket/test/test_bind.lua
+     15      37     394 ./sre/luasocket/test/test_getaddrinfo.lua
+     31     101     700 ./sre/luasocket/test/test_socket_error.lua
+    801    2311   22707 ./sre/luasocket/test/testclnt.lua
+     96     367    2957 ./sre/luasocket/test/testmesg.lua
+     20      55     526 ./sre/luasocket/test/testsrvr.lua
+     37     102     767 ./sre/luasocket/test/testsupport.lua
+     20      71     539 ./sre/luasocket/test/tftptest.lua
+     19      69     578 ./sre/luasocket/test/udpconnectclnt.lua
+     16      36     533 ./sre/luasocket/test/udpconnectsrvr.lua
+      8      21     185 ./sre/luasocket/test/unixclnt.lua
+      9      19     237 ./sre/luasocket/test/unixsrvr.lua
+    635    1632   17349 ./sre/luasocket/test/urltest.lua
+    644    1860   18346 ./sre/luasocket/test/utestclnt.lua
+     17      41     470 ./sre/luasocket/test/utestsrvr.lua
+     58     209    1566 ./sre/include/stdio.h
+     27     100     742 ./sre/include/stdlib.h
+     30     157    1214 ./sre/include/string.h
+     18      44     310 ./sre/include/ctype.h
+     26      62     452 ./sre/include/errno.h
+     20      51     450 ./sre/include/limits.h
+     40     101     820 ./sre/include/time.h
+     19      81     592 ./sre/include/unistd.h
+     14      42     310 ./sre/include/sys/types.h
+     60     179    1431 ./sre/include/sys/stat.h
+     32     133     972 ./sre/include/sys/select.h
+     59     219    1752 ./sre/include/sys/socket.h
+     21      35     310 ./sre/include/sys/time.h
+      6       8      81 ./sre/include/sys/param.h
+     18      36     279 ./sre/include/sys/poll.h
+     70     143    1401 ./sre/include/netinet/in.h
+      6       8      83 ./sre/include/netinet/tcp.h
+     11      30     258 ./sre/include/arpa/inet.h
+     61     177    1461 ./sre/include/netdb.h
+     27      55     382 ./sre/include/fcntl.h
+     20      38     352 ./sre/include/dirent.h
+     17      45     346 ./sre/include/stdint.h
+      6       8      88 ./sre/include/assert.h
+     11      21     167 ./sre/include/utime.h
+     10      20     196 ./sre/include/signal.h
+     49     132     975 ./sre/include/math.h
+     27      50     635 ./sre/include/net/if.h
+     13      26     299 ./sre/include/setjmp.h
+     18      38     297 ./sre/include/locale.h
+     81     213    2298 ./sre/sre_lua_compat.h
+     63     165    1905 ./sre/sre_config.c
+     14      29     293 ./sre/sre_config.h
+   1269    4197   47547 ./tools/asset_viewer.cpp
+    400    1537   13006 ./tools/av_audio.cpp
+     90     379    2799 ./tools/av_audio.h
+    789    2848   25450 ./tools/av_renderer.cpp
+    142     723    5956 ./tools/av_renderer.h
+    449    1779   15716 ./tools/pod_loader.cpp
+     59     257    1878 ./tools/pod_loader.h
+    288     998   10279 ./tools/scene_loader.cpp
+     65     311    2483 ./tools/scene_loader.h
+     49     200    1495 ./loader/arch_detect.h
+    249    1009   10096 ./loader/elf_loader.cpp
+     70     148    1538 ./loader/elf_loader.h
+    296    1246   12429 ./loader/elf_loader_arm64.cpp
+     71     160    1709 ./loader/elf_loader_arm64.h
+     97     197    1947 ./loader/elf_types.h
+    141     371    3376 ./loader/elf_types_arm64.h
+    163     659    6002 ./loader/loader.c
+     54     116    1140 ./loader/loader.h
+    149    1480   12548 ./imgui/imconfig.h
+  18392   97717  967022 ./imgui/imgui.cpp
+   4257   51599  428082 ./imgui/imgui.h
+   6809   30941  381632 ./imgui/imgui_draw.cpp
+   4042   31097  305065 ./imgui/imgui_internal.h
+   4711   25339  260330 ./imgui/imgui_tables.cpp
+  10992   55970  551704 ./imgui/imgui_widgets.cpp
+    627    2735   20346 ./imgui/imstb_rectpack.h
+   1527    6756   60111 ./imgui/imstb_textedit.h
+   5085   24010  199503 ./imgui/imstb_truetype.h
+   1159    5617   59727 ./imgui/backends/imgui_impl_opengl3.cpp
+     81     557    4577 ./imgui/backends/imgui_impl_opengl3.h
+    958    3831   41175 ./imgui/backends/imgui_impl_opengl3_loader.h
+    887    3969   44711 ./imgui/backends/imgui_impl_sdl3.cpp
+     54     428    3901 ./imgui/backends/imgui_impl_sdl3.h
+    136     409    4455 ./android/asset_manager.c
+     40      89     851 ./android/asset_manager.h
+     19      50     415 ./android/log.c
+     29      55     574 ./android/log.h
+ 158583  719419 6856410 total
