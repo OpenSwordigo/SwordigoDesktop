@@ -98,6 +98,12 @@ public:
     // Draw the custom LUA-registered buttons and overlays using ImGui vector elements
     void draw_buttons(void* guest_buttons_ptr, void* guest_overlays_ptr, bool globally_hidden = false);
 
+    // Draw the Lua script editor
+    void draw_lua_script_editor();
+
+    // Draw the Lua script manager
+    void draw_lua_script_manager();
+
     // Draw the remastered mod manager overlay
     void draw_mod_overlay(const std::string& save_dir);
 
@@ -191,10 +197,26 @@ private:
     uint64_t      m_console_status_addr  = 0;
     uint64_t      m_console_print_addr   = 0;
 
-    static constexpr int CONSOLE_MAX_HISTORY = 256;
+    static constexpr int CONSOLE_MAX_HISTORY = 4096;
+
     std::vector<ConsoleEntry>  m_console_history;
-    char                       m_console_input[1024] = {};
+    char                       m_console_input[16384] = {};
     std::vector<std::string>   m_console_cmd_history; // up-arrow recall
     int                        m_console_hist_idx = -1;
     bool                       m_console_scroll_bottom = false;
+
+    // ---- Lua Script Editor ----
+    bool                       m_script_editor_open = false;
+    char                       m_script_editor_name[128] = "mod_script.lua";
+    char                       m_script_editor_buf[32768] = "";
+    std::string                m_script_editor_status = "Ready";
+    float                      m_script_editor_status_color[4] = {0.5f, 0.5f, 0.5f, 1.0f};
+
+    // ---- Lua Script Manager ----
+    struct LuaScriptMeta {
+        std::string filename;
+        bool valid;
+    };
+    bool                       m_script_manager_open = false;
+    std::vector<LuaScriptMeta> m_script_list;
 };

@@ -1614,6 +1614,8 @@ void load_and_boot() {
                     }
                 }
                 g_swordfare_gui.draw_lua_console();
+                g_swordfare_gui.draw_lua_script_editor();
+                g_swordfare_gui.draw_lua_script_manager();
                 g_swordfare_gui.draw_mod_overlay(g_save_dir);
                 g_swordfare_gui.end_frame();
             }
@@ -1880,7 +1882,6 @@ void load_and_boot() {
                                 mod_speed_reset();
                                 break;
                             }
-                            // fall through
                         case SDL_EVENT_KEY_UP: {
                             if (should_block_keyboard()) {
                                 bool is_toggle = (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3 || event.key.key == SDLK_F4 || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE);
@@ -4960,6 +4961,8 @@ void load_and_boot_arm64() {
                     }
                 }
                 g_swordfare_gui.draw_lua_console();
+                g_swordfare_gui.draw_lua_script_editor();
+                g_swordfare_gui.draw_lua_script_manager();
                 g_swordfare_gui.draw_mod_overlay(g_save_dir);
                 g_swordfare_gui.end_frame();
             }
@@ -5255,10 +5258,6 @@ void load_and_boot_arm64() {
                                 g_swordfare_gui.toggle_lua_console();
                                 break;
                             }
-                            if (g_swordfare_gui.is_lua_console_open() && !event.key.repeat) {
-                                g_swordfare_gui.lua_console_key(event.key.key, "");
-                                break;
-                            }
                             if (event.key.key == SDLK_EQUALS && !event.key.repeat && !(event.key.mod & SDL_KMOD_SHIFT)) { mod_speed_up(); break; }
                             if (event.key.key == SDLK_MINUS && !event.key.repeat && !(event.key.mod & SDL_KMOD_SHIFT)) { mod_speed_down(); break; }
                             if (event.key.key == SDLK_0 && !event.key.repeat) { mod_speed_reset(); break; }
@@ -5384,9 +5383,7 @@ void load_and_boot_arm64() {
                         case SDL_EVENT_TEXT_INPUT: {
                             const char* text = event.text.text;
                             if (g_swordfare_gui.is_lua_console_open()) {
-                                if (text[0] != '`') {
-                                    g_swordfare_gui.lua_console_text(text);
-                                }
+                                // ImGui handles text input now, do nothing here.
                             } else if (g_text_input_active) {
                                 g_text_input_buffer += text;
                                 call_text_change_64(g_text_input_buffer);

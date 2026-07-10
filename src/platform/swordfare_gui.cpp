@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <fstream>
 
 bool g_sre_overlay_blocking = false;
 
@@ -1692,6 +1693,277 @@ GuiAction SwordfareGUI::draw_control_panel(bool* p_open) {
 
 
 
+void SwordfareGUI::draw_lua_script_editor() {
+    if (!m_initialized || !m_script_editor_open) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    float W = io.DisplaySize.x;
+    float H = io.DisplaySize.y;
+    float editor_w = W * 0.7f;
+    float editor_h = H * 0.6f;
+
+    ImGui::SetNextWindowPos(ImVec2(W * 0.15f, H * 0.15f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(editor_w, editor_h),  ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.98f);
+
+    // Styling matches the console
+    const ImVec4 col_bg        = ImVec4(0.040f, 0.040f, 0.060f, 1.00f);
+    const ImVec4 col_border    = ImVec4(0.180f, 0.220f, 0.380f, 1.00f);
+    const ImVec4 col_input_bg  = ImVec4(0.020f, 0.020f, 0.035f, 1.00f);
+    const ImVec4 col_accent    = ImVec4(0.36f,  0.76f,  1.00f,  1.00f);
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, col_bg);
+    ImGui::PushStyleColor(ImGuiCol_Border, col_border);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 12.0f));
+
+    bool pushed_mono = false;
+    if (m_font_mono) { ImGui::PushFont((ImFont*)m_font_mono); pushed_mono = true; }
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+
+    if (ImGui::Begin(ICON_FA_CODE " Lua Script Editor", &m_script_editor_open, flags)) {
+        
+        // ── Top Bar ────────────────────────────────────────────────────────
+        ImGui::TextColored(col_accent, ICON_FA_FILE " Filename:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(editor_w - 300.0f);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, col_input_bg);
+        ImGui::InputText("##filename", m_script_editor_name, sizeof(m_script_editor_name));
+        ImGui::PopStyleColor();
+
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(m_script_editor_status_color[0], m_script_editor_status_color[1], m_script_editor_status_color[2], m_script_editor_status_color[3]), "[ %s ]", m_script_editor_status.c_str());
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // ── Editor ─────────────────────────────────────────────────────────
+        float content_avail_y = ImGui::GetContentRegionAvail().y;
+        float footer_h = ImGui::GetFrameHeightWithSpacing() + 16.0f; // extra padding to stop clipping
+        float editor_area_h = content_avail_y - footer_h;
+
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, col_input_bg);
+        ImGui::InputTextMultiline("##source", m_script_editor_buf, sizeof(m_script_editor_buf), 
+                                  ImVec2(-FLT_MIN, editor_area_h), 
+                                  ImGuiInputTextFlags_AllowTabInput);
+        ImGui::PopStyleColor();
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // ── Footer ─────────────────────────────────────────────────────────
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.12f, 0.36f, 0.72f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.50f, 0.95f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.08f, 0.22f, 0.52f, 1.00f));
+        
+        if (ImGui::Button(" " ICON_FA_FLOPPY_DISK " Save Script ")) {
+            const char* home = std::getenv("HOME");
+            if (home) {
+                std::filesystem::path save_dir = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts";
+                std::error_code ec;
+                std::filesystem::create_directories(save_dir, ec);
+                
+                std::filesystem::path file_path = save_dir / m_script_editor_name;
+                std::ofstream out(file_path);
+                if (out.is_open()) {
+                    out << m_script_editor_buf;
+                    out.close();
+                    m_script_editor_status = "Saved OK";
+                    m_script_editor_status_color[0] = 0.2f; m_script_editor_status_color[1] = 0.9f; m_script_editor_status_color[2] = 0.2f;
+                } else {
+                    m_script_editor_status = "Save Failed!";
+                    m_script_editor_status_color[0] = 0.9f; m_script_editor_status_color[1] = 0.2f; m_script_editor_status_color[2] = 0.2f;
+                }
+            }
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button(" " ICON_FA_CIRCLE_CHECK " Validate & Save ")) {
+            // Heuristic syntax validator
+            int brackets_sq = 0, brackets_curl = 0, brackets_paren = 0;
+            int quotes_single = 0, quotes_double = 0;
+            bool in_comment = false;
+            
+            std::string code = m_script_editor_buf;
+            for (size_t i = 0; i < code.length(); i++) {
+                if (in_comment && code[i] == '\n') in_comment = false;
+                if (!in_comment && i + 1 < code.length() && code[i] == '-' && code[i+1] == '-') { in_comment = true; i++; continue; }
+                if (in_comment) continue;
+
+                if (code[i] == '[') brackets_sq++;
+                if (code[i] == ']') brackets_sq--;
+                if (code[i] == '{') brackets_curl++;
+                if (code[i] == '}') brackets_curl--;
+                if (code[i] == '(') brackets_paren++;
+                if (code[i] == ')') brackets_paren--;
+                if (code[i] == '\'') quotes_single++;
+                if (code[i] == '"') quotes_double++;
+            }
+
+            if (brackets_sq != 0 || brackets_curl != 0 || brackets_paren != 0 || 
+               (quotes_single % 2) != 0 || (quotes_double % 2) != 0) {
+                m_script_editor_status = "Syntax Error: Unmatched Bracket/Quote";
+                m_script_editor_status_color[0] = 0.9f; m_script_editor_status_color[1] = 0.2f; m_script_editor_status_color[2] = 0.2f;
+            } else {
+                // Syntax OK, proceed to save
+                const char* home = std::getenv("HOME");
+                if (home) {
+                    std::filesystem::path save_dir = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts";
+                    std::error_code ec;
+                    std::filesystem::create_directories(save_dir, ec);
+                    std::ofstream out(save_dir / m_script_editor_name);
+                    if (out.is_open()) {
+                        out << m_script_editor_buf;
+                        out.close();
+                        m_script_editor_status = "Validated & Saved";
+                        m_script_editor_status_color[0] = 0.2f; m_script_editor_status_color[1] = 0.9f; m_script_editor_status_color[2] = 0.9f;
+                    }
+                }
+            }
+        }
+
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.72f, 0.36f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.95f, 0.50f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.08f, 0.52f, 0.22f, 1.00f));
+        if (ImGui::Button(" " ICON_FA_PLAY " Run ")) {
+            console_submit(m_script_editor_buf);
+            m_script_editor_status = "Executed";
+            m_script_editor_status_color[0] = 0.2f; m_script_editor_status_color[1] = 0.9f; m_script_editor_status_color[2] = 0.9f;
+        }
+        ImGui::PopStyleColor(3);
+        
+        ImGui::PopStyleColor(3);
+
+        ImGui::SameLine(ImGui::GetWindowWidth() - 90.0f);
+        if (ImGui::Button(" " ICON_FA_XMARK " Close ")) {
+            m_script_editor_open = false;
+        }
+
+    }
+    ImGui::End();
+
+    if (pushed_mono) ImGui::PopFont();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+}
+
+void SwordfareGUI::draw_lua_script_manager() {
+    if (!m_initialized || !m_script_manager_open) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    float W = io.DisplaySize.x;
+    float H = io.DisplaySize.y;
+    
+    ImGui::SetNextWindowPos(ImVec2(W * 0.15f, H * 0.15f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(W * 0.4f, H * 0.6f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.98f);
+
+    const ImVec4 col_bg        = ImVec4(0.040f, 0.040f, 0.060f, 1.00f);
+    const ImVec4 col_border    = ImVec4(0.180f, 0.220f, 0.380f, 1.00f);
+    const ImVec4 col_accent    = ImVec4(0.36f,  0.76f,  1.00f,  1.00f);
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, col_bg);
+    ImGui::PushStyleColor(ImGuiCol_Border, col_border);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 12.0f));
+
+    if (ImGui::Begin(ICON_FA_FILE " Script Manager", &m_script_manager_open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+        
+        if (ImGui::Button("Refresh")) {
+            m_script_list.clear();
+            const char* home = std::getenv("HOME");
+            if (home) {
+                std::filesystem::path save_dir = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts";
+                std::error_code ec;
+                if (std::filesystem::exists(save_dir, ec)) {
+                    for (const auto& entry : std::filesystem::directory_iterator(save_dir, ec)) {
+                        if (entry.path().extension() == ".lua") {
+                            // Run validation
+                            std::ifstream in(entry.path());
+                            std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                            
+                            int brackets_sq = 0, brackets_curl = 0, brackets_paren = 0;
+                            int quotes_single = 0, quotes_double = 0;
+                            bool in_comment = false;
+                            
+                            for (size_t i = 0; i < content.length(); i++) {
+                                if (in_comment && content[i] == '\n') in_comment = false;
+                                if (!in_comment && i + 1 < content.length() && content[i] == '-' && content[i+1] == '-') { in_comment = true; i++; continue; }
+                                if (in_comment) continue;
+                                if (content[i] == '[') brackets_sq++;
+                                if (content[i] == ']') brackets_sq--;
+                                if (content[i] == '{') brackets_curl++;
+                                if (content[i] == '}') brackets_curl--;
+                                if (content[i] == '(') brackets_paren++;
+                                if (content[i] == ')') brackets_paren--;
+                                if (content[i] == '\'') quotes_single++;
+                                if (content[i] == '"') quotes_double++;
+                            }
+                            
+                            bool valid = (brackets_sq == 0 && brackets_curl == 0 && brackets_paren == 0 && (quotes_single % 2) == 0 && (quotes_double % 2) == 0);
+                            m_script_list.push_back({entry.path().filename().string(), valid});
+                        }
+                    }
+                }
+            }
+        }
+        
+        ImGui::SameLine();
+        ImGui::TextColored(col_accent, " %d scripts found", (int)m_script_list.size());
+        
+        ImGui::Separator();
+        
+        ImGui::BeginChild("##scriptlist", ImVec2(0, 0), true);
+        for (const auto& script : m_script_list) {
+            ImGui::PushID(script.filename.c_str());
+            if (script.valid) {
+                ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), ICON_FA_CIRCLE_CHECK " Passed");
+            } else {
+                ImGui::TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), ICON_FA_CIRCLE_XMARK " Error ");
+            }
+            ImGui::SameLine();
+            ImGui::Text("%s", script.filename.c_str());
+            ImGui::SameLine(ImGui::GetWindowWidth() - 150.0f);
+            
+            if (ImGui::Button("Edit")) {
+                const char* home = std::getenv("HOME");
+                if (home) {
+                    std::filesystem::path file_path = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts" / script.filename;
+                    std::ifstream in(file_path);
+                    if (in.is_open()) {
+                        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                        strncpy(m_script_editor_name, script.filename.c_str(), sizeof(m_script_editor_name)-1);
+                        strncpy(m_script_editor_buf, content.c_str(), sizeof(m_script_editor_buf)-1);
+                        m_script_editor_open = true;
+                    }
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Run")) {
+                const char* home = std::getenv("HOME");
+                if (home) {
+                    std::filesystem::path file_path = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts" / script.filename;
+                    std::ifstream in(file_path);
+                    if (in.is_open()) {
+                        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                        console_submit(content);
+                    }
+                }
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+    }
+    ImGui::End();
+
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+}
+
 // ============================================================================
 //  ABOUT PANEL — pulled from the project README, written up fresh for the UI
 // ============================================================================
@@ -2074,10 +2346,8 @@ void SwordfareGUI::init_lua_console(
     m_console_ready        = (buf_addr != 0);
 
     if (m_console_ready) {
-        m_console_history.push_back({"[SRE Lua Terminal] Connected to game Lua state.", false, false});
-        m_console_history.push_back({"  APIs: caver.getHero(), caver.setHp(h,999), caver.getPosition(h)", false, false});
-        m_console_history.push_back({"  All mod caver.* and sre.* APIs available inline.", false, false});
-        m_console_history.push_back({"  Backtick (`) to toggle. Up/Down = history recall.", false, false});
+        m_console_history.push_back({"Swordigo Runtime  •  Lua 5.1  •  Full game state attached", false, false});
+        m_console_history.push_back({"Type Lua and press Enter. Up/Down for history. Backtick (`) to close.", false, false});
     }
 }
 
@@ -2174,56 +2444,119 @@ void SwordfareGUI::draw_lua_console() {
     }
 
     ImGuiIO& io = ImGui::GetIO();
-    float W = io.DisplaySize.x;
-    float H = io.DisplaySize.y;
-    float panel_h = H * 0.38f;
+    float W        = io.DisplaySize.x;
+    float H        = io.DisplaySize.y;
+    float panel_h  = H * 0.50f;               // taller for bigger context
+    float font_scale = 0.82f;                 // compact — smaller than the global UI font
 
     ImGui::SetNextWindowPos(ImVec2(0, H - panel_h), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(W, panel_h),    ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.95f);
+    ImGui::SetNextWindowBgAlpha(1.0f);
 
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,    ImVec4(0.03f, 0.03f, 0.09f, 0.97f));
-    ImGui::PushStyleColor(ImGuiCol_Border,      ImVec4(0.91f, 0.27f, 0.38f, 0.90f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg,     ImVec4(0.07f, 0.07f, 0.17f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Text,        ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,    ImVec2(10.0f, 8.0f));
+    // ── Colour palette ─────────────────────────────────────────────────────
+    const ImVec4 col_bg        = ImVec4(0.040f, 0.040f, 0.060f, 1.00f); // deep navy-black
+    const ImVec4 col_border    = ImVec4(0.180f, 0.220f, 0.380f, 1.00f); // slate blue border
+    const ImVec4 col_header_bg = ImVec4(0.060f, 0.060f, 0.090f, 1.00f); // slightly lighter header strip
+    const ImVec4 col_input_bg  = ImVec4(0.030f, 0.030f, 0.050f, 1.00f); // input even darker
+    const ImVec4 col_sep       = ImVec4(0.160f, 0.200f, 0.340f, 1.00f);
+    const ImVec4 col_prompt    = ImVec4(0.36f,  0.76f,  1.00f,  1.00f); // sky-blue prompt
+    const ImVec4 col_out       = ImVec4(0.85f,  0.97f,  0.85f,  1.00f); // faint green output
+    const ImVec4 col_err       = ImVec4(1.00f,  0.38f,  0.38f,  1.00f); // red error
+    const ImVec4 col_meta      = ImVec4(0.40f,  0.44f,  0.60f,  1.00f); // dim info lines
+    const ImVec4 col_title     = ImVec4(0.36f,  0.76f,  1.00f,  1.00f); // title accent
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,        col_bg);
+    ImGui::PushStyleColor(ImGuiCol_Border,          col_border);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,         col_input_bg);
+    ImGui::PushStyleColor(ImGuiCol_Text,            ImVec4(0.90f, 0.90f, 0.90f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg,     ImVec4(0.03f, 0.03f, 0.05f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab,   ImVec4(0.18f, 0.22f, 0.40f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, ImVec4(0.28f, 0.36f, 0.60f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive,  col_prompt);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,    ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,     ImVec2(6.0f, 3.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,      ImVec2(4.0f, 2.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize,    8.0f);
 
     bool pushed_mono = false;
     if (m_font_mono) { ImGui::PushFont((ImFont*)m_font_mono); pushed_mono = true; }
 
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-                             ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+    // Apply compact font scale
+    ImGui::SetWindowFontScale(font_scale);
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoResize   |
+                             ImGuiWindowFlags_NoMove      | ImGuiWindowFlags_NoScrollbar |
+                             ImGuiWindowFlags_NoCollapse  | ImGuiWindowFlags_NoSavedSettings;
 
     if (ImGui::Begin("##SRE_LuaConsole", nullptr, flags)) {
 
-        // Title bar row
-        ImGui::TextColored(ImVec4(0.91f, 0.27f, 0.38f, 1.0f), "SRE Lua Terminal");
-        ImGui::SameLine();
-        ImGui::TextDisabled("  connected to game Lua state  |  ` to close  |  caver.* / sre.* fully exposed");
-        ImGui::SameLine(W - 100.0f);
-        if (ImGui::SmallButton("Clear##clr")) m_console_history.clear();
-        ImGui::SameLine();
-        if (ImGui::SmallButton("X##close"))   m_console_open = false;
-        ImGui::Separator();
+        ImGui::SetWindowFontScale(font_scale);
 
-        // Scrollback
-        float input_h  = ImGui::GetTextLineHeightWithSpacing() + 12.0f;
-        float title_h  = ImGui::GetTextLineHeightWithSpacing() * 2.4f;
-        float scroll_h = panel_h - title_h - input_h - 6.0f;
+        // ── Header strip ────────────────────────────────────────────────────
+        float line_h = ImGui::GetTextLineHeight();
+        float hdr_h  = line_h + 10.0f;
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            ImGui::GetWindowPos(),
+            ImVec2(ImGui::GetWindowPos().x + W, ImGui::GetWindowPos().y + hdr_h),
+            ImGui::ColorConvertFloat4ToU32(col_header_bg)
+        );
 
+        ImGui::SetCursorPos(ImVec2(10.0f, 5.0f));
+        ImGui::TextColored(col_title, ICON_FA_TERMINAL " lua");
+        ImGui::SameLine(0, 2);
+        ImGui::TextColored(col_meta, "  swordigo-runtime v8  |  lua 5.1  |  full gamestate  |  ` to close");
+
+        float btn_x = W - 320.0f;
+        ImGui::SameLine(btn_x);
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.10f, 0.10f, 0.18f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.24f, 0.44f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.14f, 0.14f, 0.30f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text,          col_meta);
+        if (ImGui::SmallButton(" " ICON_FA_FILE " Manager ")) m_script_manager_open = !m_script_manager_open;
+        ImGui::SameLine(0, 6);
+        if (ImGui::SmallButton(" " ICON_FA_CODE " Editor ")) m_script_editor_open = !m_script_editor_open;
+        ImGui::SameLine(0, 6);
+        if (ImGui::SmallButton(" " ICON_FA_CIRCLE_XMARK " Clear ")) m_console_history.clear();
+        ImGui::SameLine(0, 6);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.30f, 0.30f, 1.0f));
+        if (ImGui::SmallButton("  " ICON_FA_XMARK "  ")) m_console_open = false;
+        ImGui::PopStyleColor(5);
+
+        // thin separator line under header
+        ImVec2 sep_a(ImGui::GetWindowPos().x, ImGui::GetWindowPos().y + hdr_h);
+        ImVec2 sep_b(sep_a.x + W, sep_a.y);
+        ImGui::GetWindowDrawList()->AddLine(sep_a, sep_b,
+            ImGui::ColorConvertFloat4ToU32(col_sep), 1.0f);
+
+        // ── Scrollback area ─────────────────────────────────────────────────
+        ImGui::SetCursorPos(ImVec2(0.0f, hdr_h + 2.0f));
+
+        // Input row height: multiline (3 lines) + padding + separator
+        float input_inner_h = line_h * 3.0f + 8.0f;
+        float input_area_h  = input_inner_h + 6.0f + line_h + 6.0f; // +prompt row + gaps
+        float scroll_h = panel_h - hdr_h - input_area_h - 8.0f;
+        if (scroll_h < 40.0f) scroll_h = 40.0f;
+
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, col_bg);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 4.0f));
         ImGui::BeginChild("##scroll", ImVec2(0, scroll_h), false,
                           ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::SetWindowFontScale(font_scale);
+
         for (auto& e : m_console_history) {
             if (e.is_input) {
-                ImGui::TextColored(ImVec4(0.40f, 0.80f, 1.00f, 1.0f), ">");
-                ImGui::SameLine(0, 4);
-                ImGui::TextUnformatted(e.text.c_str() + 2);
+                ImGui::TextColored(col_prompt, ">");
+                ImGui::SameLine(0, 5);
+                // user command in slightly brighter white
+                ImGui::TextColored(ImVec4(0.95f, 0.95f, 0.95f, 1.0f), "%s", e.text.c_str() + 2);
             } else if (e.is_error) {
-                ImGui::TextColored(ImVec4(1.00f, 0.35f, 0.35f, 1.0f), "%s", e.text.c_str());
+                ImGui::TextColored(col_err, "%s", e.text.c_str());
             } else {
-                ImGui::TextColored(ImVec4(0.72f, 0.95f, 0.72f, 1.0f), "%s", e.text.c_str());
+                // dim for banner/info lines vs normal output
+                bool is_banner = (m_console_history.size() > 1 &&
+                                  &e == &m_console_history[0] || &e == &m_console_history[1]);
+                ImGui::TextColored(is_banner ? col_meta : col_out, "%s", e.text.c_str());
             }
         }
         if (m_console_scroll_bottom) {
@@ -2231,42 +2564,81 @@ void SwordfareGUI::draw_lua_console() {
             m_console_scroll_bottom = false;
         }
         ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(); // ChildBg
 
-        ImGui::Separator();
+        // thin separator above input
+        float cur_y = ImGui::GetCursorPosY();
+        ImVec2 isep_a(ImGui::GetWindowPos().x, ImGui::GetWindowPos().y + cur_y);
+        ImVec2 isep_b(isep_a.x + W, isep_a.y);
+        ImGui::GetWindowDrawList()->AddLine(isep_a, isep_b,
+            ImGui::ColorConvertFloat4ToU32(col_sep), 1.0f);
+        ImGui::SetCursorPosY(cur_y + 2.0f);
 
-        // Input row
-        ImGui::TextColored(ImVec4(0.40f, 0.80f, 1.0f, 1.0f), "lua>");
-        ImGui::SameLine();
+        // ── Input row ────────────────────────────────────────────────────────
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 4.0f));
+
+        // Prompt glyph
+        ImGui::SetCursorPosX(6.0f);
+        ImGui::TextColored(col_prompt, ">>>");
+        ImGui::SameLine(0, 6);
 
         if (m_console_focus) { ImGui::SetKeyboardFocusHere(); m_console_focus = false; }
 
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.05f, 0.05f, 0.14f, 1.0f));
-        ImGui::SetNextItemWidth(W - 100.0f);
-        bool submit = ImGui::InputText("##input", m_console_input, sizeof(m_console_input),
-                                       ImGuiInputTextFlags_EnterReturnsTrue |
-                                       ImGuiInputTextFlags_EscapeClearsAll);
-        ImGui::PopStyleColor();
+        // Multiline input — 3 visible lines, grows via scrollbar inside
+        float run_btn_w = 52.0f;
+        float input_w   = W - ImGui::GetCursorPosX() - run_btn_w - 12.0f;
+
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, col_input_bg);
+        ImGui::PushStyleColor(ImGuiCol_Border,  col_sep);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+        bool submit = ImGui::InputTextMultiline(
+            "##input", m_console_input, sizeof(m_console_input),
+            ImVec2(input_w, input_inner_h),
+            ImGuiInputTextFlags_EnterReturnsTrue |
+            ImGuiInputTextFlags_CtrlEnterForNewLine |
+            ImGuiInputTextFlags_EscapeClearsAll
+        );
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+
+        ImGui::SameLine(0, 6);
+
+        // Run button
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.12f, 0.36f, 0.72f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.50f, 0.95f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.08f, 0.22f, 0.52f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(1.00f, 1.00f, 1.00f, 1.00f));
+        if (ImGui::Button(" " ICON_FA_PLAY " ##run", ImVec2(run_btn_w, input_inner_h)) && m_console_input[0]) {
+            // strip trailing newline that Enter adds in multiline mode
+            int len = (int)strlen(m_console_input);
+            while (len > 0 && (m_console_input[len-1] == '\n' || m_console_input[len-1] == '\r'))
+                m_console_input[--len] = '\0';
+            if (len > 0) {
+                console_submit(m_console_input);
+                m_console_input[0] = 0;
+                m_console_focus    = true;
+            }
+        }
+        ImGui::PopStyleColor(4);
+        ImGui::PopStyleVar(); // WindowPadding (input row)
 
         if (submit && m_console_input[0]) {
-            console_submit(m_console_input);
-            m_console_input[0] = 0;
-            m_console_focus    = true;
+            int len = (int)strlen(m_console_input);
+            while (len > 0 && (m_console_input[len-1] == '\n' || m_console_input[len-1] == '\r'))
+                m_console_input[--len] = '\0';
+            if (len > 0) {
+                console_submit(m_console_input);
+                m_console_input[0] = 0;
+                m_console_focus    = true;
+            }
         }
-
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.91f, 0.27f, 0.38f, 0.90f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.00f, 0.40f, 0.52f, 1.00f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.65f, 0.12f, 0.22f, 1.00f));
-        if (ImGui::Button("Run", ImVec2(60, 0)) && m_console_input[0]) {
-            console_submit(m_console_input);
-            m_console_input[0] = 0;
-            m_console_focus    = true;
-        }
-        ImGui::PopStyleColor(3);
     }
     ImGui::End();
 
     if (pushed_mono) ImGui::PopFont();
-    ImGui::PopStyleVar(2);
-    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(5);
+    ImGui::PopStyleColor(8);
 }
+
+
