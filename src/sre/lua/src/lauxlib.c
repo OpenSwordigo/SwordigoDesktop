@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -546,46 +547,66 @@ static int errfile (lua_State *L, const char *what, int fnameindex) {
 extern const char* sre_vfs_resolve_path(const char* path, char* out_buf);
 
 LUALIB_API int luaL_loadfile (lua_State *L, const char *filename) {
-  LoadF lf;
-  int status, readstatus;
-  int c;
-  int fnameindex = lua_gettop(L) + 1;  /* index of filename on the stack */
-  lf.extraline = 0;
+  int fnameindex = lua_gettop(L) + 1;
+
   if (filename == NULL) {
+    /* stdin: fall back to original streaming approach — no SCL handling needed */
+    LoadF lf;
+    int status, readstatus;
+    lf.extraline = 0;
     lua_pushliteral(L, "=stdin");
     lf.f = stdin;
+    status = lua_load(L, getF, &lf, lua_tostring(L, -1));
+    readstatus = ferror(lf.f);
+    if (readstatus) {
+      lua_settop(L, fnameindex);
+      return errfile(L, "read", fnameindex);
+    }
+    lua_remove(L, fnameindex);
+    return status;
   }
-  else {
-    char vfs_buf[512];
-    const char* real_path = sre_vfs_resolve_path(filename, vfs_buf);
-    lua_pushfstring(L, "@%s", filename);
-    lf.f = fopen(real_path, "r");
-    if (lf.f == NULL) return errfile(L, "open", fnameindex);
+
+  /* For named files: read entirely into memory so we can run SCL extraction.
+   * luaL_loadbuffer already contains the protobuf + plain-text SCL detector. */
+  char vfs_buf[512];
+  const char* real_path = sre_vfs_resolve_path(filename, vfs_buf);
+  lua_pushfstring(L, "@%s", filename);
+
+  FILE* f = fopen(real_path, "rb");
+  if (f == NULL) return errfile(L, "open", fnameindex);
+
+  fseek(f, 0, SEEK_END);
+  long fsize = ftell(f);
+  fseek(f, 0, SEEK_SET);
+
+  if (fsize <= 0 || fsize > 4 * 1024 * 1024) {
+    fclose(f);
+    lua_pushfstring(L, "cannot load %s: %s", filename,
+                    fsize <= 0 ? "empty file" : "file too large");
+    lua_remove(L, fnameindex);
+    return LUA_ERRFILE;
   }
-  c = getc(lf.f);
-  if (c == '#') {  /* Unix exec. file? */
-    lf.extraline = 1;
-    while ((c = getc(lf.f)) != EOF && c != '\n') ;  /* skip first line */
-    if (c == '\n') c = getc(lf.f);
+
+  char* buf = (char*)malloc((size_t)fsize + 1);
+  if (!buf) {
+    fclose(f);
+    lua_pushfstring(L, "cannot load %s: out of memory", filename);
+    lua_remove(L, fnameindex);
+    return LUA_ERRFILE;
   }
-  if (c == LUA_SIGNATURE[0] && lf.f != stdin) {  /* binary file? */
-    char vfs_buf2[512];
-    const char* real_path2 = sre_vfs_resolve_path(filename, vfs_buf2);
-    fclose(lf.f);
-    lf.f = fopen(real_path2, "rb");  /* reopen in binary mode */
-    if (lf.f == NULL) return errfile(L, "reopen", fnameindex);
-    /* skip eventual `#!...' */
-   while ((c = getc(lf.f)) != EOF && c != LUA_SIGNATURE[0]) ;
-    lf.extraline = 0;
-  }
-  ungetc(c, lf.f);
-  status = lua_load(L, getF, &lf, lua_tostring(L, -1));
-  readstatus = ferror(lf.f);
-  if (lf.f != stdin) fclose(lf.f);  /* close file (even in case of errors) */
-  if (readstatus) {
-    lua_settop(L, fnameindex);  /* ignore results from `lua_load' */
-    return errfile(L, "read", fnameindex);
-  }
+
+  size_t nread = fread(buf, 1, (size_t)fsize, f);
+  fclose(f);
+  buf[nread] = '\0';
+
+  /* Build chunk name like original (@filename) for error messages */
+  char chunkname[520];
+  snprintf(chunkname, sizeof(chunkname), "@%s", filename);
+
+  /* luaL_loadbuffer handles SCL binary protobuf + plain-text detection internally */
+  int status = luaL_loadbuffer(L, buf, nread, chunkname);
+  free(buf);
+
   lua_remove(L, fnameindex);
   return status;
 }
@@ -714,9 +735,137 @@ LUALIB_API int luaL_loadbuffer (lua_State *L, const char *buff, size_t size,
   }
 #endif
 
+  /* =======================================================
+   * SCL Binary Protobuf detection and extraction.
+   *
+   * The game engine loads .scl files through its own loadfile
+   * and passes raw bytes here. SCL is a protobuf container:
+   *   field 5 (Program message) {
+   *     field 1 (Source — Lua source text)   ← confirmed from edgetest.scl hex
+   *     field 2 (Source — alternate)
+   *     field 3 (CompiledCode — bytecode)
+   *   }
+   * The first byte 0x2A = tag for field=5, wire=2 (length-delimited).
+   * Detect this and extract the embedded Lua source before compiling.
+   * ======================================================= */
+  const char* actual_buff = buff;
+  size_t actual_size = size;
+
+  if (buff && size > 4) {
+    /* Check for binary protobuf SCL: first byte 0x2A = field 5, wire type 2 */
+    unsigned char b0 = (unsigned char)buff[0];
+    if (b0 == 0x2A || (b0 >= 0x08 && (b0 & 7) <= 5)) {
+      /* Walk the protobuf to find field 5 (Program) -> field 2 or 3 (Source/Code) */
+      const unsigned char* p   = (const unsigned char*)buff;
+      const unsigned char* end = p + size;
+      const char* found_lua = NULL;
+      size_t found_len = 0;
+
+      while (p < end && !found_lua) {
+        /* Read varint tag */
+        uint64_t key = 0;
+        int shift = 0;
+        while (p < end) {
+          unsigned char byte = *p++;
+          key |= ((uint64_t)(byte & 0x7F)) << shift;
+          if (!(byte & 0x80)) break;
+          shift += 7;
+          if (shift >= 64) goto scl_done;
+        }
+        int field = (int)(key >> 3);
+        int wire  = (int)(key & 7);
+
+        if (wire == 2) {
+          /* Read length */
+          uint64_t len = 0;
+          shift = 0;
+          while (p < end) {
+            unsigned char byte = *p++;
+            len |= ((uint64_t)(byte & 0x7F)) << shift;
+            if (!(byte & 0x80)) break;
+            shift += 7;
+            if (shift >= 64) goto scl_done;
+          }
+          if (p + len > end) break;
+
+          if (field == 5) {
+            /* Program message — walk inner fields */
+            const unsigned char* pp  = p;
+            const unsigned char* pend = p + len;
+            while (pp < pend) {
+              uint64_t pkey = 0;
+              shift = 0;
+              while (pp < pend) {
+                unsigned char byte = *pp++;
+                pkey |= ((uint64_t)(byte & 0x7F)) << shift;
+                if (!(byte & 0x80)) break;
+                shift += 7;
+                if (shift >= 64) goto scl_done;
+              }
+              int pfield = (int)(pkey >> 3);
+              int pwire  = (int)(pkey & 7);
+              if (pwire == 2) {
+                uint64_t plen = 0;
+                shift = 0;
+                while (pp < pend) {
+                  unsigned char byte = *pp++;
+                  plen |= ((uint64_t)(byte & 0x7F)) << shift;
+                  if (!(byte & 0x80)) break;
+                  shift += 7;
+                  if (shift >= 64) goto scl_done;
+                }
+                if (pp + plen > pend) break;
+                if (pfield == 1 || pfield == 2 || pfield == 3) {
+                  /* Source (1/2) or CompiledCode (3) */
+                  found_lua = (const char*)pp;
+                  found_len = (size_t)plen;
+                  break;
+                }
+                pp += plen;
+              } else if (pwire == 0) {
+                while (pp < pend && (*pp++ & 0x80));
+              } else if (pwire == 1) { pp += 8; }
+                else if (pwire == 5) { pp += 4; }
+                else break;
+            }
+          }
+          p += len;
+        } else if (wire == 0) {
+          while (p < end && (*p++ & 0x80));
+        } else if (wire == 1) { p += 8; }
+          else if (wire == 5) { p += 4; }
+          else break;
+      }
+
+scl_done:
+      if (found_lua && found_len > 0) {
+        actual_buff = found_lua;
+        actual_size = found_len;
+      }
+    }
+
+    /* Plain-text SCL format: Program{ String : $ <lua> $end } */
+    if (actual_buff == buff) {
+      /* Quick marker: look for "String : $" in first 256 bytes */
+      size_t scan = size < 256 ? size : 256;
+      for (size_t i = 0; i + 10 < scan; i++) {
+        if (memcmp(buff + i, "String : $", 10) == 0) {
+          const char* start = buff + i + 10;
+          while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+          const char* send = strstr(start, "$end");
+          if (send) {
+            actual_buff = start;
+            actual_size = (size_t)(send - start);
+          }
+          break;
+        }
+      }
+    }
+  }
+
   LoadS ls;
-  ls.s = buff;
-  ls.size = size;
+  ls.s = actual_buff;
+  ls.size = actual_size;
   int status = lua_load(L, getS, &ls, name);
   if (status != 0) {
       fprintf(stderr, "[SRE-LUA]   -> COMPILE ERROR: %d (msg: %s)\n", status, lua_tostring(L, -1));

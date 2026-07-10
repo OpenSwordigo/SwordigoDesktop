@@ -32,6 +32,7 @@ int AAsset_openFileDescriptor(AAsset* asset, off_t* outStart, off_t* outLength);
 
 // Internal setup
 void asset_manager_init(const char* base_path);
+const char* get_assets_base_path(void);
 
 #ifdef __cplusplus
 }

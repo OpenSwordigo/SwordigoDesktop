@@ -21,6 +21,7 @@
  * Hooked functions:
  *   - Caver::FileExistsAtPath(const std::string&)
  *   - Caver::NewByteBufferFromAndroidAsset(const std::string&, uint32_t*)
+ *   - Caver::SetResourcesPath(const std::string&)  [forced to "resources"]
  *
  * Communication model:
  *   SRE (guest) writes path requests to shared globals.
@@ -29,6 +30,8 @@
 
 #include "sre.h"
 #include "sre_lua.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 /* =========================================================================
  * VFS Configuration Globals (set by host via sre_vfs_init)
@@ -58,6 +61,7 @@ int g_sre_vfs_hierarchy_enabled = 0;
 /* Original function pointers — set by host after trampoline install */
 uint64_t g_orig_FileExistsAtPath = 0;
 uint64_t g_orig_NewByteBuffer = 0;
+extern uint64_t g_swordigo_base;
 
 /* =========================================================================
  * VFS Command Buffer — written by SRE, read/processed by host
@@ -417,6 +421,15 @@ static int sre_vfs_rewrite_path(const char* original, char* rewritten, int max_l
                 vfs_strcat(rewritten, original);
                 return 1;
             }
+        } else if (g_sre_vfs_path_assets[0]) {
+            /* Vanilla fallback: "resources/X" → "<assets_dir>/resources/X"
+             * This mirrors what search-list level 5 does in hierarchy mode.
+             * Necessary so sre_FileExistsAtPath and sre_NewByteBufferFromAndroidAsset
+             * can find vanilla textures/levels/sounds using their full desktop path
+             * instead of the bare relative path "resources/..." (which has no
+             * relationship to the process CWD). */
+            if (vfs_path_join(rewritten, max_len, g_sre_vfs_path_assets, original))
+                return 1;
         }
     }
 
@@ -448,68 +461,174 @@ static int sre_vfs_rewrite_path(const char* original, char* rewritten, int max_l
  *
  * ARM64 ABI: X0 = const std::string& path
  * Returns: int (1 = exists, 0 = not found)
+ *
+ * Design rationale:
+ *   The purpose of hooking this function is mod asset prioritization.
+ *   In vanilla mode the original Android implementation returned 1 for
+ *   all packaged APK assets (no separate filesystem pre-check). We
+ *   replicate that optimistic behavior so that UI button textures with
+ *   non-standard paths are not silently blocked, and the engine's own
+ *   load failure handling runs if a file is truly absent.
+ *
+ *   Real fopen checks are ONLY performed in mod hierarchy mode, where
+ *   the 5-level search list covers both mod overrides AND vanilla fallback
+ *   (level 5 = <assets_dir>/resources/X), so a legitimate vanilla file
+ *   will still return 1.
  */
 int sre_FileExistsAtPath(SreString* path_str) {
     const char* path = path_str->data;
-    if (!path) return 0;
+    if (!path || !path[0]) return 0;
 
-    /* Try VFS rewrite */
-    if (g_sre_vfs_active) {
-        char rewritten[512];
-        if (sre_vfs_rewrite_path(path, rewritten, 512)) {
-            vfs_strcpy(g_sre_vfs_path_request, rewritten);
-            g_sre_vfs_check_pending = 1;
-            /* Optimistic return — host will handle fallback during actual load */
-            return 1;
+    char rewritten[512];
+
+    /* Mod hierarchy — do a real multi-level search */
+    if (g_sre_vfs_active && g_sre_vfs_hierarchy_enabled) {
+        if (sre_vfs_rewrite_path(path, rewritten, 512) && g_sre_vfs_search_list[0]) {
+            const char* p = g_sre_vfs_search_list;
+            char candidate[512];
+            while (*p) {
+                int ci = 0;
+                while (*p && *p != '|' && ci < 511)
+                    candidate[ci++] = *p++;
+                candidate[ci] = '\0';
+                if (*p == '|') p++;
+                if (ci > 0) {
+                    FILE* f = fopen(candidate, "rb");
+                    if (f) { fclose(f); return 1; }
+                }
+            }
+            return 0;  /* not found in any of the 5 levels */
         }
     }
 
-    /* Passthrough */
-    vfs_strcpy(g_sre_vfs_path_request, path);
-    g_sre_vfs_check_pending = 1;
+    /* Vanilla mode — optimistic.
+     * The gzdopen bridge detects PVR magic and converts it to a TEX-format stream
+     * transparently (with correct pixelFmt/width/height header), so the engine's
+     * LoadFromTEXFile path works for both real .tex.png AND .pvr files without
+     * needing FileExistsAtPath to return 0 for missing extensions.
+     *
+     * The asset_manager's try_open already handles the .tex.png → .pvr fallback
+     * at the file-open level, so the right bytes always reach gzdopen. */
     return 1;
 }
+
 
 /*
  * sre_NewByteBufferFromAndroidAsset — replacement for Caver::NewByteBufferFromAndroidAsset
  *
  * ARM64 ABI: X0 = const std::string& path, X1 = uint32_t* out_len
- * Returns: void* (pointer to loaded data buffer, or NULL on failure)
+ * Returns: void* (malloc'd buffer with file contents, or NULL on failure)
  *
- * The host intercepts this to load files from the VFS hierarchy.
+ * Uses real fopen/fread to load files from the VFS search hierarchy.
+ * The returned buffer is malloc'd and the engine is responsible for freeing it
+ * (or it leaks, but only mod data — acceptable for now).
  */
 void* sre_NewByteBufferFromAndroidAsset(SreString* path_str, uint32_t* out_len) {
     const char* path = path_str->data;
-    if (!path) {
+    if (!path || !path[0]) {
         if (out_len) *out_len = 0;
         return NULL;
     }
 
-    /* Try VFS rewrite — write the path for the host to load */
-    if (g_sre_vfs_active) {
-        char rewritten[512];
-        if (sre_vfs_rewrite_path(path, rewritten, 512)) {
-            vfs_strcpy(g_sre_vfs_path_request, rewritten);
-            g_sre_vfs_load_pending = 1;
-            /* Host processes synchronously. After host sets result, we return. */
-            if (g_sre_vfs_load_result_ptr && g_sre_vfs_load_result_size > 0) {
-                if (out_len) *out_len = g_sre_vfs_load_result_size;
-                return (void*)g_sre_vfs_load_result_ptr;
+    const char* load_path = path;
+    char rewritten[512];
+
+    if (g_sre_vfs_active && sre_vfs_rewrite_path(path, rewritten, 512)) {
+        /* Hierarchy: try each candidate in pipe-separated search list */
+        if (g_sre_vfs_hierarchy_enabled && g_sre_vfs_search_list[0]) {
+            const char* p = g_sre_vfs_search_list;
+            char candidate[512];
+            while (*p) {
+                int ci = 0;
+                while (*p && *p != '|' && ci < 511)
+                    candidate[ci++] = *p++;
+                candidate[ci] = '\0';
+                if (*p == '|') p++;
+                if (ci == 0) continue;
+                FILE* f = fopen(candidate, "rb");
+                if (!f) continue;
+                fseek(f, 0, SEEK_END);
+                long sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (sz <= 0) { fclose(f); continue; }
+                void* buf = malloc((size_t)sz);
+                if (!buf) { fclose(f); continue; }
+                fread(buf, 1, (size_t)sz, f);
+                fclose(f);
+                if (out_len) *out_len = (uint32_t)sz;
+                return buf;
             }
+            /* Not found in any level — fall through to original path */
+        } else {
+            load_path = rewritten;
         }
     }
 
-    /* Passthrough — write original path for host */
-    vfs_strcpy(g_sre_vfs_path_request, path);
-    g_sre_vfs_load_pending = 1;
+    /* Load from load_path (original or simple-rewrite) */
+    FILE* f = fopen(load_path, "rb");
+    if (!f) { if (out_len) *out_len = 0; return NULL; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); if (out_len) *out_len = 0; return NULL; }
+    void* buf = malloc((size_t)sz);
+    if (!buf) { fclose(f); if (out_len) *out_len = 0; return NULL; }
+    fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (out_len) *out_len = (uint32_t)sz;
+    return buf;
+}
 
-    if (g_sre_vfs_load_result_ptr && g_sre_vfs_load_result_size > 0) {
-        if (out_len) *out_len = g_sre_vfs_load_result_size;
-        return (void*)g_sre_vfs_load_result_ptr;
+/* Hook SetResourcesPath to force it to "resources" */
+void sre_SetResourcesPath(SreString* path_str) {
+    if (g_swordigo_base != 0) {
+        SreString* global_res_path = (SreString*)(g_swordigo_base + 0x7e9d10);
+        sre_CppString_assign(global_res_path, "resources", 9);
+        printf("[SRE VFS] Hooked SetResourcesPath (original was '%s'): forced to 'resources'\n", path_str->data);
+    }
+}
+
+static const char* vfs_strstr(const char* haystack, const char* needle) {
+    if (!haystack || !needle) return NULL;
+    int nlen = vfs_strlen(needle);
+    if (nlen == 0) return haystack;
+    for (int i = 0; haystack[i]; i++) {
+        if (vfs_strncmp(haystack + i, needle, nlen) == 0) {
+            return haystack + i;
+        }
+    }
+    return NULL;
+}
+
+/* Hook IsAndroidAssetsPath to route all game asset files to AAssetManager.
+ * CRITICAL: Any extension missing here causes NewByteBufferFromFile to fall
+ * through to fopen(relative_path) which fails on desktop. Add ALL asset types. */
+int sre_IsAndroidAssetsPath(SreString* path_str) {
+    const char* path = path_str->data;
+    if (!path) return 0;
+
+    /* "resources/" prefix always means AAssetManager — covers every resource type */
+    if (vfs_strncmp(path, "resources/", 10) == 0 ||
+        vfs_strncmp(path, "assets/", 7) == 0 ||
+        vfs_strncmp(path, "/Assets/", 8) == 0) {
+        return 1;
     }
 
-    if (out_len) *out_len = 0;
-    return NULL;
+    /* Non-prefixed asset extensions — include everything the engine loads */
+    if (vfs_strstr(path, ".scene")   || vfs_strstr(path, ".POD")     ||
+        vfs_strstr(path, ".wav")     || vfs_strstr(path, ".scl")     ||
+        vfs_strstr(path, ".pvr")     || vfs_strstr(path, ".tex.png") ||
+        vfs_strstr(path, ".ogg")     || vfs_strstr(path, ".png")     ||
+        vfs_strstr(path, ".atlas")   || vfs_strstr(path, ".fnt")     ||
+        /* Protobuf binary asset types — critical for fonts, textures, materials */
+        vfs_strstr(path, ".font")    || vfs_strstr(path, ".material") ||
+        vfs_strstr(path, ".texture") || vfs_strstr(path, ".object")  ||
+        vfs_strstr(path, ".plist")   || vfs_strstr(path, ".lua")     ||
+        vfs_strstr(path, ".mp3")     || vfs_strstr(path, ".caf")) {
+        return 1;
+    }
+
+    return 0;
 }
 
 /* =========================================================================

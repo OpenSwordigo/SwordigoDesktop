@@ -65,6 +65,7 @@ CXX_SRCS := \
     src/platform/srt_overlay.cpp \
     src/platform/video_background.cpp \
     src/platform/swordfare_gui.cpp \
+    src/platform/pvrtc_decoder.cpp \
     src/imgui/imgui.cpp \
     src/imgui/imgui_draw.cpp \
     src/imgui/imgui_tables.cpp \
@@ -77,6 +78,7 @@ CXX_SRCS += src/platform/emulator_dynarmic64.cpp
 
 C_SRCS := \
     src/android/asset_manager.c \
+    src/android/asset_manager_arm32.c \
     src/android/log.c
 
 # Object files (in build/ dir)
@@ -147,6 +149,7 @@ SRE_CORE_SRCS := \
     src/sre/sre_lua_libs.c \
     src/sre/sre_mod.c \
     src/sre/sre_config.c \
+    src/sre/sre_caver.c \
     src/sre/toml-c/toml.c \
     src/sre/luafilesystem/src/lfs.c \
     src/sre/luasocket/src/auxiliar.c \

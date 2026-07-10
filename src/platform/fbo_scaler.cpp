@@ -3,6 +3,7 @@
 #include "platform/gl_inc.h"
 #include <GL/glext.h>
 #include "pvr_loader.h"
+#include "platform/data_path.h"
 #include <iostream>
 #include <cstring>
 #include <cmath>
@@ -1332,19 +1333,13 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
     if (g_portal_active > 0.5f && g_prog_portal) {
         // Load portal texture on first use
         if (!g_portal_tex_loaded) {
-            const char* paths[] = {
-                "/home/quantumcreeper/.local/share/swordigo-desktop/assets/resources/portal_effect_2x.pvr",
-                "assets/resources/portal_effect_2x.pvr",
-                nullptr
-            };
-            for (int i = 0; paths[i]; i++) {
-                FILE* f = fopen(paths[i], "rb");
-                if (f) { fclose(f); 
-                    g_portal_tex = pvr_load_texture(paths[i]);
-                    if (g_portal_tex) {
-                        std::cout << "[PORTAL] Loaded portal texture from " << paths[i] << std::endl;
-                    }
-                    break;
+            extern std::string g_assets_dir;
+            std::string path = get_data_path(g_assets_dir + "/resources/portal_effect_2x.pvr");
+            FILE* f = fopen(path.c_str(), "rb");
+            if (f) { fclose(f); 
+                g_portal_tex = pvr_load_texture(path.c_str());
+                if (g_portal_tex) {
+                    std::cout << "[PORTAL] Loaded portal texture from " << path << std::endl;
                 }
             }
             g_portal_tex_loaded = true;
@@ -1766,19 +1761,13 @@ void fbo_draw_portal_vanilla(int viewport_w, int viewport_h) {
     
     // Load portal texture on first use
     if (!g_portal_tex_loaded) {
-        const char* paths[] = {
-            "/home/quantumcreeper/.local/share/swordigo-desktop/assets/resources/portal_effect_2x.pvr",
-            "assets/resources/portal_effect_2x.pvr",
-            nullptr
-        };
-        for (int i = 0; paths[i]; i++) {
-            FILE* f = fopen(paths[i], "rb");
-            if (f) { fclose(f);
-                g_portal_tex = pvr_load_texture(paths[i]);
-                if (g_portal_tex) {
-                    std::cout << "[PORTAL-VANILLA] Loaded texture from " << paths[i] << std::endl;
-                }
-                break;
+        extern std::string g_assets_dir;
+        std::string path = get_data_path(g_assets_dir + "/resources/portal_effect_2x.pvr");
+        FILE* f = fopen(path.c_str(), "rb");
+        if (f) { fclose(f);
+            g_portal_tex = pvr_load_texture(path.c_str());
+            if (g_portal_tex) {
+                std::cout << "[PORTAL-VANILLA] Loaded texture from " << path << std::endl;
             }
         }
         g_portal_tex_loaded = true;

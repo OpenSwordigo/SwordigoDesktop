@@ -11,6 +11,8 @@
 
 #include "sre.h"
 #include "sre_lua.h"
+#include "sre_caver.h"
+
 
 /* =========================================================================
  * Globals
@@ -186,6 +188,9 @@ SreHookEntry sre_hook_table[] = {
      * every frame. The native HUD won't animate (we own the display). */
     { 0x34ed2c, "sre_GameSceneView_Update" },  /* GameSceneView::Update(float) */
 
+    /* Force GLES 2.0 Mode (hook RenderingContext constructor) */
+    { 0x2fc03c, "sre_RenderingContext_C1" },
+
     /* NOTE: Death/Respawn hook at 0x347efc is already defined above
      * (sre_GameOverVC_ShowAdMaybe). Do NOT duplicate — the old
      * sre_ShowAdMaybe name was from the TVPG snapshot and doesn't
@@ -198,13 +203,21 @@ SreHookEntry sre_hook_table[] = {
     { 0x4c0f18, "sre_RegisterProgramLibrary", 0 },
 
     /* Virtual Filesystem — mod asset layering.
-     * DISABLED: Same trampoline issue — replaces FileExistsAtPath entirely.
-     * Our stub returns 1 optimistically, breaking actual file checks.
-     * Re-enable after implementing host-side file check delegation. */
-     //{ 0x4b44b8, "sre_FileExistsAtPath" }, 
+     * Re-enabled: sre_FileExistsAtPath now uses real fopen() checks instead
+     * of the old "optimistic return 1" stub that broke vanilla asset queries.
+     * sre_NewByteBufferFromAndroidAsset also does real fopen/fread loading.
+     * Hook offset 0x4b44b8 = Caver::FileExistsAtPath (v1.4.12 ARM64). */
+     { 0x4b44b8, "sre_FileExistsAtPath" },
+     { 0x5196cc, "sre_PVRTTextureLoadFromPVRBuffer_hook", 0 },
+     { 0, "sre_SetResourcesPath" },
+     /* IsAndroidAssetsPath — ARM64 offset NOT YET VERIFIED.
+      * README offsets are ARM32/Thumb — 0x084472 was wrong (mid-instruction).
+      * Font loading is fixed via bridge_fopen path rewriting instead. */
+     { 0, "sre_IsAndroidAssetsPath" },
+
 
     /* Unified Lua Interpreter Hooks */
-    /*
+    
     { 0, "lua_pcall" },
     { 0, "lua_resume" },
     { 0, "lua_settop" },
@@ -264,7 +277,7 @@ SreHookEntry sre_hook_table[] = {
     { 0, "lua_pushthread" },
     { 0, "lua_status" },
     { 0, "lua_gc" },
-    */
+    
     /* Sentinel — end of table */
     { 0, 0, 0 }
 };
@@ -310,6 +323,9 @@ uint64_t sre_get_hook_address(const char* symbol_name) {
 void sre_init(uint64_t swordigo_base, uint64_t empty_bss_off) {
     g_swordigo_base = swordigo_base;
 
+    /* Resolve Caver component interfaces and engine helpers */
+    sre_caver_init(swordigo_base);
+
     /* Calculate the guest address of the empty string sentinel.
      * The empty sentinel is in libswordigo.so's BSS at the given offset.
      * Its _Rep has refcount = -1 (static, never free).
@@ -337,11 +353,12 @@ void sre_init(uint64_t swordigo_base, uint64_t empty_bss_off) {
      *   [+0x00] TextInputTextDidChange(out_str, this, text_str)
      *   [+0x08] TextInputDidFinish(this)
      */
-    extern void sre_TextInputTextDidChange_vtable(void*, void*, void*);
-    extern void sre_TextInputDidFinish_vtable(void*);
-    uint64_t* itid_vtable = (uint64_t*)(swordigo_base + 0x7e1688);
-    itid_vtable[0] = (uint64_t)&sre_TextInputTextDidChange_vtable;
-    itid_vtable[1] = (uint64_t)&sre_TextInputDidFinish_vtable;
+    // Disabled under ARM64 to prevent memory corruption (we clear delegate pointer instead)
+    // extern void sre_TextInputTextDidChange_vtable(void*, void*, void*);
+    // extern void sre_TextInputDidFinish_vtable(void*);
+    // uint64_t* itid_vtable = (uint64_t*)(swordigo_base + 0x7e1688);
+    // itid_vtable[0] = (uint64_t)&sre_TextInputTextDidChange_vtable;
+    // itid_vtable[1] = (uint64_t)&sre_TextInputDidFinish_vtable;
 
     /* Load mod configuration from mini.toml */
     extern char g_sre_mod_name[128];
@@ -358,7 +375,10 @@ void sre_init(uint64_t swordigo_base, uint64_t empty_bss_off) {
     }
     
     /* Diagnostic: scan the compiled is.scl to verify if the button strings exist in it */
-    FILE* f_scl = fopen("/home/quantumcreeper/.local/share/swordigo-desktop/rln_assets/resources/is.scl", "rb");
+    extern char g_sre_vfs_path_assets[512];
+    char scl_path[512];
+    snprintf(scl_path, sizeof(scl_path), "%s/resources/is.scl", g_sre_vfs_path_assets);
+    FILE* f_scl = fopen(scl_path, "rb");
     if (f_scl) {
         fseek(f_scl, 0, SEEK_END);
         long sz = ftell(f_scl);
@@ -406,3 +426,20 @@ void sre_init(uint64_t swordigo_base, uint64_t empty_bss_off) {
         g_sre_coin_limit = config.coin_limit;
     }
 }
+
+// Host-side bridge function import
+extern void sre_PVRTTextureLoadFromPVRBuffer(
+    void *param_1, unsigned long param_2, unsigned int *param_3, 
+    void *param_4, unsigned int param_5, unsigned int param_6, 
+    int *param_7, int *param_8
+);
+
+// Guest-side hook function exported to the engine hook table
+void sre_PVRTTextureLoadFromPVRBuffer_hook(
+    void *param_1, unsigned long param_2, unsigned int *param_3, 
+    void *param_4, unsigned int param_5, unsigned int param_6, 
+    int *param_7, int *param_8
+) {
+    sre_PVRTTextureLoadFromPVRBuffer(param_1, param_2, param_3, param_4, param_5, param_6, param_7, param_8);
+}
+

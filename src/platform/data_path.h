@@ -20,3 +20,17 @@ std::string get_system_data_dir();
 // First-run setup: copies game data from system install to user data dir.
 // Returns true if data was copied, false if already exists or no system install.
 bool ensure_user_data();
+
+#ifdef __cplusplus
+void set_active_mod_name(const std::string& name);
+void set_active_profile_id(const std::string& id);
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+char* get_user_data_dir_c(void);
+bool resolve_vfs_path(const char* original_path, char* out_resolved_path, int max_len);
+#ifdef __cplusplus
+}
+#endif

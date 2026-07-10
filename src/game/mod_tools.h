@@ -48,6 +48,7 @@ void mod_toast(const std::string& message, float duration_sec = 2.0f);
 // ---------------------------------------------------------------
 void mod_update(float dt);
 void mod_render_overlay(GuiRenderer& gui, int win_w, int win_h, float dt);
+void mod_apply_frame(uint8_t* guest_mem);
 
 // ---------------------------------------------------------------
 // Achievement Popup

@@ -1,0 +1,127 @@
+#include "asset_manager_arm32.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#ifdef _WIN32
+#include <io.h>
+#define dup _dup
+#define fileno _fileno
+#else
+#include <unistd.h>
+#endif
+
+static struct AAssetManager_arm32 g_mgr;
+
+// Exposed to jni_bridge.cpp so we can tag which GL texture ID corresponds to which asset
+char g_last_opened_asset_arm32[256] = {0};
+
+void asset_manager_init_arm32(const char* base_path) {
+    strncpy(g_mgr.base_path, base_path, sizeof(g_mgr.base_path));
+}
+
+AAssetManager_arm32* AAssetManager_fromJava_arm32(void* env, void* assetManager) {
+    return &g_mgr;
+}
+
+AAsset_arm32* AAssetManager_open_arm32(AAssetManager_arm32* mgr, const char* filename, int mode) {
+    char full_path[512];
+    
+    // Track last opened filename for texture identification in jni_bridge
+    strncpy(g_last_opened_asset_arm32, filename, sizeof(g_last_opened_asset_arm32) - 1);
+    g_last_opened_asset_arm32[sizeof(g_last_opened_asset_arm32) - 1] = '\0';
+    
+    printf("[ARM32 Asset] OPEN: %s\n", filename);
+    
+    if (strstr(filename, "swordigo_title_2x.pvr") != NULL) {
+        printf("\n*********************************\n");
+        printf("* RENDERING PHASE REACHED (32) *\n");
+        printf("*********************************\n\n");
+    }
+
+    // === MOD OVERLAY: Check mod directories first ===
+    {
+        extern char* get_user_data_dir_c(void);
+        char* data_dir = get_user_data_dir_c();
+        if (data_dir) {
+            char mods_path[512];
+            snprintf(mods_path, sizeof(mods_path), "%s/mods", data_dir);
+            
+            DIR* mods_dir = opendir(mods_path);
+            if (mods_dir) {
+                struct dirent* de;
+                while ((de = readdir(mods_dir)) != NULL) {
+                    // Skip ., .., and disabled mods (dot-prefixed)
+                    if (de->d_name[0] == '.') continue;
+                    
+                    char mod_asset_path[512];
+                    snprintf(mod_asset_path, sizeof(mod_asset_path),
+                             "%s/%s/assets/%s", mods_path, de->d_name, filename);
+                    
+                    FILE* mod_fp = fopen(mod_asset_path, "rb");
+                    if (mod_fp) {
+                        printf("[ARM32 Asset] MOD OVERRIDE: %s -> %s\n", filename, mod_asset_path);
+                        AAsset_arm32* asset = (AAsset_arm32*)malloc(sizeof(AAsset_arm32));
+                        asset->fp = mod_fp;
+                        strncpy(asset->name, filename, sizeof(asset->name));
+                        closedir(mods_dir);
+                        return asset;
+                    }
+                }
+                closedir(mods_dir);
+            }
+        }
+    }
+    
+    // If filename starts with ./, don't prepend base_path
+    if (filename[0] == '.' && filename[1] == '/') {
+        strncpy(full_path, filename, sizeof(full_path));
+    } else {
+        snprintf(full_path, sizeof(full_path), "%s/%s", mgr->base_path, filename);
+    }
+
+    FILE* fp = fopen(full_path, "rb");
+    if (!fp) {
+        printf("[ARM32 Asset] OPEN FAILED: %s\n", full_path);
+        return NULL;
+    }
+    
+    printf("[ARM32 Asset] OPEN SUCCESS: %s\n", full_path);
+    
+    AAsset_arm32* asset = (AAsset_arm32*)malloc(sizeof(AAsset_arm32));
+    asset->fp = fp;
+    strncpy(asset->name, filename, sizeof(asset->name));
+    return asset;
+}
+
+int AAsset_read_arm32(AAsset_arm32* asset, void* buf, size_t count) {
+    if (!asset || !asset->fp) return -1;
+    int read = fread(buf, 1, count, asset->fp);
+    printf("[ARM32 Asset] READ: %s (%d bytes)\n", asset->name, read);
+    return read;
+}
+
+void AAsset_close_arm32(AAsset_arm32* asset) {
+    if (asset) {
+        printf("[ARM32 Asset] CLOSE: %s\n", asset->name);
+        if (asset->fp) fclose(asset->fp);
+        free(asset);
+    }
+}
+
+off_t AAsset_getLength_arm32(AAsset_arm32* asset) {
+    if (!asset || !asset->fp) return 0;
+    long current = ftell(asset->fp);
+    fseek(asset->fp, 0, SEEK_END);
+    off_t len = ftell(asset->fp);
+    fseek(asset->fp, current, SEEK_SET);
+    printf("[ARM32 Asset] GETLEN: %s -> %ld\n", asset->name, (long)len);
+    return len;
+}
+
+int AAsset_openFileDescriptor_arm32(AAsset_arm32* asset, off_t* outStart, off_t* outLength) {
+    if (!asset || !asset->fp) return -1;
+    *outStart = 0;
+    *outLength = AAsset_getLength_arm32(asset);
+    return dup(fileno(asset->fp));
+}

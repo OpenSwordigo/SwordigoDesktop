@@ -41,6 +41,95 @@ static void hook_camera_ctor(uc_engine *uc, uint64_t address, uint32_t size, voi
     }
 }
 
+uint32_t g_game_scene_controller = 0;
+uint32_t g_hero_obj = 0;
+uint32_t g_hero_char_ctrl_comp = 0;
+uint32_t g_hero_health_comp = 0;
+uint32_t g_hero_mana_comp = 0;
+
+float s_vanilla_walk_speed = 0.0f;
+float s_vanilla_run_speed = 0.0f;
+float s_vanilla_jump_height = 0.0f;
+
+// Hook 1: GameSceneController::Update
+static void hook_game_scene_controller_update(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
+    uint32_t r0 = 0;
+    uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+    if (r0 != 0) {
+        g_game_scene_controller = r0;
+        Emulator* emu = (Emulator*)user_data;
+        uint8_t* mem = emu->get_memory_base();
+        g_hero_obj = *(uint32_t*)(mem + r0 + 0xa4);
+    }
+}
+
+// Hook 2: HeroEntityComponent::Update
+static void hook_hero_entity_update(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
+    uint32_t r0 = 0;
+    uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+    if (r0 != 0) {
+        Emulator* emu = (Emulator*)user_data;
+        uint8_t* mem = emu->get_memory_base();
+        uint32_t owner1 = *(uint32_t*)(mem + r0 + 0x14);
+        uint32_t owner2 = *(uint32_t*)(mem + r0 + 0x18);
+        if (owner1 != 0 && owner1 != g_hero_obj) {
+            g_hero_obj = owner1;
+        } else if (owner2 != 0 && owner2 != g_hero_obj) {
+            g_hero_obj = owner2;
+        }
+    }
+}
+
+// Hook 3: CharControllerComponent::Update
+static void hook_char_controller_update(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
+    uint32_t r0 = 0;
+    uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+    if (r0 != 0 && g_hero_obj != 0) {
+        Emulator* emu = (Emulator*)user_data;
+        uint8_t* mem = emu->get_memory_base();
+        uint32_t owner1 = *(uint32_t*)(mem + r0 + 0x14);
+        uint32_t owner2 = *(uint32_t*)(mem + r0 + 0x18);
+        if (owner1 == g_hero_obj || owner2 == g_hero_obj) {
+            if (g_hero_char_ctrl_comp != r0) {
+                g_hero_char_ctrl_comp = r0;
+                s_vanilla_walk_speed = *(float*)(mem + r0 + 0x170);
+                s_vanilla_run_speed = *(float*)(mem + r0 + 0x178);
+                s_vanilla_jump_height = *(float*)(mem + r0 + 0x164);
+            }
+        }
+    }
+}
+
+// Hook 4: HealthComponent::Update
+static void hook_health_update(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
+    uint32_t r0 = 0;
+    uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+    if (r0 != 0 && g_hero_obj != 0) {
+        Emulator* emu = (Emulator*)user_data;
+        uint8_t* mem = emu->get_memory_base();
+        uint32_t owner1 = *(uint32_t*)(mem + r0 + 0x14);
+        uint32_t owner2 = *(uint32_t*)(mem + r0 + 0x18);
+        if (owner1 == g_hero_obj || owner2 == g_hero_obj) {
+            g_hero_health_comp = r0;
+        }
+    }
+}
+
+// Hook 5: ManaComponent::Update
+static void hook_mana_update(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
+    uint32_t r0 = 0;
+    uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+    if (r0 != 0 && g_hero_obj != 0) {
+        Emulator* emu = (Emulator*)user_data;
+        uint8_t* mem = emu->get_memory_base();
+        uint32_t owner1 = *(uint32_t*)(mem + r0 + 0x14);
+        uint32_t owner2 = *(uint32_t*)(mem + r0 + 0x18);
+        if (owner1 == g_hero_obj || owner2 == g_hero_obj) {
+            g_hero_mana_comp = r0;
+        }
+    }
+}
+
 
 Emulator::Emulator(uint8_t* guest_mem, uint32_t mem_size) 
     : memory(guest_mem), size(mem_size), bridge(nullptr), uc(nullptr) {
@@ -121,6 +210,31 @@ Emulator::Emulator(uint8_t* guest_mem, uint32_t mem_size)
     uc_hook cam_hook;
     uc_hook_add((uc_engine*)uc, &cam_hook, UC_HOOK_CODE, (void*)hook_camera_ctor, this,
                 0x002e35c4, 0x002e35c6);
+
+    // Hook 2b: GameSceneController::Update
+    uc_hook scene_ctrl_hook;
+    uc_hook_add((uc_engine*)uc, &scene_ctrl_hook, UC_HOOK_CODE, (void*)hook_game_scene_controller_update, this,
+                0x00278738, 0x0027873a);
+
+    // Hook 2c: HeroEntityComponent::Update
+    uc_hook hero_ent_hook;
+    uc_hook_add((uc_engine*)uc, &hero_ent_hook, UC_HOOK_CODE, (void*)hook_hero_entity_update, this,
+                0x001fdf18, 0x001fdf1a);
+
+    // Hook 2d: CharControllerComponent::Update
+    uc_hook char_ctrl_hook;
+    uc_hook_add((uc_engine*)uc, &char_ctrl_hook, UC_HOOK_CODE, (void*)hook_char_controller_update, this,
+                0x001f285c, 0x001f285e);
+
+    // Hook 2e: HealthComponent::Update
+    uc_hook health_hook;
+    uc_hook_add((uc_engine*)uc, &health_hook, UC_HOOK_CODE, (void*)hook_health_update, this,
+                0x001fcf2c, 0x001fcf2e);
+
+    // Hook 2f: ManaComponent::Update
+    uc_hook mana_hook;
+    uc_hook_add((uc_engine*)uc, &mana_hook, UC_HOOK_CODE, (void*)hook_mana_update, this,
+                0x00201d64, 0x00201d66);
 
     // Hook 3: Unmapped memory
     uc_hook mem_hook;

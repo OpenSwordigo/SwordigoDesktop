@@ -43,6 +43,7 @@ namespace CaverSym {
     static constexpr uint32_t CameraControllerStopFollowing= 0x002e3b85;
     static constexpr uint32_t CameraControllerGotoTarget   = 0x002e3d3f;
     static constexpr uint32_t CameraEvaluateViewMatrix     = 0x002e34bd;
+    static constexpr uint32_t CameraSetPerspectiveProjection = 0x002e33c9;
 }
 
 // Scratch area in guest memory for Vector3 arguments

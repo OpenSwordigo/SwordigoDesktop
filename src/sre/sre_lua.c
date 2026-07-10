@@ -444,128 +444,189 @@ int sre_lua_resume_safe(lua_State* L, int narg) {
 
     return result;
 }
-/* ========== Lua Console — in-engine Lua code execution ==========
+/* ========== Lua Console — Remastered Backend ==========
  * 
- * The host writes a Lua code string to g_lua_console_buf[] and
- * sets g_lua_console_pending = 1. On the next ProgramState::Execute,
- * SRE runs the code in the engine's lua_State.
+ * Protocol (host ↔ SRE guest via shared guest memory):
+ *   g_lua_console_buf      — host writes Lua source here (up to 4095 chars)
+ *   g_lua_console_pending  — host sets to 1; SRE clears after exec
+ *   g_lua_console_status   — 0=idle 1=ok 2=error (set by SRE)
+ *   g_lua_console_result   — SRE writes result/error string here
+ *   g_lua_console_print_buf— captures print() calls during exec
  *
- * Results/errors are written to g_lua_console_result[].
- *
- * These globals are at known addresses that the host reads/writes
- * directly in guest memory via get_symbol_vaddr().
+ * Extras vs old version:
+ *   • Bare expressions auto-wrapped as "return <expr>" for REPL feel
+ *   • print() output captured into result (newline-joined)
+ *   • Multiple return values joined with "\t"
+ *   • Host can poll g_lua_console_status each frame for async results
  */
-#define CONSOLE_BUF_SIZE 4096
-char g_lua_console_buf[CONSOLE_BUF_SIZE];     /* Lua code to execute */
-char g_lua_console_result[CONSOLE_BUF_SIZE];  /* Output/error message */
-int  g_lua_console_pending = 0;               /* 1 = host wants to run code */
-int  g_lua_console_status = 0;                /* 0=idle, 1=success, 2=error */
+#define CONSOLE_BUF_SIZE   4096
+#define CONSOLE_PRINT_SIZE 8192
+
+char g_lua_console_buf[CONSOLE_BUF_SIZE];        /* input: Lua source */
+char g_lua_console_result[CONSOLE_BUF_SIZE];     /* output: result or error */
+char g_lua_console_print_buf[CONSOLE_PRINT_SIZE];/* captured print() output */
+int  g_lua_console_pending  = 0;  /* host sets 1 to submit */
+int  g_lua_console_status   = 0;  /* 0=idle 1=ok 2=error */
 
 /* Last captured lua_State — for host inspection */
 lua_State* g_sre_last_lua_state = 0;
 
-/* Internal: execute pending console command in the given lua_State
- * 
- * Uses Lua's own loadstring() function via pcall — this avoids the
- * setjmp/longjmp crash that happens when luaL_loadbuffer hits syntax errors.
- * 
- * Flow: pcall(loadstring, code) → pcall(result_func)
- */
+/* ---- print() override ----
+ * Replaces the Lua "print" global while the console runs.
+ * Appends all arguments (tostring'd, tab-separated) + newline
+ * into g_lua_console_print_buf. */
+static int sre_console_print(lua_State* L) {
+    int n = g_lua_gettop(L);
+    int pos = 0;
+    /* find current end of print buf */
+    while (pos < CONSOLE_PRINT_SIZE - 1 && g_lua_console_print_buf[pos]) pos++;
+    for (int i = 1; i <= n; i++) {
+        if (i > 1 && pos < CONSOLE_PRINT_SIZE - 2) g_lua_console_print_buf[pos++] = '\t';
+        size_t len = 0;
+        const char* s = g_lua_tolstring(L, i, &len);
+        if (!s) { s = "nil"; len = 3; }
+        for (size_t j = 0; j < len && pos < CONSOLE_PRINT_SIZE - 2; j++)
+            g_lua_console_print_buf[pos++] = s[j];
+    }
+    if (pos < CONSOLE_PRINT_SIZE - 1) g_lua_console_print_buf[pos++] = '\n';
+    g_lua_console_print_buf[pos] = 0;
+    return 0;
+}
+
+/* ---- str_copy helper ---- */
+static int sre_strcopy(char* dst, const char* src, int max) {
+    int i = 0;
+    while (src[i] && i < max - 1) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+    return i;
+}
+
+/* ---- join N stack values from base+1 to top into result ---- */
+static void sre_collect_returns(lua_State* L, int base) {
+    int top = g_lua_gettop(L);
+    int pos = 0;
+    for (int i = base + 1; i <= top; i++) {
+        if (i > base + 1 && pos < CONSOLE_BUF_SIZE - 2) { g_lua_console_result[pos++] = '\t'; }
+        size_t len = 0;
+        const char* s = g_lua_tolstring(L, i, &len);
+        if (!s) {
+            /* try type name */
+            int t = g_lua_type(L, i);
+            if      (t == 0) { s = "nil";      len = 3; }
+            else if (t == 1) { s = "<bool>";   len = 6; }
+            else if (t == 5) { s = "<table>";  len = 7; }
+            else if (t == 2) { s = "<udata>";  len = 7; }
+            else             { s = "?";         len = 1; }
+        }
+        for (size_t j = 0; j < len && pos < CONSOLE_BUF_SIZE - 2; j++)
+            g_lua_console_result[pos++] = s[j];
+    }
+    g_lua_console_result[pos] = 0;
+}
+
 static void sre_run_console(lua_State* L) {
-    if (!g_lua_getfield || !g_lua_pcall || !g_lua_pushstring || !g_lua_tolstring) {
-        const char* msg = "ERR: Lua API not resolved";
-        int i;
-        for (i = 0; msg[i] && i < CONSOLE_BUF_SIZE - 1; i++)
-            g_lua_console_result[i] = msg[i];
-        g_lua_console_result[i] = 0;
+    if (!g_lua_getfield || !g_lua_pcall || !g_lua_pushstring || !g_lua_gettop) {
+        sre_strcopy(g_lua_console_result, "ERR: Lua API not resolved", CONSOLE_BUF_SIZE);
         g_lua_console_status = 2;
         return;
     }
-    
-    int base_top = g_lua_gettop(L);
-    
-    /* Step 1: Get loadstring function from globals */
+
+    /* Clear capture buffers */
+    g_lua_console_print_buf[0] = 0;
+    g_lua_console_result[0]    = 0;
+
+    int base = g_lua_gettop(L);
+
+    /* Save original print() so we can restore it after execution */
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "print");  /* stack: ... [orig_print] */
+
+    /* Override print() with our capture version */
+    g_lua_pushcclosure(L, sre_console_print, 0);
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "print");
+
+    /* Auto-wrap bare expression: try "return <code>" first */
+    char wrapped[CONSOLE_BUF_SIZE + 8];
+    wrapped[0] = 'r'; wrapped[1] = 'e'; wrapped[2] = 't'; wrapped[3] = 'u';
+    wrapped[4] = 'r'; wrapped[5] = 'n'; wrapped[6] = ' ';
+    sre_strcopy(wrapped + 7, g_lua_console_buf, CONSOLE_BUF_SIZE);
+
+    /* Try loadstring("return <code>") */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "loadstring");
-    
-    /* Step 2: Push the code string */
-    g_lua_pushstring(L, g_lua_console_buf);
-    
-    /* Step 3: pcall loadstring(code) → (func, nil) or (nil, errmsg) */
+    g_lua_pushstring(L, wrapped);
     int r = g_lua_pcall(L, 1, 2, 0);
+    int use_return = (r == 0 && g_lua_type(L, -2) == LUA_TFUNCTION);
+
+    if (!use_return) {
+        /* Fall back to plain code */
+        g_lua_settop(L, base + 1);  /* keep orig_print saved below base+1 */
+        g_lua_getfield(L, LUA_GLOBALSINDEX, "loadstring");
+        g_lua_pushstring(L, g_lua_console_buf);
+        r = g_lua_pcall(L, 1, 2, 0);
+        if (r != 0 || g_lua_type(L, -2) != LUA_TFUNCTION) {
+            const char* err = g_lua_tolstring ? g_lua_tolstring(L, -1, 0) : "syntax error";
+            if (err) sre_strcopy(g_lua_console_result, err, CONSOLE_BUF_SIZE);
+            else     sre_strcopy(g_lua_console_result, "syntax error", CONSOLE_BUF_SIZE);
+            /* Restore original print before returning */
+            g_lua_settop(L, base + 1);
+            g_lua_setfield(L, LUA_GLOBALSINDEX, "print");
+            g_lua_settop(L, base);
+            g_lua_console_status = 2;
+            return;
+        }
+    }
+
+    /* Pop nil (second return of loadstring), func is on top */
+    lua_pop(L, 1);
+    int call_base = g_lua_gettop(L);
+
+    /* Execute compiled function — capture ALL return values */
+    r = g_lua_pcall(L, 0, LUA_MULTRET, 0);
     if (r != 0) {
-        /* pcall itself failed (shouldn't happen) */
-        const char* err = lua_tostring(L, -1);
-        if (err) {
-            int i;
-            for (i = 0; err[i] && i < CONSOLE_BUF_SIZE - 1; i++)
-                g_lua_console_result[i] = err[i];
-            g_lua_console_result[i] = 0;
-        }
-        g_lua_settop(L, base_top);
+        const char* err = g_lua_tolstring ? g_lua_tolstring(L, -1, 0) : "runtime error";
+        if (err) sre_strcopy(g_lua_console_result, err, CONSOLE_BUF_SIZE);
+        else     sre_strcopy(g_lua_console_result, "runtime error", CONSOLE_BUF_SIZE);
+        /* Restore original print */
+        g_lua_settop(L, base + 1);
+        g_lua_setfield(L, LUA_GLOBALSINDEX, "print");
+        g_lua_settop(L, base);
         g_lua_console_status = 2;
         return;
     }
-    
-    /* Step 4: Check if loadstring returned a function or nil+error */
-    int type_at_minus2 = g_lua_type(L, -2);
-    
-    if (type_at_minus2 != LUA_TFUNCTION) {
-        /* Syntax error: stack is [nil, errmsg] */
-        const char* err = lua_tostring(L, -1);
-        if (err) {
-            int i;
-            for (i = 0; err[i] && i < CONSOLE_BUF_SIZE - 1; i++)
-                g_lua_console_result[i] = err[i];
-            g_lua_console_result[i] = 0;
-        } else {
-            g_lua_console_result[0] = '?';
-            g_lua_console_result[1] = 0;
-        }
-        g_lua_settop(L, base_top);
-        g_lua_console_status = 2;
-        return;
+
+    /* Collect return values */
+    sre_collect_returns(L, call_base - 1);
+
+    /* Restore original print — it's sitting at base+1 on our save slot */
+    g_lua_settop(L, base + 1);
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "print");
+    g_lua_settop(L, base);
+
+    /* If print() produced output and result is empty, use print output as result */
+    if (!g_lua_console_result[0] && g_lua_console_print_buf[0]) {
+        /* strip trailing newline */
+        int len = 0;
+        while (g_lua_console_print_buf[len]) len++;
+        if (len > 0 && g_lua_console_print_buf[len-1] == '\n') g_lua_console_print_buf[len-1] = 0;
+        sre_strcopy(g_lua_console_result, g_lua_console_print_buf, CONSOLE_BUF_SIZE);
+    } else if (g_lua_console_print_buf[0] && g_lua_console_result[0]) {
+        /* Both — prepend print output */
+        char merged[CONSOLE_BUF_SIZE];
+        sre_strcopy(merged, g_lua_console_print_buf, CONSOLE_BUF_SIZE);
+        int ml = 0; while (merged[ml]) ml++;
+        if (ml > 0 && merged[ml-1] == '\n') ml--;
+        merged[ml++] = '\n';
+        sre_strcopy(merged + ml, g_lua_console_result, CONSOLE_BUF_SIZE - ml);
+        sre_strcopy(g_lua_console_result, merged, CONSOLE_BUF_SIZE);
     }
-    
-    /* Step 5: Pop the nil, keep the function */
-    lua_pop(L, 1);  /* remove nil from top, function is now at top */
-    
-    /* Step 6: pcall the compiled function */
-    r = g_lua_pcall(L, 0, 1, 0);
-    if (r != 0) {
-        /* Runtime error */
-        const char* err = lua_tostring(L, -1);
-        if (err) {
-            int i;
-            for (i = 0; err[i] && i < CONSOLE_BUF_SIZE - 1; i++)
-                g_lua_console_result[i] = err[i];
-            g_lua_console_result[i] = 0;
-        }
-        g_lua_settop(L, base_top);
-        g_lua_console_status = 2;
-        return;
-    }
-    
-    /* Step 7: Read result */
-    if (g_lua_gettop(L) > base_top && g_lua_type(L, -1) != LUA_TNIL) {
-        const char* result = lua_tostring(L, -1);
-        if (result) {
-            int i;
-            for (i = 0; result[i] && i < CONSOLE_BUF_SIZE - 1; i++)
-                g_lua_console_result[i] = result[i];
-            g_lua_console_result[i] = 0;
-        } else {
-            g_lua_console_result[0] = 'O';
-            g_lua_console_result[1] = 'K';
-            g_lua_console_result[2] = 0;
-        }
-    } else {
+
+    if (!g_lua_console_result[0]) {
         g_lua_console_result[0] = 'O';
         g_lua_console_result[1] = 'K';
         g_lua_console_result[2] = 0;
     }
-    g_lua_settop(L, base_top);
     g_lua_console_status = 1;
 }
+
 
 /* ========== ProgramState::Execute replacement ========== 
  * Original: calls lua_call(L, nargs, 0) which aborts on error

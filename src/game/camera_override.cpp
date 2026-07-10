@@ -154,20 +154,97 @@ void cam_reset_accel() {
     s_accel_timer = 0.0f;
 }
 
+static bool s_was_active = false;
+
 void cam_apply(Emulator* emu, uint8_t* guest_mem) {
-    if (!g_cam_active) return;
     if (g_cam_ctrl_ptr == 0) return;
 
-    uint32_t vec3_addr = write_vec3(guest_mem, g_cam_off_x, g_cam_off_y, g_cam_off_z);
-    bool prev_quiet = emu->quiet_mode;
-    emu->quiet_mode = true;
+    if (g_cam_active) {
+        s_was_active = true;
 
-    // CameraController::FocusAtPoint(Vector3 const&, bool smooth)
-    // r0=this, r1=&vec3, r2=smooth
-    emu->call(CaverSym::CameraControllerFocusAtPoint,
-              {g_cam_ctrl_ptr, vec3_addr, (uint32_t)(g_cam_smooth ? 1 : 0)});
+        // Custom offsets: base offset + user control offsets
+        // Vanilla: 0, 0, -1000. 3D default: 0, 300, -600.
+        float offset_x = g_cam_off_x;
+        float offset_y = 300.0f + g_cam_off_y;
+        float offset_z = -600.0f + g_cam_off_z;
 
-    emu->quiet_mode = prev_quiet;
+        // 1. Write the custom position offset to CameraController + 0x04
+        memcpy(guest_mem + g_cam_ctrl_ptr + 0x04, &offset_x, 4);
+        memcpy(guest_mem + g_cam_ctrl_ptr + 0x08, &offset_y, 4);
+        memcpy(guest_mem + g_cam_ctrl_ptr + 0x0c, &offset_z, 4);
+
+        // 2. Write the Up Vector (0, 1, 0) to CameraController + 0x48
+        float up_x = 0.0f;
+        float up_y = 1.0f;
+        float up_z = 0.0f;
+        memcpy(guest_mem + g_cam_ctrl_ptr + 0x48, &up_x, 4);
+        memcpy(guest_mem + g_cam_ctrl_ptr + 0x4c, &up_y, 4);
+        memcpy(guest_mem + g_cam_ctrl_ptr + 0x50, &up_z, 4);
+
+        // 3. Set the 3D perspective projection on the Camera object
+        uint32_t camera_ptr = *(uint32_t*)(guest_mem + g_cam_ctrl_ptr + 0x54);
+        if (camera_ptr != 0) {
+            float fov_rad = 45.0f * 3.14159265f / 180.0f;
+            extern int g_win_w;
+            extern int g_win_h;
+            float aspect = (float)g_win_w / (float)g_win_h;
+            float near_plane = 50.0f;
+            float far_plane = 20000.0f;
+
+            bool prev_quiet = emu->quiet_mode;
+            emu->quiet_mode = true;
+            
+            // Allocate 4 bytes on guest stack for stack arguments (far)
+            uint32_t sp = emu->get_reg(13);
+            uint32_t new_sp = sp - 4;
+            *(uint32_t*)(guest_mem + new_sp) = f2u(far_plane);
+            emu->set_reg(13, new_sp);
+
+            // Call SetPerspectiveProjection(Camera* this, float fov, float aspect, float near)
+            emu->call(CaverSym::CameraSetPerspectiveProjection,
+                      {camera_ptr, f2u(fov_rad), f2u(aspect), f2u(near_plane)});
+
+            // Restore guest stack pointer
+            emu->set_reg(13, sp);
+
+            emu->quiet_mode = prev_quiet;
+        }
+    } else if (s_was_active) {
+        // Restore vanilla camera offsets and perspective projection once
+        s_was_active = false;
+
+        float offset_x = 0.0f;
+        float offset_y = 0.0f;
+        float offset_z = -1000.0f;
+        memcpy(guest_mem + g_cam_ctrl_ptr + 0x04, &offset_x, 4);
+        memcpy(guest_mem + g_cam_ctrl_ptr + 0x08, &offset_y, 4);
+        memcpy(guest_mem + g_cam_ctrl_ptr + 0x0c, &offset_z, 4);
+
+        float up_x = 0.0f;
+        float up_y = 1.0f;
+        float up_z = 0.0f;
+        memcpy(guest_mem + g_cam_ctrl_ptr + 0x48, &up_x, 4);
+        memcpy(guest_mem + g_cam_ctrl_ptr + 0x4c, &up_y, 4);
+        memcpy(guest_mem + g_cam_ctrl_ptr + 0x50, &up_z, 4);
+
+        uint32_t camera_ptr = *(uint32_t*)(guest_mem + g_cam_ctrl_ptr + 0x54);
+        if (camera_ptr != 0) {
+            bool prev_quiet = emu->quiet_mode;
+            emu->quiet_mode = true;
+
+            uint32_t sp = emu->get_reg(13);
+            uint32_t new_sp = sp - 4;
+            *(uint32_t*)(guest_mem + new_sp) = f2u(20000.0f);
+            emu->set_reg(13, new_sp);
+
+            // Vanilla: 20 degrees FOV (0.34906584 rad), aspect = 1.0, near = 50.0, far = 20000.0
+            emu->call(CaverSym::CameraSetPerspectiveProjection,
+                      {camera_ptr, f2u(0.34906584f), f2u(1.0f), f2u(50.0f)});
+
+            emu->set_reg(13, sp);
+            emu->quiet_mode = prev_quiet;
+        }
+    }
 }
 
 void cam_debug_string(char* out, int max_len) {

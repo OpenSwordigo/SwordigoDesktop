@@ -20,6 +20,7 @@
 
 #include "sre.h"
 #include "sre_gui.h"
+#include "sre_caver.h"
 
 /* =====================================================================
  * FORWARD DECLARATIONS
@@ -1198,15 +1199,13 @@ void sre_MainMenuView_ButtonPressed(void* self, void* target, void* sender) {
 
 extern uint64_t g_swordigo_base;  /* from sre_init.c */
 
-typedef void (*pfn_GameOverVC_DidContinue)(void* self, void* view);
+extern pfn_GameOverVC_DidContinue g_sre_GameOverVC_DidContinue;
 
 void sre_GameOverVC_ShowAdMaybe(void* self) {
-    /* Compute absolute address of GameOverViewDidContinue */
-    pfn_GameOverVC_DidContinue didContinue =
-        (pfn_GameOverVC_DidContinue)(g_swordigo_base + 0x348060);
-
     /* Skip the ad, go straight to respawn */
-    didContinue(self, 0);
+    if (g_sre_GameOverVC_DidContinue) {
+        g_sre_GameOverVC_DidContinue(self, 0);
+    }
 }
 
 /* =====================================================================
@@ -1247,7 +1246,7 @@ void sre_GameOverVC_ShowAdMaybe(void* self) {
  * ===================================================================== */
 
 /* BSS offset of the engine's global ITextInputDelegate* pointer */
-#define TEXTINPUT_DELEGATE_OFFSET  0x7f3ca8
+#define TEXTINPUT_DELEGATE_OFFSET  0x7e9cb0
 
 /* GUITextFieldImpl field offsets */
 #define TEXTFIELD_BASE_ADJUST      0x140  /* delegate_ptr - this = base */

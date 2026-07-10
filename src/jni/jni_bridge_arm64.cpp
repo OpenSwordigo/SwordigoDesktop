@@ -13,6 +13,7 @@
 #include "platform/data_path.h"
 #include "android/asset_manager.h"
 #include "platform/video_background.h"
+#include "platform/pvrtc_decoder.h"
 #include <iostream>
 #include <cstring>
 #include <cmath>
@@ -157,69 +158,8 @@ void JniBridge64::call_handler(uint64_t address, void* emu_ptr) {
     if (addr_to_func.count(address)) {
         BridgeFunction64& func = addr_to_func[address];
         IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-        if (!emu->quiet_mode) {
-            static const std::unordered_map<std::string, bool> quiet_funcs = {
-                {"memcpy",1},{"memset",1},{"memmove",1},{"memcmp",1},{"memchr",1},
-                {"strlen",1},{"malloc",1},{"calloc",1},{"realloc",1},{"free",1},
-                {"strchr",1},{"strrchr",1},{"strcpy",1},{"strncpy",1},
-                {"strcmp",1},{"strncmp",1},{"strcat",1},{"strstr",1},
-                {"cosf",1},{"sinf",1},{"roundf",1},{"floorf",1},{"ceilf",1},
-                {"sqrtf",1},{"atan2f",1},{"powf",1},{"sincosf",1},{"acosf",1},
-                {"asinf",1},{"atanf",1},{"tanf",1},{"tan",1},{"cos",1},{"sin",1},
-                {"acos",1},{"pow",1},{"round",1},{"fmodf",1},
-                {"strtol",1},{"strtoul",1},{"atoi",1},{"atof",1},{"strtod",1},{"strtof",1},
-                {"wctob",1},{"btowc",1},{"__ctype_get_mb_cur_max",1},
-                {"iscntrl",1},{"isprint",1},{"isgraph",1},{"ispunct",1},{"isxdigit",1},
-                {"isblank",1},{"isalpha",1},{"isdigit",1},{"isalnum",1},{"isspace",1},
-                {"isupper",1},{"islower",1},{"toupper",1},{"tolower",1},
-                {"wctype",1},{"iswctype",1},{"towupper",1},{"towlower",1},
-                {"pthread_mutex_init",1},{"pthread_mutex_lock",1},{"pthread_mutex_unlock",1},
-                {"pthread_mutex_destroy",1},{"pthread_cond_init",1},{"pthread_cond_signal",1},
-                {"pthread_cond_wait",1},{"pthread_cond_destroy",1},{"pthread_cond_broadcast",1},
-                {"pthread_key_create",1},{"pthread_key_delete",1},
-                {"pthread_getspecific",1},{"pthread_setspecific",1},
-                {"pthread_self",1},{"pthread_once",1},{"pthread_create",1},
-                {"__cxa_atexit",1},{"__cxa_finalize",1},{"__cxa_guard_acquire",1},
-                {"__cxa_guard_release",1},{"__errno",1},{"__stack_chk_fail",1},
-                {"__google_potentially_blocking_region_begin",1},
-                {"__google_potentially_blocking_region_end",1},
-                {"sprintf",1},{"snprintf",1},{"sscanf",1},{"printf",1},
-                {"fopen",1},{"fclose",1},{"fread",1},{"fwrite",1},{"fseek",1},{"ftell",1},
-                {"time",1},{"clock",1},{"clock_gettime",1},{"gettimeofday",1},
-                {"nanosleep",1},{"sched_yield",1},{"lrand48",1},
-                {"dl_iterate_phdr",1},{"strerror",1},
-                {"abort",1},{"exit",1},{"raise",1},
-                {"glBlendFunc",1},{"glEnable",1},{"glDisable",1},
-                {"glClear",1},{"glClearColor",1},{"glViewport",1},
-                {"glBindTexture",1},{"glGenTextures",1},{"glDeleteTextures",1},
-                {"glTexParameteri",1},{"glTexImage2D",1},{"glTexSubImage2D",1},
-                {"glDrawArrays",1},{"glDrawElements",1},
-                {"glBindBuffer",1},{"glBufferData",1},{"glBufferSubData",1},
-                {"glGenBuffers",1},{"glDeleteBuffers",1},
-                {"glVertexAttribPointer",1},{"glEnableVertexAttribArray",1},
-                {"glDisableVertexAttribArray",1},
-                {"glUseProgram",1},{"glGetUniformLocation",1},
-                {"glUniform1f",1},{"glUniform1i",1},{"glUniform2f",1},
-                {"glUniform3f",1},{"glUniform4f",1},{"glUniformMatrix4fv",1},
-                {"glGetError",1},{"glPixelStorei",1},{"glScissor",1},
-                {"glActiveTexture",1},{"glBlendFuncSeparate",1},
-                {"glDepthFunc",1},{"glDepthMask",1},{"glColorMask",1},
-                {"glStencilFunc",1},{"glStencilOp",1},{"glStencilMask",1},
-                {"glBindFramebuffer",1},{"glBindRenderbuffer",1},
-                {"glCompressedTexImage2D",1},{"glLineWidth",1},
-                {"alSourcePlay",1},{"alSourceStop",1},{"alSourcePause",1},
-                {"alSourcef",1},{"alSourcei",1},{"alSource3f",1},
-                {"alGetSourcei",1},{"alGetSourcef",1},
-                {"alGenSources",1},{"alDeleteSources",1},
-                {"alGenBuffers",1},{"alDeleteBuffers",1},
-                {"alBufferData",1},{"alSourceQueueBuffers",1},
-                {"alSourceUnqueueBuffers",1},{"alGetError",1},
-                {"alListenerf",1},{"alListener3f",1},{"alListenerfv",1},
-            };
-            if (!quiet_funcs.count(func.name)) {
-                std::cout << "[Bridge64] Call: " << func.name << std::endl;
-            }
-        }
+        // Successful calls are intentionally not logged to reduce noise.
+        // Only errors (UNHANDLED, Unknown address) are printed.
         if (func.handler) {
             func.handler(emu_ptr);
         } else {
@@ -277,8 +217,8 @@ static std::mutex g_heap_mutex;
 
 static uint32_t host_malloc_locked(uint32_t size) {
     size = (size + 7) & ~7;
-    // Only recycle if heap size exceeds 3080MB (fast path O(1) bump allocator under 580MB)
-    if (g_guest_heap_ptr - 0x20000000 > 3080ULL * 1024 * 1024) {
+    // Only recycle if heap size exceeds 2048MB (fast path O(1) bump allocator under 2GB)
+    if (g_guest_heap_ptr - 0x20000000 > 2048ULL * 1024 * 1024) {
         size_t search_limit = std::min(g_deferred_free_list.size(), (size_t)50);
         for (size_t i = 0; i < search_limit; i++) {
             const auto& db = g_deferred_free_list[i];
@@ -2223,6 +2163,84 @@ static void bridge_sscanf(void* emu_ptr) {
 // --- sprintf / snprintf / vsprintf / fprintf / printf ---
 // These are CRITICAL for Lua's internal error messages and string formatting
 
+static std::string format_guest_string(IEmulatorArm64* emu, const char* fmt, int start_arg_idx) {
+    uint8_t* memory = emu->get_memory_base();
+    std::string res;
+    int reg_idx = start_arg_idx;
+    int dreg_idx = 0;
+    int stack_offset = 0;
+    
+    auto get_next_arg = [&]() -> uint64_t {
+        if (reg_idx < 8) {
+            return emu->get_reg(reg_idx++);
+        } else {
+            uint64_t sp = emu->get_reg(31); // SP
+            uint64_t val = *(uint64_t*)(memory + sp + stack_offset);
+            stack_offset += 8;
+            return val;
+        }
+    };
+    
+    auto get_next_dreg = [&]() -> double {
+        if (dreg_idx < 8) {
+            return emu->get_dreg(dreg_idx++);
+        }
+        return 0.0;
+    };
+
+    while (*fmt) {
+        if (*fmt == '%' && *(fmt + 1) != '\0') {
+            fmt++;
+            char spec = *fmt;
+            std::string width_prec = "%";
+            while ((spec >= '0' && spec <= '9') || spec == '.' || spec == '-' || spec == '+') {
+                width_prec += spec;
+                fmt++;
+                spec = *fmt;
+            }
+            width_prec += spec;
+            
+            if (spec == 's') {
+                uint64_t ptr = get_next_arg();
+                if (ptr) {
+                    res += (const char*)(memory + ptr);
+                } else {
+                    res += "(null)";
+                }
+            } else if (spec == 'd' || spec == 'i') {
+                int64_t val = (int64_t)(int32_t)get_next_arg();
+                char buf[64];
+                snprintf(buf, sizeof(buf), width_prec.c_str(), val);
+                res += buf;
+            } else if (spec == 'u') {
+                uint64_t val = (uint32_t)get_next_arg();
+                char buf[64];
+                snprintf(buf, sizeof(buf), width_prec.c_str(), val);
+                res += buf;
+            } else if (spec == 'x' || spec == 'X') {
+                uint64_t val = get_next_arg();
+                char buf[64];
+                snprintf(buf, sizeof(buf), width_prec.c_str(), val);
+                res += buf;
+            } else if (spec == 'f' || spec == 'g' || spec == 'G' || spec == 'e' || spec == 'E') {
+                double val = get_next_dreg();
+                char buf[64];
+                snprintf(buf, sizeof(buf), width_prec.c_str(), val);
+                res += buf;
+            } else if (spec == '%') {
+                res += '%';
+            } else {
+                res += '%';
+                res += spec;
+            }
+        } else {
+            res += *fmt;
+        }
+        fmt++;
+    }
+    return res;
+}
+
 static void bridge_sprintf(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
@@ -2231,51 +2249,9 @@ static void bridge_sprintf(void* emu_ptr) {
     char* dst = (char*)(memory + dst_ptr);
     const char* fmt = (const char*)(memory + fmt_ptr);
     
-    // Handle common format strings used by Lua
-    if (strchr(fmt, '%') == nullptr) {
-        // No format specifiers — just copy
-        strcpy(dst, fmt);
-        emu->set_reg(0, strlen(fmt));
-    } else if (strcmp(fmt, "%s") == 0) {
-        uint32_t arg_ptr = emu->get_reg(2);
-        const char* arg = (const char*)(memory + arg_ptr);
-        int n = sprintf(dst, "%s", arg);
-        emu->set_reg(0, n);
-    } else if (strcmp(fmt, "%d") == 0 || strcmp(fmt, "%i") == 0) {
-        int arg = (int)emu->get_reg(2);
-        int n = sprintf(dst, fmt, arg);
-        emu->set_reg(0, n);
-    } else if (strcmp(fmt, "%u") == 0) {
-        uint32_t arg = (uint32_t)emu->get_reg(2);
-        int n = sprintf(dst, fmt, arg);
-        emu->set_reg(0, n);
-    } else if (strcmp(fmt, "%p") == 0) {
-        uint64_t arg = emu->get_reg(2);
-        int n = sprintf(dst, "0x%lx", arg);
-        emu->set_reg(0, n);
-    } else if (strcmp(fmt, "%f") == 0 || strcmp(fmt, "%g") == 0 || strcmp(fmt, "%e") == 0) {
-        double arg = emu->get_dreg(0);
-        int n = sprintf(dst, fmt, arg);
-        emu->set_reg(0, n);
-    } else if (strcmp(fmt, "%.14g") == 0 || strcmp(fmt, "%.7g") == 0) {
-        // Lua's default number format
-        double arg = emu->get_dreg(0);
-        int n = sprintf(dst, fmt, arg);
-        emu->set_reg(0, n);
-    } else if (strcmp(fmt, "%c") == 0) {
-        int arg = (int)emu->get_reg(2);
-        int n = sprintf(dst, fmt, arg);
-        emu->set_reg(0, n);
-    } else if (strcmp(fmt, "%x") == 0 || strcmp(fmt, "%X") == 0) {
-        uint32_t arg = (uint32_t)emu->get_reg(2);
-        int n = sprintf(dst, fmt, arg);
-        emu->set_reg(0, n);
-    } else {
-        // Fallback: try to handle as string format with one arg
-        // Just copy the format string as-is to avoid crashes
-        strcpy(dst, fmt);
-        emu->set_reg(0, strlen(fmt));
-    }
+    std::string formatted = format_guest_string(emu, fmt, 2);
+    int n = sprintf(dst, "%s", formatted.c_str());
+    emu->set_reg(0, n);
 }
 
 static void bridge_snprintf(void* emu_ptr) {
@@ -2287,27 +2263,9 @@ static void bridge_snprintf(void* emu_ptr) {
     char* dst = (char*)(memory + dst_ptr);
     const char* fmt = (const char*)(memory + fmt_ptr);
     
-    if (strchr(fmt, '%') == nullptr) {
-        int n = snprintf(dst, maxlen, "%s", fmt);
-        emu->set_reg(0, n);
-    } else if (strcmp(fmt, "%s") == 0) {
-        uint32_t arg_ptr = emu->get_reg(3);
-        const char* arg = (const char*)(memory + arg_ptr);
-        int n = snprintf(dst, maxlen, "%s", arg);
-        emu->set_reg(0, n);
-    } else if (strcmp(fmt, "%d") == 0 || strcmp(fmt, "%i") == 0) {
-        int arg = (int)emu->get_reg(3);
-        int n = snprintf(dst, maxlen, fmt, arg);
-        emu->set_reg(0, n);
-    } else if (strcmp(fmt, "%.14g") == 0 || strcmp(fmt, "%.7g") == 0 ||
-               strcmp(fmt, "%f") == 0 || strcmp(fmt, "%g") == 0) {
-        double arg = emu->get_dreg(0);
-        int n = snprintf(dst, maxlen, fmt, arg);
-        emu->set_reg(0, n);
-    } else {
-        int n = snprintf(dst, maxlen, "%s", fmt);
-        emu->set_reg(0, n);
-    }
+    std::string formatted = format_guest_string(emu, fmt, 3);
+    int n = snprintf(dst, maxlen, "%s", formatted.c_str());
+    emu->set_reg(0, n);
 }
 
 static void bridge_fprintf(void* emu_ptr) {
@@ -2315,9 +2273,9 @@ static void bridge_fprintf(void* emu_ptr) {
     uint8_t* memory = emu->get_memory_base();
     uint32_t fmt_ptr = emu->get_reg(1);
     const char* fmt = (const char*)(memory + fmt_ptr);
-    // Just print to host stderr for debugging
-    std::cerr << "[fprintf] " << fmt << std::endl;
-    emu->set_reg(0, strlen(fmt));
+    std::string formatted = format_guest_string(emu, fmt, 2);
+    std::cerr << "[fprintf] " << formatted;
+    emu->set_reg(0, formatted.length());
 }
 
 static void bridge_printf(void* emu_ptr) {
@@ -2325,8 +2283,9 @@ static void bridge_printf(void* emu_ptr) {
     uint8_t* memory = emu->get_memory_base();
     uint32_t fmt_ptr = emu->get_reg(0);
     const char* fmt = (const char*)(memory + fmt_ptr);
-    std::cout << "[printf] " << fmt;
-    emu->set_reg(0, strlen(fmt));
+    std::string formatted = format_guest_string(emu, fmt, 1);
+    std::cout << "[printf] " << formatted;
+    emu->set_reg(0, formatted.length());
 }
 
 static void bridge_fputs(void* emu_ptr) {
@@ -2577,6 +2536,38 @@ static std::unordered_map<uint32_t, FILE*> g_file_handles;
 static std::unordered_map<uint32_t, gzFile> g_gz_handles;
 static uint32_t g_next_file_handle = 0x70000001;
 
+// PVR-as-gzip: when gzdopen is called on a PVR file fd, we decode the PVR
+// pixels immediately and serve them from this buffer during gzread calls.
+struct PVRGzBuffer {
+    std::vector<uint8_t> pixels;  // decoded RGBA pixels
+    uint32_t offset;              // read cursor
+    int width, height;
+};
+static std::unordered_map<uint32_t, PVRGzBuffer> g_pvr_gz_handles;
+
+// Forward declarations — full definitions appear later in this file
+// (HostPVRv3Header and HostPVRv2Header are defined around bridge_PVRTTextureLoadFromPVRBuffer)
+static void decode_etc1_block(const uint8_t* src, uint8_t* dst, int dst_stride);
+
+// PVR header structs needed by try_decode_pvr_from_fd (duplicated here for
+// forward use; the canonical #pragma pack definitions come later)
+#pragma pack(push, 1)
+struct HostPVRv3Header {
+    uint32_t version; uint32_t flags; uint64_t pixel_format;
+    uint32_t color_space; uint32_t channel_type;
+    uint32_t height; uint32_t width; uint32_t depth;
+    uint32_t num_surfaces; uint32_t num_faces;
+    uint32_t mip_count; uint32_t metadata_size;
+};
+struct HostPVRv2Header {
+    uint32_t header_size; uint32_t height; uint32_t width;
+    uint32_t mip_count; uint32_t flags; uint32_t data_size;
+    uint32_t bpp; uint32_t mask_r; uint32_t mask_g;
+    uint32_t mask_b; uint32_t mask_a; uint32_t magic; uint32_t num_surfaces;
+};
+#pragma pack(pop)
+
+
 static void bridge_lseek(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     int fd = emu->get_reg(0);
@@ -2593,32 +2584,300 @@ static void bridge_lseek(void* emu_ptr) {
     }
 }
 
+static bool decompress_gzip_buffer(const std::vector<uint8_t>& in_buf, std::vector<uint8_t>& out_buf) {
+    z_stream strm;
+    memset(&strm, 0, sizeof(strm));
+    if (inflateInit2(&strm, 16 + MAX_WBITS) != Z_OK) return false;
+    
+    strm.next_in = const_cast<uint8_t*>(in_buf.data());
+    strm.avail_in = in_buf.size();
+    
+    uint8_t temp[16384];
+    int ret;
+    do {
+        strm.next_out = temp;
+        strm.avail_out = sizeof(temp);
+        ret = inflate(&strm, Z_NO_FLUSH);
+        if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
+            inflateEnd(&strm);
+            return false;
+        }
+        size_t decoded = sizeof(temp) - strm.avail_out;
+        if (decoded > 0) {
+            out_buf.insert(out_buf.end(), temp, temp + decoded);
+        }
+    } while (ret != Z_STREAM_END && strm.avail_in > 0);
+    
+    inflateEnd(&strm);
+    return (ret == Z_STREAM_END);
+}
+
+static bool parse_pvr_uncompressed_format(uint64_t pixel_format, GLenum& gl_format, GLenum& gl_type, int& bpp, int& caver_format) {
+    uint32_t fmt_high = pixel_format >> 32;
+    if (fmt_high == 0) {
+        return false; // Compressed format
+    }
+    
+    char c1 = (char)(pixel_format & 0xFF);
+    char c2 = (char)((pixel_format >> 8) & 0xFF);
+    char c3 = (char)((pixel_format >> 16) & 0xFF);
+    char c4 = (char)((pixel_format >> 24) & 0xFF);
+    
+    int b1 = (int)((pixel_format >> 32) & 0xFF);
+    int b2 = (int)((pixel_format >> 40) & 0xFF);
+    int b3 = (int)((pixel_format >> 48) & 0xFF);
+    int b4 = (int)((pixel_format >> 56) & 0xFF);
+    
+    bpp = (b1 + b2 + b3 + b4) / 8;
+    gl_type = GL_UNSIGNED_BYTE;
+    
+    if (c1 == 'r' && c2 == 'g' && c3 == 'b' && c4 == 'a' && b1 == 8 && b2 == 8 && b3 == 8 && b4 == 8) {
+        gl_format = GL_RGBA; caver_format = 1; return true;
+    }
+    if (c1 == 'b' && c2 == 'g' && c3 == 'r' && c4 == 'a' && b1 == 8 && b2 == 8 && b3 == 8 && b4 == 8) {
+        gl_format = GL_BGRA; caver_format = 1; return true;
+    }
+    if (c1 == 'l' && c2 == 'a' && b1 == 8 && b2 == 8) {
+        gl_format = GL_LUMINANCE_ALPHA; caver_format = 4; return true;
+    }
+    if (c1 == 'l' && b1 == 8) {
+        gl_format = GL_LUMINANCE; caver_format = 6; return true;
+    }
+    if (c1 == 'a' && b1 == 8) {
+        gl_format = GL_ALPHA; caver_format = 7; return true;
+    }
+    if (c1 == 'r' && c2 == 'g' && c3 == 'b' && b1 == 5 && b2 == 6 && b3 == 5) {
+        gl_format = GL_RGB; gl_type = GL_UNSIGNED_SHORT_5_6_5; bpp = 2; caver_format = 5; return true;
+    }
+    if (c1 == 'r' && c2 == 'g' && c3 == 'b' && c4 == 'a' && b1 == 4 && b2 == 4 && b3 == 4 && b4 == 4) {
+        gl_format = GL_RGBA; gl_type = GL_UNSIGNED_SHORT_4_4_4_4; bpp = 2; caver_format = 2; return true;
+    }
+    if (c1 == 'r' && c2 == 'g' && c3 == 'b' && c4 == 'a' && b1 == 5 && b2 == 5 && b3 == 5 && b4 == 1) {
+        gl_format = GL_RGBA; gl_type = GL_UNSIGNED_SHORT_5_5_5_1; bpp = 2; caver_format = 3; return true;
+    }
+    
+    // Fallback
+    gl_format = GL_RGBA; bpp = 4; caver_format = 1;
+    return true;
+}
+
+static bool parse_legacy_pvr_uncompressed_format(uint32_t flags, GLenum& gl_format, GLenum& gl_type, int& bpp, int& caver_format) {
+    uint32_t fmt = flags & 0xFF;
+    gl_type = GL_UNSIGNED_BYTE;
+    
+    switch (fmt) {
+        case 0x12: // OGL_RGBA_8888
+        case 0x91: // VG_sRGBA_8888
+        case 0x92: // VG_sRGBA_8888_PRE
+        case 0x98: // VG_lRGBA_8888
+        case 0x99: // VG_lRGBA_8888_PRE
+            gl_format = GL_RGBA; bpp = 4; caver_format = 1; return true;
+            
+        case 0x9c: // VG_sXRGB_8888
+        case 0x9d: // VG_sARGB_8888
+        case 0xa1: // VG_lXRGB_8888
+        case 0xa2: // VG_lARGB_8888
+            gl_format = GL_RGBA; bpp = 4; caver_format = 1; return true;
+            
+        case 0xa4: // VG_sBGRX_8888
+        case 0xa5: // VG_sBGRA_8888
+        case 0xab: // VG_lBGRX_8888
+        case 0xac: // VG_lBGRA_8888
+            gl_format = GL_BGRA; bpp = 4; caver_format = 1; return true;
+            
+        case 0xb4: // VG_sABGR_8888
+        case 0xb9: // VG_lABGR_8888
+            gl_format = GL_RGBA; bpp = 4; caver_format = 1; return true;
+            
+        case 0x93: // VG_sRGB_565
+        case 0xa7: // VG_sBGR_565
+        case 0x15: // OGL_RGB_565
+            gl_format = GL_RGB; gl_type = GL_UNSIGNED_SHORT_5_6_5; bpp = 2; caver_format = 5; return true;
+            
+        case 0x95: // VG_sRGBA_4444
+        case 0xaa: // VG_sBGRA_4444
+        case 0x14: // OGL_RGBA_4444
+            gl_format = GL_RGBA; gl_type = GL_UNSIGNED_SHORT_4_4_4_4; bpp = 2; caver_format = 2; return true;
+            
+        case 0x94: // VG_sRGBA_5551
+        case 0xa9: // VG_sBGRA_5551
+        case 0x13: // OGL_RGBA_5551
+            gl_format = GL_RGBA; gl_type = GL_UNSIGNED_SHORT_5_5_5_1; bpp = 2; caver_format = 3; return true;
+            
+        case 0x96: // VG_sL_8
+        case 0x9a: // VG_lL_8
+        case 0x16: // OGL_I_8 (Intensity 8)
+            gl_format = GL_LUMINANCE; bpp = 1; caver_format = 6; return true;
+            
+        case 0x9b: // VG_A_8
+        case 0x17: // OGL_A_8 (Alpha 8)
+            gl_format = GL_ALPHA; bpp = 1; caver_format = 7; return true;
+            
+        default:
+            return false; // Compressed format or unknown
+    }
+}
+
+static bool try_decode_pvr_from_fd(int real_fd, PVRGzBuffer& out) {
+    // Save position, read data, restore
+    off_t orig = lseek(real_fd, 0, SEEK_CUR);
+    lseek(real_fd, 0, SEEK_END);
+    off_t sz = lseek(real_fd, 0, SEEK_CUR);
+    lseek(real_fd, 0, SEEK_SET);
+    if (sz < 12) { lseek(real_fd, orig, SEEK_SET); return false; }
+    std::vector<uint8_t> buf(sz);
+    if (read(real_fd, buf.data(), sz) != sz) { lseek(real_fd, orig, SEEK_SET); return false; }
+    lseek(real_fd, orig, SEEK_SET);
+
+    std::vector<uint8_t> decompressed;
+    const uint8_t* data = buf.data();
+    size_t data_sz = sz;
+
+    if (buf.size() >= 2 && buf[0] == 0x1f && buf[1] == 0x8b) {
+        if (decompress_gzip_buffer(buf, decompressed)) {
+            data = decompressed.data();
+            data_sz = decompressed.size();
+        } else {
+            return false; // corrupt gzip
+        }
+    }
+
+    int width = 0, height = 0;
+    bool is_etc1 = false, is_pvrtc = false, is_uncompressed = false;
+    int pvrtc_bpp = 4;
+    GLenum gl_format = GL_RGBA;
+    GLenum gl_type = GL_UNSIGNED_BYTE;
+    int bpp = 4;
+    int caver_format = 1;
+    const uint8_t* pixel_data = nullptr;
+
+    // PVR v3: magic 0x03525650 ('PVR\x03' LE)
+    const HostPVRv3Header* v3 = (const HostPVRv3Header*)data;
+    if (data_sz >= sizeof(HostPVRv3Header) && v3->version == 0x03525650) {
+        width = v3->width; height = v3->height;
+        uint64_t pixel_format = v3->pixel_format;
+        if (parse_pvr_uncompressed_format(pixel_format, gl_format, gl_type, bpp, caver_format)) {
+            is_uncompressed = true;
+        } else {
+            uint32_t fmt_low = pixel_format & 0xFFFFFFFF;
+            if (fmt_low == 6) { is_etc1 = true; }
+            else if (fmt_low == 0 || fmt_low == 1) { is_pvrtc = true; pvrtc_bpp = 2; }
+            else if (fmt_low == 2 || fmt_low == 3) { is_pvrtc = true; pvrtc_bpp = 4; }
+        }
+        pixel_data = data + sizeof(HostPVRv3Header) + v3->metadata_size;
+    } else {
+        // PVR v2: magic 0x21525650 ('PVR!')
+        const HostPVRv2Header* v2 = (const HostPVRv2Header*)data;
+        if (data_sz >= sizeof(HostPVRv2Header) &&
+            (v2->magic == 0x21525650 || v2->header_size == 44)) {
+            width = v2->width; height = v2->height;
+            uint32_t fmt = v2->flags & 0xFF;
+            if (parse_legacy_pvr_uncompressed_format(v2->flags, gl_format, gl_type, bpp, caver_format)) {
+                is_uncompressed = true;
+            } else if (fmt == 0x36 || fmt == 0x06 || fmt == 0x12) { is_etc1 = true; }
+            else if (fmt == 0x0c || fmt == 0x18) { is_pvrtc = true; pvrtc_bpp = 2; }
+            else if (fmt == 0x0d || fmt == 0x19) { is_pvrtc = true; pvrtc_bpp = 4; }
+            else { is_etc1 = true; }  // assume ETC1
+            pixel_data = data + v2->header_size;
+        } else {
+            return false;  // not a PVR
+        }
+    }
+
+    if (width <= 0 || height <= 0 || width > 4096 || height > 4096) return false;
+    if (!pixel_data || pixel_data >= data + data_sz) return false;
+
+    /* Decode into pixels */
+    std::vector<uint8_t> rgba;
+
+    if (is_uncompressed) {
+        rgba.assign(pixel_data, pixel_data + width * height * bpp);
+        if (gl_format == GL_BGRA) { // BGRA -> swap to RGBA
+            for (size_t i = 0; i < rgba.size(); i += 4) {
+                uint8_t b = rgba[i];
+                rgba[i] = rgba[i+2];
+                rgba[i+2] = b;
+            }
+            gl_format = GL_RGBA;
+            caver_format = 1;
+        }
+    } else if (is_etc1) {
+        rgba.assign(width * height * 4, 0xFF);
+        uint32_t block_w = (width + 3) / 4;
+        uint32_t block_h = (height + 3) / 4;
+        for (uint32_t by = 0; by < block_h; by++) {
+            for (uint32_t bx = 0; bx < block_w; bx++) {
+                uint8_t blk[64];
+                decode_etc1_block(pixel_data + (by * block_w + bx) * 8, blk, 4 * 4);
+                for (int row = 0; row < 4 && (int)(by*4+row) < height; row++)
+                    for (int col = 0; col < 4 && (int)(bx*4+col) < width; col++)
+                        memcpy(&rgba[((by*4+row)*width+(bx*4+col))*4],
+                               &blk[row*16+col*4], 4);
+            }
+        }
+    } else if (is_pvrtc) {
+        rgba.assign(width * height * 4, 0xFF);
+        pvr::PVRTDecompressPVRTC(pixel_data, (pvrtc_bpp==2)?1:0, width, height, rgba.data());
+    } else {
+        return false;
+    }
+
+    /* Prepend the TEX binary header that BinaryFile::ReadInt32 expects:
+     *   int32 pixelFormat  — Caver PixelFormat enum
+     *   int32 width
+     *   int32 height
+     * then raw pixels follow. */
+    out.pixels.resize(12 + rgba.size());
+    uint32_t hdr[3] = { (uint32_t)caver_format, (uint32_t)width, (uint32_t)height };
+    memcpy(out.pixels.data(),       hdr,       12);
+    memcpy(out.pixels.data() + 12,  rgba.data(), rgba.size());
+    out.offset = 0;
+    out.width  = width;
+    out.height = height;
+
+    std::cerr << "[SRE-PVR] gzdopen: decoded PVR " << width << "x" << height
+              << " format=" << caver_format << " -> TEX stream" << std::endl;
+    return true;
+}
+
 static void bridge_gzdopen(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
     int fd = emu->get_reg(0);
-    uint32_t mode_ptr = emu->get_reg(1);
-    const char* mode = (const char*)(memory + mode_ptr);
-    
-    std::cout << "[ZLIB] gzdopen(fd=" << fd << ", mode=\"" << mode << "\")";
+    // mode_ptr is get_reg(1) — we don't need to log it
 
     int real_fd = fd;
     if (g_file_handles.count(fd)) {
         real_fd = fileno(g_file_handles[fd]);
     }
-    
-    // Always dup so gzclose doesn't close our original asset/file handle
-    int new_fd = dup(real_fd);
-    gzFile gz = gzdopen(new_fd, mode);
 
+    if (real_fd <= 0) {
+        std::cerr << "[ZLIB] gzdopen: invalid fd " << real_fd << std::endl;
+        emu->set_reg(0, 0);
+        return;
+    }
+
+    // Try to decode as PVR first
+    PVRGzBuffer pvr_buf;
+    if (try_decode_pvr_from_fd(real_fd, pvr_buf)) {
+        uint32_t handle = g_next_file_handle++;
+        g_pvr_gz_handles[handle] = std::move(pvr_buf);
+        emu->set_reg(0, handle);
+        return;
+    }
+
+    // Not a PVR — open as real gzip
+    int new_fd = dup(real_fd);
+    uint32_t mode_ptr = emu->get_reg(1);
+    const char* mode = (const char*)(memory + mode_ptr);
+    gzFile gz = gzdopen(new_fd, mode);
     if (gz) {
         uint32_t handle = g_next_file_handle++;
         g_gz_handles[handle] = gz;
-        std::cout << " -> handle 0x" << std::hex << handle << std::dec << std::endl;
         emu->set_reg(0, handle);
     } else {
-        std::cout << " -> FAILED" << std::endl;
         if (new_fd >= 0) close(new_fd);
+        std::cerr << "[ZLIB] gzdopen: gzdopen() failed on fd " << real_fd << std::endl;
         emu->set_reg(0, 0);
     }
 }
@@ -2629,29 +2888,43 @@ static void bridge_gzread(void* emu_ptr) {
     uint32_t handle = emu->get_reg(0);
     uint32_t buf = emu->get_reg(1);
     uint32_t len = emu->get_reg(2);
-    
+
+    // PVR decoded buffer path
+    if (g_pvr_gz_handles.count(handle)) {
+        PVRGzBuffer& pvr = g_pvr_gz_handles[handle];
+        uint32_t avail = (uint32_t)pvr.pixels.size() - pvr.offset;
+        uint32_t to_copy = (len < avail) ? len : avail;
+        if (to_copy > 0) {
+            memcpy(memory + buf, pvr.pixels.data() + pvr.offset, to_copy);
+            pvr.offset += to_copy;
+        }
+        emu->set_reg(0, (uint32_t)to_copy);
+        return;
+    }
+
+    // Real gzip path
     if (g_gz_handles.count(handle)) {
         int read = gzread(g_gz_handles[handle], memory + buf, len);
-        if (!emu->quiet_mode) {
-             std::cout << "[ZLIB] gzread(handle=0x" << std::hex << handle << ", len=" << std::dec << len << ") -> " << read << " bytes";
-             if (read < 0) {
-                 int errnum;
-                 const char* errmsg = gzerror(g_gz_handles[handle], &errnum);
-                 std::cout << " ERROR: " << errmsg << " (" << errnum << ")";
-             }
-             std::cout << std::endl;
+        if (read < 0) {
+            int errnum;
+            const char* errmsg = gzerror(g_gz_handles[handle], &errnum);
+            std::cerr << "[ZLIB] gzread ERROR: " << errmsg << " (" << errnum << ")" << std::endl;
         }
         emu->set_reg(0, (uint32_t)read);
-    } else {
-        std::cout << "[ZLIB] gzread(INVALID handle=0x" << std::hex << handle << ")" << std::endl;
-        emu->set_reg(0, (uint32_t)-1);
+        return;
     }
+
+    std::cerr << "[ZLIB] gzread: INVALID handle=0x" << std::hex << handle << std::dec << std::endl;
+    emu->set_reg(0, (uint32_t)-1);
 }
 
 static void bridge_gzclose(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t handle = emu->get_reg(0);
-    if (g_gz_handles.count(handle)) {
+    if (g_pvr_gz_handles.count(handle)) {
+        g_pvr_gz_handles.erase(handle);
+        emu->set_reg(0, 0);
+    } else if (g_gz_handles.count(handle)) {
         gzclose(g_gz_handles[handle]);
         g_gz_handles.erase(handle);
         emu->set_reg(0, 0);
@@ -2659,6 +2932,7 @@ static void bridge_gzclose(void* emu_ptr) {
         emu->set_reg(0, (uint32_t)-1);
     }
 }
+extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_path, int max_len);
 
 static void bridge_fopen(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
@@ -2667,35 +2941,44 @@ static void bridge_fopen(void* emu_ptr) {
     uint32_t mode_ptr = emu->get_reg(1);
     const char* path = (const char*)(memory + path_ptr);
     const char* mode = (const char*)(memory + mode_ptr);
-    
-    // Always log write-mode opens for save debugging
+
+    // Resolve relative asset paths to the absolute base directory
+    std::string resolved_path = path;
     bool is_write = (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'));
+
     if (is_write) {
-        // std::cout << "[File] fopen(\"" << path << "\", \"" << mode << "\") [WRITE]" << std::endl;
+        if (path[0] != '/' && (strncmp(path, "resources/", 10) == 0 || strncmp(path, "assets/", 7) == 0)) {
+            resolved_path = std::string(get_assets_base_path()) + "/" + path;
+        }
         try {
-            fs::create_directories(fs::path(path).parent_path());
+            fs::create_directories(fs::path(resolved_path).parent_path());
         } catch (...) {
             // Ignore failure
         }
-    } else if (!emu->quiet_mode) {
-        // std::cout << "[File] fopen(\"" << path << "\", \"" << mode << "\")" << std::endl;
+    } else {
+        char resolved[512];
+        if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+            resolved_path = resolved;
+        }
     }
     
-    FILE* f = fopen(path, mode);
+    FILE* f = fopen(resolved_path.c_str(), mode);
+    
     if (f) {
         uint32_t handle = g_next_file_handle++;
         g_file_handles[handle] = f;
         emu->set_reg(0, handle);
-        if (is_write) {
-            // std::cout << "[File]   -> OK (handle=" << handle << ")" << std::endl;
+        if (!emu->quiet_mode) {
+            printf("[AssetMgr/fopen] Opened: %s -> %s (handle=%u)\n", path, resolved_path.c_str(), handle);
         }
     } else {
         emu->set_reg(0, 0);
-        if (is_write) {
-            // std::cout << "[File]   -> FAILED: " << strerror(errno) << " (errno=" << errno << ")" << std::endl;
+        if (!emu->quiet_mode) {
+            printf("[AssetMgr/fopen] Failed to open: %s -> %s (mode=%s)\n", path, resolved_path.c_str(), mode);
         }
     }
 }
+
 
 static void bridge_fclose(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
@@ -5388,10 +5671,191 @@ static void bridge_gl_compressed_tex_image_2d(void* emu_ptr) {
         glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
         std::cout << "[ETC1] Decoded " << width << "x" << height << " texture (" 
                   << (block_w * block_h) << " blocks)" << std::endl;
+    } else if (internalformat == 0x8C00 || internalformat == 0x8C01 ||
+               internalformat == 0x8C02 || internalformat == 0x8C03) {
+        // Decode PVRTC to RGBA8888
+        const uint8_t* src = memory + data_ptr;
+        uint32_t do2bitMode = (internalformat == 0x8C01 || internalformat == 0x8C03) ? 1 : 0;
+        
+        std::vector<uint8_t> rgba(width * height * 4, 255);
+        pvr::PVRTDecompressPVRTC(src, do2bitMode, width, height, rgba.data());
+        
+        glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        std::cout << "[PVRTC] Decoded " << width << "x" << height << " texture (format=0x" 
+                  << std::hex << internalformat << std::dec << ")" << std::endl;
     } else {
         std::cout << "[GL] glCompressedTexImage2D: unknown format 0x" 
                   << std::hex << internalformat << std::dec << " — skipped" << std::endl;
     }
+}
+
+
+static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    
+    uint32_t file_data_ptr = (uint32_t)emu->get_reg(0);
+    uint32_t file_size = (uint32_t)emu->get_reg(1);
+    uint32_t out_tex_name_ptr = (uint32_t)emu->get_reg(2);
+    uint32_t image_ptr = (uint32_t)emu->get_reg(3);      // X3 = Image* temp
+    uint32_t out_height_ptr = (uint32_t)emu->get_reg(6); // X6 = height out (pTVar11) -> writes width to HEIGHT field
+    uint32_t out_width_ptr = (uint32_t)emu->get_reg(7);  // X7 = width out  (pTVar10) -> writes height to WIDTH field
+    
+    if (file_data_ptr == 0) {
+        std::cerr << "[SRE-PVR] Error: file_data_ptr is NULL" << std::endl;
+        return;
+    }
+    
+    const uint8_t* file_data = memory + file_data_ptr;
+    
+    int width = 0, height = 0;
+    int is_etc1 = 0, is_pvrtc = 0, pvrtc_bpp = 4;
+    int is_uncompressed = 0;
+    GLenum gl_format = GL_RGBA;
+    GLenum gl_type = GL_UNSIGNED_BYTE;
+    int bpp = 4;
+    int caver_format = 1;
+    const uint8_t* pixel_data = nullptr;
+    
+    // Parse PVR v3
+    const HostPVRv3Header* v3 = (const HostPVRv3Header*)file_data;
+    if (v3->version == 0x03525650) {
+        width = v3->width;
+        height = v3->height;
+        uint64_t pixel_format = v3->pixel_format;
+        if (parse_pvr_uncompressed_format(pixel_format, gl_format, gl_type, bpp, caver_format)) {
+            is_uncompressed = 1;
+        } else {
+            uint32_t fmt_low = pixel_format & 0xFFFFFFFF;
+            if (fmt_low == 6) { // ETC1
+                is_etc1 = 1;
+            } else if (fmt_low == 0 || fmt_low == 1) { // PVRTC 2bpp
+                is_pvrtc = 1; pvrtc_bpp = 2;
+            } else if (fmt_low == 2 || fmt_low == 3) { // PVRTC 4bpp
+                is_pvrtc = 1; pvrtc_bpp = 4;
+            }
+        }
+        pixel_data = file_data + sizeof(HostPVRv3Header) + v3->metadata_size;
+    } else {
+        // Parse PVR v2
+        const HostPVRv2Header* v2 = (const HostPVRv2Header*)file_data;
+        if (v2->magic == 0x21525650 || v2->header_size == 44) {
+            width = v2->width;
+            height = v2->height;
+            uint32_t fmt = v2->flags & 0xFF;
+            if (parse_legacy_pvr_uncompressed_format(v2->flags, gl_format, gl_type, bpp, caver_format)) {
+                is_uncompressed = 1;
+            } else if (fmt == 0x36 || fmt == 0x06 || fmt == 0x12) {
+                is_etc1 = 1;
+            } else if (fmt == 0x0c || fmt == 0x18) {
+                is_pvrtc = 1; pvrtc_bpp = 2;
+            } else if (fmt == 0x0d || fmt == 0x19) {
+                is_pvrtc = 1; pvrtc_bpp = 4;
+            } else {
+                // Unknown, try ETC1 as default for Swordigo
+                is_etc1 = 1;
+            }
+            pixel_data = file_data + v2->header_size;
+        } else {
+            std::cerr << "[SRE-PVR] Unknown PVR header magic 0x" << std::hex << v3->version << std::dec << std::endl;
+            return;
+        }
+    }
+    
+    if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
+        std::cerr << "[SRE-PVR] Invalid PVR dimensions " << width << "x" << height << std::endl;
+        return;
+    }
+    
+    // Generate texture ID if not already generated
+    uint32_t tex_name = 0;
+    if (out_tex_name_ptr) {
+        tex_name = *(uint32_t*)(memory + out_tex_name_ptr);
+    }
+    if (tex_name == 0) {
+        GLuint gl_tex;
+        glGenTextures(1, &gl_tex);
+        tex_name = gl_tex;
+        if (out_tex_name_ptr) {
+            *(uint32_t*)(memory + out_tex_name_ptr) = tex_name;
+        }
+    }
+    
+    glBindTexture(GL_TEXTURE_2D, tex_name);
+
+    /* NOTE: We also set X0=0 (success) at the END of this function so the engine
+     * proceeds with UV setup. See set_reg(0,0) call below. */
+    
+    const uint8_t* upload_pixels = nullptr;
+    std::vector<uint8_t> rgba;
+    
+    if (is_uncompressed) {
+        upload_pixels = pixel_data;
+        if (gl_format == GL_BGRA) { // BGRA -> swap to RGBA
+            rgba.assign(pixel_data, pixel_data + width * height * 4);
+            for (size_t i = 0; i < rgba.size(); i += 4) {
+                uint8_t b = rgba[i];
+                rgba[i] = rgba[i+2];
+                rgba[i+2] = b;
+            }
+            upload_pixels = rgba.data();
+            gl_format = GL_RGBA;
+            caver_format = 1;
+        }
+    } else if (is_etc1) {
+        rgba.assign(width * height * 4, 255);
+        uint32_t block_w = (width + 3) / 4;
+        uint32_t block_h = (height + 3) / 4;
+        for (uint32_t by = 0; by < block_h; by++) {
+            for (uint32_t bx = 0; bx < block_w; bx++) {
+                uint8_t block_rgba[4 * 4 * 4];
+                decode_etc1_block(pixel_data + (by * block_w + bx) * 8, block_rgba, 4 * 4);
+                for (int row = 0; row < 4 && (by * 4 + row) < height; row++) {
+                    for (int col = 0; col < 4 && (bx * 4 + col) < width; col++) {
+                        memcpy(&rgba[((by * 4 + row) * width + (bx * 4 + col)) * 4],
+                               &block_rgba[row * 16 + col * 4], 4);
+                    }
+                }
+            }
+        }
+        upload_pixels = rgba.data();
+    } else if (is_pvrtc) {
+        rgba.assign(width * height * 4, 255);
+        pvr::PVRTDecompressPVRTC(pixel_data, (pvrtc_bpp == 2) ? 1 : 0, width, height, rgba.data());
+        upload_pixels = rgba.data();
+    } else {
+        std::cerr << "[SRE-PVR] Unsupported format decoding " << width << "x" << height << std::endl;
+        return;
+    }
+    
+    glTexImage2D(GL_TEXTURE_2D, 0, gl_format, width, height, 0, gl_format, gl_type, upload_pixels);
+    bool is_npot = ((width & (width - 1)) != 0) || ((height & (height - 1)) != 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, is_npot ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, is_npot ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+
+    // Write swapped dimensions to Texture struct (X6=height_ptr gets width, X7=width_ptr gets height)
+    // to match guest engine's compiled scaling calculation and struct layout expectations.
+    if (out_height_ptr) {  /* X6 = height field in Texture struct gets width */
+        *(uint32_t*)(memory + out_height_ptr) = (uint32_t)width;
+    }
+    if (out_width_ptr) {   /* X7 = width field in Texture struct gets height */
+        *(uint32_t*)(memory + out_width_ptr) = (uint32_t)height;
+    }
+    
+    // Populate Image temp struct at X3 (so local scaling factors are calculated correctly by guest)
+    if (image_ptr) {
+        *(int32_t*)(memory + image_ptr + 4) = (int32_t)height; // local_7c (Image width gets height)
+        *(int32_t*)(memory + image_ptr + 8) = (int32_t)width;  // iStack_78 (Image height gets width)
+        *(int32_t*)(memory + image_ptr + 12) = (int32_t)caver_format; // format: caver_format
+    }
+
+    std::cerr << "[SRE-PVR] Uploaded " << width << "x" << height
+              << " format=" << caver_format << " -> GL tex " << tex_name << std::endl;
+
+    /* Return 0 = success so the engine proceeds with UV setup */
+    emu->set_reg(0, 0);
 }
 
 static void bridge_gl_tex_parameteri(void* emu_ptr) {
@@ -5583,6 +6047,432 @@ static void bridge_gl_pixel_storei(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glPixelStorei(emu->get_reg(0), emu->get_reg(1));
+}
+
+// Player position guest addresses for GLES2 lighting (defined in main.cpp)
+extern uint64_t g_sre_hero_pos_x_addr;
+extern uint64_t g_sre_hero_pos_y_addr;
+extern uint64_t g_sre_hero_pos_z_addr;
+
+// UPGRADED SHADERS FOR GLES2 LIGHTING
+const char* UPGRADED_VERT_SHADER = 
+    "attribute vec4 position;\n"
+    "attribute vec4 vertexColor;\n"
+    "attribute vec2 texCoord;\n"
+    "varying vec4 v_color;\n"
+    "varying vec2 v_texCoord;\n"
+    "varying vec3 v_world_pos;\n"
+    "uniform mat4 mvpMatrix;\n"
+    "void main() {\n"
+    "    v_color = vertexColor;\n"
+    "    v_texCoord = texCoord;\n"
+    "    v_world_pos = position.xyz;\n"
+    "    gl_Position = mvpMatrix * position;\n"
+    "}\n";
+
+const char* UPGRADED_VERT_SHADER_COLOR = 
+    "attribute vec4 position;\n"
+    "attribute vec4 vertexColor;\n"
+    "varying vec4 v_color;\n"
+    "varying vec3 v_world_pos;\n"
+    "uniform mat4 mvpMatrix;\n"
+    "void main() {\n"
+    "    v_color = vertexColor;\n"
+    "    v_world_pos = position.xyz;\n"
+    "    gl_Position = mvpMatrix * position;\n"
+    "}\n";
+
+const char* UPGRADED_FRAG_SHADER_TEXTURED = 
+    "precision mediump float;\n"
+    "varying vec4 v_color;\n"
+    "varying vec2 v_texCoord;\n"
+    "varying vec3 v_world_pos;\n"
+    "uniform sampler2D s_texture;\n"
+    "uniform vec3 u_light_pos;\n"
+    "uniform vec3 u_light_color;\n"
+    "uniform vec3 u_ambient_color;\n"
+    "uniform float u_light_radius;\n"
+    "void main() {\n"
+    "    vec4 tex_color = texture2D(s_texture, v_texCoord);\n"
+    "    vec4 base_color = tex_color * v_color;\n"
+    "    float dist = distance(v_world_pos, u_light_pos);\n"
+    "    float attenuation = clamp(1.0 - (dist / u_light_radius), 0.0, 1.0);\n"
+    "    vec3 diffuse = u_light_color * attenuation;\n"
+    "    vec3 final_light = clamp(u_ambient_color + diffuse, 0.0, 1.0);\n"
+    "    gl_FragColor = vec4(base_color.rgb * final_light, base_color.a);\n"
+    "}\n";
+
+const char* UPGRADED_FRAG_SHADER_COLOR = 
+    "precision mediump float;\n"
+    "varying vec4 v_color;\n"
+    "varying vec3 v_world_pos;\n"
+    "uniform vec3 u_light_pos;\n"
+    "uniform vec3 u_light_color;\n"
+    "uniform vec3 u_ambient_color;\n"
+    "uniform float u_light_radius;\n"
+    "void main() {\n"
+    "    float dist = distance(v_world_pos, u_light_pos);\n"
+    "    float attenuation = clamp(1.0 - (dist / u_light_radius), 0.0, 1.0);\n"
+    "    vec3 diffuse = u_light_color * attenuation;\n"
+    "    vec3 final_light = clamp(u_ambient_color + diffuse, 0.0, 1.0);\n"
+    "    gl_FragColor = vec4(v_color.rgb * final_light, v_color.a);\n"
+    "}\n";
+
+static void bridge_glCreateShader(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLenum type = (GLenum)emu->get_reg(0);
+    GLuint shader = 0;
+    if (g_display_active) {
+        shader = glCreateShader(type);
+    }
+    emu->set_reg(0, shader);
+}
+
+static void bridge_glShaderSource(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    uint32_t shader = emu->get_reg(0);
+    uint32_t count = emu->get_reg(1);
+    uint64_t string_ptr = emu->get_reg(2);
+    uint64_t length_ptr = emu->get_reg(3);
+
+    std::vector<const GLchar*> sources;
+    std::vector<GLint> lengths;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t str_addr = *(uint64_t*)(memory + string_ptr + i * 8);
+        sources.push_back((const GLchar*)(memory + str_addr));
+        if (length_ptr != 0) {
+            lengths.push_back(*(GLint*)(memory + length_ptr + i * 4));
+        }
+    }
+
+    if (count > 0 && sources[0] != nullptr) {
+        std::string src;
+        if (length_ptr != 0 && lengths[0] > 0) {
+            src = std::string(sources[0], lengths[0]);
+        } else {
+            src = sources[0];
+        }
+        // Upgrade flat shaders dynamically to support lighting/tinting
+        if (src.find("attribute vec4 position;") != std::string::npos) {
+            if (src.find("attribute vec2 texCoord;") != std::string::npos) {
+                sources[0] = UPGRADED_VERT_SHADER;
+                if (length_ptr != 0) lengths[0] = strlen(UPGRADED_VERT_SHADER);
+            } else {
+                sources[0] = UPGRADED_VERT_SHADER_COLOR;
+                if (length_ptr != 0) lengths[0] = strlen(UPGRADED_VERT_SHADER_COLOR);
+            }
+        } else if (src.find("texture2D") != std::string::npos) {
+            sources[0] = UPGRADED_FRAG_SHADER_TEXTURED;
+            if (length_ptr != 0) lengths[0] = strlen(UPGRADED_FRAG_SHADER_TEXTURED);
+        } else if (src.find("gl_FragColor =") != std::string::npos) {
+            sources[0] = UPGRADED_FRAG_SHADER_COLOR;
+            if (length_ptr != 0) lengths[0] = strlen(UPGRADED_FRAG_SHADER_COLOR);
+        }
+    }
+
+    if (g_display_active) {
+        glShaderSource(shader, count, sources.data(), length_ptr ? lengths.data() : NULL);
+    }
+}
+
+static void bridge_glCompileShader(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLuint shader = (GLuint)emu->get_reg(0);
+    if (g_display_active) {
+        glCompileShader(shader);
+    }
+}
+
+static void bridge_glCreateProgram(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLuint program = 0;
+    if (g_display_active) {
+        program = glCreateProgram();
+    }
+    emu->set_reg(0, program);
+}
+
+static void bridge_glAttachShader(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLuint program = (GLuint)emu->get_reg(0);
+    GLuint shader = (GLuint)emu->get_reg(1);
+    if (g_display_active) {
+        glAttachShader(program, shader);
+    }
+}
+
+static void bridge_glLinkProgram(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLuint program = (GLuint)emu->get_reg(0);
+    if (g_display_active) {
+        glLinkProgram(program);
+    }
+}
+
+static void bridge_glUseProgram(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLuint program = (GLuint)emu->get_reg(0);
+    g_frame_stats.state_changes++;
+    if (g_display_active) {
+        glUseProgram(program);
+        if (program != 0) {
+            GLint u_light_pos_loc = glGetUniformLocation(program, "u_light_pos");
+            if (u_light_pos_loc != -1) {
+                // Fetch dynamic player coordinates & ambient colors
+                extern uint64_t g_sre_hero_pos_x_addr;
+                extern uint64_t g_sre_hero_pos_y_addr;
+                extern uint64_t g_sre_hero_pos_z_addr;
+                extern float g_bg_ambient_r, g_bg_ambient_g, g_bg_ambient_b;
+
+                uint8_t* memory = emu->get_memory_base();
+                float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+                if (g_sre_hero_pos_x_addr != 0) {
+                    hx = *(float*)(memory + g_sre_hero_pos_x_addr);
+                    hy = *(float*)(memory + g_sre_hero_pos_y_addr);
+                    hz = *(float*)(memory + g_sre_hero_pos_z_addr);
+                }
+
+                glUniform3f(u_light_pos_loc, hx, hy + 40.0f, hz);
+
+                GLint u_light_color_loc = glGetUniformLocation(program, "u_light_color");
+                if (u_light_color_loc != -1) {
+                    glUniform3f(u_light_color_loc, 1.0f, 0.85f, 0.6f);
+                }
+
+                GLint u_light_radius_loc = glGetUniformLocation(program, "u_light_radius");
+                if (u_light_radius_loc != -1) {
+                    glUniform1f(u_light_radius_loc, 250.0f);
+                }
+
+                GLint u_ambient_color_loc = glGetUniformLocation(program, "u_ambient_color");
+                if (u_ambient_color_loc != -1) {
+                    glUniform3f(u_ambient_color_loc, g_bg_ambient_r, g_bg_ambient_g, g_bg_ambient_b);
+                }
+            }
+        }
+    }
+}
+
+static void bridge_glGetUniformLocation(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLuint program = (GLuint)emu->get_reg(0);
+    uint64_t name_ptr = emu->get_reg(1);
+    const char* name = (const char*)(memory + name_ptr);
+    GLint loc = -1;
+    if (g_display_active) {
+        loc = glGetUniformLocation(program, name);
+    }
+    emu->set_reg(0, loc);
+}
+
+static void bridge_glUniformMatrix4fv(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLint location = (GLint)emu->get_reg(0);
+    GLsizei count = (GLsizei)emu->get_reg(1);
+    GLboolean transpose = (GLboolean)emu->get_reg(2);
+    uint64_t value_ptr = emu->get_reg(3);
+    if (g_display_active && value_ptr != 0) {
+        glUniformMatrix4fv(location, count, transpose, (const GLfloat*)(memory + value_ptr));
+    }
+}
+
+static void bridge_glUniform4fv(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLint location = (GLint)emu->get_reg(0);
+    GLsizei count = (GLsizei)emu->get_reg(1);
+    uint64_t value_ptr = emu->get_reg(2);
+    if (g_display_active && value_ptr != 0) {
+        glUniform4fv(location, count, (const GLfloat*)(memory + value_ptr));
+    }
+}
+
+static void bridge_glUniform1f(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLint location = (GLint)emu->get_reg(0);
+    float v0 = emu->get_sreg(0);
+    if (g_display_active) {
+        glUniform1f(location, v0);
+    }
+}
+
+static void bridge_glUniform2f(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLint location = (GLint)emu->get_reg(0);
+    float v0 = emu->get_sreg(0);
+    float v1 = emu->get_sreg(1);
+    if (g_display_active) {
+        glUniform2f(location, v0, v1);
+    }
+}
+
+static void bridge_glUniform3f(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLint location = (GLint)emu->get_reg(0);
+    float v0 = emu->get_sreg(0);
+    float v1 = emu->get_sreg(1);
+    float v2 = emu->get_sreg(2);
+    if (g_display_active) {
+        glUniform3f(location, v0, v1, v2);
+    }
+}
+
+static void bridge_glUniform4f(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLint location = (GLint)emu->get_reg(0);
+    float v0 = emu->get_sreg(0);
+    float v1 = emu->get_sreg(1);
+    float v2 = emu->get_sreg(2);
+    float v3 = emu->get_sreg(3);
+    if (g_display_active) {
+        glUniform4f(location, v0, v1, v2, v3);
+    }
+}
+
+static void bridge_glUniform1i(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLint location = (GLint)emu->get_reg(0);
+    GLint v0 = (GLint)emu->get_reg(1);
+    if (g_display_active) {
+        glUniform1i(location, v0);
+    }
+}
+
+static void bridge_glVertexAttribPointer(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLuint index = (GLuint)emu->get_reg(0);
+    GLint size = (GLint)emu->get_reg(1);
+    GLenum type = (GLenum)emu->get_reg(2);
+    GLboolean normalized = (GLboolean)emu->get_reg(3);
+    GLsizei stride = (GLsizei)emu->get_reg(4);
+    uint64_t pointer_ptr = emu->get_reg(5);
+    if (g_display_active) {
+        GLint bound_vbo = 0;
+        glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &bound_vbo);
+        const void* ptr = (bound_vbo != 0) ? (const void*)pointer_ptr : (const void*)(memory + pointer_ptr);
+        glVertexAttribPointer(index, size, type, normalized, stride, ptr);
+    }
+}
+
+static void bridge_glEnableVertexAttribArray(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLuint index = (GLuint)emu->get_reg(0);
+    if (g_display_active) {
+        glEnableVertexAttribArray(index);
+    }
+}
+
+static void bridge_glDisableVertexAttribArray(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLuint index = (GLuint)emu->get_reg(0);
+    if (g_display_active) {
+        glDisableVertexAttribArray(index);
+    }
+}
+
+static void bridge_glGetShaderiv(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLuint shader = (GLuint)emu->get_reg(0);
+    GLenum pname = (GLenum)emu->get_reg(1);
+    uint64_t params_ptr = emu->get_reg(2);
+    if (g_display_active && params_ptr != 0) {
+        glGetShaderiv(shader, pname, (GLint*)(memory + params_ptr));
+    }
+}
+
+static void bridge_glGetShaderInfoLog(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLuint shader = (GLuint)emu->get_reg(0);
+    GLsizei maxLength = (GLsizei)emu->get_reg(1);
+    uint64_t length_ptr = emu->get_reg(2);
+    uint64_t infoLog_ptr = emu->get_reg(3);
+    if (g_display_active) {
+        glGetShaderInfoLog(shader, maxLength, length_ptr ? (GLsizei*)(memory + length_ptr) : NULL, (GLchar*)(memory + infoLog_ptr));
+    }
+}
+
+static void bridge_glGetProgramiv(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLuint program = (GLuint)emu->get_reg(0);
+    GLenum pname = (GLenum)emu->get_reg(1);
+    uint64_t params_ptr = emu->get_reg(2);
+    if (g_display_active && params_ptr != 0) {
+        glGetProgramiv(program, pname, (GLint*)(memory + params_ptr));
+    }
+}
+
+static void bridge_glGetProgramInfoLog(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLuint program = (GLuint)emu->get_reg(0);
+    GLsizei maxLength = (GLsizei)emu->get_reg(1);
+    uint64_t length_ptr = emu->get_reg(2);
+    uint64_t infoLog_ptr = emu->get_reg(3);
+    if (g_display_active) {
+        glGetProgramInfoLog(program, maxLength, length_ptr ? (GLsizei*)(memory + length_ptr) : NULL, (GLchar*)(memory + infoLog_ptr));
+    }
+}
+
+static void bridge_glBindAttribLocation(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLuint program = (GLuint)emu->get_reg(0);
+    GLuint index = (GLuint)emu->get_reg(1);
+    uint64_t name_ptr = emu->get_reg(2);
+    if (g_display_active && name_ptr != 0) {
+        glBindAttribLocation(program, index, (const GLchar*)(memory + name_ptr));
+    }
+}
+
+static void bridge_glGetAttribLocation(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLuint program = (GLuint)emu->get_reg(0);
+    uint64_t name_ptr = emu->get_reg(1);
+    GLint loc = -1;
+    if (g_display_active && name_ptr != 0) {
+        loc = glGetAttribLocation(program, (const GLchar*)(memory + name_ptr));
+    }
+    emu->set_reg(0, loc);
+}
+
+static void bridge_glDeleteShader(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLuint shader = (GLuint)emu->get_reg(0);
+    if (g_display_active) glDeleteShader(shader);
+}
+
+static void bridge_glDeleteProgram(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLuint program = (GLuint)emu->get_reg(0);
+    if (g_display_active) glDeleteProgram(program);
+}
+
+static void bridge_glDetachShader(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLuint program = (GLuint)emu->get_reg(0);
+    GLuint shader = (GLuint)emu->get_reg(1);
+    if (g_display_active) glDetachShader(program, shader);
+}
+
+static void bridge_gl_buffer_sub_data(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLenum target = (GLenum)emu->get_reg(0);
+    GLintptr offset = (GLintptr)emu->get_reg(1);
+    GLsizeiptr size = (GLsizeiptr)emu->get_reg(2);
+    uint64_t data_ptr = emu->get_reg(3);
+    if (g_display_active && data_ptr != 0) {
+        glBufferSubData(target, offset, size, (const void*)(memory + data_ptr));
+    }
 }
 
 static void bridge_gl_alpha_func(void* emu_ptr) {
@@ -5808,9 +6698,8 @@ static void bridge_glGetString(void* emu_ptr) {
     if (!initialized) {
         strcpy((char*)(memory + 0x40000), "OpenGL ES 2.0 (Swordigo Desktop)");
         strcpy((char*)(memory + 0x40100), "Swordigo Desktop Emulator");
-        // Advertise ETC1 support — we have a full software decoder (bridge_gl_compressed_tex_image_2d).
-        // This makes the engine load .pvr textures instead of .tex.png (which don't exist for many assets).
-        strcpy((char*)(memory + 0x40200), "GL_OES_compressed_ETC1_texture_data GL_OES_texture_npot");
+        // Advertise ETC1 and PVRTC support — we have full software decoders.
+        strcpy((char*)(memory + 0x40200), "GL_OES_compressed_ETC1_RGB8_texture GL_OES_compressed_ETC1_RGB8_sub_texture GL_OES_texture_npot GL_IMG_texture_format_BGRA8888 GL_IMG_texture_compression_pvrtc");
         initialized = true;
     }
     uint32_t name = emu->get_reg(0);
@@ -7060,6 +7949,7 @@ void JniBridge64::init_standard_bridges() {
     register_handler("glTexParameteri", bridge_gl_tex_parameteri);
     register_handler("glTexParameterf", bridge_gl_tex_parameterf);
     register_handler("glCompressedTexImage2D", bridge_gl_compressed_tex_image_2d);
+    register_handler("sre_PVRTTextureLoadFromPVRBuffer", bridge_PVRTTextureLoadFromPVRBuffer);
     register_handler("glVertexPointer", bridge_gl_vertex_pointer);
     register_handler("glTexCoordPointer", bridge_gl_texcoord_pointer);
     register_handler("glColorPointer", bridge_gl_color_pointer);
@@ -7090,13 +7980,38 @@ void JniBridge64::init_standard_bridges() {
     register_handler("glActiveTexture", bridge_gl_active_texture);
     register_handler("glClientActiveTexture", bridge_gl_client_active_texture);
     register_handler("glPixelStorei", bridge_gl_pixel_storei);
-    register_handler("glVertexAttribPointer", bridge_gl_noop);
-    register_handler("glEnableVertexAttribArray", bridge_gl_noop);
-    register_handler("glDisableVertexAttribArray", bridge_gl_noop);
-    register_handler("glUseProgram", bridge_gl_noop);
+    register_handler("glVertexAttribPointer", bridge_glVertexAttribPointer);
+    register_handler("glEnableVertexAttribArray", bridge_glEnableVertexAttribArray);
+    register_handler("glDisableVertexAttribArray", bridge_glDisableVertexAttribArray);
+    register_handler("glUseProgram", bridge_glUseProgram);
     register_handler("glBindBuffer", bridge_gl_bind_buffer);
     register_handler("glBufferData", bridge_gl_buffer_data);
-    register_handler("glBufferSubData", bridge_gl_noop);
+    register_handler("glBufferSubData", bridge_gl_buffer_sub_data);
+
+    // GLES 2.0 Shader APIs
+    register_handler("glCreateShader", bridge_glCreateShader);
+    register_handler("glShaderSource", bridge_glShaderSource);
+    register_handler("glCompileShader", bridge_glCompileShader);
+    register_handler("glCreateProgram", bridge_glCreateProgram);
+    register_handler("glAttachShader", bridge_glAttachShader);
+    register_handler("glLinkProgram", bridge_glLinkProgram);
+    register_handler("glGetUniformLocation", bridge_glGetUniformLocation);
+    register_handler("glUniformMatrix4fv", bridge_glUniformMatrix4fv);
+    register_handler("glUniform4fv", bridge_glUniform4fv);
+    register_handler("glUniform1f", bridge_glUniform1f);
+    register_handler("glUniform2f", bridge_glUniform2f);
+    register_handler("glUniform3f", bridge_glUniform3f);
+    register_handler("glUniform4f", bridge_glUniform4f);
+    register_handler("glUniform1i", bridge_glUniform1i);
+    register_handler("glGetShaderiv", bridge_glGetShaderiv);
+    register_handler("glGetShaderInfoLog", bridge_glGetShaderInfoLog);
+    register_handler("glGetProgramiv", bridge_glGetProgramiv);
+    register_handler("glGetProgramInfoLog", bridge_glGetProgramInfoLog);
+    register_handler("glBindAttribLocation", bridge_glBindAttribLocation);
+    register_handler("glGetAttribLocation", bridge_glGetAttribLocation);
+    register_handler("glDeleteShader", bridge_glDeleteShader);
+    register_handler("glDeleteProgram", bridge_glDeleteProgram);
+    register_handler("glDetachShader", bridge_glDetachShader);
     register_handler("glDeleteTextures", bridge_gl_delete_textures);
     register_handler("glDeleteBuffers", bridge_gl_delete_buffers);
     register_handler("glBindFramebuffer", bridge_gl_noop);

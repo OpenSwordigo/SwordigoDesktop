@@ -53,7 +53,7 @@ extern volatile char g_sre_lni_arg2[512];
 extern volatile int  g_sre_lni_pending;
 
 /* ========== Internal State ========== */
-static float s_master_volume = 1.0f;     /* Engine-set master volume */
+float g_sre_music_master_volume = 1.0f;  /* Engine-set master volume */
 static float s_fade_volume = 1.0f;       /* Current fade multiplier (0..1) */
 static float s_fade_target = 1.0f;       /* Fade destination */
 static float s_fade_speed = 0.0f;        /* Fade rate per second */
@@ -114,7 +114,7 @@ void sre_AudioSystem_SetMusicVolume(void* self, float vol) {
     if (vol > 1.0f) vol = 1.0f;
 
     /* Update internal state for fade calculations */
-    s_master_volume = vol;
+    g_sre_music_master_volume = vol;
 
     /* Write to command interface — host picks this up and applies via OpenAL */
     g_sre_music_volume = vol * s_fade_volume;
@@ -314,7 +314,7 @@ void sre_MusicPlayer_FadeIn(void* self, float duration) {
     } else {
         s_fade_volume = 1.0f;
         s_fade_speed = 0.0f;
-        g_sre_music_volume = s_master_volume;
+        g_sre_music_volume = g_sre_music_master_volume;
         g_sre_music_volume_dirty = 1;
     }
 }
@@ -353,8 +353,13 @@ void sre_MusicPlayer_Update(void* self, float deltaTime) {
      * Original SetVolume stores volume at this+4. Read it here. */
     float obj_volume = *(float*)((char*)self + 4);
     if (obj_volume >= 0.0f && obj_volume <= 1.0f) {
-        s_master_volume = obj_volume;
+        static float last_synced_obj_volume = -1.0f;
+        if (obj_volume != last_synced_obj_volume) {
+            g_sre_music_master_volume = obj_volume;
+            last_synced_obj_volume = obj_volume;
+        }
     }
+    *(float*)((char*)self + 4) = g_sre_music_master_volume;
     
     /* === Sync looping flag from MusicPlayer object ===
      * SetLooping (0x48206c) can't be hooked either (same collision).
@@ -413,7 +418,7 @@ void sre_MusicPlayer_Update(void* self, float deltaTime) {
     }
     
     /* === Apply combined volume every frame === */
-    float vol = s_master_volume * s_fade_volume;
+    float vol = g_sre_music_master_volume * s_fade_volume;
     if (vol < 0.0f) vol = 0.0f;
     if (vol > 1.0f) vol = 1.0f;
     
@@ -428,8 +433,8 @@ void sre_MusicPlayer_Update(void* self, float deltaTime) {
  * These stay for reference / future use. */
 
 void sre_MusicPlayer_SetVolume(void* self, float volume) {
-    s_master_volume = volume;
-    float vol = s_master_volume * s_fade_volume;
+    g_sre_music_master_volume = volume;
+    float vol = g_sre_music_master_volume * s_fade_volume;
     if (vol < 0.0f) vol = 0.0f;
     if (vol > 1.0f) vol = 1.0f;
     g_sre_music_volume = vol;

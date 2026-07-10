@@ -31,7 +31,6 @@
 #include "platform/srt_overlay.h"
 #include "platform/gui.h"
 #include <vector>
-
 #include <string>
 #include <cstdint>
 
@@ -112,7 +111,36 @@ public:
     GuiAction draw_settings_panel(bool* p_open);
     bool m_show_about = false;
     bool m_show_help  = false;
-    // Returns true if coordinates (mx, my) fall inside any active overlay or button
+
+    // ---- Lua Console (ImGui-native, replaces old bitmap console) ----
+    //
+    // Call init_lua_console() once when SRE console addrs are resolved.
+    // draw_lua_console() is called every frame from main loop.
+    // submit_lua_console() can be called externally (e.g. from keyboard handler).
+    //
+    struct ConsoleEntry { std::string text; bool is_error; bool is_input; };
+
+    void init_lua_console(
+        uint8_t* guest_memory,
+        uint64_t buf_addr,
+        uint64_t result_addr,
+        uint64_t pending_addr,
+        uint64_t status_addr,
+        uint64_t print_addr);
+
+    // Returns true if a command was consumed (caller should not re-process key).
+    bool lua_console_key(SDL_Keycode key, const std::string& text_input);
+    // Append text from SDL_EVENT_TEXT_INPUT
+    void lua_console_text(const char* text);
+
+    // Draw the full ImGui terminal window. Call between begin_frame()/end_frame().
+    void draw_lua_console();
+
+    bool is_lua_console_open() const { return m_console_open; }
+    bool is_lua_console_ready() const { return m_console_ready; }
+    void toggle_lua_console();
+
+    // Returns true if coordinates fall inside any active overlay, button, or console
     bool is_input_blocked(float mx, float my);
 
 private:
@@ -121,12 +149,14 @@ private:
     void scan_saves(const std::string& save_dir);
     bool load_save(const std::string& path);
     bool write_save(const std::string& path);
+    void console_submit(const std::string& cmd); // write to guest + set pending
 
     SDL_Window*   m_window   = nullptr;
     SDL_GLContext m_gl_ctx   = nullptr;
     void*         m_imgui_ctx = nullptr;   // ImGuiContext*
     void*         m_font_main = nullptr;   // ImFont*
     void*         m_font_button = nullptr; // ImFont*
+    void*         m_font_mono = nullptr;   // ImFont* (monospace for console)
 
     bool          m_initialized = false;
     bool          m_visible     = false;
@@ -148,4 +178,23 @@ private:
     static constexpr int FPS_HISTORY = 90;
     float m_fps_history[FPS_HISTORY] = {};
     int   m_fps_idx = 0;
+
+    // ---- Lua Console state ----
+    bool          m_console_ready  = false;
+    bool          m_console_open   = false;
+    bool          m_console_focus  = false; // request ImGui focus next frame
+
+    uint8_t*      m_guest_memory   = nullptr;
+    uint64_t      m_console_buf_addr     = 0;
+    uint64_t      m_console_result_addr  = 0;
+    uint64_t      m_console_pending_addr = 0;
+    uint64_t      m_console_status_addr  = 0;
+    uint64_t      m_console_print_addr   = 0;
+
+    static constexpr int CONSOLE_MAX_HISTORY = 256;
+    std::vector<ConsoleEntry>  m_console_history;
+    char                       m_console_input[1024] = {};
+    std::vector<std::string>   m_console_cmd_history; // up-arrow recall
+    int                        m_console_hist_idx = -1;
+    bool                       m_console_scroll_bottom = false;
 };

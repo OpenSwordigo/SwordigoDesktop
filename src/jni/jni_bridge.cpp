@@ -2,8 +2,9 @@
 #include "platform/emulator.h"
 #include "platform/io_thread.h"
 #include "platform/data_path.h"
-#include "android/asset_manager.h"
+#include "android/asset_manager_arm32.h"
 #include "platform/video_background.h"
+#include "platform/pvrtc_decoder.h"
 #include <iostream>
 #include <cstring>
 #include <cmath>
@@ -132,31 +133,9 @@ void JniBridge::call_handler(uint32_t address, void* emu_ptr) {
     if (addr_to_func.count(address)) {
         BridgeFunction& func = addr_to_func[address];
         Emulator* emu = (Emulator*)emu_ptr;
-        // Only log when not in quiet mode, and skip trivial calls
-        if (!emu->quiet_mode) {
-            static const std::unordered_map<std::string, bool> quiet_funcs = {
-                {"memcpy",1},{"memset",1},{"memmove",1},{"memcmp",1},{"memchr",1},
-                {"strlen",1},{"malloc",1},{"calloc",1},{"realloc",1},{"free",1},
-                {"__aeabi_memclr",1},{"__aeabi_memclr4",1},{"__aeabi_memclr8",1},
-                {"__aeabi_memset",1},{"__aeabi_memset4",1},{"__aeabi_memset8",1},
-                {"__aeabi_memcpy",1},{"__aeabi_memcpy4",1},{"__aeabi_memcpy8",1},
-                {"__aeabi_memmove",1},{"__aeabi_memmove4",1},{"__aeabi_memmove8",1},
-                {"__aeabi_uidiv",1},{"__aeabi_idiv",1},{"__aeabi_uidivmod",1},
-                {"__aeabi_idivmod",1},{"__aeabi_ldivmod",1},{"__aeabi_uldivmod",1},
-                {"strchr",1},{"strrchr",1},{"strcpy",1},{"strncpy",1},
-                {"strcmp",1},{"strncmp",1},{"strcat",1},{"strstr",1},
-                {"cosf",1},{"sinf",1},{"roundf",1},{"floorf",1},{"ceilf",1},
-                {"sqrtf",1},{"atan2f",1},{"powf",1},{"sincosf",1},
-                {"strtol",1},{"strtoul",1},{"atoi",1},{"atof",1},
-                {"wctob",1},{"btowc",1},{"__ctype_get_mb_cur_max",1},
-                {"pthread_mutex_init",1},{"pthread_mutex_lock",1},{"pthread_mutex_unlock",1},
-                {"pthread_mutex_destroy",1},{"pthread_cond_init",1},{"pthread_cond_signal",1},
-                {"pthread_cond_wait",1},{"pthread_cond_destroy",1},{"pthread_cond_broadcast",1},
-            };
-            if (!quiet_funcs.count(func.name) || func.name == "GetMethodID") {
-                std::cout << "[Bridge] Call: " << func.name << std::endl;
-            }
-        }
+        // Successful calls are intentionally not logged to reduce noise.
+        // Only errors (UNIMPLEMENTED, Unknown address) are printed.
+
         if (func.handler) {
             func.handler(emu_ptr);
         } else {
@@ -965,14 +944,14 @@ void bridge_GetStringUTFChars(void* emu_ptr) {
 
 void bridge_AAssetManager_fromJava(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
-    void* mgr = AAssetManager_fromJava(NULL, NULL);
+    void* mgr = AAssetManager_fromJava_arm32(NULL, NULL);
     emu->set_reg(0, register_pointer(mgr));
 }
 
 void bridge_AAssetManager_open(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
-    AAssetManager* mgr = (AAssetManager*)get_pointer(emu->get_reg(0));
+    AAssetManager_arm32* mgr = (AAssetManager_arm32*)get_pointer(emu->get_reg(0));
     uint32_t filename_ptr = emu->get_reg(1);
     const char* filename = (const char*)(memory + filename_ptr);
     g_frame_stats.asset_opens++;
@@ -997,7 +976,7 @@ void bridge_AAssetManager_open(void* emu_ptr) {
         std::cout << "[ASSET PROOF] ✓ Common atlas loaded: " << filename << std::endl;
     }
     
-    void* asset = AAssetManager_open(mgr, filename, emu->get_reg(2));
+    void* asset = AAssetManager_open_arm32(mgr, filename, emu->get_reg(2));
     std::cout << "[ASSET] Open " << filename << (asset ? " -> SUCCESS" : " -> FAILED") << std::endl;
     emu->set_reg(0, register_pointer(asset));
 }
@@ -1007,10 +986,10 @@ void bridge_AAssetManager_open(void* emu_ptr) {
 void bridge_AAsset_read(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
-    AAsset* asset = (AAsset*)get_pointer(emu->get_reg(0));
+    AAsset_arm32* asset = (AAsset_arm32*)get_pointer(emu->get_reg(0));
     void* buf = (void*)(memory + emu->get_reg(1));
     uint32_t count = emu->get_reg(2);
-    int read = AAsset_read(asset, buf, count);
+    int read = AAsset_read_arm32(asset, buf, count);
     if (read > 0 && !emu->quiet_mode) {
         std::cout << "[Asset] READ: " << (asset ? asset->name : "NULL") << " (" << read << " bytes) to 0x" << std::hex << emu->get_reg(1) << std::dec << std::endl;
     }
@@ -1019,24 +998,24 @@ void bridge_AAsset_read(void* emu_ptr) {
 
 void bridge_AAsset_close(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
-    AAsset* asset = (AAsset*)get_pointer(emu->get_reg(0));
-    AAsset_close(asset);
+    AAsset_arm32* asset = (AAsset_arm32*)get_pointer(emu->get_reg(0));
+    AAsset_close_arm32(asset);
     release_pointer(asset);
 }
 
 void bridge_AAsset_getLength(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
-    AAsset* asset = (AAsset*)get_pointer(emu->get_reg(0));
-    emu->set_reg(0, (uint32_t)AAsset_getLength(asset));
+    AAsset_arm32* asset = (AAsset_arm32*)get_pointer(emu->get_reg(0));
+    emu->set_reg(0, (uint32_t)AAsset_getLength_arm32(asset));
 }
 
 void bridge_AAsset_openFileDescriptor(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
-    AAsset* asset = (AAsset*)get_pointer(emu->get_reg(0));
+    AAsset_arm32* asset = (AAsset_arm32*)get_pointer(emu->get_reg(0));
     off_t* outStart = (off_t*)(memory + emu->get_reg(1));
     off_t* outLength = (off_t*)(memory + emu->get_reg(2));
-    int fd = AAsset_openFileDescriptor(asset, outStart, outLength);
+    int fd = AAsset_openFileDescriptor_arm32(asset, outStart, outLength);
     if (!emu->quiet_mode) {
         std::cout << "[Asset] openFileDescriptor: " << (asset ? asset->name : "NULL") << " -> fd=" << fd << std::endl;
     }
@@ -2018,6 +1997,12 @@ void bridge_gzdopen(void* emu_ptr) {
         real_fd = fileno(g_file_handles[fd]);
     }
     
+    if (real_fd <= 0) {
+        std::cout << " -> FAILED (invalid fd " << real_fd << ")" << std::endl;
+        emu->set_reg(0, 0);
+        return;
+    }
+    
     // Always dup so gzclose doesn't close our original asset/file handle
     int new_fd = dup(real_fd);
     gzFile gz = gzdopen(new_fd, mode);
@@ -2093,6 +2078,72 @@ void bridge_fopen(void* emu_ptr) {
     }
     
     FILE* f = fopen(path, mode);
+    if (!f && !is_write) {
+        // Try fallback logic for texture/asset naming variants
+        const char* ext = strrchr(path, '.');
+        if (ext) {
+            char base[512];
+            strncpy(base, path, ext - path);
+            base[ext - path] = '\0';
+
+            int is_tex_png = (strcmp(ext, ".png") == 0 && (ext - path > 4) && strcmp(ext - 4, ".tex.png") == 0);
+            if (is_tex_png) {
+                base[ext - path - 4] = '\0';
+            }
+
+            int blen = strlen(base);
+            int has_2x = (blen > 3 && strcmp(base + blen - 3, "_2x") == 0);
+
+            char base_no_2x[512];
+            strcpy(base_no_2x, base);
+            if (has_2x) {
+                base_no_2x[blen - 3] = '\0';
+            }
+
+            char alt[512];
+            if (has_2x) {
+                // Preferred: _2x. Try opposite extension first
+                if (is_tex_png) {
+                    snprintf(alt, sizeof(alt), "%s_2x.pvr", base_no_2x);
+                    f = fopen(alt, mode);
+                } else {
+                    snprintf(alt, sizeof(alt), "%s_2x.tex.png", base_no_2x);
+                    f = fopen(alt, mode);
+                }
+                // Secondary: 1x fallback
+                if (!f) {
+                    snprintf(alt, sizeof(alt), "%s.tex.png", base_no_2x);
+                    f = fopen(alt, mode);
+                }
+                if (!f) {
+                    snprintf(alt, sizeof(alt), "%s.pvr", base_no_2x);
+                    f = fopen(alt, mode);
+                }
+            } else {
+                // Preferred: 1x. Try opposite extension first
+                if (is_tex_png) {
+                    snprintf(alt, sizeof(alt), "%s.pvr", base_no_2x);
+                    f = fopen(alt, mode);
+                } else {
+                    snprintf(alt, sizeof(alt), "%s.tex.png", base_no_2x);
+                    f = fopen(alt, mode);
+                }
+                // Secondary: 2x fallback
+                if (!f) {
+                    snprintf(alt, sizeof(alt), "%s_2x.tex.png", base_no_2x);
+                    f = fopen(alt, mode);
+                }
+                if (!f) {
+                    snprintf(alt, sizeof(alt), "%s_2x.pvr", base_no_2x);
+                    f = fopen(alt, mode);
+                }
+            }
+            if (f && !emu->quiet_mode) {
+                printf("[AssetMgr/fopen] Resolved fallback: %s -> %s\n", path, alt);
+            }
+        }
+    }
+
     if (f) {
         uint32_t handle = g_next_file_handle++;
         g_file_handles[handle] = f;
@@ -3555,7 +3606,7 @@ static GLuint g_controls_atlas_tex_id = 0;    // Original atlas texture ID
 static GLuint g_controls_hidden_tex = 0;       // Modified copy with controls zeroed out
 
 // From asset_manager.c — tracks last opened asset filename
-extern "C" { extern char g_last_opened_asset[256]; }
+extern "C" { extern char g_last_opened_asset_arm32[256]; }
 
 // Control regions in 1024x1024 pixel space (parsed from ui_game_atlas_2x.atlas)
 // Format: {x, y, w, h} — these are the touch button sprite regions to zero out
@@ -3899,19 +3950,19 @@ void bridge_gl_tex_image_2d(void* emu_ptr) {
         glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
         
         // Tag the controls atlas texture and create a modified copy
-        if (width >= 512 && height >= 512 && strstr(g_last_opened_asset, "ui_game_atlas") != nullptr
-            && strstr(g_last_opened_asset, "ui_game2") == nullptr) {
+        if (width >= 512 && height >= 512 && strstr(g_last_opened_asset_arm32, "ui_game_atlas") != nullptr
+            && strstr(g_last_opened_asset_arm32, "ui_game2") == nullptr) {
             g_controls_atlas_tex_id = g_frame_stats.last_bound_texture;
             printf("[HUD] Tagged controls atlas: texture ID=%u (from %s, %ux%u)\n",
-                   g_controls_atlas_tex_id, g_last_opened_asset, width, height);
+                   g_controls_atlas_tex_id, g_last_opened_asset_arm32, width, height);
             // Create the modified copy with control regions zeroed out
             create_hidden_controls_atlas(target, level, internalformat,
                                           width, height, border, format, type, pixels);
         }
         // Video background: register texture if a .mp4 video version exists
-        if (g_last_opened_asset[0] != '\0') {
+        if (g_last_opened_asset_arm32[0] != '\0') {
             VideoBackground::register_texture_maybe(
-                g_frame_stats.last_bound_texture, g_last_opened_asset, width, height);
+                g_frame_stats.last_bound_texture, g_last_opened_asset_arm32, width, height);
         }
     }
 }
@@ -4065,10 +4116,176 @@ void bridge_gl_compressed_tex_image_2d(void* emu_ptr) {
         glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
         std::cout << "[ETC1] Decoded " << width << "x" << height << " texture (" 
                   << (block_w * block_h) << " blocks)" << std::endl;
-    } else {
+    } else if (internalformat == 0x8C00 || internalformat == 0x8C01 ||
+               internalformat == 0x8C02 || internalformat == 0x8C03) {
+        // Decode PVRTC to RGBA8888
+        const uint8_t* src = memory + data_ptr;
+        uint32_t do2bitMode = (internalformat == 0x8C01 || internalformat == 0x8C03) ? 1 : 0;
+        
+        std::vector<uint8_t> rgba(width * height * 4, 255);
+        pvr::PVRTDecompressPVRTC(src, do2bitMode, width, height, rgba.data());
+        
+        glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        std::cout << "[PVRTC] Decoded " << width << "x" << height << " texture (format=0x" 
+                  << std::hex << internalformat << std::dec << ")" << std::endl;
         std::cout << "[GL] glCompressedTexImage2D: unknown format 0x" 
                   << std::hex << internalformat << std::dec << " — skipped" << std::endl;
     }
+}
+
+#pragma pack(push, 1)
+struct HostPVRv3Header {
+    uint32_t version;       /* 0x03525650 = "PVR\3" */
+    uint32_t flags;
+    uint64_t pixel_format;  /* Lower 32 bits: 6=ETC1, ... */
+    uint32_t color_space;
+    uint32_t channel_type;
+    uint32_t height;
+    uint32_t width;
+    uint32_t depth;
+    uint32_t num_surfaces;
+    uint32_t num_faces;
+    uint32_t mip_count;
+    uint32_t metadata_size;
+};
+
+struct HostPVRv2Header {
+    uint32_t header_size;   /* Always 44 */
+    uint32_t height;
+    uint32_t width;
+    uint32_t mip_count;
+    uint32_t flags;
+    uint32_t data_size;
+    uint32_t bpp;
+    uint32_t mask_r;
+    uint32_t mask_g;
+    uint32_t mask_b;
+    uint32_t mask_a;
+    uint32_t magic;         /* 0x21525650 = "PVR!" */
+    uint32_t num_surfaces;
+};
+#pragma pack(pop)
+
+static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    
+    uint32_t file_data_ptr = emu->get_reg(0);
+    uint32_t file_size = emu->get_reg(1);
+    uint32_t out_tex_name_ptr = emu->get_reg(2);
+    uint32_t sp = emu->get_reg(13); // SP
+    uint32_t out_width_ptr = *(uint32_t*)(memory + sp + 8);
+    uint32_t out_height_ptr = *(uint32_t*)(memory + sp + 12);
+    
+    if (file_data_ptr == 0) {
+        std::cerr << "[SRE-PVR32] Error: file_data_ptr is NULL" << std::endl;
+        return;
+    }
+    
+    const uint8_t* file_data = memory + file_data_ptr;
+    
+    int width = 0, height = 0;
+    int is_etc1 = 0, is_pvrtc = 0, pvrtc_bpp = 4;
+    const uint8_t* pixel_data = nullptr;
+    
+    // Parse PVR v3
+    const HostPVRv3Header* v3 = (const HostPVRv3Header*)file_data;
+    if (v3->version == 0x03525650) {
+        width = v3->width;
+        height = v3->height;
+        uint32_t fmt = v3->pixel_format & 0xFFFFFFFF;
+        if (fmt == 6) { // ETC1
+            is_etc1 = 1;
+        } else if (fmt == 0 || fmt == 1) { // PVRTC 2bpp
+            is_pvrtc = 1; pvrtc_bpp = 2;
+        } else if (fmt == 2 || fmt == 3) { // PVRTC 4bpp
+            is_pvrtc = 1; pvrtc_bpp = 4;
+        }
+        pixel_data = file_data + sizeof(HostPVRv3Header) + v3->metadata_size;
+    } else {
+        // Parse PVR v2
+        const HostPVRv2Header* v2 = (const HostPVRv2Header*)file_data;
+        if (v2->magic == 0x21525650 || v2->header_size == 44) {
+            width = v2->width;
+            height = v2->height;
+            uint32_t fmt = v2->flags & 0xFF;
+            if (fmt == 0x36 || fmt == 0x06 || fmt == 0x12) {
+                is_etc1 = 1;
+            } else if (fmt == 0x0c || fmt == 0x18) {
+                is_pvrtc = 1; pvrtc_bpp = 2;
+            } else if (fmt == 0x0d || fmt == 0x19) {
+                is_pvrtc = 1; pvrtc_bpp = 4;
+            } else {
+                // Unknown, try ETC1 as default for Swordigo
+                is_etc1 = 1;
+            }
+            pixel_data = file_data + v2->header_size;
+        } else {
+            std::cerr << "[SRE-PVR32] Unknown PVR header magic 0x" << std::hex << v2->magic << std::dec << std::endl;
+            return;
+        }
+    }
+    
+    if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
+        std::cerr << "[SRE-PVR32] Invalid PVR dimensions " << width << "x" << height << std::endl;
+        return;
+    }
+    
+    // Generate texture ID if not already generated
+    uint32_t tex_name = 0;
+    if (out_tex_name_ptr) {
+        tex_name = *(uint32_t*)(memory + out_tex_name_ptr);
+    }
+    if (tex_name == 0) {
+        GLuint gl_tex;
+        glGenTextures(1, &gl_tex);
+        tex_name = gl_tex;
+        if (out_tex_name_ptr) {
+            *(uint32_t*)(memory + out_tex_name_ptr) = tex_name;
+        }
+    }
+    
+    glBindTexture(GL_TEXTURE_2D, tex_name);
+    
+    std::vector<uint8_t> rgba(width * height * 4, 255);
+    
+    if (is_etc1) {
+        uint32_t block_w = (width + 3) / 4;
+        uint32_t block_h = (height + 3) / 4;
+        for (uint32_t by = 0; by < block_h; by++) {
+            for (uint32_t bx = 0; bx < block_w; bx++) {
+                uint8_t block_rgba[4 * 4 * 4];
+                decode_etc1_block(pixel_data + (by * block_w + bx) * 8, block_rgba, 4 * 4);
+                for (int row = 0; row < 4 && (by * 4 + row) < height; row++) {
+                    for (int col = 0; col < 4 && (bx * 4 + col) < width; col++) {
+                        memcpy(&rgba[((by * 4 + row) * width + (bx * 4 + col)) * 4],
+                               &block_rgba[row * 16 + col * 4], 4);
+                    }
+                }
+            }
+        }
+    } else if (is_pvrtc) {
+        pvr::PVRTDecompressPVRTC(pixel_data, (pvrtc_bpp == 2) ? 1 : 0, width, height, rgba.data());
+    } else {
+        std::cerr << "[SRE-PVR32] Unsupported format decoding " << width << "x" << height << std::endl;
+        return;
+    }
+    
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    
+    if (out_width_ptr) {
+        *(uint32_t*)(memory + out_width_ptr) = width;
+    }
+    if (out_height_ptr) {
+        *(uint32_t*)(memory + out_height_ptr) = height;
+    }
+    
+    std::cout << "[SRE-PVR32] Successfully loaded and uploaded " << width << "x" << height 
+              << " PVR to GL texture " << tex_name << " (Format: " << (is_etc1 ? "ETC1" : "PVRTC") << ", Size: " << file_size << " bytes)" << std::endl;
 }
 
 void bridge_gl_tex_parameteri(void* emu_ptr) {
@@ -4444,8 +4661,8 @@ void bridge_glGetString(void* emu_ptr) {
     if (!initialized) {
         strcpy((char*)(memory + 0x40000), "OpenGL ES 2.0 (Swordigo Desktop)");
         strcpy((char*)(memory + 0x40100), "Swordigo Desktop Emulator");
-        // Don't advertise ETC1 — forces game to use uncompressed textures (faster, no CPU decode)
-        strcpy((char*)(memory + 0x40200), "GL_OES_compressed_ETC1_texture_data GL_OES_texture_npot");
+        // Advertise ETC1 and PVRTC support — we have full software decoders.
+        strcpy((char*)(memory + 0x40200), "GL_OES_compressed_ETC1_RGB8_texture GL_OES_compressed_ETC1_RGB8_sub_texture GL_OES_texture_npot GL_IMG_texture_format_BGRA8888 GL_IMG_texture_compression_pvrtc");
         initialized = true;
     }
     uint32_t name = emu->get_reg(0);
@@ -5041,6 +5258,7 @@ void JniBridge::init_standard_bridges() {
     register_handler("glTexParameteri", bridge_gl_tex_parameteri);
     register_handler("glTexParameterf", bridge_gl_tex_parameterf);
     register_handler("glCompressedTexImage2D", bridge_gl_compressed_tex_image_2d);
+    register_handler("sre_PVRTTextureLoadFromPVRBuffer", bridge_PVRTTextureLoadFromPVRBuffer);
     register_handler("glVertexPointer", bridge_gl_vertex_pointer);
     register_handler("glTexCoordPointer", bridge_gl_texcoord_pointer);
     register_handler("glColorPointer", bridge_gl_color_pointer);

@@ -13,6 +13,7 @@
  * ============================================================ */
 
 #include "sre.h"
+#include "sre_caver.h"
 
 /* Swordigo base address — defined in sre_init.c */
 extern uint64_t g_swordigo_base;
@@ -63,38 +64,38 @@ typedef int  (*fn_int_self_ptr)(void* self, void* shared_ptr_ref);
  * ========================================================================= */
 
 /* HealthBar */
-#define OFF_HealthBar_SetMaxHealth       0x3dad24
-#define OFF_HealthBar_SetCurrentHealth   0x3dad4c
+#define OFF_HealthBar_SetMaxHealth       0x3d9b74
+#define OFF_HealthBar_SetCurrentHealth   0x3d9b9c
 
 /* ManaBar */
-#define OFF_ManaBar_SetMaxMana           0x3e0254
-#define OFF_ManaBar_SetCurrentMana       0x3e0328
+#define OFF_ManaBar_SetMaxMana           0x3df0a4
+#define OFF_ManaBar_SetCurrentMana       0x3df178
 
 /* CoinBar */
-#define OFF_CoinBar_SetCurrentCoins      0x3c4c7c
+#define OFF_CoinBar_SetCurrentCoins      0x3c3acc
 
 /* GameOverlayView */
-#define OFF_GameOverlayView_SetControlsHidden      0x3d6544
-#define OFF_GameOverlayView_SetShowsUseButton      0x3d685c
-#define OFF_GameOverlayView_SetSkillButtonDisabled  0x3d6974
+#define OFF_GameOverlayView_SetControlsHidden      0x3d5394
+#define OFF_GameOverlayView_SetShowsUseButton      0x3d56ac
+#define OFF_GameOverlayView_SetSkillButtonDisabled  0x3d57c4
 
 /* GUIEffect */
-#define OFF_GUIEffect_FadeOut            0x4a7174
-#define OFF_GUIEffect_FadeIn             0x4a72bc
-#define OFF_GUIEffect_Update             0x4a71a8
+#define OFF_GUIEffect_FadeOut            0x4a6f54
+#define OFF_GUIEffect_FadeIn             0x4a709c
+#define OFF_GUIEffect_Update             0x4a6f88
 
 /* GUIView */
-#define OFF_GUIView_Update               0x49e55c
+#define OFF_GUIView_Update               0x49e33c
 
 /* CharControllerComponent */
-#define OFF_CharController_CanUse        0x25eaa0
-#define OFF_CharController_CanPickup     0x25ebb8
+#define OFF_CharController_CanUse        0x25c950
+#define OFF_CharController_CanPickup     0x25ca68
 
 /* GameSceneController */
-#define OFF_GameSceneController_CanCastSkill  0x34d44c
+#define OFF_GameSceneController_CanCastSkill  0x34c2fc
 
 /* GameSceneView (own methods we call on self) */
-#define OFF_GameSceneView_HideCinematicSkipButton  0x34f044
+#define OFF_GameSceneView_HideCinematicSkipButton  0x34def4
 
 /* =========================================================================
  * Helper: compute function pointer from offset
@@ -154,6 +155,21 @@ volatile int g_sre_player_mana_level = 0;
 volatile int g_sre_player_xp = 0;
 volatile int g_sre_player_level = 0;
 volatile int g_sre_player_atk_level = 0;
+
+/* Player Position — Exported to Host for GLES2 Lighting */
+volatile float g_sre_hero_pos_x = 0.0f;
+volatile float g_sre_hero_pos_y = 0.0f;
+volatile float g_sre_hero_pos_z = 0.0f;
+
+/* Relay pointer to original RenderingContext constructor */
+uint64_t g_orig_RenderingContext_C1 = 0;
+
+/* Hook: Force GLES 2.0 API Mode */
+void sre_RenderingContext_C1(void* self, int api_mode) {
+    // Call the original constructor through relay stub forcing GLES 2.0 (api_mode = 1)
+    typedef void (*fn_Ctor)(void*, int);
+    ((fn_Ctor)g_orig_RenderingContext_C1)(self, 1);
+}
 
 /* Scene state flags */
 volatile int g_sre_gui_scene_active = 0;
@@ -229,6 +245,19 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
     g_sre_gamestate_ptr = (uint64_t)gamestate;
 
     /* Synchronize global camera coordinates using hero position fallback disabled */
+    if (ctrl_ptr != 0) {
+        void* hero = *(void**)(ctrl_ptr + 0xd8); // Hero SceneObject*
+        if (hero != 0 && TransformComponent_Interface != 0) {
+            void* tc = g_SceneObject_ComponentWithInterface(hero, TransformComponent_Interface);
+            if (tc != 0) {
+                float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+                sre_transform_get_position(tc, &hx, &hy, &hz);
+                g_sre_hero_pos_x = hx;
+                g_sre_hero_pos_y = hy;
+                g_sre_hero_pos_z = hz;
+            }
+        }
+    }
     
     /* ---- 1. HEALTH BAR ---- */
     {
@@ -238,7 +267,7 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
             int max_hp   = hp_level * 2 + 4;
             int cur_hp   = *(int*)(gamestate + 0xA8);
             
-            FN(fn_void_self_int, OFF_HealthBar_SetMaxHealth)((void*)health_bar, max_hp);
+            if (g_sre_HealthBar_SetMaxHealth) g_sre_HealthBar_SetMaxHealth((void*)health_bar, max_hp);
             
             /* Damage flash: if HP decreased, flash red */
             int prev_hp = *(int*)((char*)health_bar + 0x110); /* HealthBar::currentHealth */
@@ -247,15 +276,15 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
                 if (dmg_effect != 0) {
                     /* Set damage flash color to red: RGBA = 0xCC0000CC */
                     *(uint32_t*)((char*)dmg_effect + 0x48) = 0xCC0000CC;
-                    FN(fn_void_self_float, OFF_GUIEffect_FadeOut)((void*)dmg_effect, 0.0f);
-                    FN(fn_void_self_float, OFF_GUIEffect_FadeIn)((void*)dmg_effect, 0.6f);
+                    if (g_sre_GUIEffect_FadeOut) g_sre_GUIEffect_FadeOut((void*)dmg_effect, 0.0f);
+                    if (g_sre_GUIEffect_FadeIn) g_sre_GUIEffect_FadeIn((void*)dmg_effect, 0.6f);
                 }
                 /* Re-read HP after potential effect calls */
                 cur_hp = *(int*)(gamestate + 0xA8);
                 health_bar = *(uint64_t*)(*(uint64_t*)(this_ + 0x100) + 0x1E8);
             }
             
-            FN(fn_void_self_int, OFF_HealthBar_SetCurrentHealth)((void*)health_bar, cur_hp);
+            if (g_sre_HealthBar_SetCurrentHealth) g_sre_HealthBar_SetCurrentHealth((void*)health_bar, cur_hp);
             
             /* Export to host */
             g_sre_player_hp       = cur_hp;
@@ -278,16 +307,16 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
             int max_mana   = mana_level * 20 + 10;
             int cur_mana   = *(int*)(gamestate + 0xAC);
             
-            FN(fn_void_self_int, OFF_ManaBar_SetMaxMana)((void*)mana_bar, max_mana);
-            FN(fn_void_self_int, OFF_ManaBar_SetCurrentMana)(
-                (void*)*(uint64_t*)(*(uint64_t*)(this_ + 0x100) + 0x1F8), cur_mana);
+            if (g_sre_ManaBar_SetMaxMana) g_sre_ManaBar_SetMaxMana((void*)mana_bar, max_mana);
+            if (g_sre_ManaBar_SetCurrentMana) {
+                g_sre_ManaBar_SetCurrentMana(
+                    (void*)*(uint64_t*)(*(uint64_t*)(this_ + 0x100) + 0x1F8), cur_mana);
+            }
             
             /* Export to host */
             g_sre_player_mana       = cur_mana;
             g_sre_player_max_mana   = max_mana;
-            g_sre_player_mana_level = mana_level;
-            
-            /* ---- 2b. SKILL BUTTON (CanCastSkill) ---- */
+                       /* ---- 2b. SKILL BUTTON (CanCastSkill) ---- */
             /* Read the current skill shared_ptr from GameState */
             uint64_t skill_px = *(uint64_t*)(gamestate + 0x68);
             void*    skill_pn = *(void**)(gamestate + 0x70);
@@ -306,12 +335,14 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
                 /* Call CanCastSkill */
                 void* controller = (void*)*(uint64_t*)(this_ + 0xF0);
                 void* game_overlay = (void*)*(uint64_t*)(this_ + 0x100);
-                int can_cast = FN(fn_int_self_ptr, OFF_GameSceneController_CanCastSkill)(
-                    controller, (void*)local_sp);
+                int can_cast = g_sre_GameSceneController_CanCastSkill ? g_sre_GameSceneController_CanCastSkill(
+                    controller, (void*)local_sp) : 0;
                 
                 /* SetSkillButtonDisabled(overlay, !can_cast) */
-                FN(fn_void_self_bool, OFF_GameOverlayView_SetSkillButtonDisabled)(
-                    game_overlay, (can_cast & 1) ^ 1);
+                if (g_sre_GameOverlayView_SetSkillButtonDisabled) {
+                    g_sre_GameOverlayView_SetSkillButtonDisabled(
+                        game_overlay, (can_cast & 1) ^ 1);
+                }
                 
                 /* Release local shared_ptr (non-atomic) */
                 sp_release(skill2_pn);
@@ -347,7 +378,7 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
                 *(int*)(gamestate + 0xB0) = g_sre_player_coins;
                 coins = g_sre_player_coins;
             }
-            FN(fn_void_self_int, OFF_CoinBar_SetCurrentCoins)((void*)coin_bar, coins);
+            if (g_sre_CoinBar_SetCurrentCoins) g_sre_CoinBar_SetCurrentCoins((void*)coin_bar, coins);
             g_sre_player_coins = coins;
             
             /* Check if we're in a shop area (house/town music) */
@@ -407,7 +438,7 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
         
         void* overlay = (void*)*(uint64_t*)(this_ + 0x100);
         int hide = (enemy_count >= 1 || combat_flag != 0) ? 1 : 0;
-        FN(fn_void_self_bool, OFF_GameOverlayView_SetControlsHidden)(overlay, hide);
+        if (g_sre_GameOverlayView_SetControlsHidden) g_sre_GameOverlayView_SetControlsHidden(overlay, hide);
     }
     
     /* ---- 5. USE/PICKUP BUTTON ---- */
@@ -417,14 +448,14 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
             void* overlay = (void*)*(uint64_t*)(this_ + 0x100);
             int can_interact;
             
-            int can_pickup = FN(fn_int_self, OFF_CharController_CanPickup)((void*)char_ctrl);
+            int can_pickup = g_sre_CharController_CanPickup ? g_sre_CharController_CanPickup((void*)char_ctrl) : 0;
             if (can_pickup & 1) {
                 can_interact = 1;
             } else {
-                can_interact = FN(fn_int_self, OFF_CharController_CanUse)((void*)char_ctrl) & 1;
+                can_interact = g_sre_CharController_CanUse ? (g_sre_CharController_CanUse((void*)char_ctrl) & 1) : 0;
             }
             
-            FN(fn_void_self_bool, OFF_GameOverlayView_SetShowsUseButton)(overlay, can_interact);
+            if (g_sre_GameOverlayView_SetShowsUseButton) g_sre_GameOverlayView_SetShowsUseButton(overlay, can_interact);
         }
     }
     
@@ -436,36 +467,35 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
             *timer -= deltaTime;
             if (*timer <= 0.0f) {
                 /* Call HideCinematicSkipButton(this, true) */
-                FN(fn_void_self_bool, OFF_GameSceneView_HideCinematicSkipButton)(self, 1);
+                if (g_sre_GameSceneView_HideCinematicSkipButton) g_sre_GameSceneView_HideCinematicSkipButton(self, 1);
             }
         }
     }
-
+ 
 do_effects:
     /* ---- 7. GUI EFFECT UPDATES ---- */
     /* Cinematic bars effect */
     {
         uint64_t effect_bars = *(uint64_t*)(this_ + 0x188);
         if (effect_bars != 0) {
-            FN(fn_void_self_float, OFF_GUIEffect_Update)((void*)effect_bars, deltaTime);
+            if (g_sre_GUIEffect_Update) g_sre_GUIEffect_Update((void*)effect_bars, deltaTime);
         }
     }
     /* Screen effect 2 */
     {
         uint64_t effect2 = *(uint64_t*)(this_ + 0x160);
         if (effect2 != 0) {
-            FN(fn_void_self_float, OFF_GUIEffect_Update)((void*)effect2, deltaTime);
+            if (g_sre_GUIEffect_Update) g_sre_GUIEffect_Update((void*)effect2, deltaTime);
         }
     }
     /* Damage flash effect */
     {
         uint64_t dmg_flash = *(uint64_t*)(this_ + 0x170);
         if (dmg_flash != 0) {
-            FN(fn_void_self_float, OFF_GUIEffect_Update)((void*)dmg_flash, deltaTime);
+            if (g_sre_GUIEffect_Update) g_sre_GUIEffect_Update((void*)dmg_flash, deltaTime);
         }
     }
-        /* ---- 8. BASE GUIView::Update (animation system) ---- */
-    FN(fn_void_self_float, OFF_GUIView_Update)(self, deltaTime);
+    if (g_sre_GUIView_Update) g_sre_GUIView_Update(self, deltaTime);
     /* GUIView::Update (animation system) is now hooked as sre_GUIView_Update
      * (safe no-op) — no direct call needed here. */
 }

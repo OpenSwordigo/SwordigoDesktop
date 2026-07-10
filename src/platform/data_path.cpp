@@ -2,12 +2,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <filesystem>
 #include <iostream>
 #ifndef _WIN32
 #include <unistd.h>
 #include <pwd.h>
 #endif
+
+extern std::string g_assets_dir;
 
 namespace fs = std::filesystem;
 
@@ -208,3 +211,191 @@ std::string get_data_path(const std::string& relative_path) {
     // Fallback
     return "./" + relative_path;
 }
+
+// ============================================================
+//  Unified VFS Path Resolver for Host-Side asset loading
+// ============================================================
+
+static std::string g_active_mod_name = "";
+static std::string g_active_profile_id = "";
+
+void set_active_mod_name(const std::string& name) {
+    g_active_mod_name = name;
+    std::cout << "[VFS/Host] Set active mod: \"" << name << "\"" << std::endl;
+}
+
+void set_active_profile_id(const std::string& id) {
+    g_active_profile_id = id;
+    std::cout << "[VFS/Host] Set active profile: \"" << id << "\"" << std::endl;
+}
+
+// Helper to check if a file exists, with recursive scene remapping, texture format swaps, and Retina fallback
+static bool check_file_exists(const std::string& path, std::string& out_resolved) {
+    if (fs::exists(path) && !fs::is_directory(path)) {
+        out_resolved = path;
+        return true;
+    }
+
+    // 1. Bare scene renaming: levels/menu.scene -> levels/menu.scenebin, etc.
+    if (path.length() > 6 && path.substr(path.length() - 6) == ".scene") {
+        std::string stem = path.substr(0, path.length() - 6);
+        const char* ext_alts[] = { ".scenebin", ".scene.gz", ".scene.bin", ".scenez" };
+        for (const char* ext : ext_alts) {
+            std::string alt = stem + ext;
+            if (fs::exists(alt) && !fs::is_directory(alt)) {
+                out_resolved = alt;
+                return true;
+            }
+        }
+    }
+
+    // 2. .tex.png <-> .pvr texture format swaps (to allow modded PVRs to override PNGs and vice-versa)
+    if (path.length() > 8 && path.substr(path.length() - 8) == ".tex.png") {
+        std::string alt = path.substr(0, path.length() - 8) + ".pvr";
+        if (fs::exists(alt) && !fs::is_directory(alt)) {
+            out_resolved = alt;
+            return true;
+        }
+    } else if (path.length() > 4 && path.substr(path.length() - 4) == ".pvr") {
+        std::string alt = path.substr(0, path.length() - 4) + ".tex.png";
+        if (fs::exists(alt) && !fs::is_directory(alt)) {
+            out_resolved = alt;
+            return true;
+        }
+    }
+
+    // 3. Retina _2x -> _1x fallback (recursively checks renames/swaps on the base name)
+    size_t hi2x = path.find("_2x.");
+    if (hi2x != std::string::npos) {
+        std::string alt = path.substr(0, hi2x) + path.substr(hi2x + 3);
+        if (check_file_exists(alt, out_resolved)) {
+            return true;
+        }
+    }
+
+    // 4. Retina _1x -> _2x fallback (non-recursive check for upgrade if _2x is not in path)
+    if (hi2x == std::string::npos) {
+        size_t dot = path.rfind('.');
+        if (dot != std::string::npos) {
+            std::string alt = path.substr(0, dot) + "_2x" + path.substr(dot);
+            if (fs::exists(alt) && !fs::is_directory(alt)) {
+                out_resolved = alt;
+                return true;
+            }
+            // Also check texture format swaps with _2x
+            if (path.length() - dot >= 8 && path.substr(dot) == ".tex.png") {
+                std::string alt_pvr = path.substr(0, dot) + "_2x.pvr";
+                if (fs::exists(alt_pvr) && !fs::is_directory(alt_pvr)) {
+                    out_resolved = alt_pvr;
+                    return true;
+                }
+            } else if (path.length() - dot >= 4 && path.substr(dot) == ".pvr") {
+                std::string alt_png = path.substr(0, dot) + "_2x.tex.png";
+                if (fs::exists(alt_png) && !fs::is_directory(alt_png)) {
+                    out_resolved = alt_png;
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_path, int max_len) {
+    if (!original_path || original_path[0] == '\0') {
+        return false;
+    }
+
+    std::string path(original_path);
+
+    // Strip virtual folder prefixes (if any)
+    std::string prefix1 = "assets/resources/";
+    std::string prefix2 = g_assets_dir + "/resources/";
+    if (path.rfind(prefix1, 0) == 0) {
+        path = path.substr(prefix1.length());
+    } else if (path.rfind(prefix2, 0) == 0) {
+        path = path.substr(prefix2.length());
+    } else if (path.rfind("resources/", 0) == 0) {
+        path = path.substr(10);
+    }
+
+    // MiniPath translations: virtual paths defined by touchfoo/SWKiwi
+    if (path.rfind("/Assets/", 0) == 0) {
+        std::string res = get_user_data_dir() + g_assets_dir + "/" + path.substr(8);
+        strncpy(out_resolved_path, res.c_str(), max_len - 1);
+        out_resolved_path[max_len - 1] = '\0';
+        return true;
+    }
+    if (path.rfind("/Files/", 0) == 0) {
+        std::string res = get_user_data_dir() + "save/" + path.substr(7);
+        strncpy(out_resolved_path, res.c_str(), max_len - 1);
+        out_resolved_path[max_len - 1] = '\0';
+        return true;
+    }
+    if (path.rfind("/ExternalFiles/", 0) == 0) {
+        std::string res = get_user_data_dir() + "external/" + path.substr(15);
+        strncpy(out_resolved_path, res.c_str(), max_len - 1);
+        out_resolved_path[max_len - 1] = '\0';
+        return true;
+    }
+    if (path.rfind("/Cache/", 0) == 0 || path.rfind("/ExternalCache/", 0) == 0) {
+        size_t offset = (path.rfind("/Cache/", 0) == 0) ? 7 : 15;
+        std::string res = get_user_data_dir() + "cache/" + path.substr(offset);
+        strncpy(out_resolved_path, res.c_str(), max_len - 1);
+        out_resolved_path[max_len - 1] = '\0';
+        return true;
+    }
+
+    // Absolute paths are passed through as-is
+    if (original_path[0] == '/') {
+        strncpy(out_resolved_path, original_path, max_len - 1);
+        out_resolved_path[max_len - 1] = '\0';
+        return true;
+    }
+
+    // Clean data base path
+    std::string data_dir = get_user_data_dir();
+    if (!data_dir.empty() && data_dir.back() == '/') {
+        data_dir.pop_back();
+    }
+
+    // Build SWKiwi-compatible 5-level search hierarchy candidates:
+    std::vector<std::string> candidates;
+    bool has_mod = !g_active_mod_name.empty();
+    bool has_profile = !g_active_profile_id.empty();
+
+    // 1. mods/<mod>/resources/<profile>/X
+    if (has_mod && has_profile) {
+        candidates.push_back(data_dir + "/mods/" + g_active_mod_name + "/resources/" + g_active_profile_id + "/" + path);
+    }
+    // 2. mods/<mod>/resources/X
+    if (has_mod) {
+        candidates.push_back(data_dir + "/mods/" + g_active_mod_name + "/resources/" + path);
+    }
+    // 3. resources/<profile>/X
+    if (has_profile) {
+        candidates.push_back(data_dir + "/resources/" + g_active_profile_id + "/" + path);
+    }
+    // 4. resources/X
+    candidates.push_back(data_dir + "/resources/" + path);
+    // 5. custom_assets/resources/X (fallback to configured assets dir)
+    candidates.push_back(data_dir + "/" + g_assets_dir + "/resources/" + path);
+
+    // Search through candidates in priority order
+    for (const auto& candidate : candidates) {
+        std::string resolved;
+        if (check_file_exists(candidate, resolved)) {
+            strncpy(out_resolved_path, resolved.c_str(), max_len - 1);
+            out_resolved_path[max_len - 1] = '\0';
+            return true;
+        }
+    }
+
+    // Ultimate fallback: configured assets resources path (level 5)
+    std::string fallback = data_dir + "/" + g_assets_dir + "/resources/" + path;
+    strncpy(out_resolved_path, fallback.c_str(), max_len - 1);
+    out_resolved_path[max_len - 1] = '\0';
+    return true;
+}
+

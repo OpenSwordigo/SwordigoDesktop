@@ -197,7 +197,7 @@ void GuiRenderer::init() {
         m.items.push_back(MenuItem("---", GUI_NONE, false));
         m.items.push_back(MenuItem("God Mode", GUI_MOD_GOD_MODE));
         m.items.push_back(MenuItem("Infinite Mana", GUI_MOD_INFINITE_MANA));
-        m.items.push_back(MenuItem("Fly Mode", GUI_MOD_FLY_MODE));
+        m.items.push_back(MenuItem("Fly Mode (N/A)", GUI_MOD_FLY_MODE, false));
         m.items.push_back(MenuItem("Infinite Jump", GUI_MOD_INFINITE_JUMP));
         m.x = cur_x;
         m.w = (float)m.title.length() * char_w + pad * 2.0f;
@@ -1077,7 +1077,7 @@ void GuiRenderer::render_mod_panel(float fwin_w, float fwin_h, int mouse_x, int 
 
     // ── MOVEMENT ──
     draw_section("MOVEMENT");
-    draw_checkbox("Fly Mode", mod_fly_mode, true);
+    draw_checkbox("Fly Mode (N/A)", mod_fly_mode, false);
     draw_checkbox("Infinite Jump", mod_infinite_jump, true);
     char ws_buf[16]; snprintf(ws_buf, 16, "%.1fx", mod_walk_speed);
     draw_value("Walk Speed", ws_buf, true);
@@ -1088,7 +1088,7 @@ void GuiRenderer::render_mod_panel(float fwin_w, float fwin_h, int mouse_x, int 
 
     // ── ECONOMY ──
     draw_section("ECONOMY");
-    draw_checkbox("Coin Limit Breaker", mod_coin_break, true);
+    draw_checkbox("Coin Limit Breaker (N/A)", mod_coin_break, false);
     char lv_buf[16]; snprintf(lv_buf, 16, "%d", mod_level);
     draw_value("Level", lv_buf, true);
     char xp_buf[16]; snprintf(xp_buf, 16, "%d", mod_exp);
@@ -1188,23 +1188,35 @@ void GuiRenderer::render_mod_sidebar(float fwin_w, float fwin_h, int mouse_x, in
     cy -= rh * 0.5f;
 
     // Compact checkbox helper
-    auto draw_cb = [&](const char* label, bool checked) {
+    auto draw_cb = [&](const char* label, bool checked, bool enabled = true) {
         float bx = cx + 2*s, by = cy + 2*s;
-        draw_border(bx, by, box_sz, box_sz, 1.0f, 120, 120, 140, 200);
+        uint8_t bc = enabled ? 120 : 55;
+        draw_border(bx, by, box_sz, box_sz, 1.0f, bc, bc, bc+20, 200);
         if (checked) {
-            draw_rect(bx+2*s, by+2*s, box_sz-4*s, box_sz-4*s, 50, 200, 90, 255);
+            uint8_t fr = enabled ? 50 : 40, fg = enabled ? 200 : 60, fb = enabled ? 90 : 50;
+            draw_rect(bx+2*s, by+2*s, box_sz-4*s, box_sz-4*s, fr, fg, fb, 255);
         }
-        draw_string(label, bx + box_sz + 6*s, cy + 2*s, ts * 0.85f, 200, 200, 220, 255);
+        uint8_t lr = enabled ? 200 : 90, lg = enabled ? 200 : 90, lb = enabled ? 220 : 100;
+        draw_string(label, bx + box_sz + 6*s, cy + 2*s, ts * 0.85f, lr, lg, lb, 255);
+        if (!enabled) {
+            draw_string("(soon)", cx + cw - 45*s, cy + 2*s, ts * 0.65f, 70, 70, 90, 140);
+        }
         cy -= rh;
     };
 
-    auto draw_val = [&](const char* label, const char* val) {
-        draw_string(label, cx + 2*s, cy + 2*s, ts * 0.85f, 200, 200, 220, 255);
+    auto draw_val = [&](const char* label, const char* val, bool enabled = true) {
+        uint8_t lr = enabled ? 200 : 90, lg = enabled ? 200 : 90, lb = enabled ? 220 : 100;
+        draw_string(label, cx + 2*s, cy + 2*s, ts * 0.85f, lr, lg, lb, 255);
         float vx = cx + cw * 0.55f;
-        draw_string("<", vx, cy + 2*s, ts * 0.85f, 70, 130, 230, 255);
-        draw_string(val, vx + 10*s, cy + 2*s, ts * 0.85f, 255, 220, 100, 255);
-        float vw2 = strlen(val) * 8.0f * ts * 0.85f;
-        draw_string(">", vx + 10*s + vw2 + 4*s, cy + 2*s, ts * 0.85f, 70, 130, 230, 255);
+        if (enabled) {
+            draw_string("<", vx, cy + 2*s, ts * 0.85f, 70, 130, 230, 255);
+            draw_string(val, vx + 10*s, cy + 2*s, ts * 0.85f, 255, 220, 100, 255);
+            float vw2 = strlen(val) * 8.0f * ts * 0.85f;
+            draw_string(">", vx + 10*s + vw2 + 4*s, cy + 2*s, ts * 0.85f, 70, 130, 230, 255);
+        } else {
+            draw_string(val, vx, cy + 2*s, ts * 0.85f, 70, 70, 90, 140);
+            draw_string("(soon)", cx + cw - 45*s, cy + 2*s, ts * 0.65f, 70, 70, 90, 140);
+        }
         cy -= rh;
     };
 
@@ -1213,40 +1225,38 @@ void GuiRenderer::render_mod_sidebar(float fwin_w, float fwin_h, int mouse_x, in
         cy -= rh * 0.8f;
     };
 
-    /* v5.0 vanilla release — non-functional sections hidden, code preserved
     draw_sec("COMBAT");
-    draw_cb("God Mode", mod_god_mode);
-    draw_cb("Inf. Mana", mod_infinite_mana);
+    draw_cb("God Mode", mod_god_mode, true);
+    draw_cb("Inf. Mana", mod_infinite_mana, true);
 
     draw_sec("MOVEMENT");
-    draw_cb("Fly Mode", mod_fly_mode);
-    draw_cb("Inf. Jump", mod_infinite_jump);
+    draw_cb("Fly Mode", mod_fly_mode, false);
+    draw_cb("Inf. Jump", mod_infinite_jump, true);
     char ws[16]; snprintf(ws, 16, "%.1fx", mod_walk_speed);
-    draw_val("Walk Spd", ws);
+    draw_val("Walk Spd", ws, true);
     char rs[16]; snprintf(rs, 16, "%.1fx", mod_run_speed);
-    draw_val("Run Spd", rs);
+    draw_val("Run Spd", rs, true);
     char jh[16]; snprintf(jh, 16, "%.1fx", mod_jump_height);
-    draw_val("Jump Ht", jh);
+    draw_val("Jump Ht", jh, true);
 
     draw_sec("ECONOMY");
-    draw_cb("Coin Break", mod_coin_break);
+    draw_cb("Coin Break", mod_coin_break, false);
     char lv[16]; snprintf(lv, 16, "%d", mod_level);
-    draw_val("Level", lv);
+    draw_val("Level", lv, true);
     char xp[16]; snprintf(xp, 16, "%d", mod_exp);
-    draw_val("Exp", xp);
+    draw_val("Exp", xp, true);
 
     draw_sec("CHEATS");
-    draw_val("Heal", "[FULL]");
-    draw_val("Coins", "[+100]");
-    draw_val("Mana", "[FULL]");
-    */
+    draw_val("Heal", "[FULL]", true);
+    draw_val("Coins", "[+100]", true);
+    draw_val("Mana", "[FULL]", true);
 
     draw_sec("GAME");
     char gs[16]; snprintf(gs, 16, "%.1fx", g_game_speed);
-    draw_val("Speed", gs);
-    draw_cb("Pause", g_game_paused);
-    draw_cb("Free Cam", g_cam_active);
-    draw_cb("Smooth Cam", g_cam_smooth);
+    draw_val("Speed", gs, true);
+    draw_cb("Pause", g_game_paused, true);
+    draw_cb("Free Cam", g_cam_active, true);
+    draw_cb("Smooth Cam", g_cam_smooth, true);
 }
 
 // ============================================================================
@@ -1299,13 +1309,33 @@ GuiAction GuiRenderer::handle_mod_panel_click(int mouse_x, int mouse_y, int win_
         bool click_left = (mouse_x < (int)(vx + 14*s));
 
         switch (row) {
-            case 1: // Game Speed
+            case 1: // God Mode
+                return GUI_MOD_GOD_MODE;
+            case 2: // Infinite Mana
+                return GUI_MOD_INFINITE_MANA;
+            case 4: // Fly Mode (disabled)
+                break;
+            case 5: // Infinite Jump
+                return GUI_MOD_INFINITE_JUMP;
+            case 6: // Walk Speed
+                return click_left ? GUI_MOD_WALK_SPEED_DOWN : GUI_MOD_WALK_SPEED_UP;
+            case 7: // Run Speed
+                return click_left ? GUI_MOD_RUN_SPEED_DOWN : GUI_MOD_RUN_SPEED_UP;
+            case 8: // Jump Height
+                return click_left ? GUI_MOD_JUMP_HEIGHT_DOWN : GUI_MOD_JUMP_HEIGHT_UP;
+            case 10: // Coin Limit Breaker (disabled)
+                break;
+            case 11: // Level
+                return click_left ? GUI_MOD_LEVEL_DOWN : GUI_MOD_LEVEL_UP;
+            case 12: // Experience
+                return click_left ? GUI_MOD_EXP_DOWN : GUI_MOD_EXP_UP;
+            case 14: // Game Speed
                 return click_left ? GUI_GAME_SPEED_DOWN : GUI_GAME_SPEED_UP;
-            case 2: // Pause Game
+            case 15: // Pause Game
                 return GUI_TOGGLE_PAUSE;
-            case 3: // Free Camera
+            case 16: // Free Camera
                 return GUI_TOGGLE_CAM;
-            case 4: // Smooth Camera
+            case 17: // Smooth Camera
                 return GUI_TOGGLE_SMOOTH_CAM;
             default:
                 break;
@@ -1387,9 +1417,6 @@ GuiAction GuiRenderer::handle_mod_sidebar_click(int mouse_x, int mouse_y, int wi
         // We track items by stepping through the layout
         // Section = skip sec_rh, Checkbox/Value = skip rh
 
-        // v5.0 — only GAME section visible in sidebar
-        // (COMBAT, MOVEMENT, ECONOMY sections hidden — code preserved below)
-        /* hidden sections layout
         cy -= sec_rh;
         float god_top = cy; cy -= rh;
         float mana_top = cy; cy -= rh;
@@ -1407,7 +1434,7 @@ GuiAction GuiRenderer::handle_mod_sidebar_click(int mouse_x, int mouse_y, int wi
         float heal_top = cy; cy -= rh;
         float addcoin_top = cy; cy -= rh;
         float refmana_top = cy; cy -= rh;
-        */
+
         // GAME header
         cy -= sec_rh;
         float spd_top = cy; cy -= rh;       // 0: Speed (val)
@@ -1419,7 +1446,28 @@ GuiAction GuiRenderer::handle_mod_sidebar_click(int mouse_x, int mouse_y, int wi
         float vx = sb_x + mg + cw * 0.55f;
         bool click_left = (mouse_x < (int)(vx + 10*s));
 
-        // Check GAME items only
+        // COMBAT
+        if (my_f >= god_top - rh && my_f < god_top) { return GUI_MOD_GOD_MODE; }
+        if (my_f >= mana_top - rh && my_f < mana_top) { return GUI_MOD_INFINITE_MANA; }
+
+        // MOVEMENT
+        if (my_f >= fly_top - rh && my_f < fly_top) { return GUI_NONE; } // disabled
+        if (my_f >= ijmp_top - rh && my_f < ijmp_top) { return GUI_MOD_INFINITE_JUMP; }
+        if (my_f >= walk_top - rh && my_f < walk_top) { return click_left ? GUI_MOD_WALK_SPEED_DOWN : GUI_MOD_WALK_SPEED_UP; }
+        if (my_f >= run_top - rh && my_f < run_top) { return click_left ? GUI_MOD_RUN_SPEED_DOWN : GUI_MOD_RUN_SPEED_UP; }
+        if (my_f >= jump_top - rh && my_f < jump_top) { return click_left ? GUI_MOD_JUMP_HEIGHT_DOWN : GUI_MOD_JUMP_HEIGHT_UP; }
+
+        // ECONOMY
+        if (my_f >= coin_top - rh && my_f < coin_top) { return GUI_NONE; } // disabled
+        if (my_f >= lvl_top - rh && my_f < lvl_top) { return click_left ? GUI_MOD_LEVEL_DOWN : GUI_MOD_LEVEL_UP; }
+        if (my_f >= exp_top - rh && my_f < exp_top) { return click_left ? GUI_MOD_EXP_DOWN : GUI_MOD_EXP_UP; }
+
+        // CHEATS
+        if (my_f >= heal_top - rh && my_f < heal_top) { return GUI_MOD_HEAL_FULL; }
+        if (my_f >= addcoin_top - rh && my_f < addcoin_top) { return GUI_MOD_ADD_COINS; }
+        if (my_f >= refmana_top - rh && my_f < refmana_top) { return GUI_MOD_REFILL_MANA; }
+
+        // GAME
         if (my_f >= spd_top - rh && my_f < spd_top) { return click_left ? GUI_GAME_SPEED_DOWN : GUI_GAME_SPEED_UP; }
         if (my_f >= pause_top - rh && my_f < pause_top) { return GUI_TOGGLE_PAUSE; }
         if (my_f >= fcam_top - rh && my_f < fcam_top) { return GUI_TOGGLE_CAM; }

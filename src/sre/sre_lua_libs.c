@@ -1215,63 +1215,80 @@ static int pb_read_varint(const unsigned char** p, const unsigned char* end, uin
     return 0;
 }
 
-static int sre_scl_extract_lua(const char* buf, size_t size, const char** out_lua, size_t* out_len) {
-    const unsigned char* p = (const unsigned char*)buf;
-    const unsigned char* end = p + size;
-    
-    while (p < end) {
-        uint64_t key;
-        if (!pb_read_varint(&p, end, &key)) return 0;
-        int field = key >> 3;
-        int wire = key & 7;
-        
-        if (wire == 2) {
-            uint64_t len;
-            if (!pb_read_varint(&p, end, &len)) return 0;
-            if (p + len > end) return 0;
-            
-            if (field == 5) { /* Program */
-                const unsigned char* prog_p = p;
-                const unsigned char* prog_end = p + len;
-                while (prog_p < prog_end) {
-                    uint64_t pkey;
-                    if (!pb_read_varint(&prog_p, prog_end, &pkey)) return 0;
-                    int pfield = pkey >> 3;
-                    int pwire = pkey & 7;
-                    if (pwire == 2) {
-                        uint64_t plen;
-                        if (!pb_read_varint(&prog_p, prog_end, &plen)) return 0;
-                        if (prog_p + plen > prog_end) return 0;
-                        if (pfield == 2 || pfield == 3) { /* Source or CompiledCode */
-                            *out_lua = (const char*)prog_p;
-                            *out_len = plen;
-                            return 1;
-                        }
-                        prog_p += plen;
-                    } else if (pwire == 0) {
-                        uint64_t dummy;
-                        if (!pb_read_varint(&prog_p, prog_end, &dummy)) return 0;
-                    } else if (pwire == 1) {
-                        prog_p += 8;
-                    } else if (pwire == 5) {
-                        prog_p += 4;
-                    } else {
-                        return 0; /* Unknown wire type */
+int sre_scl_extract_lua(const char* buf, size_t size, const char** out_lua, size_t* out_len) {
+    if (!buf || size == 0) return 0;
+
+    /* Quick heuristic: if the first byte could not be a valid protobuf tag (wire 0-5),
+     * or the file starts with ASCII text chars like 'P' (Program{), skip to text mode. */
+    unsigned char first = (unsigned char)buf[0];
+    int wire0 = first & 7;
+    int is_likely_proto = (wire0 <= 5) && (first >= 0x08);  /* valid varint tag byte range */
+
+    if (is_likely_proto) {
+        const unsigned char* p = (const unsigned char*)buf;
+        const unsigned char* end = p + size;
+
+        while (p < end) {
+            uint64_t key;
+            if (!pb_read_varint(&p, end, &key)) break;
+            int field = key >> 3;
+            int wire  = key & 7;
+
+            if (wire == 2) {
+                uint64_t len;
+                if (!pb_read_varint(&p, end, &len)) break;
+                if (p + len > end) break;
+
+                if (field == 5) { /* Program message */
+                    const unsigned char* prog_p   = p;
+                    const unsigned char* prog_end = p + len;
+                    while (prog_p < prog_end) {
+                        uint64_t pkey;
+                        if (!pb_read_varint(&prog_p, prog_end, &pkey)) break;
+                        int pfield = pkey >> 3;
+                        int pwire  = pkey & 7;
+                        if (pwire == 2) {
+                            uint64_t plen;
+                            if (!pb_read_varint(&prog_p, prog_end, &plen)) break;
+                            if (prog_p + plen > prog_end) break;
+                            if (pfield == 1 || pfield == 2 || pfield == 3) { /* Source (1/2) or CompiledCode (3) */
+                                *out_lua = (const char*)prog_p;
+                                *out_len = (size_t)plen;
+                                return 1;
+                            }
+                            prog_p += plen;
+                        } else if (pwire == 0) {
+                            uint64_t dummy;
+                            if (!pb_read_varint(&prog_p, prog_end, &dummy)) break;
+                        } else if (pwire == 1) { prog_p += 8; }
+                          else if (pwire == 5) { prog_p += 4; }
+                          else break;
                     }
                 }
-            }
-            p += len;
-        } else if (wire == 0) {
-            uint64_t dummy;
-            if (!pb_read_varint(&p, end, &dummy)) return 0;
-        } else if (wire == 1) {
-            p += 8;
-        } else if (wire == 5) {
-            p += 4;
-        } else {
-            return 0;
+                p += len;
+            } else if (wire == 0) {
+                uint64_t dummy;
+                if (!pb_read_varint(&p, end, &dummy)) break;
+            } else if (wire == 1) { p += 8; }
+              else if (wire == 5) { p += 4; }
+              else break;
         }
     }
+
+    /* Fall back: plain-text SCL format — Program{ String : $ <lua> $end } */
+    const char* text_start = strstr(buf, "String : $");
+    if (text_start) {
+        text_start += 10;
+        while (*text_start == ' ' || *text_start == '\t' || *text_start == '\r' || *text_start == '\n')
+            text_start++;
+        const char* text_end = strstr(text_start, "$end");
+        if (text_end) {
+            *out_lua = text_start;
+            *out_len = (size_t)(text_end - text_start);
+            return 1;
+        }
+    }
+
     return 0;
 }
 
@@ -1303,7 +1320,7 @@ static int sre_loadfile(lua_State* L) {
     const char* real_path = sre_vfs_resolve_path(filename, vfs_buf);
 
     /* Read the entire file */
-    FILE* fp = fopen(real_path, "r");
+    FILE* fp = fopen(real_path, "rb");
     if (!fp) {
         g_lua_pushnil(L);
         g_lua_pushstring(L, "cannot open file");
@@ -1407,7 +1424,7 @@ static int sre_dofile(lua_State* L) {
     const char* real_path = sre_vfs_resolve_path(filename, vfs_buf);
 
     /* Read the entire file */
-    FILE* fp = fopen(real_path, "r");
+    FILE* fp = fopen(real_path, "rb");
     if (!fp) {
         g_lua_pushstring(L, "dofile: cannot open file");
         if (g_lua_error) return g_lua_error(L);
@@ -1706,3 +1723,459 @@ void sre_open_std_libs(lua_State* L) {
     g_lua_pushcclosure(L, sre_dofile, 0);
     g_lua_setfield(L, LUA_GLOBALSINDEX, "dofile");
 }
+
+/* ==========================================================================
+ * caver Lua module — exposes Caver engine objects to Lua mods
+ *
+ * Usage from Lua:
+ *   local hero = caver.getHero()           -- returns SceneObject userdata
+ *   local hp   = caver.getHp(hero)         -- float
+ *   caver.setHp(hero, 999)
+ *   local maxhp = caver.getMaxHp(hero)
+ *   local x,y,z = caver.getPosition(hero)
+ *   caver.setPosition(hero, x, y, z)
+ *   local spd = caver.getSpeed(hero)
+ *   caver.setSpeed(hero, 1.5)
+ *   local comp = caver.getComponent(hero, "Health")  -- returns component ud
+ * ========================================================================= */
+
+#include "sre_caver.h"
+
+/* Push a raw pointer as lightuserdata (NULL → nil) */
+static void push_ptr(lua_State* L, void* p) {
+    if (p) g_lua_pushlightuserdata(L, p);
+    else   g_lua_pushnil(L);
+}
+
+/* Pull a lightuserdata or nil from stack */
+static void* check_ptr(lua_State* L, int idx) {
+    if (g_lua_type(L, idx) != 2 /* LUA_TLIGHTUSERDATA */) return (void*)0;
+    return g_lua_touserdata(L, idx);
+}
+
+/* caver.getHero() → userdata|nil */
+static int l_caver_getHero(lua_State* L) {
+    push_ptr(L, sre_hero_object_from_L(L));
+    return 1;
+}
+
+/* caver.getGameController() → userdata|nil */
+static int l_caver_getGameController(lua_State* L) {
+    push_ptr(L, sre_game_controller_from_L(L));
+    return 1;
+}
+
+/* caver.getSceneController() → userdata|nil */
+static int l_caver_getSceneController(lua_State* L) {
+    push_ptr(L, sre_scene_controller_from_L(L));
+    return 1;
+}
+
+/* caver.getSpeed(obj) → number */
+static int l_caver_getSpeed(lua_State* L) {
+    void* obj = check_ptr(L, 1);
+    g_lua_pushnumber(L, sre_scene_object_get_speed(obj));
+    return 1;
+}
+
+/* caver.setSpeed(obj, speed) */
+static int l_caver_setSpeed(lua_State* L) {
+    void* obj   = check_ptr(L, 1);
+    float speed = (float)g_lua_tonumber(L, 2);
+    sre_scene_object_set_speed(obj, speed);
+    return 0;
+}
+
+/* caver.getPosition(obj) → x, y, z */
+static int l_caver_getPosition(lua_State* L) {
+    void* obj = check_ptr(L, 1);
+    /* obj → PhysicsObjectComponent → transform, but quick path:
+     * TransformComponent is cached; get it and read position. */
+    void* tc = 0;
+    if (obj && g_SceneObject_ComponentWithInterface && TransformComponent_Interface)
+        tc = g_SceneObject_ComponentWithInterface(obj, TransformComponent_Interface);
+    float x = 0, y = 0, z = 0;
+    if (tc) sre_transform_get_position(tc, &x, &y, &z);
+    g_lua_pushnumber(L, x);
+    g_lua_pushnumber(L, y);
+    g_lua_pushnumber(L, z);
+    return 3;
+}
+
+/* caver.setPosition(obj, x, y, z) */
+static int l_caver_setPosition(lua_State* L) {
+    void* obj = check_ptr(L, 1);
+    float x   = (float)g_lua_tonumber(L, 2);
+    float y   = (float)g_lua_tonumber(L, 3);
+    float z   = (float)g_lua_tonumber(L, 4);
+    void* tc  = 0;
+    if (obj && g_SceneObject_ComponentWithInterface && TransformComponent_Interface)
+        tc = g_SceneObject_ComponentWithInterface(obj, TransformComponent_Interface);
+    if (tc) sre_transform_set_position(tc, x, y, z);
+    return 0;
+}
+
+/* caver.getHp(obj) → number */
+static int l_caver_getHp(lua_State* L) {
+    void* obj = check_ptr(L, 1);
+    void* hc  = 0;
+    if (obj && g_SceneObject_ComponentWithInterface && HealthComponent_Interface)
+        hc = g_SceneObject_ComponentWithInterface(obj, HealthComponent_Interface);
+    g_lua_pushnumber(L, hc ? sre_health_get_hp(hc) : 0.0);
+    return 1;
+}
+
+/* caver.setHp(obj, hp) */
+static int l_caver_setHp(lua_State* L) {
+    void* obj = check_ptr(L, 1);
+    float hp  = (float)g_lua_tonumber(L, 2);
+    void* hc  = 0;
+    if (obj && g_SceneObject_ComponentWithInterface && HealthComponent_Interface)
+        hc = g_SceneObject_ComponentWithInterface(obj, HealthComponent_Interface);
+    if (hc) sre_health_set_hp(hc, hp);
+    return 0;
+}
+
+/* caver.getMaxHp(obj) → number */
+static int l_caver_getMaxHp(lua_State* L) {
+    void* obj = check_ptr(L, 1);
+    void* hc  = 0;
+    if (obj && g_SceneObject_ComponentWithInterface && HealthComponent_Interface)
+        hc = g_SceneObject_ComponentWithInterface(obj, HealthComponent_Interface);
+    g_lua_pushnumber(L, hc ? sre_health_get_max_hp(hc) : 0.0);
+    return 1;
+}
+
+/* caver.getComponent(obj, name) → userdata|nil
+ * name = e.g. "Health", "Transform", "Entity", "Properties", ...
+ * Supports all 60+ component interface names. */
+static int l_caver_getComponent(lua_State* L) {
+    void* obj      = check_ptr(L, 1);
+    const char* nm = lua_tostring(L, 2);
+    void* iface    = (void*)0;
+    if (!obj || !nm) { g_lua_pushnil(L); return 1; }
+
+#define MATCH(name, ivar) \
+    do { \
+        const char* s = name; const char* t = nm; \
+        while(*s && *s == *t) { s++; t++; } \
+        if (!*s && !*t) iface = ivar; \
+    } while(0)
+
+    MATCH("Glow",                    GlowComponent_Interface);
+    MATCH("Mana",                    ManaComponent_Interface);
+    MATCH("Light",                   LightComponent_Interface);
+    MATCH("Model",                   ModelComponent_Interface);
+    MATCH("Shape",                   ShapeComponent_Interface);
+    MATCH("Skill",                   SkillComponent_Interface);
+    MATCH("Spell",                   SpellComponent_Interface);
+    MATCH("Swing",                   SwingComponent_Interface);
+    MATCH("Attack",                  AttackComponent_Interface);
+    MATCH("Damage",                  DamageComponent_Interface);
+    MATCH("Entity",                  EntityComponent_Interface);
+    MATCH("Health",                  HealthComponent_Interface);
+    MATCH("Portal",                  PortalComponent_Interface);
+    MATCH("Shadow",                  ShadowComponent_Interface);
+    MATCH("Sprite",                  SpriteComponent_Interface);
+    MATCH("Overlay",                 OverlayComponent_Interface);
+    MATCH("Program",                 ProgramComponent_Interface);
+    MATCH("Shatter",                 ShatterComponent_Interface);
+    MATCH("ItemDrop",                ItemDropComponent_Interface);
+    MATCH("Particle",                ParticleComponent_Interface);
+    MATCH("Animation",               AnimationComponent_Interface);
+    MATCH("MagicBolt",               MagicBoltComponent_Interface);
+    MATCH("MagicBomb",               MagicBombComponent_Interface);
+    MATCH("Touchable",               TouchableComponent_Interface);
+    MATCH("Transform",               TransformComponent_Interface);
+    MATCH("WaterMesh",               WaterMeshComponent_Interface);
+    MATCH("Background",              BackgroundComponent_Interface);
+    MATCH("EntityInfo",              EntityInfoComponent_Interface);
+    MATCH("FireBreath",              FireBreathComponent_Interface);
+    MATCH("GroundMesh",              GroundMeshComponent_Interface);
+    MATCH("HeroEntity",              HeroEntityComponent_Interface);
+    MATCH("Properties",              PropertiesComponent_Interface);
+    MATCH("SimpleGlow",              SimpleGlowComponent_Interface);
+    MATCH("SpawnPoint",              SpawnPointComponent_Interface);
+    MATCH("TextBubble",              TextBubbleComponent_Interface);
+    MATCH("WeaponGlow",              WeaponGlowComponent_Interface);
+    MATCH("FireEmitter",             FireEmitterComponent_Interface);
+    MATCH("OverlayText",             OverlayTextComponent_Interface);
+    MATCH("SoundEffect",             SoundEffectComponent_Interface);
+    MATCH("WeaponTrail",             WeaponTrailComponent_Interface);
+    MATCH("EntityAction",            EntityActionComponent_Interface);
+    MATCH("PortalEffect",            PortalEffectComponent_Interface);
+    MATCH("ShadowVolume",            ShadowVolumeComponent_Interface);
+    MATCH("UtilityShape",            UtilityShapeComponent_Interface);
+    MATCH("GroundPolygon",           GroundPolygonComponent_Interface);
+    MATCH("HookshotTrail",           HookshotTrailComponent_Interface);
+    MATCH("MagicHookshot",           MagicHookshotComponent_Interface);
+    MATCH("MonsterEntity",           MonsterEntityComponent_Interface);
+    MATCH("ParticleField",           ParticleFieldComponent_Interface);
+    MATCH("PhysicsObject",           PhysicsObjectComponent_Interface);
+    MATCH("BlendAnimation",          BlendAnimationComponent_Interface);
+    MATCH("BushController",          BushControllerComponent_Interface);
+    MATCH("CharController",          CharControllerComponent_Interface);
+    MATCH("CollisionShape",          CollisionShapeComponent_Interface);
+    MATCH("DimensionSpell",          DimensionSpellComponent_Interface);
+    MATCH("DoorController",          DoorControllerComponent_Interface);
+    MATCH("MagicExplosion",          MagicExplosionComponent_Interface);
+    MATCH("MagicSpellCast",          MagicSpellCastComponent_Interface);
+    MATCH("ObjectModifier",          ObjectModifierComponent_Interface);
+    MATCH("ParticleObject",          ParticleObjectComponent_Interface);
+    MATCH("TextureMapping",          TextureMappingComponent_Interface);
+    MATCH("BreakableObject",         BreakableObjectComponent_Interface);
+    MATCH("CollectableItem",         CollectableItemComponent_Interface);
+    MATCH("DimensionObject",         DimensionObjectComponent_Interface);
+    MATCH("OrbitController",         OrbitControllerComponent_Interface);
+    MATCH("ParticleEmitter",         ParticleEmitterComponent_Interface);
+    MATCH("PhysicsPlatform",         PhysicsPlatformComponent_Interface);
+    MATCH("PressureTrigger",         PressureTriggerComponent_Interface);
+    MATCH("SwingableWeapon",         SwingableWeaponComponent_Interface);
+    MATCH("EntityController",        EntityControllerComponent_Interface);
+    MATCH("KeyframeAnimation",       KeyframeAnimationComponent_Interface);
+    MATCH("MonsterController",       MonsterControllerComponent_Interface);
+    MATCH("CharAnimController",      CharAnimControllerComponent_Interface);
+    MATCH("ElevatorController",      ElevatorControllerComponent_Interface);
+    MATCH("OverlayTargetArrow",      OverlayTargetArrowComponent_Interface);
+    MATCH("RotatingBackground",      RotatingBackgroundComponent_Interface);
+    MATCH("AnimationController",     AnimationControllerComponent_Interface);
+    MATCH("GroundMeshGenerator",     GroundMeshGeneratorComponent_Interface);
+    MATCH("TransformController",     TransformControllerComponent_Interface);
+    MATCH("BatMonsterController",    BatMonsterControllerComponent_Interface);
+    MATCH("MagicParticleEmitter",    MagicParticleEmitterComponent_Interface);
+    MATCH("ObjectLinkController",    ObjectLinkControllerComponent_Interface);
+    MATCH("ProjectileController",    ProjectileControllerComponent_Interface);
+    MATCH("MonsterDeathController",  MonsterDeathControllerComponent_Interface);
+    MATCH("SkellyMonsterController", SkellyMonsterControllerComponent_Interface);
+    MATCH("StaticMonsterController", StaticMonsterControllerComponent_Interface);
+    MATCH("GenericMonsterController",GenericMonsterControllerComponent_Interface);
+    MATCH("LeapingMonsterController",LeapingMonsterControllerComponent_Interface);
+    MATCH("ModelTransformController",ModelTransformControllerComponent_Interface);
+    MATCH("WalkingMonsterController",WalkingMonsterControllerComponent_Interface);
+    MATCH("BouncingMonsterController",BouncingMonsterControllerComponent_Interface);
+    MATCH("ChargingMonsterController",ChargingMonsterControllerComponent_Interface);
+    MATCH("ShootingMonsterController",ShootingMonsterControllerComponent_Interface);
+    MATCH("SnappingMonsterController",SnappingMonsterControllerComponent_Interface);
+    MATCH("SwingableWeaponController",SwingableWeaponControllerComponent_Interface);
+    MATCH("ProjectileMonsterController",ProjectileMonsterControllerComponent_Interface);
+    MATCH("BoneControlledCollisionShape",BoneControlledCollisionShapeComponent_Interface);
+#undef MATCH
+
+    if (!iface || !g_SceneObject_ComponentWithInterface) {
+        g_lua_pushnil(L);
+        return 1;
+    }
+    push_ptr(L, g_SceneObject_ComponentWithInterface(obj, iface));
+    return 1;
+}
+
+/* caver.getFieldFloat(ptr, offset) → number   — raw field read */
+static int l_caver_getFieldFloat(lua_State* L) {
+    void* ptr    = check_ptr(L, 1);
+    int   offset = (int)g_lua_tointeger(L, 2);
+    if (!ptr) { g_lua_pushnumber(L, 0.0); return 1; }
+    g_lua_pushnumber(L, $F(float, ptr, offset));
+    return 1;
+}
+
+/* caver.setFieldFloat(ptr, offset, value) */
+static int l_caver_setFieldFloat(lua_State* L) {
+    void* ptr    = check_ptr(L, 1);
+    int   offset = (int)g_lua_tointeger(L, 2);
+    float val    = (float)g_lua_tonumber(L, 3);
+    if (!ptr) return 0;
+    $W(float, ptr, offset, val);
+    return 0;
+}
+
+/* caver.getFieldInt(ptr, offset) → integer */
+static int l_caver_getFieldInt(lua_State* L) {
+    void* ptr    = check_ptr(L, 1);
+    int   offset = (int)g_lua_tointeger(L, 2);
+    if (!ptr) { g_lua_pushinteger(L, 0); return 1; }
+    g_lua_pushinteger(L, (int64_t)$F(int32_t, ptr, offset));
+    return 1;
+}
+
+/* caver.setFieldInt(ptr, offset, value) */
+static int l_caver_setFieldInt(lua_State* L) {
+    void* ptr    = check_ptr(L, 1);
+    int   offset = (int)g_lua_tointeger(L, 2);
+    int32_t val  = (int32_t)g_lua_tointeger(L, 3);
+    if (!ptr) return 0;
+    $W(int32_t, ptr, offset, val);
+    return 0;
+}
+
+/* =========================================================================
+ * caver.getBase() → number
+ *
+ * Returns g_swordigo_base — the loaded base address of libswordigo.so in
+ * guest memory. All native engine function offsets are relative to this.
+ *
+ * Usage:
+ *   local base  = caver.getBase()
+ *   local cc_fn = base + 0x111533   -- CharControllerComponent::Die
+ *   caver.call(cc_fn, cc)
+ * ========================================================================= */
+extern uint64_t g_swordigo_base;
+
+static int l_caver_getBase(lua_State* L) {
+    /* Lua 5.1 doubles can represent all 32-bit guest addresses losslessly */
+    g_lua_pushnumber(L, (double)g_swordigo_base);
+    return 1;
+}
+
+/* =========================================================================
+ * caver.call(addr [, a1 [, a2 [, a3 [, a4]]]]) → number
+ *
+ * Calls a native ARM64 function at the given absolute guest address.
+ * Arguments can be numbers OR lightuserdata (pointers).
+ * Always passes 4 integer/pointer registers (X0-X3); unused slots are 0.
+ * Returns the integer/pointer result (X0) as a Lua number.
+ *
+ * This is the core primitive that makes SRE as powerful as SCL:
+ *   local base = caver.getBase()
+ *   local hero = caver.getHero()
+ *   caver.call(base + 0x111533, hero)    -- Die()
+ *   caver.call(base + 0x111709, hero, 1) -- StartMovingToDirection(right)
+ * ========================================================================= */
+static int l_caver_call(lua_State* L) {
+    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    if (!addr) { g_lua_pushnumber(L, 0.0); return 1; }
+
+    /* Helper: read arg N as uint64 — handles both numbers and lightuserdata */
+#define ARG(n) \
+    (g_lua_type(L, (n)) == 2 /* LUA_TLIGHTUSERDATA */ \
+        ? (uint64_t)g_lua_touserdata(L, (n)) \
+        : (uint64_t)(int64_t)g_lua_tonumber(L, (n)))
+
+    uint64_t a0 = (g_lua_gettop(L) >= 2) ? ARG(2) : 0;
+    uint64_t a1 = (g_lua_gettop(L) >= 3) ? ARG(3) : 0;
+    uint64_t a2 = (g_lua_gettop(L) >= 4) ? ARG(4) : 0;
+    uint64_t a3 = (g_lua_gettop(L) >= 5) ? ARG(5) : 0;
+#undef ARG
+
+    typedef uint64_t (*pfn4_t)(uint64_t, uint64_t, uint64_t, uint64_t);
+    uint64_t ret = ((pfn4_t)addr)(a0, a1, a2, a3);
+    g_lua_pushnumber(L, (double)ret);
+    return 1;
+}
+
+/* =========================================================================
+ * Raw memory access — absolute guest addresses
+ *
+ * caver.read8(addr)          → integer
+ * caver.read16(addr)         → integer
+ * caver.read32(addr)         → integer
+ * caver.read64(addr)         → number  (double, may lose precision > 2^53)
+ * caver.write8(addr, val)
+ * caver.write16(addr, val)
+ * caver.write32(addr, val)
+ * caver.write64(addr, val)
+ *
+ * These let Lua inspect and patch arbitrary engine memory at runtime,
+ * equivalent to what SCL scripts can do via native bindings.
+ * ========================================================================= */
+
+static int l_caver_read8(lua_State* L) {
+    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    if (!addr) { g_lua_pushinteger(L, 0); return 1; }
+    g_lua_pushinteger(L, (int64_t)(*(uint8_t*)addr));
+    return 1;
+}
+
+static int l_caver_read16(lua_State* L) {
+    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    if (!addr) { g_lua_pushinteger(L, 0); return 1; }
+    g_lua_pushinteger(L, (int64_t)(*(uint16_t*)addr));
+    return 1;
+}
+
+static int l_caver_read32(lua_State* L) {
+    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    if (!addr) { g_lua_pushinteger(L, 0); return 1; }
+    g_lua_pushinteger(L, (int64_t)(*(uint32_t*)addr));
+    return 1;
+}
+
+static int l_caver_read64(lua_State* L) {
+    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    if (!addr) { g_lua_pushnumber(L, 0.0); return 1; }
+    /* Use pushnumber — lua_Integer is int64 on some platforms but
+     * unsigned 64-bit values > 2^63 need number anyway. */
+    g_lua_pushnumber(L, (double)(*(uint64_t*)addr));
+    return 1;
+}
+
+static int l_caver_write8(lua_State* L) {
+    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    uint8_t  val  = (uint8_t)g_lua_tointeger(L, 2);
+    if (addr) *(uint8_t*)addr = val;
+    return 0;
+}
+
+static int l_caver_write16(lua_State* L) {
+    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    uint16_t val  = (uint16_t)g_lua_tointeger(L, 2);
+    if (addr) *(uint16_t*)addr = val;
+    return 0;
+}
+
+static int l_caver_write32(lua_State* L) {
+    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    uint32_t val  = (uint32_t)g_lua_tointeger(L, 2);
+    if (addr) *(uint32_t*)addr = val;
+    return 0;
+}
+
+static int l_caver_write64(lua_State* L) {
+    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    uint64_t val  = (uint64_t)(int64_t)g_lua_tonumber(L, 2);
+    if (addr) *(uint64_t*)addr = val;
+    return 0;
+}
+
+static const void* caverlib[] = {
+    /* Object access */
+    (const void*)"getHero",           (const void*)l_caver_getHero,
+    (const void*)"getGameController", (const void*)l_caver_getGameController,
+    (const void*)"getSceneController",(const void*)l_caver_getSceneController,
+    (const void*)"getComponent",      (const void*)l_caver_getComponent,
+    /* Field accessors (relative offsets) */
+    (const void*)"getSpeed",          (const void*)l_caver_getSpeed,
+    (const void*)"setSpeed",          (const void*)l_caver_setSpeed,
+    (const void*)"getPosition",       (const void*)l_caver_getPosition,
+    (const void*)"setPosition",       (const void*)l_caver_setPosition,
+    (const void*)"getHp",             (const void*)l_caver_getHp,
+    (const void*)"setHp",             (const void*)l_caver_setHp,
+    (const void*)"getMaxHp",          (const void*)l_caver_getMaxHp,
+    (const void*)"getFieldFloat",     (const void*)l_caver_getFieldFloat,
+    (const void*)"setFieldFloat",     (const void*)l_caver_setFieldFloat,
+    (const void*)"getFieldInt",       (const void*)l_caver_getFieldInt,
+    (const void*)"setFieldInt",       (const void*)l_caver_setFieldInt,
+    /* ---- Native engine access (absolute addresses) ---- */
+    /* caver.getBase() → libswordigo.so load address */
+    (const void*)"getBase",           (const void*)l_caver_getBase,
+    /* caver.call(addr, ...) → call native ARM64 function */
+    (const void*)"call",              (const void*)l_caver_call,
+    /* caver.read8/16/32/64(addr) — raw memory reads */
+    (const void*)"read8",             (const void*)l_caver_read8,
+    (const void*)"read16",            (const void*)l_caver_read16,
+    (const void*)"read32",            (const void*)l_caver_read32,
+    (const void*)"read64",            (const void*)l_caver_read64,
+    /* caver.write8/16/32/64(addr, val) — raw memory writes */
+    (const void*)"write8",            (const void*)l_caver_write8,
+    (const void*)"write16",           (const void*)l_caver_write16,
+    (const void*)"write32",           (const void*)l_caver_write32,
+    (const void*)"write64",           (const void*)l_caver_write64,
+    /* Sentinel */
+    (const void*)0,                   (const void*)0
+};
+
+void sre_open_caver_lib(lua_State* L) {
+    if (!g_luaL_register) return;
+    g_luaL_register(L, "caver", (const void*)caverlib);
+    lua_pop(L, 1);
+}
+

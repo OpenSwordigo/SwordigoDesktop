@@ -258,4 +258,46 @@ void mod_achievement_render(GuiRenderer& gui, int win_w, int win_h, float dt) {
     gui.draw_string(popup.desc, banner_x + 12, banner_y + banner_h - 40, 1.0f, 200, 200, 200, alpha);
 }
 
+extern GuiRenderer g_gui;
+
+extern uint32_t g_hero_obj;
+extern uint32_t g_hero_char_ctrl_comp;
+extern uint32_t g_hero_health_comp;
+extern uint32_t g_hero_mana_comp;
+
+extern float s_vanilla_walk_speed;
+extern float s_vanilla_run_speed;
+extern float s_vanilla_jump_height;
+
+void mod_apply_frame(uint8_t* guest_mem) {
+    // 1. God Mode
+    if (g_gui.mod_god_mode && g_hero_health_comp != 0) {
+        int max_hp = *(int*)(guest_mem + g_hero_health_comp + 0x88);
+        if (max_hp > 0) {
+            *(int*)(guest_mem + g_hero_health_comp + 0x7c) = max_hp;
+            *(int*)(guest_mem + g_hero_health_comp + 0x80) = max_hp;
+        }
+    }
+
+    // 2. Infinite Mana
+    if (g_gui.mod_infinite_mana && g_hero_mana_comp != 0) {
+        int max_mana = *(int*)(guest_mem + g_hero_mana_comp + 0x3c);
+        if (max_mana > 0) {
+            *(int*)(guest_mem + g_hero_mana_comp + 0x40) = max_mana;
+        }
+    }
+
+    // 3. Infinite Jump
+    if (g_gui.mod_infinite_jump && g_hero_char_ctrl_comp != 0) {
+        *(int*)(guest_mem + g_hero_char_ctrl_comp + 0x158) = 0; // Reset air jump count
+    }
+
+    // 4. Walk, Run, Jump speed multipliers
+    if (g_hero_char_ctrl_comp != 0 && s_vanilla_walk_speed > 0.0f) {
+        *(float*)(guest_mem + g_hero_char_ctrl_comp + 0x170) = s_vanilla_walk_speed * g_gui.mod_walk_speed;
+        *(float*)(guest_mem + g_hero_char_ctrl_comp + 0x178) = s_vanilla_run_speed * g_gui.mod_run_speed;
+        *(float*)(guest_mem + g_hero_char_ctrl_comp + 0x164) = s_vanilla_jump_height * g_gui.mod_jump_height;
+    }
+}
+
 

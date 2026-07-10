@@ -14,10 +14,14 @@
 
 #include "sre.h"
 #include "sre_lua.h"
+#include "sre_caver.h"
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/* g_swordigo_base — loaded base address of libswordigo.so in guest space */
+extern uint64_t g_swordigo_base;
 
 
 /* Avoid relying on system headers (cross-build). Provide minimal externs */
@@ -409,177 +413,251 @@ float g_sre_run_speed = 1.0f;
 float g_sre_jump_height = 1.0f;
 int   g_sre_move_direction = 0;  /* 0=stopped, -1=left, 1=right */
 
+static void* sre_get_hero_cc(lua_State* L);
+
 static int l_mini_char_get_walk_speed(lua_State* L) {
-    g_lua_pushnumber(L, (double)g_sre_walk_speed);
+    void* cc = sre_get_hero_cc(L);
+    if (cc) {
+        float speed = *(float*)((char*)cc + 0x26c);
+        g_lua_pushnumber(L, (double)speed);
+    } else {
+        g_lua_pushnumber(L, (double)g_sre_walk_speed);
+    }
     return 1;
 }
 
 static int l_mini_char_set_walk_speed(lua_State* L) {
-    g_sre_walk_speed = (float)g_lua_tonumber(L, 1);
+    float speed = (float)g_lua_tonumber(L, 1);
+    g_sre_walk_speed = speed;
+    void* cc = sre_get_hero_cc(L);
+    if (cc) {
+        *(float*)((char*)cc + 0x26c) = speed;
+    }
     return 0;
 }
 
 static int l_mini_char_get_run_speed(lua_State* L) {
-    g_lua_pushnumber(L, (double)g_sre_run_speed);
+    void* cc = sre_get_hero_cc(L);
+    if (cc) {
+        float speed = *(float*)((char*)cc + 0x268);
+        g_lua_pushnumber(L, (double)speed);
+    } else {
+        g_lua_pushnumber(L, (double)g_sre_run_speed);
+    }
     return 1;
 }
 
 static int l_mini_char_set_run_speed(lua_State* L) {
-    g_sre_run_speed = (float)g_lua_tonumber(L, 1);
+    float speed = (float)g_lua_tonumber(L, 1);
+    g_sre_run_speed = speed;
+    void* cc = sre_get_hero_cc(L);
+    if (cc) {
+        *(float*)((char*)cc + 0x268) = speed;
+    }
     return 0;
 }
 
 static int l_mini_char_set_jump_height(lua_State* L) {
-    g_sre_jump_height = (float)g_lua_tonumber(L, 1);
+    float jh = (float)g_lua_tonumber(L, 1);
+    g_sre_jump_height = jh;
+    void* cc = sre_get_hero_cc(L);
+    if (cc) {
+        *(float*)((char*)cc + 0x274) = jh;
+        *(float*)((char*)cc + 0x27c) = jh;
+    }
     return 0;
 }
 
 static int l_mini_char_get_jump_height(lua_State* L) {
-    g_lua_pushnumber(L, (double)g_sre_jump_height);
+    void* cc = sre_get_hero_cc(L);
+    if (cc) {
+        float jh = *(float*)((char*)cc + 0x27c);
+        g_lua_pushnumber(L, (double)jh);
+    } else {
+        g_lua_pushnumber(L, (double)g_sre_jump_height);
+    }
     return 1;
 }
 
-/* Mini.Character.StartMovingToDirection(dir) — dir: -1=left, 1=right */
-static int l_mini_char_start_moving(lua_State* L) {
-    g_sre_move_direction = (int)g_lua_tonumber(L, 1);
-    return 0;
-}
-
-/* Mini.Character.StopMovingToDirection() */
-static int l_mini_char_stop_moving(lua_State* L) {
-    (void)L;
-    g_sre_move_direction = 0;
-    return 0;
-}
-
 /* =========================================================================
- * Mini.Character.* SwKiwi Action Functions (deferred-action pattern)
+ * Mini.Character.* SwKiwi Action Functions — direct guest C++ calls
  *
- * Each sets g_sre_char_action and g_sre_char_action_pending=1.
- * The host polls g_sre_char_action_pending and reads g_sre_char_action.
+ * Instead of the old deferred-action pattern (writing to g_sre_char_action_pending
+ * and hoping the host polls), we call the real CharControllerComponent methods
+ * directly in guest address space. This matches exactly how SwKiwi's functions.c
+ * works: resolve CharControllerComponent via SceneObject::ComponentWithInterface,
+ * then call the method at its nm-verified ARM64 offset.
+ *
+ * Offsets are relative to g_swordigo_base (libswordigo.so v1.4.12 ARM64).
+ * Verified against GhidraDecomp src/game_entities/CharControllerComponent.c.
  * ========================================================================= */
 
+/* Helper: resolve CharControllerComponent* for the hero, or NULL */
+static void* sre_get_hero_cc(lua_State* L) {
+    SceneObject* hero = sre_hero_object_from_L(L);
+    if (!hero) return (void*)0;
+    return sre_scene_object_component(hero, CharControllerComponent_Interface);
+}
+
+/* Macro: void method — no args besides 'this' */
+#define CC_VOID(fn_ptr) \
+    do { \
+        void* cc = sre_get_hero_cc(L); \
+        if (cc && fn_ptr) { \
+            fn_ptr(cc); \
+        } \
+    } while(0)
+
+/* Macro: bool method — pushes result onto Lua stack */
+#define CC_BOOL(fn_ptr) \
+    do { \
+        void* cc = sre_get_hero_cc(L); \
+        if (!cc || !fn_ptr) { g_lua_pushboolean(L, 0); return 1; } \
+        int r = fn_ptr(cc); \
+        g_lua_pushboolean(L, r); \
+        return 1; \
+    } while(0)
+
+/* Mini.Character.StartMovingToDirection(dir) — dir: -1=left, 1=right
+ * Calls CharControllerComponent::StartMovingToDirection(int dir) at offset 0x111709.
+ * SwKiwi normalizes dir to ±1; we do the same. */
+static int l_mini_char_start_moving(lua_State* L) {
+    int dir = (int)g_lua_tonumber(L, 1);
+    int norm = (dir >= 0) ? 1 : -1;
+    g_sre_move_direction = norm;  /* keep for host reads */
+    void* cc = sre_get_hero_cc(L);
+    if (cc && g_sre_CharController_StartMovingToDirection) {
+        g_sre_CharController_StartMovingToDirection(cc, norm);
+    }
+    return 0;
+}
+
+/* Mini.Character.StopMovingToDirection() — no direction argument
+ * Calls CharControllerComponent::StopMovingToDirection(int dir) at offset 0x25c85c
+ * with the last known direction (matches SwKiwi behaviour). */
+static int l_mini_char_stop_moving(lua_State* L) {
+    int dir = g_sre_move_direction ? g_sre_move_direction : 1;
+    g_sre_move_direction = 0;  /* keep for host reads */
+    void* cc = sre_get_hero_cc(L);
+    if (cc && g_sre_CharController_StopMovingToDirection) {
+        g_sre_CharController_StopMovingToDirection(cc, dir);
+    }
+    return 0;
+}
+
 static int l_mini_char_die(lua_State* L) {
-    (void)L;
-    g_sre_char_action = SRE_CHAR_ACTION_DIE;
-    g_sre_char_action_pending = 1;
+    CC_VOID(g_sre_CharController_Die);
     return 0;
 }
 
 static int l_mini_char_hurt(lua_State* L) {
-    (void)L;
-    g_sre_char_action = SRE_CHAR_ACTION_HURT;
-    g_sre_char_action_pending = 1;
+    CC_VOID(g_sre_CharController_Hurt);
     return 0;
 }
 
 static int l_mini_char_use(lua_State* L) {
-    (void)L;
-    g_sre_char_action = SRE_CHAR_ACTION_USE;
-    g_sre_char_action_pending = 1;
+    CC_VOID(g_sre_CharController_Use);
     return 0;
 }
 
 static int l_mini_char_swing(lua_State* L) {
-    (void)L;
-    g_sre_char_action = SRE_CHAR_ACTION_SWING;
-    g_sre_char_action_pending = 1;
+    CC_VOID(g_sre_CharController_Swing);
     return 0;
 }
 
 static int l_mini_char_stop_swing(lua_State* L) {
-    (void)L;
-    g_sre_char_action = SRE_CHAR_ACTION_STOP_SWING;
-    g_sre_char_action_pending = 1;
+    CC_VOID(g_sre_CharController_StopSwing);
     return 0;
 }
 
 static int l_mini_char_start_jumping(lua_State* L) {
-    (void)L;
-    g_sre_char_action = SRE_CHAR_ACTION_START_JUMP;
-    g_sre_char_action_pending = 1;
+    CC_VOID(g_sre_CharController_StartJumping);
     return 0;
 }
 
 static int l_mini_char_stop_jumping(lua_State* L) {
-    (void)L;
-    g_sre_char_action = SRE_CHAR_ACTION_STOP_JUMP;
-    g_sre_char_action_pending = 1;
+    CC_VOID(g_sre_CharController_StopJumping);
     return 0;
 }
 
 static int l_mini_char_drop_quickly(lua_State* L) {
-    (void)L;
-    g_sre_char_action = SRE_CHAR_ACTION_DROP_QUICKLY;
-    g_sre_char_action_pending = 1;
+    CC_VOID(g_sre_CharController_DropQuickly);
     return 0;
 }
 
 static int l_mini_char_cancel_casting(lua_State* L) {
-    (void)L;
-    g_sre_char_action = SRE_CHAR_ACTION_CANCEL_CAST;
-    g_sre_char_action_pending = 1;
+    CC_VOID(g_sre_CharController_CancelCasting);
     return 0;
 }
 
 static int l_mini_char_finish_casting(lua_State* L) {
-    (void)L;
-    g_sre_char_action = SRE_CHAR_ACTION_FINISH_CAST;
-    g_sre_char_action_pending = 1;
+    CC_VOID(g_sre_CharController_FinishCasting);
     return 0;
 }
 
 /* =========================================================================
- * Mini.Character.* SwKiwi Capability Stubs (optimistic — return true)
+ * Mini.Character.* Capability Queries — direct guest C++ calls
+ *
+ * Previously returned hardcoded 'true'. Now queries the real
+ * CharControllerComponent boolean methods via CC_BOOL.
+ *
+ * Offsets (ARM64 v1.4.12, from GhidraDecomp README.md):
+ *   CanDoSomething  25c888
+ *   CanBeginCasting 25cb80
+ *   CanUse          25c950
+ *   CanJump         25c8e4
+ *   CanSwing        25aebc
+ *   CanPickup       25ca68
  * ========================================================================= */
 
 static int l_mini_char_can_do_something(lua_State* L) {
-    (void)L;
-    g_lua_pushboolean(L, 1);
-    return 1;
+    CC_BOOL(g_sre_CharController_CanDoSomething);
 }
 
 static int l_mini_char_can_begin_casting(lua_State* L) {
-    (void)L;
-    g_lua_pushboolean(L, 1);
-    return 1;
+    CC_BOOL(g_sre_CharController_CanBeginCasting);
 }
 
 static int l_mini_char_can_use(lua_State* L) {
-    (void)L;
-    g_lua_pushboolean(L, 1);
-    return 1;
+    CC_BOOL(g_sre_CharController_CanUse);
 }
 
 static int l_mini_char_can_jump(lua_State* L) {
-    (void)L;
-    g_lua_pushboolean(L, 1);
-    return 1;
+    CC_BOOL(g_sre_CharController_CanJump);
 }
 
 static int l_mini_char_can_swing(lua_State* L) {
-    (void)L;
-    g_lua_pushboolean(L, 1);
-    return 1;
+    CC_BOOL(g_sre_CharController_CanSwing);
 }
 
 static int l_mini_char_can_pickup(lua_State* L) {
-    (void)L;
-    g_lua_pushboolean(L, 1);
-    return 1;
+    CC_BOOL(g_sre_CharController_CanPickup);
 }
+
 
 /* =========================================================================
  * Mini.Character.* SwKiwi Extended State
+ *
+ * SetMovementFacingLock / SetStunTime write directly into the
+ * CharControllerComponent struct at the ARM64 field offsets used by
+ * SwKiwi functions.c:
+ *   movement_facing_lock → CC + 0x245  (int/bool, 1 byte)
+ *   stun_time            → CC + 0x2f8  (float, 4 bytes)
  * ========================================================================= */
 
 static int l_mini_char_set_movement_facing_lock(lua_State* L) {
-    g_sre_char_movement_facing_lock = g_lua_toboolean(L, 1);
+    int val = g_lua_toboolean(L, 1);
+    g_sre_char_movement_facing_lock = val;  /* keep for host reads */
+    void* cc = sre_get_hero_cc(L);
+    if (cc) *(int*)((char*)cc + 0x245) = val;
     return 0;
 }
 
 static int l_mini_char_set_stun_time(lua_State* L) {
-    g_sre_char_stun_time = (float)g_lua_tonumber(L, 1);
+    float t = (float)g_lua_tonumber(L, 1);
+    g_sre_char_stun_time = t;              /* keep for host reads */
+    void* cc = sre_get_hero_cc(L);
+    if (cc) *(float*)((char*)cc + 0x2f8) = t;
     return 0;
 }
 
@@ -592,6 +670,7 @@ static int l_mini_char_set_air_jump_used(lua_State* L) {
     g_sre_char_air_jump_used = g_lua_toboolean(L, 1);
     return 0;
 }
+
 
 /* Mini.Character.ExpForLevel(n) → 100 * n * (n + 1) / 2 */
 static int l_mini_char_exp_for_level(lua_State* L) {
@@ -4040,9 +4119,11 @@ void sre_register_mini_api(lua_State* L) {
     g_lua_setfield(L, -2, "SetButtonConfined");
 
     g_lua_setfield(L, LUA_GLOBALSINDEX, "ButtonController");
-    /* Alias Button to ButtonController */
+    /* Alias Button and OverlayController to ButtonController */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "ButtonController");
     g_lua_setfield(L, LUA_GLOBALSINDEX, "Button");
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "ButtonController");
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "OverlayController");
 
     /* ---- Keyboard table ---- */
     g_lua_createtable(L, 0, 8);
@@ -4601,8 +4682,6 @@ static void create_universal_stub_table(lua_State* L, const char* name) {
     g_lua_settop(L, -2); /* pop table */
 }
 
-extern uint64_t g_swordigo_base;
-
 /* Mangled C++ Component virtual lookups and class method bindings */
 typedef void* (*pfn_ComponentWithInterface)(void* scene_obj, long interface_id);
 typedef long (*pfn_Touchable_Interface)(void);
@@ -4622,6 +4701,9 @@ static void* get_scene_object(lua_State* L, int idx) {
 }
 
 /* Touchable.SetTouchRadius(bubble, radius) */
+extern void* TouchableComponent_Interface;
+extern void* TextBubbleComponent_Interface;
+
 static int l_touchable_set_touch_radius(lua_State* L) {
     void* bubble = get_scene_object(L, 1);
     double radius = 0.0;
@@ -4629,12 +4711,8 @@ static int l_touchable_set_touch_radius(lua_State* L) {
         radius = g_lua_tonumber(L, 2);
     }
     
-    if (bubble && g_swordigo_base) {
-        pfn_ComponentWithInterface comp_with_iface = (pfn_ComponentWithInterface)(g_swordigo_base + 0x47462c);
-        pfn_Touchable_Interface touch_iface = (pfn_Touchable_Interface)(g_swordigo_base + 0x23e174);
-        
-        long iface_id = touch_iface();
-        void* component = comp_with_iface(bubble, iface_id);
+    if (bubble && g_SceneObject_ComponentWithInterface && TouchableComponent_Interface) {
+        void* component = g_SceneObject_ComponentWithInterface(bubble, TouchableComponent_Interface);
         if (component) {
             *(float*)((char*)component + 0x70) = (float)radius;
         }
@@ -4652,15 +4730,10 @@ static int l_textbubble_set_touch_handling_enabled(lua_State* L) {
         enabled = (g_lua_tonumber(L, 2) != 0.0);
     }
     
-    if (bubble && g_swordigo_base) {
-        pfn_ComponentWithInterface comp_with_iface = (pfn_ComponentWithInterface)(g_swordigo_base + 0x47462c);
-        pfn_TextBubble_Interface bubble_iface = (pfn_TextBubble_Interface)(g_swordigo_base + 0x23dd48);
-        pfn_TextBubble_SetHandleTouches set_handle = (pfn_TextBubble_SetHandleTouches)(g_swordigo_base + 0x23d4bc);
-        
-        long iface_id = bubble_iface();
-        void* component = comp_with_iface(bubble, iface_id);
-        if (component) {
-            set_handle(component, enabled);
+    if (bubble && g_SceneObject_ComponentWithInterface && TextBubbleComponent_Interface) {
+        void* component = g_SceneObject_ComponentWithInterface(bubble, TextBubbleComponent_Interface);
+        if (component && g_sre_TextBubble_SetHandleTouches) {
+            g_sre_TextBubble_SetHandleTouches(component, enabled);
         }
     }
     return 0;
@@ -4671,15 +4744,10 @@ static int l_textbubble_is_text_finished(lua_State* L) {
     void* bubble = get_scene_object(L, 1);
     int finished = 1; /* Default to finished to prevent infinite wait loops on invalid bubble */
     
-    if (bubble && g_swordigo_base) {
-        pfn_ComponentWithInterface comp_with_iface = (pfn_ComponentWithInterface)(g_swordigo_base + 0x47462c);
-        pfn_TextBubble_Interface bubble_iface = (pfn_TextBubble_Interface)(g_swordigo_base + 0x23dd48);
-        pfn_TextBubble_IsTextFinishedShowing is_finished = (pfn_TextBubble_IsTextFinishedShowing)(g_swordigo_base + 0x23d270);
-        
-        long iface_id = bubble_iface();
-        void* component = comp_with_iface(bubble, iface_id);
-        if (component) {
-            finished = is_finished(component);
+    if (bubble && g_SceneObject_ComponentWithInterface && TextBubbleComponent_Interface) {
+        void* component = g_SceneObject_ComponentWithInterface(bubble, TextBubbleComponent_Interface);
+        if (component && g_sre_TextBubble_IsTextFinishedShowing) {
+            finished = g_sre_TextBubble_IsTextFinishedShowing(component);
         }
     }
     g_lua_pushboolean(L, finished);
@@ -4699,17 +4767,12 @@ static int l_textbubble_show_text(lua_State* L) {
         maxWidth = g_lua_tonumber(L, 3);
     }
     
-    if (bubble && g_swordigo_base && text) {
-        pfn_ComponentWithInterface comp_with_iface = (pfn_ComponentWithInterface)(g_swordigo_base + 0x47462c);
-        pfn_TextBubble_Interface bubble_iface = (pfn_TextBubble_Interface)(g_swordigo_base + 0x23dd48);
-        pfn_TextBubble_ShowText show_text = (pfn_TextBubble_ShowText)(g_swordigo_base + 0x23cea0);
-        
-        long iface_id = bubble_iface();
-        void* component = comp_with_iface(bubble, iface_id);
-        if (component) {
+    if (bubble && g_SceneObject_ComponentWithInterface && text && TextBubbleComponent_Interface) {
+        void* component = g_SceneObject_ComponentWithInterface(bubble, TextBubbleComponent_Interface);
+        if (component && g_sre_TextBubble_ShowText) {
             SreString str;
             sre_CppString_from_char_p(&str, text);
-            show_text(component, &str, (float)maxWidth);
+            g_sre_TextBubble_ShowText(component, &str, (float)maxWidth);
             sre_CppString_release(&str);
         }
     }
@@ -4725,14 +4788,12 @@ static int l_overlaytext_set_text(lua_State* L) {
     }
     
     extern void* g_OverlayTextComponent_Interface_addr;
-    if (obj && g_swordigo_base && g_OverlayTextComponent_Interface_addr) {
-        pfn_ComponentWithInterface comp_with_iface = (pfn_ComponentWithInterface)(g_swordigo_base + 0x47462c);
-        
+    if (obj && g_SceneObject_ComponentWithInterface && g_OverlayTextComponent_Interface_addr) {
         typedef void* (*pfn_Interface)(void);
         pfn_Interface iface_fn = (pfn_Interface)g_OverlayTextComponent_Interface_addr;
         
         void* iface_id = iface_fn();
-        void* component = comp_with_iface(obj, (long)iface_id);
+        void* component = g_SceneObject_ComponentWithInterface(obj, iface_id);
         if (component) {
             SreString* text_str = (SreString*)((char*)component + 0x70);
             sre_CppString_release(text_str);
@@ -4939,38 +5000,66 @@ static int g_injected_count = 0;
 
 
 
+/* Declared in sre_lua_libs.c — extracts Lua source from binary protobuf SCL */
+extern int sre_scl_extract_lua(const char* buf, size_t size, const char** out_lua, size_t* out_len);
+
 static void sre_load_edgetest_scl(lua_State* L) {
-    const char* home = getenv("HOME");
+    extern char g_sre_vfs_path_assets[512];
     char path[512];
-    if (home) {
-        snprintf(path, sizeof(path), "%s/.local/share/swordigo-desktop/rl_assets/resources/edgetest.scl", home);
-    } else {
-        snprintf(path, sizeof(path), "rl_assets/resources/edgetest.scl");
-    }
-    void* f = fopen(path, "r");
+    /* Try configured assets dir first, then bare relative fallback */
+    snprintf(path, sizeof(path), "%s/resources/edgetest.scl", g_sre_vfs_path_assets);
+    FILE* f = fopen(path, "rb");
     if (!f) {
-        f = fopen("resources/edgetest.scl", "r");
+        snprintf(path, sizeof(path), "resources/edgetest.scl");
+        f = fopen(path, "rb");
     }
-    if (f) {
-        fseek(f, 0, 2); /* SEEK_END = 2 */
-        long size = ftell(f);
-        fseek(f, 0, 0); /* SEEK_SET = 0 */
-        char* buf = malloc(size + 1);
-        if (buf) {
-            size_t read_bytes = fread(buf, 1, size, f);
-            buf[read_bytes] = '\0';
-            char* code = buf;
-            if (read_bytes >= 2 && buf[0] == '*' && buf[1] == 'P') {
-                char* start = strstr(buf, "--");
-                if (start != NULL) {
-                    code = start;
-                }
-            }
-            sre_eval_lua(L, code);
-            free(buf);
+    if (!f) return;
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0) { fclose(f); return; }
+
+    char* buf = malloc(size + 1);
+    if (!buf) { fclose(f); return; }
+
+    size_t read_bytes = fread(buf, 1, size, f);
+    fclose(f);
+    buf[read_bytes] = '\0';
+
+    const char* code = NULL;
+    size_t code_len = 0;
+
+    /* 1. Try binary protobuf SCL extraction (field 5 = Program, field 2/3 = Source/CompiledCode) */
+    if (sre_scl_extract_lua(buf, read_bytes, &code, &code_len) && code && code_len > 0) {
+        /* Got Lua source from protobuf — make a NUL-terminated copy and evaluate */
+        char* lua_src = malloc(code_len + 1);
+        if (lua_src) {
+            memcpy(lua_src, code, code_len);
+            lua_src[code_len] = '\0';
+            sre_eval_lua(L, lua_src);
+            free(lua_src);
         }
-        fclose(f);
+        free(buf);
+        return;
     }
+
+    /* 2. Try plain-text SCL (source format: Program{ String : $ ... $end }) */
+    const char* text_start = strstr(buf, "String : $");
+    if (text_start) {
+        text_start += 10; /* skip "String : $" */
+        while (*text_start == ' ' || *text_start == '\t' || *text_start == '\r' || *text_start == '\n')
+            text_start++;
+        char* text_end = strstr(text_start, "$end");
+        if (text_end) *text_end = '\0';
+        sre_eval_lua(L, text_start);
+        free(buf);
+        return;
+    }
+
+    /* 3. Last resort: raw Lua source file (no SCL wrapper) */
+    sre_eval_lua(L, buf);
+    free(buf);
 }
 
 /*
@@ -5344,6 +5433,10 @@ void sre_mini_ensure_injected(lua_State* L) {
     /* Inject standard Lua libraries (math, table, os, debug, io) */
     extern void sre_open_std_libs(lua_State* L);
     sre_open_std_libs(L);
+
+    /* Inject Caver engine API (hero, components, health, transform, etc.) */
+    extern void sre_open_caver_lib(lua_State* L);
+    sre_open_caver_lib(L);
 
     /* Hook nil arithmetic to prevent mod crashes from nil fields (e.g. self.offset) */
     sre_eval_lua(L,

@@ -608,10 +608,10 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
             if (ovrs) {
                 for (int i = 0; i < SRE_OVERLAY_MAX; i++) {
                     if (ovrs[i].active) {
-                        fprintf(f, "Slot %d: id='%s' active=%d hidden=%d x=%.3f y=%.3f w=%.3f h=%.3f bg_color=0x%08X bg_alpha=%d corner_radius=%.3f\n",
+                        fprintf(f, "Slot %d: id='%s' active=%d hidden=%d x=%.3f y=%.3f w=%.3f h=%.3f bg_color=0x%08X bg_alpha=%d corner_radius=%.3f scale=%.3f\n",
                                 i, ovrs[i].id, ovrs[i].active, ovrs[i].hidden,
                                 ovrs[i].x, ovrs[i].y, ovrs[i].w, ovrs[i].h,
-                                (unsigned int)ovrs[i].bg_color, ovrs[i].bg_alpha, ovrs[i].corner_radius);
+                                (unsigned int)ovrs[i].bg_color, ovrs[i].bg_alpha, ovrs[i].corner_radius, ovrs[i].scale_factor);
                     } else {
                         fprintf(f, "Slot %d: id='%s' active=0\n", i, ovrs[i].id);
                     }
@@ -652,7 +652,6 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
         vp_h = win_w / game_asp;
         vp_y = (win_h - vp_h) / 2;
     }
-    float base = std::min(vp_w, vp_h);
 
     SreOverlaySlot* overlays = static_cast<SreOverlaySlot*>(guest_overlays_ptr);
     SreBtnSlot* buttons = static_cast<SreBtnSlot*>(guest_buttons_ptr);
@@ -665,27 +664,9 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
     if (current_active_count != last_active_count) {
         last_active_count = current_active_count;
         std::cout << "[GUI-Debug] Active buttons count changed to " << current_active_count << std::endl;
-        for (int i = 0; i < SRE_BTN_MAX; i++) {
-            if (buttons[i].active) {
-                std::cout << "  - Button " << i << ": id='" << buttons[i].id 
-                          << "', label='" << buttons[i].label 
-                          << "', active=" << buttons[i].active 
-                          << ", hidden=" << buttons[i].hidden 
-                          << ", overlay_id='" << buttons[i].overlay_id 
-                          << "', x=" << buttons[i].cur_x 
-                          << ", y=" << buttons[i].cur_y 
-                          << ", w=" << buttons[i].w 
-                          << ", h=" << buttons[i].h 
-                          << ", bg_alpha=" << buttons[i].bg_alpha 
-                          << ", alpha=" << buttons[i].alpha 
-                          << ", text_color=0x" << std::hex << buttons[i].text_color << std::dec
-                          << std::endl;
-            }
-        }
     }
-    // ---------------------------------------------------------------------------
+
     // Determine if any full-screen / blocking overlay is active (for input gating)
-    // ---------------------------------------------------------------------------
     bool any_overlay_blocking = false;
     if (overlays) {
         for (int i = 0; i < SRE_OVERLAY_MAX; i++) {
@@ -697,26 +678,68 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
             }
         }
     }
-    // Expose to main.cpp for SDL input gating
     extern bool g_sre_overlay_blocking;
     g_sre_overlay_blocking = any_overlay_blocking;
 
-    // ---------------------------------------------------------------------------
-    // 1. Draw Active Overlay BACKGROUNDS using BackgroundDrawList
-    //    (BackgroundDrawList is ALWAYS rendered behind all ImGui windows and the
-    //     foreground draw list, so it can never cover buttons.)
-    // ---------------------------------------------------------------------------
-    ImDrawList* bg_dl = ImGui::GetBackgroundDrawList();
+    // Set up transparent fullscreen window for drawing and hit-testing
+    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 
+    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | 
+                                    ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | 
+                                    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground |
+                                    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                                    ImGuiWindowFlags_NoDecoration;
+
+    ImVec2 mpos = io.MousePos;
+    if (!is_input_blocked(mpos.x, mpos.y)) {
+        window_flags |= ImGuiWindowFlags_NoInputs;
+    }
+
+    ImGui::Begin("##SreOverlayButtonsWindow", nullptr, window_flags);
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+    // 1. Draw Overlays
     if (overlays) {
         for (int i = 0; i < SRE_OVERLAY_MAX; i++) {
             SreOverlaySlot& ovr = overlays[i];
             if (!ovr.active || ovr.hidden) continue;
 
-            float ow = vp_w * ovr.w;
-            float oh = vp_h * ovr.h;
+            float ow = vp_w * ovr.w * ovr.scale_factor;
+            float oh = vp_h * ovr.h * ovr.scale_factor;
             float ox = vp_x + vp_w * ovr.x - ow / 2.0f;
             float oy = vp_y + vp_h * ovr.y - oh / 2.0f;
+
+            // Handle dragging & pinching on the overlay background
+            if (ovr.movable || ovr.pinchable) {
+                ImGui::SetCursorScreenPos(ImVec2(ox, oy));
+                ImGui::PushID(ovr.id);
+                ImGui::InvisibleButton("##ovr_bg", ImVec2(ow, oh));
+                
+                bool ovr_hovered = ImGui::IsItemHovered();
+                bool ovr_active = ImGui::IsItemActive();
+
+                if (ovr_active && ovr.movable && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                    ImVec2 delta = io.MouseDelta;
+                    if (vp_w > 0) ovr.x += delta.x / vp_w;
+                    if (vp_h > 0) ovr.y += delta.y / vp_h;
+                    ovr.dirty = 1;
+                }
+
+                if (ovr_hovered && ovr.pinchable) {
+                    float wheel = io.MouseWheel;
+                    if (wheel != 0.0f) {
+                        ovr.scale_factor += wheel * 0.1f;
+                        if (ovr.scale_factor < 0.2f) ovr.scale_factor = 0.2f;
+                        if (ovr.scale_factor > 3.0f) ovr.scale_factor = 3.0f;
+                        ovr.dirty = 1;
+                    }
+                }
+                ImGui::PopID();
+            }
 
             // Parse background color from packed ARGB (0xAARRGGBB)
             unsigned int c_val = (unsigned int)ovr.bg_color;
@@ -725,7 +748,6 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
             uint8_t bg_c = (c_val >> 8) & 0xFF;
             uint8_t bb = c_val & 0xFF;
 
-            // Fallback: if no color set, use dark semi-transparent
             if (c_val == 0) {
                 br = 22; bg_c = 27; bb = 34;
                 ba = (uint8_t)ovr.bg_alpha;
@@ -733,39 +755,26 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
 
             ImU32 fill_col = IM_COL32(br, bg_c, bb, ba);
             float rounding = (ovr.corner_radius > 0.0f) ? ovr.corner_radius : 6.0f;
-            // For full-screen overlays, skip rounding (looks bad)
             if (ovr.w >= 0.98f && ovr.h >= 0.98f) rounding = 0.0f;
 
-            bg_dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + ow, oy + oh), fill_col, rounding);
+            draw_list->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + ow, oy + oh), fill_col, rounding);
 
-            // Border (subtle, except full-screen)
             if (ovr.w < 0.98f || ovr.h < 0.98f) {
-                bg_dl->AddRect(ImVec2(ox, oy), ImVec2(ox + ow, oy + oh),
-                               IM_COL32(233, 69, 96, 100), rounding, 0, 1.0f);
+                draw_list->AddRect(ImVec2(ox, oy), ImVec2(ox + ow, oy + oh),
+                                   IM_COL32(233, 69, 96, 100), rounding, 0, 1.0f);
             }
 
             // Separators
             for (int s = 0; s < ovr.separator_count; s++) {
                 float sy = ovr.separators[s];
                 float line_y = oy + oh * sy;
-                bg_dl->AddLine(ImVec2(ox, line_y), ImVec2(ox + ow, line_y),
-                               IM_COL32(255, 255, 255, 50), 1.5f);
+                draw_list->AddLine(ImVec2(ox, line_y), ImVec2(ox + ow, line_y),
+                                   IM_COL32(255, 255, 255, 50), 1.5f);
             }
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // 2. Draw Buttons using ForegroundDrawList + manual hit-testing
-    //    (ForegroundDrawList is ALWAYS on top of everything — no Z-order issues)
-    // ---------------------------------------------------------------------------
-    ImDrawList* fg_dl = ImGui::GetForegroundDrawList();
-    ImGuiIO& io2 = ImGui::GetIO();
-    ImVec2 mouse_pos = io2.MousePos;
-    bool mouse_down = ImGui::IsMouseDown(ImGuiMouseButton_Left);
-    bool mouse_clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-    bool mouse_released = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
-
-    // Load button font (same font object as before)
+    // 2. Draw Buttons
     ImFont* btn_font = static_cast<ImFont*>(m_font_button);
 
     for (int i = 0; i < SRE_BTN_MAX; i++) {
@@ -781,21 +790,21 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
                     break;
                 }
             }
-            // Button belongs to an overlay that no longer exists → skip
             if (!parent_ovr) continue;
         }
 
         // Hide button if parent overlay is hidden/inactive
         if (parent_ovr && (parent_ovr->hidden || !parent_ovr->active)) continue;
 
-        // Compute pixel rect — use script-driven sizes, no hardcoded scale
-        float pw = vp_w * btn.w * btn.scale_x;
-        float ph = vp_h * btn.h * btn.scale_y;
+        // Compute sizes, accounting for overlay scale
+        float o_scale = parent_ovr ? parent_ovr->scale_factor : 1.0f;
+        float pw = vp_w * btn.w * btn.scale_x * o_scale;
+        float ph = vp_h * btn.h * btn.scale_y * o_scale;
         float bx, by;
 
         if (parent_ovr) {
-            float ow = vp_w * parent_ovr->w;
-            float oh = vp_h * parent_ovr->h;
+            float ow = vp_w * parent_ovr->w * parent_ovr->scale_factor;
+            float oh = vp_h * parent_ovr->h * parent_ovr->scale_factor;
             float ox = vp_x + vp_w * parent_ovr->x - ow / 2.0f;
             float oy = vp_y + vp_h * parent_ovr->y - oh / 2.0f;
             bx = ox + ow * btn.cur_x - pw / 2.0f;
@@ -805,65 +814,86 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
             by = vp_y + vp_h * btn.cur_y - ph / 2.0f;
         }
 
-        // Clamp to visible area (avoids off-screen draw commands)
         float bx2 = bx + pw;
         float by2 = by + ph;
         if (bx2 < 0 || by2 < 0 || bx > win_w || by > win_h) continue;
 
-        // --- Hit test ---
-        bool hovered = btn.clickable &&
-                       (mouse_pos.x >= bx && mouse_pos.x <= bx2 &&
-                        mouse_pos.y >= by  && mouse_pos.y <= by2);
-        bool pressing = hovered && mouse_down;
+        // Interactive Invisible Button
+        ImGui::SetCursorScreenPos(ImVec2(bx, by));
+        ImGui::PushID(btn.id);
+        
+        bool clicked = false;
+        if (btn.clickable) {
+            clicked = ImGui::InvisibleButton("##btn", ImVec2(pw, ph));
+        } else {
+            // Non-interactive spacing/dummy widget
+            ImGui::Dummy(ImVec2(pw, ph));
+        }
 
-        // --- Draw background ---
+        bool hovered = btn.clickable && ImGui::IsItemHovered();
+        bool pressing = btn.clickable && ImGui::IsItemActive();
+
+        // Draw premium background style
         if (btn.bg_alpha > 0) {
             float alpha = (btn.alpha / 255.0f) * (btn.bg_alpha / 255.0f);
             
-            // Premium glassmorphism style
             ImU32 bg_col;
             if (pressing) {
-                bg_col = IM_COL32(0, 100, 200, (uint8_t)(alpha * 255.0f * 0.9f)); // Sleek blue press state
+                bg_col = IM_COL32(0, 100, 200, (uint8_t)(alpha * 255.0f * 0.9f));
             } else if (hovered) {
-                bg_col = IM_COL32(40, 45, 60, (uint8_t)(alpha * 255.0f * 0.85f)); // Hover state blue-grey tint
+                bg_col = IM_COL32(40, 45, 60, (uint8_t)(alpha * 255.0f * 0.85f));
             } else {
-                bg_col = IM_COL32(20, 20, 25, (uint8_t)(alpha * 255.0f * 0.75f)); // Translucent glass background
+                bg_col = IM_COL32(20, 20, 25, (uint8_t)(alpha * 255.0f * 0.75f));
             }
             
-            float rounding = ph * 0.25f; // Proportional rounded corners
+            float rounding = ph * 0.25f;
             if (rounding < 4.0f) rounding = 4.0f;
             if (rounding > 12.0f) rounding = 12.0f;
 
-            fg_dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx2, by2), bg_col, rounding);
+            draw_list->AddRectFilled(ImVec2(bx, by), ImVec2(bx2, by2), bg_col, rounding);
 
-            // Glowing mod-blue border on hover/press, translucent white otherwise
             ImU32 border_col;
             if (pressing) {
                 border_col = IM_COL32(0, 180, 255, 255);
             } else if (hovered) {
-                border_col = IM_COL32(0, 140, 255, 220); // Glowing border
+                border_col = IM_COL32(0, 140, 255, 220);
             } else {
-                border_col = IM_COL32(255, 255, 255, (uint8_t)(alpha * 120.0f)); // Subtle border
+                border_col = IM_COL32(255, 255, 255, (uint8_t)(alpha * 120.0f));
             }
-            fg_dl->AddRect(ImVec2(bx, by), ImVec2(bx2, by2), border_col, rounding, 0, 1.5f);
+            draw_list->AddRect(ImVec2(bx, by), ImVec2(bx2, by2), border_col, rounding, 0, 1.5f);
         }
 
-        // --- Draw label ---
+        // Draw label
         const char* lbl = btn.label;
-
         if (lbl[0] != '\0' && btn_font) {
             float fscale = btn.text_scale > 0.0f ? btn.text_scale : 1.0f;
-            // Clamp font scale to avoid insanely large text
             if (fscale > 3.0f) fscale = 3.0f;
-
-            // Compute text size at script-driven scale
-            float fs = btn_font->LegacySize * fscale;
+            float fs = btn_font->LegacySize * fscale * o_scale;
             ImVec2 tsize = btn_font->CalcTextSizeA(fs, FLT_MAX, 0.0f, lbl);
 
+            float pl = btn.padding_l * o_scale;
+            float pt = btn.padding_t * o_scale;
+            float pr = btn.padding_r * o_scale;
+            float pb = btn.padding_b * o_scale;
+
+            int gravity = btn.alignment;
             float tx = bx + (pw - tsize.x) * 0.5f;
             float ty = by + (ph - tsize.y) * 0.5f;
 
-            // Parse text color (packed ARGB 0xAARRGGBB)
+            if (gravity != 0) {
+                if ((gravity & 3) == 3 || gravity == 3) {
+                    tx = bx + pl;
+                } else if ((gravity & 5) == 5 || gravity == 5) {
+                    tx = bx2 - tsize.x - pr;
+                }
+                
+                if ((gravity & 48) == 48 || gravity == 48) {
+                    ty = by + pt;
+                } else if ((gravity & 80) == 80 || gravity == 80) {
+                    ty = by2 - tsize.y - pb;
+                }
+            }
+
             unsigned int tc = (unsigned int)btn.text_color;
             uint8_t ta = (tc >> 24) & 0xFF;
             uint8_t tr = (tc >> 16) & 0xFF;
@@ -872,37 +902,52 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
             if (ta == 0) ta = (uint8_t)btn.alpha;
             ImU32 text_col = IM_COL32(tr, tg, tb, ta);
 
-            fg_dl->AddText(btn_font, fs, ImVec2(tx, ty), text_col, lbl);
+            draw_list->AddText(btn_font, fs, ImVec2(tx, ty), text_col, lbl);
         }
 
-        // --- Input state machine ---
+        // Input state machine
         if (btn.clickable) {
             if (pressing) {
                 btn.pressed = 1;
-                if (btn.movable) {
+                if (btn.movable && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                     btn.dragging = 1;
-                    ImVec2 delta = io2.MouseDelta;
+                    ImVec2 delta = io.MouseDelta;
                     if (parent_ovr) {
-                        float ow = vp_w * parent_ovr->w;
-                        float oh = vp_h * parent_ovr->h;
+                        float ow = vp_w * parent_ovr->w * parent_ovr->scale_factor;
+                        float oh = vp_h * parent_ovr->h * parent_ovr->scale_factor;
                         if (ow > 0) btn.cur_x += delta.x / ow;
                         if (oh > 0) btn.cur_y += delta.y / oh;
                     } else {
                         if (vp_w > 0) btn.cur_x += delta.x / vp_w;
                         if (vp_h > 0) btn.cur_y += delta.y / vp_h;
                     }
+
+                    if (btn.confined) {
+                        if (parent_ovr) {
+                            float min_x = (pw / 2.0f) / (vp_w * parent_ovr->w * parent_ovr->scale_factor);
+                            float max_x = 1.0f - min_x;
+                            float min_y = (ph / 2.0f) / (vp_h * parent_ovr->h * parent_ovr->scale_factor);
+                            float max_y = 1.0f - min_y;
+                            if (btn.cur_x < min_x) btn.cur_x = min_x;
+                            if (btn.cur_x > max_x) btn.cur_x = max_x;
+                            if (btn.cur_y < min_y) btn.cur_y = min_y;
+                            if (btn.cur_y > max_y) btn.cur_y = max_y;
+                        } else {
+                            float min_x = (pw / 2.0f) / vp_w;
+                            float max_x = 1.0f - min_x;
+                            float min_y = (ph / 2.0f) / vp_h;
+                            float max_y = 1.0f - min_y;
+                            if (btn.cur_x < min_x) btn.cur_x = min_x;
+                            if (btn.cur_x > max_x) btn.cur_x = max_x;
+                            if (btn.cur_y < min_y) btn.cur_y = min_y;
+                            if (btn.cur_y > max_y) btn.cur_y = max_y;
+                        }
+                    }
                     btn.dirty = 1;
                 }
             } else {
-                if (btn.pressed == 1 && hovered && mouse_released) {
-                    btn.pressed = 0;
-                    btn.released = 1;
-                    std::cout << "[SRE GUI] Click: '" << btn.label
-                              << "' (slot " << i << ")\n";
-                } else if (!pressing) {
-                    btn.pressed = 0;
-                }
-                if (btn.dragging && !mouse_down) {
+                btn.pressed = 0;
+                if (btn.dragging) {
                     btn.dragging = 0;
                     if (btn.snapback) {
                         btn.cur_x = btn.home_x;
@@ -911,8 +956,18 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
                     }
                 }
             }
+
+            if (clicked) {
+                btn.released = 1;
+                std::cout << "[SRE GUI] ImGui Click: '" << btn.label << "' (slot " << i << ")\n";
+            }
         }
+
+        ImGui::PopID();
     }
+
+    ImGui::End();
+    ImGui::PopStyleVar(3);
 }
 
 
@@ -1349,18 +1404,39 @@ bool SwordfareGUI::is_input_blocked(float mx, float my) {
         }
     }
 
-    // 3. Check if coords hit any active clickable button outside an overlay
+    // 3. Check if coords hit any active clickable button
     if (buttons) {
         for (int i = 0; i < SRE_BTN_MAX; i++) {
             SreBtnSlot& btn = buttons[i];
             if (!btn.active || btn.hidden || !btn.clickable) continue;
-            // Buttons with a parent overlay are already covered by check 2 above
-            if (btn.overlay_id[0] != '\0') continue;
+
+            // Resolve parent overlay
+            SreOverlaySlot* parent_ovr = nullptr;
+            if (btn.overlay_id[0] != '\0' && overlays) {
+                for (int o = 0; o < SRE_OVERLAY_MAX; o++) {
+                    if (overlays[o].active && strcmp(overlays[o].id, btn.overlay_id) == 0) {
+                        parent_ovr = &overlays[o];
+                        break;
+                    }
+                }
+                if (parent_ovr && (parent_ovr->hidden || !parent_ovr->active)) continue;
+            }
 
             float pw = vp_w * btn.w * btn.scale_x;
             float ph = vp_h * btn.h * btn.scale_y;
-            float bx = vp_x + vp_w * btn.cur_x - pw / 2.0f;
-            float by = vp_y + vp_h * btn.cur_y - ph / 2.0f;
+            float bx, by;
+
+            if (parent_ovr) {
+                float ow = vp_w * parent_ovr->w;
+                float oh = vp_h * parent_ovr->h;
+                float ox = vp_x + vp_w * parent_ovr->x - ow / 2.0f;
+                float oy = vp_y + vp_h * parent_ovr->y - oh / 2.0f;
+                bx = ox + ow * btn.cur_x - pw / 2.0f;
+                by = oy + oh * btn.cur_y - ph / 2.0f;
+            } else {
+                bx = vp_x + vp_w * btn.cur_x - pw / 2.0f;
+                by = vp_y + vp_h * btn.cur_y - ph / 2.0f;
+            }
 
             if (mx >= bx && mx <= bx + pw && my >= by && my <= by + ph) {
                 return true;
@@ -1471,7 +1547,6 @@ static void DrawAccentUnderline(ImVec2 p0, ImVec2 p1) {
 GuiAction SwordfareGUI::draw_control_panel(bool* p_open) {
     if (!m_initialized || !*p_open) return GUI_NONE;
     ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_ctx));
-    using namespace SwordfareTheme;
 
     GuiAction action = GUI_NONE;
     ImGuiIO& io = ImGui::GetIO();
@@ -1481,171 +1556,132 @@ GuiAction SwordfareGUI::draw_control_panel(bool* p_open) {
     extern GuiRenderer g_gui;
     extern bool g_game_paused;
 
-    float scale = win_h / 720.0f;          // rebased for a 720p-logical UI
+    float scale = win_h / 720.0f;
     if (scale < 1.0f) scale = 1.0f;
-    float bar_h = 38.0f * scale;
 
-    // ---- Docked to the TOP now, not win_h - bar_h -----------------------
-    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
-    ImGui::SetNextWindowSize(ImVec2(win_w, bar_h));
+    // Modern clean dark charcoal palette
+    ImVec4 kBg          = ImVec4(0.07f, 0.08f, 0.10f, 1.00f);
+    ImVec4 kBgPopup     = ImVec4(0.09f, 0.10f, 0.12f, 1.00f);
+    ImVec4 kBorder      = ImVec4(0.20f, 0.22f, 0.26f, 0.50f);
+    ImVec4 kText        = ImVec4(0.85f, 0.88f, 0.92f, 1.00f);
+    ImVec4 kCyan        = ImVec4(0.00f, 0.55f, 1.00f, 1.00f); // Bright blue/cyan matching the image
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * scale, 0.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f * scale, 0.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * scale, 3.5f * scale)); // reduced height and padding
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(14.0f * scale, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 4.0f);
 
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,      kBg);
+    ImGui::PushStyleColor(ImGuiCol_MenuBarBg,     kBg);
     ImGui::PushStyleColor(ImGuiCol_PopupBg,       kBgPopup);
     ImGui::PushStyleColor(ImGuiCol_Border,        kBorder);
     ImGui::PushStyleColor(ImGuiCol_Text,          kText);
-    // These are now subtle tints instead of solid opaque blocks — this is
-    // the actual fix for "clicking a button selects the whole section".
-    ImGui::PushStyleColor(ImGuiCol_Header,        kActiveTint);
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, kHoverTint);
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive,  kActiveTint);
+    ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0.00f, 0.55f, 1.00f, 0.20f)); // active tint
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.00f, 0.55f, 1.00f, 0.35f)); // hover tint
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0.00f, 0.55f, 1.00f, 0.50f));
 
     ImFont* bar_font = static_cast<ImFont*>(m_font_button);
-    float font_size = 14.0f * scale;
+    float font_size = 9.5f * scale; // compact font size
     if (bar_font) ImGui::PushFont(bar_font);
 
-    ImGui::Begin("##sfw_header_bar", nullptr,
-        ImGuiWindowFlags_NoTitleBar      | ImGuiWindowFlags_NoResize    |
-        ImGuiWindowFlags_NoMove          | ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    float bar_h = 24.0f * scale;
 
-    float pad_y = (bar_h - font_size) * 0.5f;
-    ImGui::SetCursorPosY(pad_y > 0 ? pad_y : 2.0f);
+    if (ImGui::BeginMainMenuBar()) {
+        bar_h = ImGui::GetWindowHeight();
 
-    // ── Brand mark ───────────────────────────────────────────────────
-    ImGui::TextColored(kCyan, "SWORDFARE");
-    ImGui::SameLine(0.0f, 14.0f * scale);
-    ImGui::TextColored(kBorder, "|");
-    ImGui::SameLine(0.0f, 14.0f * scale);
-    ImGui::SetCursorPosY(pad_y > 0 ? pad_y : 2.0f);
+        auto menu = [&](const char* label, auto fn) {
+            if (ImGui::BeginMenu(label)) {
+                fn();
+                ImGui::EndMenu();
+            }
+        };
 
-    auto menu = [&](const char* label, auto fn) {
-        if (ImGui::BeginMenu(label)) {
-            fn();
-            ImGui::EndMenu();
-        }
-        ImGui::SameLine();
-        ImGui::SetCursorPosY(pad_y > 0 ? pad_y : 2.0f);
-    };
+        // ── File ─────────────────────────────────────────────────────────
+        menu("File", [&]() {
+            if (ImGui::MenuItem("Save State"))        action = GUI_SAVE_STATE;
+            if (ImGui::MenuItem("Load State"))        action = GUI_LOAD_STATE;
+            ImGui::Separator();
+            if (ImGui::MenuItem("Exit Game"))         action = GUI_EXIT;
+        });
 
-    // ── File ─────────────────────────────────────────────────────────
-    menu("File", [&]() {
-        if (ImGui::MenuItem("Save State"))        action = GUI_SAVE_STATE;
-        if (ImGui::MenuItem("Load State"))        action = GUI_LOAD_STATE;
-        ImGui::Separator();
-        if (ImGui::MenuItem(g_game_paused ? "Resume" : "Pause", "F8"))
-            action = GUI_PAUSE;
-        ImGui::Separator();
-        ImGui::PushStyleColor(ImGuiCol_Text, kDanger);
-        if (ImGui::MenuItem("Exit Game")) action = GUI_EXIT;
-        ImGui::PopStyleColor();
-    });
+        // ── Emulation ────────────────────────────────────────────────────
+        menu("Emulation", [&]() {
+            if (ImGui::MenuItem(g_game_paused ? "Resume" : "Pause", "F8"))
+                action = GUI_PAUSE;
+            ImGui::Separator();
+            if (ImGui::MenuItem("Speed Up",   "+")) action = GUI_GAME_SPEED_UP;
+            if (ImGui::MenuItem("Speed Down", "-")) action = GUI_GAME_SPEED_DOWN;
+            if (ImGui::MenuItem("Speed Reset","0")) action = GUI_GAME_SPEED_RESET;
+        });
 
-    // ── Tools ────────────────────────────────────────────────────────
-    menu("Tools", [&]() {
-        if (ImGui::MenuItem("Customize Controls", "F2")) action = GUI_CUSTOMIZE_CONTROLS;
-        if (ImGui::MenuItem("Toggle Cam Override", "F5")) action = GUI_TOGGLE_CAM;
-        if (ImGui::MenuItem("Toggle Smooth Cam"))          action = GUI_TOGGLE_SMOOTH_CAM;
-    });
+        // ── Config ───────────────────────────────────────────────────────
+        menu("Config", [&]() {
+            if (ImGui::MenuItem("Customize Controls", "F2")) action = GUI_CUSTOMIZE_CONTROLS;
+        });
 
-    // ── Cheats ───────────────────────────────────────────────────────
-    menu("Cheats", [&]() {
-        ImGui::TextColored(kTextDim, "TOGGLES");
-        ImGui::Separator();
-        ImGui::Checkbox("God Mode",       &g_gui.mod_god_mode);
-        ImGui::Checkbox("Infinite Mana",  &g_gui.mod_infinite_mana);
-        ImGui::Checkbox("Fly Mode",       &g_gui.mod_fly_mode);
-        ImGui::Checkbox("Infinite Jump",  &g_gui.mod_infinite_jump);
-        ImGui::Checkbox("Coin Break",     &g_gui.mod_coin_break);
-        ImGui::Spacing();
-        ImGui::TextColored(kTextDim, "QUICK ACTIONS");
-        ImGui::Separator();
-        if (ImGui::MenuItem("Heal Full HP"))  action = GUI_MOD_HEAL_FULL;
-        if (ImGui::MenuItem("Refill Mana"))   action = GUI_MOD_REFILL_MANA;
-        if (ImGui::MenuItem("+100 Coins"))    action = GUI_MOD_ADD_COINS;
-        ImGui::Separator();
-        if (ImGui::MenuItem("Level +1"))      action = GUI_MOD_LEVEL_UP;
-        if (ImGui::MenuItem("Level -1"))      action = GUI_MOD_LEVEL_DOWN;
-        if (ImGui::MenuItem("XP +500"))       action = GUI_MOD_EXP_UP;
-        if (ImGui::MenuItem("XP -500"))       action = GUI_MOD_EXP_DOWN;
-    });
+        // ── Mods ─────────────────────────────────────────────────────────
+        menu("Mods", [&]() {
+            ImGui::TextDisabled("CHEAT TOGGLES");
+            ImGui::Separator();
+            ImGui::MenuItem("God Mode",       nullptr, &g_gui.mod_god_mode);
+            ImGui::MenuItem("Infinite Mana",  nullptr, &g_gui.mod_infinite_mana);
+            ImGui::MenuItem("Fly Mode",       nullptr, &g_gui.mod_fly_mode);
+            ImGui::MenuItem("Infinite Jump",  nullptr, &g_gui.mod_infinite_jump);
+            ImGui::MenuItem("Coin Break",     nullptr, &g_gui.mod_coin_break);
+            
+            ImGui::Separator();
+            
+            if (ImGui::BeginMenu("Stats Editor")) {
+                if (ImGui::MenuItem("Heal Full HP"))  action = GUI_MOD_HEAL_FULL;
+                if (ImGui::MenuItem("Refill Mana"))   action = GUI_MOD_REFILL_MANA;
+                if (ImGui::MenuItem("+100 Coins"))    action = GUI_MOD_ADD_COINS;
+                ImGui::Separator();
+                if (ImGui::MenuItem("Level Up (+1)")) action = GUI_MOD_LEVEL_UP;
+                if (ImGui::MenuItem("Level Down (-1)")) action = GUI_MOD_LEVEL_DOWN;
+                if (ImGui::MenuItem("XP +500"))       action = GUI_MOD_EXP_UP;
+                if (ImGui::MenuItem("XP -500"))       action = GUI_MOD_EXP_DOWN;
+                ImGui::EndMenu();
+            }
+            
+            if (ImGui::BeginMenu("Physics Editor")) {
+                ImGui::SetNextItemWidth(120.0f * scale);
+                ImGui::SliderFloat("Walk Speed", &g_gui.mod_walk_speed,  0.5f, 10.0f, "%.1f");
+                ImGui::SetNextItemWidth(120.0f * scale);
+                ImGui::SliderFloat("Run Speed",  &g_gui.mod_run_speed,   0.5f, 10.0f, "%.1f");
+                ImGui::SetNextItemWidth(120.0f * scale);
+                ImGui::SliderFloat("Jump Height", &g_gui.mod_jump_height, 0.5f, 10.0f, "%.1f");
+                ImGui::EndMenu();
+            }
+        });
 
-    // ── Speed ────────────────────────────────────────────────────────
-    menu("Speed", [&]() {
-        ImGui::SetNextItemWidth(170.0f * scale);
-        ImGui::SliderFloat("Walk", &g_gui.mod_walk_speed,  0.5f, 10.0f, "%.1f");
-        ImGui::SetNextItemWidth(170.0f * scale);
-        ImGui::SliderFloat("Run",  &g_gui.mod_run_speed,   0.5f, 10.0f, "%.1f");
-        ImGui::SetNextItemWidth(170.0f * scale);
-        ImGui::SliderFloat("Jump", &g_gui.mod_jump_height, 0.5f, 10.0f, "%.1f");
-        ImGui::Separator();
-        if (ImGui::MenuItem("Speed Up"))    action = GUI_GAME_SPEED_UP;
-        if (ImGui::MenuItem("Speed Down"))  action = GUI_GAME_SPEED_DOWN;
-        if (ImGui::MenuItem("Speed Reset")) action = GUI_GAME_SPEED_RESET;
-    });
+        // ── Settings ─────────────────────────────────────────────────────
+        menu("Settings", [&]() {
+            if (ImGui::MenuItem("Toggle Cam Override", "F5")) action = GUI_TOGGLE_CAM;
+            if (ImGui::MenuItem("Toggle Smooth Cam"))          action = GUI_TOGGLE_SMOOTH_CAM;
+            ImGui::Separator();
+            if (ImGui::MenuItem("Mute Music"))     action = GUI_MUSIC_MUTE;
+            if (ImGui::MenuItem("Volume Up"))      action = GUI_MUSIC_VOL_UP;
+            if (ImGui::MenuItem("Volume Down"))    action = GUI_MUSIC_VOL_DOWN;
+        });
 
-    // ── Audio ────────────────────────────────────────────────────────
-    menu("Audio", [&]() {
-        if (ImGui::MenuItem("Mute / Unmute")) action = GUI_MUSIC_MUTE;
-        if (ImGui::MenuItem("Volume Up"))     action = GUI_MUSIC_VOL_UP;
-        if (ImGui::MenuItem("Volume Down"))   action = GUI_MUSIC_VOL_DOWN;
-    });
+        // ── Help ─────────────────────────────────────────────────────────
+        menu("Help", [&]() {
+            if (ImGui::MenuItem("Help / Hotkeys")) m_show_help = true;
+            if (ImGui::MenuItem("About Mod"))      m_show_about = true;
+        });
 
-    // ── About / Help — plain buttons, not menus, since they just open a panel
-    ImGui::SameLine();
-    ImGui::SetCursorPosY(pad_y > 0 ? pad_y : 2.0f);
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kHoverTint);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, kActiveTint);
-    if (ImGui::SmallButton("Help"))  m_show_help = true;
-    ImGui::SameLine();
-    ImGui::SetCursorPosY(pad_y > 0 ? pad_y : 2.0f);
-    if (ImGui::SmallButton("About")) m_show_about = true;
-    ImGui::PopStyleColor(3);
+        // ── Right-aligned branding "Swordigo" ────────────────────────────
+        const char* brand_lbl = "Swordigo";
+        ImVec2 brand_sz = ImGui::CalcTextSize(brand_lbl);
+        float brand_x = win_w - brand_sz.x - 12.0f * scale;
 
-    // ── Right-aligned status + close ────────────────────────────────
-    char status_buf[64];
-    snprintf(status_buf, sizeof(status_buf), g_game_paused ? "PAUSED" : "RUNNING");
-    ImVec2 status_sz = ImGui::CalcTextSize(status_buf);
+        ImGui::SameLine(brand_x);
+        ImGui::TextColored(kCyan, "%s", brand_lbl);
 
-    const char* close_lbl = "  F1 Close  ";
-    ImVec2 close_sz = ImGui::CalcTextSize(close_lbl);
-
-    float right_edge = win_w - 12.0f * scale;
-    float close_x    = right_edge - close_sz.x;
-    float status_x   = close_x - status_sz.x - 16.0f * scale;
-
-    ImGui::SetCursorPosX(status_x);
-    ImGui::SetCursorPosY(pad_y > 0 ? pad_y : 2.0f);
-    ImGui::TextColored(g_game_paused ? kDanger : kOk, "%s", status_buf);
-
-    ImGui::SetCursorPosX(close_x);
-    ImGui::SetCursorPosY(pad_y > 0 ? pad_y : 2.0f);
-    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kDangerHover);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  kDanger);
-    ImGui::PushStyleColor(ImGuiCol_Text,          kDanger);
-    if (ImGui::SmallButton(close_lbl)) *p_open = false;
-    ImGui::PopStyleColor(4);
-
-    // Accent underline across the whole bar (this replaces the old flat
-    // block-highlight look with a single thin brand-colored seam).
-    ImVec2 win_pos = ImGui::GetWindowPos();
-    ImVec2 win_sz  = ImGui::GetWindowSize();
-    DrawAccentUnderline(ImVec2(win_pos.x, win_pos.y + win_sz.y - 2.0f),
-                        ImVec2(win_pos.x + win_sz.x, win_pos.y + win_sz.y));
-
-    ImGui::End();
+        ImGui::EndMainMenuBar();
+    }
 
     if (bar_font) ImGui::PopFont();
     ImGui::PopStyleColor(7);
-    ImGui::PopStyleVar(6);
+    ImGui::PopStyleVar(3);
 
     // Draw the About/Help panels (self-contained, opened via the buttons above)
     if (m_show_about) draw_about_panel(&m_show_about, bar_h);
@@ -1653,6 +1689,8 @@ GuiAction SwordfareGUI::draw_control_panel(bool* p_open) {
 
     return action;
 }
+
+
 
 // ============================================================================
 //  ABOUT PANEL — pulled from the project README, written up fresh for the UI
@@ -2016,3 +2054,219 @@ GuiAction SwordfareGUI::draw_settings_panel(bool* p_open) {
     return action;
 }
 */
+
+// =============================================================================
+// SwordfareGUI — Lua Console (ImGui-native, remastered)
+// =============================================================================
+
+void SwordfareGUI::init_lua_console(
+    uint8_t* guest_memory,
+    uint64_t buf_addr,   uint64_t result_addr,
+    uint64_t pending_addr, uint64_t status_addr,
+    uint64_t print_addr)
+{
+    m_guest_memory         = guest_memory;
+    m_console_buf_addr     = buf_addr;
+    m_console_result_addr  = result_addr;
+    m_console_pending_addr = pending_addr;
+    m_console_status_addr  = status_addr;
+    m_console_print_addr   = print_addr;
+    m_console_ready        = (buf_addr != 0);
+
+    if (m_console_ready) {
+        m_console_history.push_back({"[SRE Lua Terminal] Connected to game Lua state.", false, false});
+        m_console_history.push_back({"  APIs: caver.getHero(), caver.setHp(h,999), caver.getPosition(h)", false, false});
+        m_console_history.push_back({"  All mod caver.* and sre.* APIs available inline.", false, false});
+        m_console_history.push_back({"  Backtick (`) to toggle. Up/Down = history recall.", false, false});
+    }
+}
+
+void SwordfareGUI::toggle_lua_console() {
+    if (!m_console_ready) return;
+    m_console_open  = !m_console_open;
+    m_console_focus = m_console_open;
+    m_console_scroll_bottom = true;
+}
+
+void SwordfareGUI::console_submit(const std::string& cmd) {
+    if (cmd.empty() || !m_guest_memory || !m_console_buf_addr) return;
+
+    m_console_history.push_back({"> " + cmd, false, true});
+    while ((int)m_console_history.size() > CONSOLE_MAX_HISTORY)
+        m_console_history.erase(m_console_history.begin());
+
+    if (m_console_cmd_history.empty() || m_console_cmd_history.back() != cmd)
+        m_console_cmd_history.push_back(cmd);
+    m_console_hist_idx = -1;
+
+    char* buf = (char*)(m_guest_memory + m_console_buf_addr);
+    size_t len = cmd.size();
+    if (len > 4094) len = 4094;
+    memcpy(buf, cmd.c_str(), len);
+    buf[len] = 0;
+
+    *(int32_t*)(m_guest_memory + m_console_status_addr)  = 0;
+    *(int32_t*)(m_guest_memory + m_console_pending_addr) = 1;
+    m_console_scroll_bottom = true;
+}
+
+void SwordfareGUI::lua_console_text(const char* text) {
+    if (!m_console_open || !text) return;
+    size_t cur = strlen(m_console_input);
+    size_t add = strlen(text);
+    if (cur + add < sizeof(m_console_input) - 1)
+        strcat(m_console_input, text);
+}
+
+bool SwordfareGUI::lua_console_key(SDL_Keycode key, const std::string& /*unused*/) {
+    if (!m_console_open) return false;
+
+    if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
+        if (m_console_input[0]) { console_submit(m_console_input); m_console_input[0] = 0; }
+        return true;
+    }
+    if (key == SDLK_BACKSPACE) {
+        size_t len = strlen(m_console_input);
+        if (len) m_console_input[len-1] = 0;
+        return true;
+    }
+    if (key == SDLK_ESCAPE) { m_console_open = false; return true; }
+    if (key == SDLK_UP) {
+        if (!m_console_cmd_history.empty()) {
+            if (m_console_hist_idx < 0)
+                m_console_hist_idx = (int)m_console_cmd_history.size() - 1;
+            else if (m_console_hist_idx > 0)
+                m_console_hist_idx--;
+            strncpy(m_console_input, m_console_cmd_history[m_console_hist_idx].c_str(),
+                    sizeof(m_console_input)-1);
+        }
+        return true;
+    }
+    if (key == SDLK_DOWN) {
+        if (m_console_hist_idx >= 0) {
+            m_console_hist_idx++;
+            if (m_console_hist_idx >= (int)m_console_cmd_history.size()) {
+                m_console_hist_idx = -1; m_console_input[0] = 0;
+            } else {
+                strncpy(m_console_input, m_console_cmd_history[m_console_hist_idx].c_str(),
+                        sizeof(m_console_input)-1);
+            }
+        }
+        return true;
+    }
+    return true; // consume all keys when console is open
+}
+
+void SwordfareGUI::draw_lua_console() {
+    if (!m_initialized || !m_console_open || !m_console_ready) return;
+
+    // Poll SRE for completed execution
+    int status = *(int32_t*)(m_guest_memory + m_console_status_addr);
+    if (status != 0) {
+        const char* result = (const char*)(m_guest_memory + m_console_result_addr);
+        if (result && result[0]) {
+            m_console_history.push_back({std::string(result), (status == 2), false});
+            while ((int)m_console_history.size() > CONSOLE_MAX_HISTORY)
+                m_console_history.erase(m_console_history.begin());
+            m_console_scroll_bottom = true;
+        }
+        *(int32_t*)(m_guest_memory + m_console_status_addr) = 0;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    float W = io.DisplaySize.x;
+    float H = io.DisplaySize.y;
+    float panel_h = H * 0.38f;
+
+    ImGui::SetNextWindowPos(ImVec2(0, H - panel_h), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(W, panel_h),    ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.95f);
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,    ImVec4(0.03f, 0.03f, 0.09f, 0.97f));
+    ImGui::PushStyleColor(ImGuiCol_Border,      ImVec4(0.91f, 0.27f, 0.38f, 0.90f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,     ImVec4(0.07f, 0.07f, 0.17f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text,        ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,    ImVec2(10.0f, 8.0f));
+
+    bool pushed_mono = false;
+    if (m_font_mono) { ImGui::PushFont((ImFont*)m_font_mono); pushed_mono = true; }
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                             ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+
+    if (ImGui::Begin("##SRE_LuaConsole", nullptr, flags)) {
+
+        // Title bar row
+        ImGui::TextColored(ImVec4(0.91f, 0.27f, 0.38f, 1.0f), "SRE Lua Terminal");
+        ImGui::SameLine();
+        ImGui::TextDisabled("  connected to game Lua state  |  ` to close  |  caver.* / sre.* fully exposed");
+        ImGui::SameLine(W - 100.0f);
+        if (ImGui::SmallButton("Clear##clr")) m_console_history.clear();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("X##close"))   m_console_open = false;
+        ImGui::Separator();
+
+        // Scrollback
+        float input_h  = ImGui::GetTextLineHeightWithSpacing() + 12.0f;
+        float title_h  = ImGui::GetTextLineHeightWithSpacing() * 2.4f;
+        float scroll_h = panel_h - title_h - input_h - 6.0f;
+
+        ImGui::BeginChild("##scroll", ImVec2(0, scroll_h), false,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        for (auto& e : m_console_history) {
+            if (e.is_input) {
+                ImGui::TextColored(ImVec4(0.40f, 0.80f, 1.00f, 1.0f), ">");
+                ImGui::SameLine(0, 4);
+                ImGui::TextUnformatted(e.text.c_str() + 2);
+            } else if (e.is_error) {
+                ImGui::TextColored(ImVec4(1.00f, 0.35f, 0.35f, 1.0f), "%s", e.text.c_str());
+            } else {
+                ImGui::TextColored(ImVec4(0.72f, 0.95f, 0.72f, 1.0f), "%s", e.text.c_str());
+            }
+        }
+        if (m_console_scroll_bottom) {
+            ImGui::SetScrollHereY(1.0f);
+            m_console_scroll_bottom = false;
+        }
+        ImGui::EndChild();
+
+        ImGui::Separator();
+
+        // Input row
+        ImGui::TextColored(ImVec4(0.40f, 0.80f, 1.0f, 1.0f), "lua>");
+        ImGui::SameLine();
+
+        if (m_console_focus) { ImGui::SetKeyboardFocusHere(); m_console_focus = false; }
+
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.05f, 0.05f, 0.14f, 1.0f));
+        ImGui::SetNextItemWidth(W - 100.0f);
+        bool submit = ImGui::InputText("##input", m_console_input, sizeof(m_console_input),
+                                       ImGuiInputTextFlags_EnterReturnsTrue |
+                                       ImGuiInputTextFlags_EscapeClearsAll);
+        ImGui::PopStyleColor();
+
+        if (submit && m_console_input[0]) {
+            console_submit(m_console_input);
+            m_console_input[0] = 0;
+            m_console_focus    = true;
+        }
+
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.91f, 0.27f, 0.38f, 0.90f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.00f, 0.40f, 0.52f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.65f, 0.12f, 0.22f, 1.00f));
+        if (ImGui::Button("Run", ImVec2(60, 0)) && m_console_input[0]) {
+            console_submit(m_console_input);
+            m_console_input[0] = 0;
+            m_console_focus    = true;
+        }
+        ImGui::PopStyleColor(3);
+    }
+    ImGui::End();
+
+    if (pushed_mono) ImGui::PopFont();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(4);
+}

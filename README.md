@@ -9,8 +9,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/TheCorrectSynovian/SwordigoDesktop/blob/master/LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20x86__64-purple.svg)](#)
-[![Version](https://img.shields.io/badge/Version-v7.3-00e5ff.svg)](https://github.com/TheCorrectSynovian/SwordigoDesktop/releases)
-[![Engine](https://img.shields.io/badge/Engine-SRT%20v7.3-8b3dff.svg)](#-srt-architecture)
+[![Version](https://img.shields.io/badge/Version-v8.0%20Beta%201-00e5ff.svg)](https://github.com/TheCorrectSynovian/SwordigoDesktop/releases)
+[![Engine](https://img.shields.io/badge/Engine-SRT%20v8.0-8b3dff.svg)](#-srt-architecture)
 
 [Website](https://thecorrectsynovian.github.io/SwordigoDesktop/web/) · [Download](https://github.com/TheCorrectSynovian/SwordigoDesktop/releases) · [Research](https://thecorrectsynovian.github.io/SwordigoDesktop/web/research.html) · [Changelog](https://thecorrectsynovian.github.io/SwordigoDesktop/web/changelog.html)
 
@@ -20,47 +20,38 @@
 
 **Swordigo Desktop** is a native Linux port of the beloved mobile action-adventure platformer by Touch Foo. Rather than running through Android emulation layers, this project uses the **Swordigo Runtime (SRT)** — a layered runtime architecture that treats `libswordigo.so` as a gameplay kernel while progressively replacing subsystems with clean, native reimplementations.
 
-v7.3 Combatch Update brings **Swordfare GUI (ImGui-based vector overlay)**, **Host-side Coin Limit Breakers**, **UI Input Swallowing**, **custom video background support**, **dynamic edge clear void correction**, a default-on **Low-end PC PostFX preset**, and full system vertical sync (VSync) — building on top of the decentralized instance architecture and libmpg123 music decoding from v7.2.
+v8.0 Beta 1 brings a monumental overhaul to the modding ecosystem: a **Host-side Virtual File System (VFS)** with 5-layer prioritized fallback, **Native Uncompressed PVR & PVRTC decoding**, a fully unrestricted **Lua console (`caver.call`)**, **TOML Mod Manifests**, and **SwKiwi Native UI Vector Overlays** — completely decoupling asset emulation from legacy guest limits while maintaining perfect backwards compatibility through an isolated ARM32 backend.
 
 ---
 
-## 🎯 What's New in v7.3
+## 🎯 What's New in v8.0 Beta 1
 
-### 🖥️ Swordfare GUI & Vector Overlay
-- Replaces legacy raw-text panels with a sleek dark-themed ImGui overlay.
-- High-DPI support with dynamic vector scaling and custom Swordfare typography.
-- Remastered F3 Debug panel with collapsible tray metrics (Resolutions, Frametimes graph, Render calls, PostFX state, CPU delta).
+### 📂 Universal Mod Virtual File System (VFS)
+- Complete host-side `AAssetManager` interception with a 5-layer path priority (`mods/<active_mod>/resources/<profile>/` → `assets/resources/`).
+- Seamless overrides: Mod assets instantly replace vanilla assets without destructive file changes.
+- Smart fallbacks: Transparent `.tex.png` ↔ `.pvr` and `_2x` ↔ `_1x` format swapping under the hood.
 
-### 🪙 9999 Coin Limit Breaker
-- Host-side JNI memory patches for both ARM32 and ARM64 engines to bypass the hard-coded 999 coin limit.
+### 🗜️ Native PVR & PVRTC Decoding
+- **PVR v3 + RGBA/BGRA:** Fonts and UI atlases render flawlessly using a native host-side extractor.
+- **PVRTC Decompression:** Raw iOS PVRTC textures are unpacked directly on the host using the PowerVR SDK decoder, bypassing broken guest fallback software pipelines.
 
-### 🔒 UI Control Lockout
-- Native touch event swallowing when `UI.SetControlsDisabled` is active. Prevents gameplay movements while custom UI buttons or settings menus are open.
+### ⌨️ SwKiwi: Native UI Overlays (ImGui)
+- The Android-based `ButtonController` ported natively into ImGui vector elements.
+- Spawn interactive window overlays, draggable panels (`movable`), and pinch-to-zoom elements (`pinchable`).
+- Input gating: hovering SwKiwi elements automatically swallows gameplay touches.
 
-### 🎥 Video Background Support (F7 Toggle)
-- Dynamic frame-by-frame background loop playback (0.4x speed)
-- Shell-based FFmpeg extraction keeps host memory safe and stable
-- Toggle dynamic backgrounds on/off with `F7` (instantly falls back to vanilla assets, no freezing)
+### 📜 True Lua Console
+- Real standard `print()` is fixed and no longer crashes the game.
+- Execute any native ARM64 engine method via `caver.call(addr, ...)` directly from the console.
+- Native memory inspection via `caver.read32(addr)` and `caver.write8(addr, val)`.
 
-### 🎨 Background Border Void Correction
-- Samples boundary edge colors of vanilla backgrounds and video frames
-- Dynamically overrides `glClearColor` if a screen clear is black/dark
-- Eliminates the ugly black void underneath levels when jumping or falling
+### ⚙️ TOML Mod Manifests
+- Uses TOMLC to instantly parse `mini.toml` files on boot to configure engine state, versions, and limits natively before VFS activation.
 
-### 💨 Default-On Optimized "Low" PostFX Preset
-- Configures default-on color correction, vignette, and screen-space shadows
-- SSAO, Bloom, and God rays are disabled for a fast, lag-free experience on low-end GPUs
-- Requires zero extra rendering passes, compiling to a single composite pass
+### 🛡️ Isolated ARM32 Asset Emulation
+- Complete decoupling of ARM32 asset management into an isolated implementation, ensuring classic `armeabi-v7a` mods run exactly as intended without SRE path mutations.
 
-### ⌨️ Re-allocated Hotkeys
-- `F7` is now dedicated to toggling video backgrounds
-- `\` (Backslash) toggles manual keyboard typing mode
-
-### 📦 Modular Packaging Updates
-- RPM and DEB packages exclude heavy video files (`.mp4`) automatically
-- Users grab `vbg.zip` separately and unpack it to their local assets folder
-
-> See [v7.3 Release Notes](RELEASE_NOTES_v7.3.md) for full details.
+> See [v8.0 Beta 1 Release Notes](documentation/Release%20Notes/RELEASE_NOTES_v8.0_Beta_1.md) for full details.
 
 ---
 
