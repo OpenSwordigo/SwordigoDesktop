@@ -97,7 +97,7 @@ assets.tar*
 research/experiments/
 # -------- PROPRIETARY REFERENCE MATERIALS --------
 reference/
-reference/**
+#reference/**
 # -------- WINDOWS BUILD DEPENDENCIES --------
 # vcpkg and build artifacts (large, downloadable)
 winbuild/

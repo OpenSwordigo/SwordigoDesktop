@@ -186,7 +186,9 @@ SreHookEntry sre_hook_table[] = {
     /* GUI System — game state extraction.
      * Hooks GameSceneView::Update to read HP/mana/coins from GameState
      * every frame. The native HUD won't animate (we own the display). */
-    { 0x34ed2c, "sre_GameSceneView_Update" },  /* GameSceneView::Update(float) */
+     { 0x34ed2c, "sre_GameSceneView_Update" },  /* GameSceneView::Update(float) */
+      { 0, "sre_CameraController_Update" },
+      { 0, "sre_SceneGrid_UpdateVisibleAreasWithCamera" },
 
     /* Force GLES 2.0 Mode (hook RenderingContext constructor) */
     { 0x2fc03c, "sre_RenderingContext_C1" },

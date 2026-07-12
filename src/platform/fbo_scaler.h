@@ -61,6 +61,10 @@ struct PostFXState {
     float shadow_softness = 0.003f;      // blur radius for soft shadow edges
     float shadow_light_x = 0.3f;         // light direction X (+right, normalized)
     float shadow_light_y = -0.8f;        // light direction Y (-down, normalized)
+    float shadow_sun_z = 0.15f;          // virtual sun depth component for 3D shadow angle
+                                         // >0 = player/camera side (shadows angle toward player)
+                                         // 0  = purely 2D screen-space shadows
+                                         // <0 = background side (shadows angle away from player)
     
     bool outlines = false;               // depth-based edge outlines (cel-shading style)
     float outline_thickness = 1.0f;      // pixel width of outline (1.0 = 1px, 2.0 = thicker)
@@ -86,6 +90,9 @@ enum class PostFXPreset : int {
 
 void postfx_apply_preset(PostFXState& state, PostFXPreset preset);
 const char* postfx_preset_name(PostFXPreset p);
+
+bool postfx_load_custom_json(PostFXState& state);
+void postfx_save_default_json();
 
 bool fbo_init(int game_w, int game_h);
 void fbo_destroy();

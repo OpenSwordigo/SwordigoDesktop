@@ -255,6 +255,7 @@ dynarmic-build:
 		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
 		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
 		-DDYNARMIC_IGNORE_ASSERTS=ON \
+		-DDYNARMIC_WARNINGS_AS_ERRORS=OFF \
 		-Wno-dev
 	@cd $(DYNARMIC_BUILD) && make -j$$(nproc) dynarmic
 	@echo "[DYN]  Dynarmic built successfully!"

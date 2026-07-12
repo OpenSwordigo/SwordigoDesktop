@@ -116,33 +116,19 @@ v8.0 Beta 1 brings a monumental overhaul to the modding ecosystem: a **Host-side
 
 ## ✨ Features
 
-### 🎮 Full Gameplay
-- Complete game loop — explore, fight, solve puzzles, defeat bosses
-- **Instant death respawn** — native checkpoint respawn, no process restart
-- Save system with persistent progress (`~/.local/share/swordigo-desktop/save/`)
-- Full audio: music tracks + sound effects through OpenAL
-- **Music loop watchdog** — ensures background music never stops unexpectedly
-- **Music format support** — MP3, OGG, WAV via direct libmpg123 (v7.2+)
-
-### 🚀 Multi-Instance Support
-- **Vanilla Swordigo 1.4.12 ARM64** — fully stable, beatable end-to-end
-- **RLSwordigo 6.6** — roguelike mode, near-stable with experimental features
-- **Modded Instances** — Mason Mod, Phonkdigo, and more (KiwiAPI framework)
-- **Decentralized `.ini` configs** (v7.2+) — each instance is self-contained
-
-### 🎨 Desktop-Native Experience
+### Desktop-Native Experience
 - **1920×1080 internal rendering** with FBO-based scaling (Sharp Bilinear, Nearest, CRT Scanline)
 - **Keyboard controls** — fully remappable via the in-game Controls Editor (F2)
 - **Gamepad support** — Xbox/PlayStation controllers with analog stick + D-pad
 - **Multi-touch support** — 10 independent touch inputs for touchscreen laptops
 
-### 🎨 PostFX Pipeline
+### PostFX Pipeline
 - **6 Presets** (F6) — Cinematic, Retro, Fantasy, Noir, Ethereal, Atmospheric
 - **SSAO** — Screen Space Ambient Occlusion with 16-sample hemisphere
 - **God Rays** — 64-sample radial blur from configurable sun position
 - **Color Effects** — Vignette, Film Grain, Chromatic Aberration, Sharpen
 
-### 🛠️ Engine Features
+### Engine Features
 | Key | Feature |
 |-----|---------|
 | **F1** | Toggle GUI menu bar (File/Emulation/Config/Misc/Help) |
@@ -155,13 +141,6 @@ v8.0 Beta 1 brings a monumental overhaul to the modding ecosystem: a **Host-side
 | **\\** | Toggle keyboard typing mode |
 | **F10** | Toggle native on-screen controls |
 | **F12** | Fullscreen toggle |
-
-### 🚀 SRT Launcher
-- **PolyMC-inspired Instance Manager** — Card grid layout with instance icons
-- **Multi-Binary Support** — v1.4.6, v1.4.12 in ARM32 + ARM64
-- **Engine Selection** — Dynarmic JIT (default) or Unicorn interpreter
-- **Decentralized Config** — `.ini` files per instance (v7.2+)
-- **Custom Instance Import** — Add any `.so` binary with custom naming
 
 ---
 
@@ -317,8 +296,11 @@ All controls are fully remappable — press **F2** to open the Controls Editor. 
 | Contribution | Name | GitHub |
 |-------------|------|--------|
 | **SwMini** — Swordigo Mini mod loader & reverse engineering | ItsJustSomeDude (IJSD) | [@ItsJustSomeDude](https://github.com/ItsJustSomeDude) |
-| **SwKiwi API** — KiwiAPI modding framework for Swordigo | Kiziyon | [@Kiziyon](https://github.com/Kiziyon) |
-| **Swordigo Vita Port** — Original ARM→desktop porting research | Rinnegatamante | [@Rinnegatamante](https://github.com/Rinnegatamante) |
+| **SwKiwi** is Fork of SwMini — KiwiAPI modding framework for Swordigo | Kiziyon | [@Kiziyon](https://github.com/Kiziyon) |
+| **Swordigo Vita Port** — Original porting research | Rinnegatamante | [@Rinnegatamante](https://github.com/Rinnegatamante) |
+| **Swordigo FileRift** , **Boulder v1** and **SW3D** - Parsing, decoding and encoding of protobuff files, Camera overeide and work on Groundmeshes. | DanielSpaniel | [@DanielSpaniel](https://github.com/DanielSpaniel) |
+
+Thanking the **Swordiforge** community for keeping the swordigo modding active.
 
 ### Original Game
 

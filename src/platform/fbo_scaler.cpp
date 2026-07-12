@@ -7,6 +7,9 @@
 #include <iostream>
 #include <cstring>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 
 // ============================================================
 //  FBO + Multi-Pass Post-Processing Pipeline
@@ -122,6 +125,7 @@ static GLint loc_comp_shadow_enabled = -1;
 static GLint loc_comp_shadow_intensity = -1;
 static GLint loc_comp_shadow_softness = -1;
 static GLint loc_comp_shadow_light_dir = -1;
+static GLint loc_comp_shadow_sun_z = -1;
 static GLint loc_comp_shadow_near = -1;
 static GLint loc_comp_shadow_far = -1;
 static GLint loc_comp_shadow_lift = -1;
@@ -130,6 +134,7 @@ static GLint loc_comp_bg_scale = -1;
 static GLint loc_comp_ambient_r = -1;
 static GLint loc_comp_ambient_g = -1;
 static GLint loc_comp_ambient_b = -1;
+static GLint loc_comp_tex_size = -1;
 
 // g_prog_postfx uniforms
 static GLint loc_postfx_tex = -1;
@@ -459,11 +464,13 @@ void main() {
 )GLSL";
 
 // ----- God Rays (screen-space radial blur from sun position) -----
+// Sun is positioned ABOVE the screen at (0.5, 1.1) — invisible, but rays emanate down
+// from there, creating the impression of a powerful overhead sun.
 static const char* FRAG_GODRAYS = R"GLSL(
 #version 330
 uniform sampler2D u_tex;      // scene color
 uniform sampler2D u_depth;    // depth texture
-uniform vec2 u_sun_pos;       // sun position in UV space
+uniform vec2 u_sun_pos;       // sun position in UV space (can be off-screen, e.g. 0.5, 1.1)
 uniform float u_intensity;    // overall intensity
 uniform float u_decay;        // per-sample decay
 uniform float u_density;      // sample spacing
@@ -476,17 +483,21 @@ float rand(vec2 co) {
 }
 
 void main() {
-    // Direction from this pixel toward the sun
+    // Direction from this pixel toward the (off-screen) sun
     vec2 delta = v_uv - u_sun_pos;
     float dist = length(delta);
     
-    // Anisotropic scattering: brighter when looking closer to the sun
-    float scattering = 1.0 / (1.0 + dist * 2.0);
+    // Anisotropic scattering: rays spread wide from the top
+    // Stronger near screen top-center, taper out at screen edges
+    float vertical_bias = clamp(1.0 - v_uv.y * 0.8, 0.0, 1.0);  // stronger near top
+    float scattering = vertical_bias / (1.0 + dist * 0.75);
     
-    // Sun corona/glow: radial glow centered on the sun
-    float sun_glow = smoothstep(0.25, 0.0, dist) * 0.4;
+    // No visible sun corona (sun is off-screen) — only rays are visible
+    // We still compute a small "horizon glow" at the top edge
+    float horizon_glow = smoothstep(0.55, 1.0, v_uv.y) * 0.15;
     
-    delta = delta / max(dist, 0.001) * (1.0 / 64.0) * u_density;
+    // Step direction: from current pixel toward the sun (which is above screen)
+    delta = delta / max(dist, 0.001) * (1.0 / 80.0) * u_density;
     
     // Dither starting offset to eliminate banding artifacts
     float dither = rand(v_uv);
@@ -495,40 +506,45 @@ void main() {
     float illumination_decay = 1.0;
     vec3 god_ray = vec3(0.0);
     
-    // March toward the sun, accumulating light
-    for (int i = 0; i < 64; i++) {
+    // March 80 steps toward the sun, accumulating light
+    // More steps = smoother rays from off-screen sun
+    for (int i = 0; i < 80; i++) {
         uv -= delta;
-        // Clamp to valid UV range
-        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
+        // Clamp to valid UV range (we march UP, so clamp top)
+        uv = clamp(uv, vec2(0.0), vec2(1.0));
         
         vec3 sample_col = texture(u_tex, uv).rgb;
         float depth = texture(u_depth, uv).r;
         
         // Depth masking — only sky/background (far pixels) can emit light
-        // Depth near 1.0 = far/sky, near 0.0 = close (foreground occluder)
-        float depth_mask = smoothstep(0.95, 1.0, depth);
+        // Depth near 1.0 = far/sky (background), near 0.0 = close (foreground)
+        float depth_mask = smoothstep(0.92, 1.0, depth);
         
-        // Brightness threshold for the light source
-        float bright = max(max(sample_col.r, sample_col.g), sample_col.b);
-        float brightness_mask = smoothstep(0.2, 0.7, bright);
+        // Brightness — sky and bright highlights scatter light
+        float bright = dot(sample_col, vec3(0.2126, 0.7152, 0.0722));
+        float brightness_mask = smoothstep(0.15, 0.6, bright);
         
-        // Combined emission: only the sky/sun region emits rays. 
-        // Close objects (depth <= 0.95) block the light (emission = 0.0).
+        // Combined emission
         float emission = depth_mask * brightness_mask;
         
         god_ray += sample_col * emission * illumination_decay;
         illumination_decay *= u_decay;
     }
     
-    god_ray *= u_exposure / 64.0;
+    god_ray *= u_exposure / 80.0;
     
-    // Add sun corona and apply intensity & scattering
-    vec3 final_ray = god_ray * u_intensity * (1.0 + scattering * 0.5) + vec3(sun_glow * u_intensity);
+    // Horizon glow fill — subtle warm bloom near top screen edge
+    vec3 final_ray = god_ray * u_intensity * (1.0 + scattering * 0.6)
+                   + vec3(horizon_glow * u_intensity * 0.6, horizon_glow * u_intensity * 0.5, horizon_glow * u_intensity * 0.3);
     FragColor = vec4(clamp(final_ray, 0.0, 1.0), 1.0);
 }
 )GLSL";
 
+
 // ----- SSAO (Screen Space Ambient Occlusion) -----
+// Upgraded: uses cross-pattern depth reconstruction to reconstruct
+// approximate normals on-the-fly, giving better orientation-aware occlusion
+// and preventing halos on flat surfaces.
 static const char* FRAG_SSAO = R"GLSL(
 #version 330
 uniform sampler2D u_depth;    // depth texture
@@ -549,6 +565,16 @@ float linearize_depth(float d) {
     return (2.0 * u_near_plane) / (u_far_plane + u_near_plane - d * (u_far_plane - u_near_plane));
 }
 
+// Reconstruct a view-space position from a UV coordinate
+vec3 get_view_pos(vec2 uv) {
+    float d = linearize_depth(texture(u_depth, uv).r);
+    float aspect = u_tex_size.x / u_tex_size.y;
+    // Map UV to [-1,1] NDC, scale by depth for a rough view-space position
+    float x = (uv.x * 2.0 - 1.0) * d * aspect;
+    float y = (uv.y * 2.0 - 1.0) * d;
+    return vec3(x, y, d);
+}
+
 void main() {
     float depth = texture(u_depth, v_uv).r;
     float center_z = linearize_depth(depth);
@@ -558,6 +584,13 @@ void main() {
         FragColor = vec4(1.0, 1.0, 1.0, 1.0);
         return;
     }
+    
+    // Reconstruct view-space normal from screen-space depth derivatives
+    vec2 px = 1.0 / u_tex_size;
+    vec3 pos_c = get_view_pos(v_uv);
+    vec3 pos_r = get_view_pos(v_uv + vec2(px.x, 0.0));
+    vec3 pos_u = get_view_pos(v_uv + vec2(0.0, px.y));
+    vec3 normal = normalize(cross(pos_r - pos_c, pos_u - pos_c));
     
     float occlusion = 0.0;
     int samples = 16;
@@ -576,24 +609,38 @@ void main() {
         offset.x *= u_tex_size.y / u_tex_size.x;
         
         vec2 sample_uv = v_uv + offset;
+        if (sample_uv.x < 0.0 || sample_uv.x > 1.0 ||
+            sample_uv.y < 0.0 || sample_uv.y > 1.0) continue;
+        
         float sample_depth = texture(u_depth, sample_uv).r;
         float sample_z = linearize_depth(sample_depth);
         
         // If sample is closer to the camera than center (sample_z < center_z), it blocks light
         float occluded = step(sample_z, center_z - 0.001);
         
-        // Range check: check if neighboring sample is within depth radius to prevent false halos
-        float range_check = smoothstep(u_radius * 2.0, 0.0, abs(center_z - sample_z));
+        // Range check: prevent halos across large depth discontinuities
+        // (e.g., don't let background occlude foreground character)
+        float range_check = smoothstep(u_radius * 3.0, 0.0, abs(center_z - sample_z));
         
-        occlusion += occluded * range_check;
+        // Normal-aware weight: prefer samples in the hemisphere facing the normal
+        // This prevents flat surfaces from self-occluding
+        vec3 sample_pos = get_view_pos(sample_uv);
+        vec3 to_sample = normalize(sample_pos - pos_c);
+        float normal_weight = clamp(dot(normal, to_sample) + 0.5, 0.0, 1.0);
+        
+        occlusion += occluded * range_check * normal_weight;
     }
     
     float ao = 1.0 - (occlusion / float(samples)) * u_intensity;
     ao = clamp(ao, 0.0, 1.0);
     
+    // Gamma correction pass to keep AO looking natural
+    ao = pow(ao, 0.8);
+    
     FragColor = vec4(ao, ao, ao, 1.0);
 }
 )GLSL";
+
 
 // ----- Gaussian Blur (separable, for SSAO smoothing) -----
 static const char* FRAG_BLUR = R"GLSL(
@@ -652,9 +699,11 @@ uniform float u_gr_tint_r, u_gr_tint_g, u_gr_tint_b;  // god ray color tint
 uniform float u_shadow_enabled;  // 0 or 1
 uniform float u_shadow_intensity;
 uniform float u_shadow_softness;
-uniform vec2  u_shadow_light_dir;  // light direction (normalized, in UV space)
+uniform vec2  u_shadow_light_dir;  // 2D light direction in UV space (from sun toward scene)
+uniform float u_shadow_sun_z;      // virtual sun depth (>0 = player/camera side, <0 = background side)
 uniform float u_shadow_near;
 uniform float u_shadow_far;
+uniform vec2  u_tex_size;          // resolution size
 
 // === Background-driven atmosphere (from SRE) ===
 uniform float u_bg_depth;       // distance to background plane
@@ -665,52 +714,103 @@ uniform float u_ambient_r, u_ambient_g, u_ambient_b;  // sky ambient color
 in vec2 v_uv;
 out vec4 FragColor;
 
+float rand(vec2 co) {
+    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
 float linearize_depth(float d) {
     float n = u_shadow_near;
     float f = u_shadow_far;
     return (2.0 * n) / (f + n - d * (f - n));
 }
 
-float compute_shadow() {
-    // Screen-space directional shadow via depth ray marching
-    // March FROM this pixel TOWARD the light source.
-    // If any sample along the ray has CLOSER depth, we're in shadow.
-    
-    float my_depth = linearize_depth(texture(u_depth, v_uv).r);
-    
-    // Skip far background pixels (no shadow on sky/backgrounds)
+float compute_shadow_at(vec2 uv) {
+    float my_depth = linearize_depth(texture(u_depth, uv).r);
     if (my_depth > 0.95) return 1.0;
     
     float shadow = 1.0;
-    vec2 step_dir = u_shadow_light_dir * u_shadow_softness;
+    vec3 ray_dir_3d = normalize(vec3(u_shadow_light_dir, u_shadow_sun_z));
+    vec2 step_uv  = ray_dir_3d.xy * u_shadow_softness;
+    float step_z   = ray_dir_3d.z  * u_shadow_softness;
     
-    // March 12 steps toward the light
+    float dither = rand(uv);
+    
     for (int i = 1; i <= 12; i++) {
-        vec2 sample_uv = v_uv + step_dir * float(i);
+        float t = float(i) - dither * 0.9;
+        vec2 sample_uv = uv + step_uv * t;
+        float ray_depth = my_depth + step_z * t;
         
-        // Bounds check
         if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || 
             sample_uv.y < 0.0 || sample_uv.y > 1.0) break;
         
         float sample_depth = linearize_depth(texture(u_depth, sample_uv).r);
+        float depth_diff = ray_depth - sample_depth;
         
-        // If the sample is CLOSER to the camera than us, it's an occluder
-        float depth_diff = my_depth - sample_depth;
-        
-        // Only count as shadow if occluder is close in depth (not a distant wall)
-        // and actually closer than us
-        if (depth_diff > 0.001 && depth_diff < 0.15) {
-            // Closer samples = harder shadow, distant samples = softer
-            float falloff = 1.0 - float(i) / 12.0;
+        if (depth_diff > 0.001 && depth_diff < 0.18) {
+            float falloff = 1.0 - t / 12.0;
             shadow = min(shadow, 1.0 - u_shadow_intensity * falloff);
         }
     }
-    
     return shadow;
 }
 
+float compute_shadow_soft() {
+    float eps_x = 1.2 / u_tex_size.x;
+    float eps_y = 1.2 / u_tex_size.y;
+    
+    float s_c = compute_shadow_at(v_uv);
+    float s_r = compute_shadow_at(v_uv + vec2(eps_x, 0.0));
+    float s_l = compute_shadow_at(v_uv - vec2(eps_x, 0.0));
+    float s_u = compute_shadow_at(v_uv + vec2(0.0, eps_y));
+    float s_d = compute_shadow_at(v_uv - vec2(0.0, eps_y));
+    
+    return (s_c * 4.0 + s_r + s_l + s_u + s_d) / 8.0;
+}
+
+vec3 get_bumped_scene(vec2 uv) {
+    float eps_x = 1.0 / u_tex_size.x;
+    float eps_y = 1.0 / u_tex_size.y;
+    
+    // Sample luminance around the current pixel to get height map
+    float h_c  = dot(texture(u_scene, uv).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float h_r  = dot(texture(u_scene, uv + vec2(eps_x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float h_l  = dot(texture(u_scene, uv - vec2(eps_x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float h_u  = dot(texture(u_scene, uv + vec2(0.0, eps_y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float h_d  = dot(texture(u_scene, uv - vec2(0.0, eps_y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    
+    // Compute bump gradient
+    vec2 bump = vec2(h_r - h_l, h_u - h_d);
+    
+    // 3D Parallax offset based on height gradient
+    // We displace the UV coordinate slightly opposite to the gradient
+    // this shifts bright texels relative to dark texels based on viewing angle
+    vec2 displaced_uv = uv - bump * 0.0018; // relief strength
+    
+    // Clamp to screen bounds
+    displaced_uv = clamp(displaced_uv, vec2(0.0), vec2(1.0));
+    
+    vec3 col = texture(u_scene, displaced_uv).rgb;
+    
+    // Pseudo-normal vector for local lighting
+    // z component represents slope steepness (1.0 is flat)
+    vec3 normal = normalize(vec3(-bump.x * 2.0, -bump.y * 2.0, 1.0));
+    
+    // Compute local directional light from the 3D sun position
+    // u_shadow_light_dir is the 2D direction of the light.
+    // -u_shadow_sun_z is the light's forward component.
+    vec3 light_dir_3d = normalize(vec3(u_shadow_light_dir, -u_shadow_sun_z));
+    
+    // Simple Lambertian diffuse bump reflection
+    float diff = clamp(dot(normal, light_dir_3d), 0.0, 1.0);
+    
+    // Apply soft bump lighting highlights and shadow crevices
+    col *= (0.88 + 0.24 * diff);
+    
+    return col;
+}
+
 void main() {
-    vec3 scene = texture(u_scene, v_uv).rgb;
+    vec3 scene = get_bumped_scene(v_uv);
     
     // Apply SSAO with shadow lift — don't let AO darken too much
     if (u_ao_enabled > 0.5) {
@@ -721,7 +821,7 @@ void main() {
     
     // Apply screen-space shadows
     if (u_shadow_enabled > 0.5) {
-        float shadow = compute_shadow();
+        float shadow = compute_shadow_soft();
         scene *= shadow;
     }
     
@@ -729,7 +829,7 @@ void main() {
     float luma = dot(scene, vec3(0.2126, 0.7152, 0.0722));
     float shadow_mask = smoothstep(0.4, 0.1, luma);  // 1.0 in dark areas
     vec3 ambient = vec3(u_ambient_r, u_ambient_g, u_ambient_b);
-    scene += ambient * shadow_mask * 0.08;  // subtle fill light
+    scene += ambient * shadow_mask * 0.10;  // slightly stronger sky fill
     
     // Apply God Rays (additive with tint)
     if (u_gr_enabled > 0.5) {
@@ -750,14 +850,15 @@ void main() {
     
     // --- Saturation boost ---
     float luma2 = dot(scene, vec3(0.2126, 0.7152, 0.0722));
-    scene = mix(vec3(luma2), scene, 1.15);
+    scene = mix(vec3(luma2), scene, 1.18);  // slightly more vivid
     
     // --- Contrast micro-curve ---
-    scene = smoothstep(0.0, 1.0, scene);
+    scene = smoothstep(0.02, 1.0, scene);  // slight shadow lift in tone curve
     
     FragColor = vec4(clamp(scene, 0.0, 1.0), 1.0);
 }
 )GLSL";
+
 
 // ----- FSR 1.0 EASU: Edge-Adaptive Spatial Upscaling (simplified) -----
 // Based on AMD FidelityFX Super Resolution 1.0
@@ -1063,6 +1164,7 @@ bool fbo_init(int game_w, int game_h) {
         loc_comp_shadow_intensity = glGetUniformLocation(g_prog_composite, "u_shadow_intensity");
         loc_comp_shadow_softness  = glGetUniformLocation(g_prog_composite, "u_shadow_softness");
         loc_comp_shadow_light_dir = glGetUniformLocation(g_prog_composite, "u_shadow_light_dir");
+        loc_comp_shadow_sun_z     = glGetUniformLocation(g_prog_composite, "u_shadow_sun_z");
         loc_comp_shadow_near      = glGetUniformLocation(g_prog_composite, "u_shadow_near");
         loc_comp_shadow_far       = glGetUniformLocation(g_prog_composite, "u_shadow_far");
         loc_comp_shadow_lift      = glGetUniformLocation(g_prog_composite, "u_shadow_lift");
@@ -1071,6 +1173,7 @@ bool fbo_init(int game_w, int game_h) {
         loc_comp_ambient_r        = glGetUniformLocation(g_prog_composite, "u_ambient_r");
         loc_comp_ambient_g        = glGetUniformLocation(g_prog_composite, "u_ambient_g");
         loc_comp_ambient_b        = glGetUniformLocation(g_prog_composite, "u_ambient_b");
+        loc_comp_tex_size         = glGetUniformLocation(g_prog_composite, "u_tex_size");
     }
     if (g_prog_postfx) {
         loc_postfx_tex                  = glGetUniformLocation(g_prog_postfx, "u_tex");
@@ -1296,17 +1399,29 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
         draw_fsq();
 
-        // Blur horizontal: bloom_a -> bloom_b
+        // Blur horizontal 1: bloom_a -> bloom_b
         glBindFramebuffer(GL_FRAMEBUFFER, g_bloom_fbo_b);
         glUseProgram(g_prog_blur);
         glUniform1i(loc_blur_tex, 0);
-        glUniform2f(loc_blur_direction, 1.0f / g_quarter_w, 0.0f);
+        glUniform2f(loc_blur_direction, 1.2f / g_quarter_w, 0.0f);
         glBindTexture(GL_TEXTURE_2D, g_bloom_tex_a);
         draw_fsq();
 
-        // Blur vertical: bloom_b -> bloom_a
+        // Blur vertical 1: bloom_b -> bloom_a
         glBindFramebuffer(GL_FRAMEBUFFER, g_bloom_fbo_a);
-        glUniform2f(loc_blur_direction, 0.0f, 1.0f / g_quarter_h);
+        glUniform2f(loc_blur_direction, 0.0f, 1.2f / g_quarter_h);
+        glBindTexture(GL_TEXTURE_2D, g_bloom_tex_b);
+        draw_fsq();
+
+        // Blur horizontal 2 (wider): bloom_a -> bloom_b
+        glBindFramebuffer(GL_FRAMEBUFFER, g_bloom_fbo_b);
+        glUniform2f(loc_blur_direction, 2.5f / g_quarter_w, 0.0f);
+        glBindTexture(GL_TEXTURE_2D, g_bloom_tex_a);
+        draw_fsq();
+
+        // Blur vertical 2 (wider): bloom_b -> bloom_a
+        glBindFramebuffer(GL_FRAMEBUFFER, g_bloom_fbo_a);
+        glUniform2f(loc_blur_direction, 0.0f, 2.5f / g_quarter_h);
         glBindTexture(GL_TEXTURE_2D, g_bloom_tex_b);
         draw_fsq();
 
@@ -1426,6 +1541,9 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         glUniform2f(loc_comp_shadow_light_dir,
                     postfx ? postfx->shadow_light_x : 0.3f,
                     postfx ? postfx->shadow_light_y : -0.8f);
+        // 3D shadow sun_z: positive = shadow ray toward camera/player side
+        // Gives a natural angled shadow between the sun position and the player
+        glUniform1f(loc_comp_shadow_sun_z, postfx ? postfx->shadow_sun_z : 0.15f);
         glUniform1f(loc_comp_shadow_near, 50.0f);
         glUniform1f(loc_comp_shadow_far, 20000.0f);
         // Warm golden tint for god rays
@@ -1440,6 +1558,9 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         glUniform1f(loc_comp_ambient_r, g_bg_ambient_r);
         glUniform1f(loc_comp_ambient_g, g_bg_ambient_g);
         glUniform1f(loc_comp_ambient_b, g_bg_ambient_b);
+        if (loc_comp_tex_size != -1) {
+            glUniform2f(loc_comp_tex_size, (float)g_game_w, (float)g_game_h);
+        }
         draw_fsq();
 
         final_tex = g_postfx_tex;
@@ -1607,48 +1728,81 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
     switch (p) {
         case PostFXPreset::OFF:
             s.enabled = true;
-            s.shadows = true;
+            s.ssao = true; s.ssao_radius = 0.032f; s.ssao_intensity = 1.8f;
             s.shadow_intensity = 0.35f;
             s.shadow_softness = 0.002f;
             s.shadow_light_x = 0.3f;
             s.shadow_light_y = -0.8f;
             s.color_adjust = true;
-            s.warmth = 0.08f;
-            s.contrast = 1.03f;
-            s.saturation = 1.05f;
-            s.brightness = 0.02f;
+            s.warmth = 0.18f;
+            s.contrast = 1.13f;
+            s.saturation = 1.15f;
+            s.brightness = 0.07f;
             s.vignette = true;
-            s.vignette_intensity = 0.15f;
+            s.vignette_intensity = 0.35f;
             s.preset_name = "Low";
             break;
         case PostFXPreset::SW_PLUS:
-            s.enabled = true;
-            // SSAO — softer shadows (reduced from 1.5 to 0.8 — shadow lift handles the rest)
-            s.ssao = true; s.ssao_radius = 0.025f; s.ssao_intensity = 1.2f;
-            // God rays — dramatic light shafts from sky
-            s.god_rays = true; s.god_rays_intensity = 0.6f; s.god_rays_decay = 0.96f;
-            s.sun_x = 0.65f; s.sun_y = 0.88f;
-            // Volumetric light — layered atmosphere
-            s.volumetric_light = true; s.volumetric_intensity = 0.3f;
-            // Warm vibrant color grading — make it pop!
-            s.color_adjust = true; s.warmth = 0.2f; s.contrast = 1.05f; 
-            s.saturation = 1.12f; s.brightness = 0.03f;  // brighter overall
-            // Vignette — subtle cinematic frame
-            s.vignette = true; s.vignette_intensity = 0.2f;
-            // Sharpening — crisp edges
-            s.sharpen = true; s.sharpen_strength = 0.3f;
-            // Subtle chromatic aberration — premium lens feel
-            s.chromatic_aberration = true; s.ca_offset = 0.0008f;
-            // Bloom for glowing highlights
-            s.bloom = true; s.bloom_threshold = 0.65f; s.bloom_intensity = 0.25f;
-            // Screen-space shadows — light from upper-right
-            s.shadows = true; s.shadow_intensity = 0.45f; s.shadow_softness = 0.003f;
-            s.shadow_light_x = 0.3f; s.shadow_light_y = -0.8f;
-            // Edge outlines — subtle depth definition
-            s.outlines = true; s.outline_thickness = 1.0f; s.outline_intensity = 0.5f;
-            s.outline_depth_threshold = 0.002f;
-            s.preset_name = "Sw+";
-            break;
+    s.enabled = true;
+
+    // SSAO — gentle contact depth, preserve Swordigo's soft geometry
+    s.ssao = true;
+    s.ssao_radius = 0.026f;
+    s.ssao_intensity = 1.15f;
+
+    // God rays — atmospheric, not dominant
+    s.god_rays = true;
+    s.god_rays_intensity = 0.42f;
+    s.god_rays_decay = 0.965f;
+
+    // Sun above screen
+    s.sun_x = 0.58f;
+    s.sun_y = 1.12f;
+
+    // Volumetric atmosphere
+    s.volumetric_light = true;
+    s.volumetric_intensity = 0.18f;
+
+    // Color grading — preserve Swordigo palette, enrich rather than replace
+    s.color_adjust = true;
+    s.warmth = 0.08f;
+    s.contrast = 1.07f;
+    s.saturation = 1.08f;
+    s.brightness = 0.035f;
+
+    // Very soft cinematic framing
+    s.vignette = true;
+    s.vignette_intensity = 0.20f;
+
+    // Crisp texture detail without ringing
+    s.sharpen = true;
+    s.sharpen_strength = 0.11f;
+
+    // Extremely subtle lens separation
+    s.chromatic_aberration = true;
+    s.ca_offset = 0.00035f;
+
+    // Controlled bloom — only actual luminous/highlight regions
+    s.bloom = true;
+    s.bloom_threshold = 0.86f;
+    s.bloom_intensity = 0.38f;
+
+    // Soft directional shadows
+    s.shadows = true;
+    s.shadow_intensity = 0.34f;
+    s.shadow_softness = 0.0080f;
+    s.shadow_light_x = -0.10f;
+    s.shadow_light_y = 0.85f;
+    s.shadow_sun_z = 0.16f;
+
+    // Tiny depth definition, not cartoon ink
+    s.outlines = true;
+    s.outline_thickness = 1.0f;
+    s.outline_intensity = 0.24f;
+    s.outline_depth_threshold = 0.0035f;
+
+    s.preset_name = "Sw+";
+    break;
         case PostFXPreset::ATMOSPHERIC:
             s.enabled = true;
             s.ssao = true; s.ssao_radius = 0.025f; s.ssao_intensity = 1.4f;
@@ -1706,9 +1860,164 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
         case PostFXPreset::CUSTOM:
             s.enabled = true;
             s.preset_name = "Custom";
+            if (!postfx_load_custom_json(s)) {
+                postfx_save_default_json();
+                postfx_load_custom_json(s);
+            }
             break;
         default: break;
     }
+}
+
+bool postfx_load_custom_json(PostFXState& state) {
+    const char* home = std::getenv("HOME");
+    if (!home) return false;
+    std::filesystem::path config_path = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "shaders" / "postfx_config.json";
+    
+    std::ifstream file(config_path);
+    if (!file.is_open()) return false;
+
+    std::string line;
+    while (std::getline(file, line)) {
+        size_t comment_pos = line.find("//");
+        if (comment_pos != std::string::npos) line = line.substr(0, comment_pos);
+        comment_pos = line.find("#");
+        if (comment_pos != std::string::npos) line = line.substr(0, comment_pos);
+
+        size_t first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        size_t last = line.find_last_not_of(" \t\r\n");
+        line = line.substr(first, (last - first + 1));
+
+        if (line.empty() || line == "{" || line == "}" || line == "},") continue;
+
+        size_t quote_first = line.find('\"');
+        if (quote_first == std::string::npos) continue;
+        size_t quote_second = line.find('\"', quote_first + 1);
+        if (quote_second == std::string::npos) continue;
+
+        std::string key = line.substr(quote_first + 1, quote_second - quote_first - 1);
+
+        size_t colon = line.find(':', quote_second);
+        if (colon == std::string::npos) continue;
+
+        std::string val_str = line.substr(colon + 1);
+        size_t val_first = val_str.find_first_not_of(" \t\r\n");
+        if (val_first == std::string::npos) continue;
+        size_t val_last = val_str.find_last_not_of(" \t\r\n,");
+        if (val_last == std::string::npos) continue;
+        val_str = val_str.substr(val_first, (val_last - val_first + 1));
+
+        auto parse_bool = [](const std::string& s) -> bool {
+            return (s == "true" || s == "1");
+        };
+        auto parse_float = [](const std::string& s) -> float {
+            try {
+                return std::stof(s);
+            } catch (...) {
+                return 0.0f;
+            }
+        };
+
+        if (key == "enabled") state.enabled = parse_bool(val_str);
+        else if (key == "vignette") state.vignette = parse_bool(val_str);
+        else if (key == "vignette_intensity") state.vignette_intensity = parse_float(val_str);
+        else if (key == "film_grain") state.film_grain = parse_bool(val_str);
+        else if (key == "grain_intensity") state.grain_intensity = parse_float(val_str);
+        else if (key == "chromatic_aberration") state.chromatic_aberration = parse_bool(val_str);
+        else if (key == "ca_offset") state.ca_offset = parse_float(val_str);
+        else if (key == "color_adjust") state.color_adjust = parse_bool(val_str);
+        else if (key == "saturation") state.saturation = parse_float(val_str);
+        else if (key == "contrast") state.contrast = parse_float(val_str);
+        else if (key == "brightness") state.brightness = parse_float(val_str);
+        else if (key == "warmth") state.warmth = parse_float(val_str);
+        else if (key == "sharpen") state.sharpen = parse_bool(val_str);
+        else if (key == "sharpen_strength") state.sharpen_strength = parse_float(val_str);
+        else if (key == "god_rays") state.god_rays = parse_bool(val_str);
+        else if (key == "god_rays_intensity") state.god_rays_intensity = parse_float(val_str);
+        else if (key == "god_rays_decay") state.god_rays_decay = parse_float(val_str);
+        else if (key == "ssao") state.ssao = parse_bool(val_str);
+        else if (key == "ssao_radius") state.ssao_radius = parse_float(val_str);
+        else if (key == "ssao_intensity") state.ssao_intensity = parse_float(val_str);
+        else if (key == "volumetric_light") state.volumetric_light = parse_bool(val_str);
+        else if (key == "volumetric_intensity") state.volumetric_intensity = parse_float(val_str);
+        else if (key == "bloom") state.bloom = parse_bool(val_str);
+        else if (key == "bloom_threshold") state.bloom_threshold = parse_float(val_str);
+        else if (key == "bloom_intensity") state.bloom_intensity = parse_float(val_str);
+        else if (key == "shadows") state.shadows = parse_bool(val_str);
+        else if (key == "shadow_intensity") state.shadow_intensity = parse_float(val_str);
+        else if (key == "shadow_softness") state.shadow_softness = parse_float(val_str);
+        else if (key == "outlines") state.outlines = parse_bool(val_str);
+        else if (key == "outline_thickness") state.outline_thickness = parse_float(val_str);
+        else if (key == "outline_intensity") state.outline_intensity = parse_float(val_str);
+        else if (key == "outline_depth_threshold") state.outline_depth_threshold = parse_float(val_str);
+    }
+    return true;
+}
+
+void postfx_save_default_json() {
+    const char* home = std::getenv("HOME");
+    if (!home) return;
+    std::filesystem::path shaders_dir = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "shaders";
+    std::error_code ec;
+    std::filesystem::create_directories(shaders_dir, ec);
+    std::filesystem::path config_path = shaders_dir / "postfx_config.json";
+    
+    std::ofstream out(config_path);
+    if (!out.is_open()) return;
+
+    out << "{\n"
+        << "  // ==========================================\n"
+        << "  // Swordigo Desktop Custom PostFX Config\n"
+        << "  // ==========================================\n\n"
+        << "  // Enable post-processing effects globally (true/false)\n"
+        << "  \"enabled\": true,\n\n"
+        << "  // --- Tier 1: Color & Screen-Space Effects ---\n\n"
+        << "  // Vignette (darkened edges)\n"
+        << "  \"vignette\": true,\n"
+        << "  \"vignette_intensity\": 0.3,\n\n"
+        << "  // Film Grain (retro analog noise)\n"
+        << "  \"film_grain\": false,\n"
+        << "  \"grain_intensity\": 0.06,\n\n"
+        << "  // Chromatic Aberration (color fringing at edges)\n"
+        << "  \"chromatic_aberration\": false,\n"
+        << "  \"ca_offset\": 0.002,\n\n"
+        << "  // Color Adjustments (Brightness, Contrast, Saturation, Warmth)\n"
+        << "  \"color_adjust\": true,\n"
+        << "  \"saturation\": 1.0,\n"
+        << "  \"contrast\": 1.0,\n"
+        << "  \"brightness\": 0.0,\n"
+        << "  \"warmth\": 0.0,\n\n"
+        << "  // Sharpening\n"
+        << "  \"sharpen\": false,\n"
+        << "  \"sharpen_strength\": 0.4,\n\n"
+        << "  // --- Tier 2: Advanced Effects ---\n\n"
+        << "  // God Rays (radial light bursts)\n"
+        << "  \"god_rays\": false,\n"
+        << "  \"god_rays_intensity\": 0.4,\n"
+        << "  \"god_rays_decay\": 0.96,\n\n"
+        << "  // Screen Space Ambient Occlusion (SSAO)\n"
+        << "  \"ssao\": false,\n"
+        << "  \"ssao_radius\": 0.02,\n"
+        << "  \"ssao_intensity\": 1.2,\n\n"
+        << "  // Volumetric Lighting\n"
+        << "  \"volumetric_light\": false,\n"
+        << "  \"volumetric_intensity\": 0.3,\n\n"
+        << "  // Bloom (glow on bright objects)\n"
+        << "  \"bloom\": false,\n"
+        << "  \"bloom_threshold\": 0.7,\n"
+        << "  \"bloom_intensity\": 0.35,\n\n"
+        << "  // Screen-space Shadows\n"
+        << "  \"shadows\": false,\n"
+        << "  \"shadow_intensity\": 0.5,\n"
+        << "  \"shadow_softness\": 0.003,\n\n"
+        << "  // Cel-shaded Outlines\n"
+        << "  \"outlines\": false,\n"
+        << "  \"outline_thickness\": 1.0,\n"
+        << "  \"outline_intensity\": 0.7,\n"
+        << "  \"outline_depth_threshold\": 0.002\n"
+        << "}\n";
+    out.close();
 }
 
 const char* postfx_preset_name(PostFXPreset p) {

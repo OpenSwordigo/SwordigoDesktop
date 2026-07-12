@@ -660,6 +660,63 @@ static unsigned int fnv1a_hash(const char* data, size_t len) {
     return hash;
 }
 
+static int extract_scl_recursive(const unsigned char* p, const unsigned char* end, const char** found_lua, size_t* found_len, int is_inside_program) {
+  while (p < end) {
+    uint64_t key = 0;
+    int shift = 0;
+    while (p < end) {
+      unsigned char byte = *p++;
+      key |= ((uint64_t)(byte & 0x7F)) << shift;
+      if (!(byte & 0x80)) break;
+      shift += 7;
+      if (shift >= 64) return 0;
+    }
+    int field = (int)(key >> 3);
+    int wire  = (int)(key & 7);
+
+    if (wire == 2) {
+      uint64_t len = 0;
+      shift = 0;
+      while (p < end) {
+        unsigned char byte = *p++;
+        len |= ((uint64_t)(byte & 0x7F)) << shift;
+        if (!(byte & 0x80)) break;
+        shift += 7;
+        if (shift >= 64) return 0;
+      }
+      if (p + len > end) return 0;
+
+      if (is_inside_program) {
+        if (field == 1 || field == 2 || field == 3) {
+          *found_lua = (const char*)p;
+          *found_len = (size_t)len;
+          return 1;
+        }
+      } else {
+        if (field == 5) {
+          if (extract_scl_recursive(p, p + len, found_lua, found_len, 1)) {
+            return 1;
+          }
+        } else {
+          if (extract_scl_recursive(p, p + len, found_lua, found_len, 0)) {
+            return 1;
+          }
+        }
+      }
+      p += len;
+    } else if (wire == 0) {
+      while (p < end && (*p++ & 0x80));
+    } else if (wire == 1) {
+      p += 8;
+    } else if (wire == 5) {
+      p += 4;
+    } else {
+      break;
+    }
+  }
+  return 0;
+}
+
 LUALIB_API int luaL_loadbuffer (lua_State *L, const char *buff, size_t size,
                                 const char *name) {
 #if ENABLE_SCRIPT_CACHE
@@ -735,112 +792,19 @@ LUALIB_API int luaL_loadbuffer (lua_State *L, const char *buff, size_t size,
   }
 #endif
 
-  /* =======================================================
-   * SCL Binary Protobuf detection and extraction.
-   *
-   * The game engine loads .scl files through its own loadfile
-   * and passes raw bytes here. SCL is a protobuf container:
-   *   field 5 (Program message) {
-   *     field 1 (Source — Lua source text)   ← confirmed from edgetest.scl hex
-   *     field 2 (Source — alternate)
-   *     field 3 (CompiledCode — bytecode)
-   *   }
-   * The first byte 0x2A = tag for field=5, wire=2 (length-delimited).
-   * Detect this and extract the embedded Lua source before compiling.
-   * ======================================================= */
   const char* actual_buff = buff;
   size_t actual_size = size;
 
   if (buff && size > 4) {
-    /* Check for binary protobuf SCL: first byte 0x2A = field 5, wire type 2 */
     unsigned char b0 = (unsigned char)buff[0];
-    if (b0 == 0x2A || (b0 >= 0x08 && (b0 & 7) <= 5)) {
-      /* Walk the protobuf to find field 5 (Program) -> field 2 or 3 (Source/Code) */
-      const unsigned char* p   = (const unsigned char*)buff;
-      const unsigned char* end = p + size;
+    if (b0 != 0x1B && (b0 == 0x2A || (b0 >= 0x08 && (b0 & 7) <= 5))) {
       const char* found_lua = NULL;
       size_t found_len = 0;
-
-      while (p < end && !found_lua) {
-        /* Read varint tag */
-        uint64_t key = 0;
-        int shift = 0;
-        while (p < end) {
-          unsigned char byte = *p++;
-          key |= ((uint64_t)(byte & 0x7F)) << shift;
-          if (!(byte & 0x80)) break;
-          shift += 7;
-          if (shift >= 64) goto scl_done;
+      if (extract_scl_recursive((const unsigned char*)buff, (const unsigned char*)buff + size, &found_lua, &found_len, 0)) {
+        if (found_lua && found_len > 0) {
+          actual_buff = found_lua;
+          actual_size = found_len;
         }
-        int field = (int)(key >> 3);
-        int wire  = (int)(key & 7);
-
-        if (wire == 2) {
-          /* Read length */
-          uint64_t len = 0;
-          shift = 0;
-          while (p < end) {
-            unsigned char byte = *p++;
-            len |= ((uint64_t)(byte & 0x7F)) << shift;
-            if (!(byte & 0x80)) break;
-            shift += 7;
-            if (shift >= 64) goto scl_done;
-          }
-          if (p + len > end) break;
-
-          if (field == 5) {
-            /* Program message — walk inner fields */
-            const unsigned char* pp  = p;
-            const unsigned char* pend = p + len;
-            while (pp < pend) {
-              uint64_t pkey = 0;
-              shift = 0;
-              while (pp < pend) {
-                unsigned char byte = *pp++;
-                pkey |= ((uint64_t)(byte & 0x7F)) << shift;
-                if (!(byte & 0x80)) break;
-                shift += 7;
-                if (shift >= 64) goto scl_done;
-              }
-              int pfield = (int)(pkey >> 3);
-              int pwire  = (int)(pkey & 7);
-              if (pwire == 2) {
-                uint64_t plen = 0;
-                shift = 0;
-                while (pp < pend) {
-                  unsigned char byte = *pp++;
-                  plen |= ((uint64_t)(byte & 0x7F)) << shift;
-                  if (!(byte & 0x80)) break;
-                  shift += 7;
-                  if (shift >= 64) goto scl_done;
-                }
-                if (pp + plen > pend) break;
-                if (pfield == 1 || pfield == 2 || pfield == 3) {
-                  /* Source (1/2) or CompiledCode (3) */
-                  found_lua = (const char*)pp;
-                  found_len = (size_t)plen;
-                  break;
-                }
-                pp += plen;
-              } else if (pwire == 0) {
-                while (pp < pend && (*pp++ & 0x80));
-              } else if (pwire == 1) { pp += 8; }
-                else if (pwire == 5) { pp += 4; }
-                else break;
-            }
-          }
-          p += len;
-        } else if (wire == 0) {
-          while (p < end && (*p++ & 0x80));
-        } else if (wire == 1) { p += 8; }
-          else if (wire == 5) { p += 4; }
-          else break;
-      }
-
-scl_done:
-      if (found_lua && found_len > 0) {
-        actual_buff = found_lua;
-        actual_size = found_len;
       }
     }
 

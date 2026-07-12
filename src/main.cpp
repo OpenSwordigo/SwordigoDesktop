@@ -1244,6 +1244,8 @@ void load_and_boot() {
                 } else {
                     cam_reset_accel();
                 }
+                extern void cam_write_to_guest();
+                cam_write_to_guest();
             }
 
             // --- Apply game speed multiplier ---
@@ -1347,7 +1349,7 @@ void load_and_boot() {
             }
 
             // Apply camera position override (after draw, before swap)
-            cam_apply(g_emulator, g_guest_memory);
+            // cam_apply(g_emulator, g_guest_memory);
             mod_apply_frame(g_guest_memory);
 
             // Render GUI overlay (F1 toggle)
@@ -1833,6 +1835,17 @@ void load_and_boot() {
                                 std::cout << "[PostFX] Preset: " << g_postfx.preset_name << std::endl;
                                 break;
                             }
+                            if (event.key.key == SDLK_R && !event.key.repeat) {
+                                std::cout << "[PostFX] Reloading custom postfx config..." << std::endl;
+                                if (postfx_load_custom_json(g_postfx)) {
+                                    std::cout << "[PostFX] Successfully loaded custom config!" << std::endl;
+                                } else {
+                                    std::cout << "[PostFX] Failed to load custom config, generating default template." << std::endl;
+                                    postfx_save_default_json();
+                                    postfx_load_custom_json(g_postfx);
+                                }
+                                break;
+                            }
                             if (event.key.key == SDLK_BACKSLASH && !event.key.repeat) {
                                 g_typing_mode = !g_typing_mode;
                                 if (g_typing_mode) {
@@ -1989,12 +2002,12 @@ void load_and_boot() {
                                     break;
                                 }
 
-                                // Prevent camera modifier keys (Shift + Arrows, Shift + +/-) from moving the character
+                                // Prevent camera keys from moving the character when camera mode is active
                                 bool is_cam_key = (event.key.key == SDLK_LEFT || event.key.key == SDLK_RIGHT ||
                                                    event.key.key == SDLK_UP || event.key.key == SDLK_DOWN ||
                                                    event.key.key == SDLK_EQUALS || event.key.key == SDLK_MINUS ||
                                                    event.key.key == SDLK_KP_PLUS || event.key.key == SDLK_KP_MINUS);
-                                if ((event.key.mod & SDL_KMOD_SHIFT) && is_cam_key) {
+                                if (g_cam_active && is_cam_key) {
                                     // Bypassed, do not route to game controls
                                 } else {
                                     int btn_idx = g_input_config.find_by_scancode(scancode);
@@ -2038,37 +2051,33 @@ void load_and_boot() {
                             // Camera + arrow keys (camera-only, not game movement)
                             switch (event.key.key) {
                                 case SDLK_LEFT:
-                                    arrow_left = is_down && (event.key.mod & SDL_KMOD_SHIFT);
+                                    if (g_cam_active) arrow_left = is_down;
                                     break;
                                 case SDLK_RIGHT:
-                                    arrow_right = is_down && (event.key.mod & SDL_KMOD_SHIFT);
+                                    if (g_cam_active) arrow_right = is_down;
                                     break;
                                 case SDLK_UP:
-                                    arrow_up = is_down && (event.key.mod & SDL_KMOD_SHIFT);
+                                    if (g_cam_active) arrow_up = is_down;
                                     break;
                                 case SDLK_DOWN:
-                                    arrow_down = is_down && (event.key.mod & SDL_KMOD_SHIFT);
+                                    if (g_cam_active) arrow_down = is_down;
                                     break;
                                 case SDLK_PAGEUP:
-                                    cam_key_pgup = is_down;
+                                    if (g_cam_active) cam_key_pgup = is_down;
                                     break;
                                 case SDLK_PAGEDOWN:
-                                    cam_key_pgdn = is_down;
+                                    if (g_cam_active) cam_key_pgdn = is_down;
                                     break;
                                 case SDLK_EQUALS:
                                 case SDLK_KP_PLUS:
-                                    if (event.key.mod & SDL_KMOD_SHIFT) {
-                                        cam_key_pgup = is_down;
-                                    }
+                                    if (g_cam_active) cam_key_pgup = is_down;
                                     break;
                                 case SDLK_MINUS:
                                 case SDLK_KP_MINUS:
-                                    if (event.key.mod & SDL_KMOD_SHIFT) {
-                                        cam_key_pgdn = is_down;
-                                    }
+                                    if (g_cam_active) cam_key_pgdn = is_down;
                                     break;
                                 case SDLK_HOME:
-                                    if (is_down) cam_reset();
+                                    if (is_down && g_cam_active) cam_reset();
                                     break;
                             }
                             break;
@@ -2960,6 +2969,8 @@ void load_and_boot_arm64() {
                     {"sre_ProgramState_Resume",  "_ZN5Caver12ProgramState6ResumeEi"},
                     {"sre_ProgramState_Update",  "_ZN5Caver12ProgramState6UpdateEf"},
                     {"sre_updateApplication",    "Java_com_touchfoo_swordigo_Native_updateApplication"},
+                    {"sre_CameraController_Update", "_ZN5Caver16CameraController6UpdateEf"},
+                    {"sre_SceneGrid_UpdateVisibleAreasWithCamera", "_ZN5Caver9SceneGrid28UpdateVisibleAreasWithCameraEPNS_6CameraE"},
                     {"sre_GUIView_Update",             "_ZN5Caver7GUIView6UpdateEf"},
                     {"sre_AchievementsManager_Update", "_ZN5Caver19AchievementsManager6UpdateEf"},
                     {"sre_SetResourcesPath",           "_ZN5Caver16SetResourcesPathERKSs"},
@@ -3082,11 +3093,50 @@ void load_and_boot_arm64() {
                         cave32[1] = 0xD61F0200;  // BR X16
                         *(uint64_t*)(cave32 + 2) = update_vaddr + 16;
 
-                        uint32_t* saved = (uint32_t*)cave;
-                        std::cout << "[SRE] ProgramState::Update relay pre-saved at 0x" << std::hex
-                                  << UPDATE_RELAY << " (insns: " << saved[0] << " " << saved[1]
-                                  << " " << saved[2] << " " << saved[3] << ")"
-                                  << std::dec << std::endl;
+                    }
+
+                    // Pre-save CameraController::Update's first 16 bytes for relay stub.
+                    const uint64_t CAM_UPDATE_RELAY = 0x3000340;
+                    uint64_t cam_update_vaddr = g_loader_64->get_symbol_vaddr(
+                        &g_main_mod_64, "_ZN5Caver16CameraController6UpdateEf");
+                    if (cam_update_vaddr) {
+                        uint8_t* orig_cam_update = g_guest_memory + cam_update_vaddr;
+                        uint8_t* cave = g_guest_memory + CAM_UPDATE_RELAY;
+                        copy_and_relocate(cave, orig_cam_update, CAM_UPDATE_RELAY, cam_update_vaddr, 4);
+                        uint32_t* cave32 = (uint32_t*)(cave + 16);
+                        cave32[0] = 0x58000050;  // LDR X16, [PC, #8]
+                        cave32[1] = 0xD61F0200;  // BR X16
+                        *(uint64_t*)(cave32 + 2) = cam_update_vaddr + 16;
+
+                        uint64_t g_orig_cam_update_addr = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "g_orig_CameraController_Update");
+                        if (g_orig_cam_update_addr) {
+                            *(uint64_t*)(g_guest_memory + g_orig_cam_update_addr) = CAM_UPDATE_RELAY;
+                            std::cout << "[SRE] g_orig_CameraController_Update → relay @ 0x"
+                                      << std::hex << CAM_UPDATE_RELAY << std::dec << std::endl;
+                        }
+                    }
+
+                    // Pre-save SceneGrid::UpdateVisibleAreasWithCamera's first 16 bytes for relay stub.
+                    const uint64_t SCENEGRID_UPDATE_RELAY = 0x3000380;
+                    uint64_t scenegrid_update_vaddr = g_loader_64->get_symbol_vaddr(
+                        &g_main_mod_64, "_ZN5Caver9SceneGrid28UpdateVisibleAreasWithCameraEPNS_6CameraE");
+                    if (scenegrid_update_vaddr) {
+                        uint8_t* orig_sg_update = g_guest_memory + scenegrid_update_vaddr;
+                        uint8_t* cave = g_guest_memory + SCENEGRID_UPDATE_RELAY;
+                        copy_and_relocate(cave, orig_sg_update, SCENEGRID_UPDATE_RELAY, scenegrid_update_vaddr, 4);
+                        uint32_t* cave32 = (uint32_t*)(cave + 16);
+                        cave32[0] = 0x58000050;  // LDR X16, [PC, #8]
+                        cave32[1] = 0xD61F0200;  // BR X16
+                        *(uint64_t*)(cave32 + 2) = scenegrid_update_vaddr + 16;
+
+                        uint64_t g_orig_sg_update_addr = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "g_orig_SceneGrid_UpdateVisibleAreasWithCamera");
+                        if (g_orig_sg_update_addr) {
+                            *(uint64_t*)(g_guest_memory + g_orig_sg_update_addr) = SCENEGRID_UPDATE_RELAY;
+                            std::cout << "[SRE] g_orig_SceneGrid_UpdateVisibleAreasWithCamera → relay @ 0x"
+                                      << std::hex << SCENEGRID_UPDATE_RELAY << std::dec << std::endl;
+                        }
                     }
 
                     // ========= GUI Relay Stubs (table-driven) =========
@@ -3289,6 +3339,7 @@ void load_and_boot_arm64() {
                         const char* engine_mangled;
                     };
                     const DynamicFns dynamic_fns[] = {
+                        { "g_Camera_SetPerspectiveProjection", "_ZN5Caver6Camera24SetPerspectiveProjectionEffff" },
                         { "g_SceneObject_ComponentWithInterface", "_ZNK5Caver11SceneObject22ComponentWithInterfaceEl" },
                         { "g_ProgramState_FromLuaState", "_ZN5Caver12ProgramState12FromLuaStateEP9lua_State" },
                         { "g_sre_GameOverVC_DidContinue", "_ZN5Caver22GameOverViewController23GameOverViewDidContinueEPNS_12GameOverViewE" },
@@ -4321,6 +4372,8 @@ void load_and_boot_arm64() {
                 } else {
                     cam_reset_accel();
                 }
+                extern void cam_write_to_guest();
+                cam_write_to_guest();
             }
 
             float game_dt = dt_seconds * g_game_speed;
@@ -5117,6 +5170,17 @@ void load_and_boot_arm64() {
                                 std::cout << "[PostFX] Preset: " << g_postfx.preset_name << std::endl;
                                 break;
                             }
+                            if (event.key.key == SDLK_R && !event.key.repeat) {
+                                std::cout << "[PostFX] Reloading custom postfx config..." << std::endl;
+                                if (postfx_load_custom_json(g_postfx)) {
+                                    std::cout << "[PostFX] Successfully loaded custom config!" << std::endl;
+                                } else {
+                                    std::cout << "[PostFX] Failed to load custom config, generating default template." << std::endl;
+                                    postfx_save_default_json();
+                                    postfx_load_custom_json(g_postfx);
+                                }
+                                break;
+                            }
                             if (event.key.key == SDLK_BACKSLASH && !event.key.repeat) {
                                 g_typing_mode = !g_typing_mode;
                                 if (g_typing_mode) {
@@ -5341,40 +5405,36 @@ void load_and_boot_arm64() {
                                 break;
                             }
 
-                            // Camera + arrow keys
+                            // Camera + arrow keys (camera-only when active, not game movement)
                             switch (event.key.key) {
                                 case SDLK_LEFT:
-                                    arrow_left = is_down && (event.key.mod & SDL_KMOD_SHIFT);
+                                    if (g_cam_active) arrow_left = is_down;
                                     break;
                                 case SDLK_RIGHT:
-                                    arrow_right = is_down && (event.key.mod & SDL_KMOD_SHIFT);
+                                    if (g_cam_active) arrow_right = is_down;
                                     break;
                                 case SDLK_UP:
-                                    arrow_up = is_down && (event.key.mod & SDL_KMOD_SHIFT);
+                                    if (g_cam_active) arrow_up = is_down;
                                     break;
                                 case SDLK_DOWN:
-                                    arrow_down = is_down && (event.key.mod & SDL_KMOD_SHIFT);
+                                    if (g_cam_active) arrow_down = is_down;
                                     break;
                                 case SDLK_PAGEUP:
-                                    cam_key_pgup = is_down;
+                                    if (g_cam_active) cam_key_pgup = is_down;
                                     break;
                                 case SDLK_PAGEDOWN:
-                                    cam_key_pgdn = is_down;
+                                    if (g_cam_active) cam_key_pgdn = is_down;
                                     break;
                                 case SDLK_EQUALS:
                                 case SDLK_KP_PLUS:
-                                    if (event.key.mod & SDL_KMOD_SHIFT) {
-                                        cam_key_pgup = is_down;
-                                    }
+                                    if (g_cam_active) cam_key_pgup = is_down;
                                     break;
                                 case SDLK_MINUS:
                                 case SDLK_KP_MINUS:
-                                    if (event.key.mod & SDL_KMOD_SHIFT) {
-                                        cam_key_pgdn = is_down;
-                                    }
+                                    if (g_cam_active) cam_key_pgdn = is_down;
                                     break;
                                 case SDLK_HOME:
-                                    if (is_down) cam_reset();
+                                    if (is_down && g_cam_active) cam_reset();
                                     break;
                             }
                             break;
@@ -5527,10 +5587,22 @@ void load_and_boot_arm64() {
                         // Check both primary and alt key bindings
                         bool is_down = false;
                         if (keys) {
-                            if (btn->sdl_scancode > 0 && btn->sdl_scancode < 512)
-                                is_down = keys[btn->sdl_scancode];
-                            if (!is_down && btn->sdl_scancode_alt > 0 && btn->sdl_scancode_alt < 512)
-                                is_down = keys[btn->sdl_scancode_alt];
+                            if (btn->sdl_scancode > 0 && btn->sdl_scancode < 512) {
+                                bool block_primary = g_cam_active && 
+                                    (btn->sdl_scancode == SDL_SCANCODE_LEFT || btn->sdl_scancode == SDL_SCANCODE_RIGHT ||
+                                     btn->sdl_scancode == SDL_SCANCODE_UP || btn->sdl_scancode == SDL_SCANCODE_DOWN);
+                                if (!block_primary) {
+                                    is_down = keys[btn->sdl_scancode];
+                                }
+                            }
+                            if (!is_down && btn->sdl_scancode_alt > 0 && btn->sdl_scancode_alt < 512) {
+                                bool block_alt = g_cam_active && 
+                                    (btn->sdl_scancode_alt == SDL_SCANCODE_LEFT || btn->sdl_scancode_alt == SDL_SCANCODE_RIGHT ||
+                                     btn->sdl_scancode_alt == SDL_SCANCODE_UP || btn->sdl_scancode_alt == SDL_SCANCODE_DOWN);
+                                if (!block_alt) {
+                                    is_down = keys[btn->sdl_scancode_alt];
+                                }
+                            }
                         }
                         
                         if (is_down && !btn->is_pressed) {

@@ -6,6 +6,10 @@
 #include <iostream>
 #include <cstdio>
 #include <algorithm>
+#include "../loader/elf_loader_arm64.h"
+extern so_module_arm64 g_sre_mod;
+extern ElfLoaderArm64* g_loader_64;
+extern uint8_t* g_guest_memory;
 
 // ============================================================
 //  SwordigoDesktop — Modernized Camera Override
@@ -21,21 +25,21 @@ float    g_cam_off_x     = 0.0f;
 float    g_cam_off_y     = 0.0f;
 float    g_cam_off_z     = 0.0f;
 bool     g_cam_smooth    = false;   // false = instant, true = smooth interp
-float    g_cam_speed_base= 120.0f;  // Units per second at 1x speed
+float    g_cam_speed_base= 90.0f;  // Units per second at 1x speed
 
 CamPreset g_cam_presets[5] = {};    // All initialized to {0,0,0,false}
 
 // Internal: acceleration tracking
 static float s_accel_timer = 0.0f;  // How long movement keys have been held
 static const float ACCEL_RAMP = 3.0f;  // Seconds to reach max speed
-static const float ACCEL_MAX  = 4.0f;  // Max speed multiplier from acceleration
+static const float ACCEL_MAX  = 3.3f;  // Max speed multiplier from acceleration
 
 // Limits
 static const float CAM_LIMIT_XZ = 2000.0f;
 static const float CAM_LIMIT_Y  = 1000.0f;
 
 // Scroll zoom speed
-static const float SCROLL_ZOOM_SPEED = 40.0f;
+static const float SCROLL_ZOOM_SPEED = 24.0f;
 
 // ----- Helpers -----------------------------------------------
 
@@ -82,6 +86,7 @@ void cam_set_active(bool active) {
         std::cout << "[Camera] Override ENABLED (Free, "
                   << (g_cam_smooth ? "Smooth" : "Instant") << ")" << std::endl;
     }
+    cam_write_to_guest();
 }
 
 void cam_toggle() {
@@ -107,6 +112,7 @@ void cam_scroll_zoom(float delta) {
     if (!g_cam_active) return;
     g_cam_off_z = clampf(g_cam_off_z - delta * SCROLL_ZOOM_SPEED,
                          -CAM_LIMIT_XZ, CAM_LIMIT_XZ);
+    cam_write_to_guest();
 }
 
 void cam_toggle_smooth() {
@@ -122,6 +128,7 @@ void cam_reset() {
     s_accel_timer = 0.0f;
     mod_toast("Camera: Reset", 1.0f);
     std::cout << "[Camera] Position reset" << std::endl;
+    cam_write_to_guest();
 }
 
 void cam_save_preset(int slot) {
@@ -146,6 +153,7 @@ void cam_load_preset(int slot) {
     char msg[64];
     snprintf(msg, sizeof(msg), "Camera: Loaded slot %d", slot + 1);
     mod_toast(msg, 1.0f);
+    cam_write_to_guest();
 }
 
 // Reset acceleration when no movement keys are held
@@ -157,93 +165,34 @@ void cam_reset_accel() {
 static bool s_was_active = false;
 
 void cam_apply(Emulator* emu, uint8_t* guest_mem) {
-    if (g_cam_ctrl_ptr == 0) return;
+    // Ported to guest-side SRE CameraController::Update hook
+}
 
-    if (g_cam_active) {
-        s_was_active = true;
+void cam_write_to_guest() {
+    if (!g_guest_memory || !g_loader_64) return;
+    static uint64_t active_addr = 0;
+    static uint64_t off_x_addr = 0;
+    static uint64_t off_y_addr = 0;
+    static uint64_t off_z_addr = 0;
+    static uint64_t aspect_addr = 0;
 
-        // Custom offsets: base offset + user control offsets
-        // Vanilla: 0, 0, -1000. 3D default: 0, 300, -600.
-        float offset_x = g_cam_off_x;
-        float offset_y = 300.0f + g_cam_off_y;
-        float offset_z = -600.0f + g_cam_off_z;
+    if (active_addr == 0) {
+        active_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_active");
+        off_x_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_off_x");
+        off_y_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_off_y");
+        off_z_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_off_z");
+        aspect_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_aspect");
+    }
 
-        // 1. Write the custom position offset to CameraController + 0x04
-        memcpy(guest_mem + g_cam_ctrl_ptr + 0x04, &offset_x, 4);
-        memcpy(guest_mem + g_cam_ctrl_ptr + 0x08, &offset_y, 4);
-        memcpy(guest_mem + g_cam_ctrl_ptr + 0x0c, &offset_z, 4);
-
-        // 2. Write the Up Vector (0, 1, 0) to CameraController + 0x48
-        float up_x = 0.0f;
-        float up_y = 1.0f;
-        float up_z = 0.0f;
-        memcpy(guest_mem + g_cam_ctrl_ptr + 0x48, &up_x, 4);
-        memcpy(guest_mem + g_cam_ctrl_ptr + 0x4c, &up_y, 4);
-        memcpy(guest_mem + g_cam_ctrl_ptr + 0x50, &up_z, 4);
-
-        // 3. Set the 3D perspective projection on the Camera object
-        uint32_t camera_ptr = *(uint32_t*)(guest_mem + g_cam_ctrl_ptr + 0x54);
-        if (camera_ptr != 0) {
-            float fov_rad = 45.0f * 3.14159265f / 180.0f;
-            extern int g_win_w;
-            extern int g_win_h;
-            float aspect = (float)g_win_w / (float)g_win_h;
-            float near_plane = 50.0f;
-            float far_plane = 20000.0f;
-
-            bool prev_quiet = emu->quiet_mode;
-            emu->quiet_mode = true;
-            
-            // Allocate 4 bytes on guest stack for stack arguments (far)
-            uint32_t sp = emu->get_reg(13);
-            uint32_t new_sp = sp - 4;
-            *(uint32_t*)(guest_mem + new_sp) = f2u(far_plane);
-            emu->set_reg(13, new_sp);
-
-            // Call SetPerspectiveProjection(Camera* this, float fov, float aspect, float near)
-            emu->call(CaverSym::CameraSetPerspectiveProjection,
-                      {camera_ptr, f2u(fov_rad), f2u(aspect), f2u(near_plane)});
-
-            // Restore guest stack pointer
-            emu->set_reg(13, sp);
-
-            emu->quiet_mode = prev_quiet;
-        }
-    } else if (s_was_active) {
-        // Restore vanilla camera offsets and perspective projection once
-        s_was_active = false;
-
-        float offset_x = 0.0f;
-        float offset_y = 0.0f;
-        float offset_z = -1000.0f;
-        memcpy(guest_mem + g_cam_ctrl_ptr + 0x04, &offset_x, 4);
-        memcpy(guest_mem + g_cam_ctrl_ptr + 0x08, &offset_y, 4);
-        memcpy(guest_mem + g_cam_ctrl_ptr + 0x0c, &offset_z, 4);
-
-        float up_x = 0.0f;
-        float up_y = 1.0f;
-        float up_z = 0.0f;
-        memcpy(guest_mem + g_cam_ctrl_ptr + 0x48, &up_x, 4);
-        memcpy(guest_mem + g_cam_ctrl_ptr + 0x4c, &up_y, 4);
-        memcpy(guest_mem + g_cam_ctrl_ptr + 0x50, &up_z, 4);
-
-        uint32_t camera_ptr = *(uint32_t*)(guest_mem + g_cam_ctrl_ptr + 0x54);
-        if (camera_ptr != 0) {
-            bool prev_quiet = emu->quiet_mode;
-            emu->quiet_mode = true;
-
-            uint32_t sp = emu->get_reg(13);
-            uint32_t new_sp = sp - 4;
-            *(uint32_t*)(guest_mem + new_sp) = f2u(20000.0f);
-            emu->set_reg(13, new_sp);
-
-            // Vanilla: 20 degrees FOV (0.34906584 rad), aspect = 1.0, near = 50.0, far = 20000.0
-            emu->call(CaverSym::CameraSetPerspectiveProjection,
-                      {camera_ptr, f2u(0.34906584f), f2u(1.0f), f2u(50.0f)});
-
-            emu->set_reg(13, sp);
-            emu->quiet_mode = prev_quiet;
-        }
+    if (active_addr) *(int*)(g_guest_memory + active_addr) = g_cam_active ? 1 : 0;
+    if (off_x_addr) *(float*)(g_guest_memory + off_x_addr) = g_cam_off_x;
+    if (off_y_addr) *(float*)(g_guest_memory + off_y_addr) = g_cam_off_y;
+    if (off_z_addr) *(float*)(g_guest_memory + off_z_addr) = g_cam_off_z;
+    if (aspect_addr) {
+        extern int g_win_w;
+        extern int g_win_h;
+        float aspect = (float)g_win_w / (float)g_win_h;
+        *(float*)(g_guest_memory + aspect_addr) = aspect;
     }
 }
 

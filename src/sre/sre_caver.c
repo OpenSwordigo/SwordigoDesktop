@@ -168,6 +168,16 @@ pfn_GameSceneController_CanCastSkill g_sre_GameSceneController_CanCastSkill = 0;
 
 pfn_GameSceneView_HideCinematicSkipButton g_sre_GameSceneView_HideCinematicSkipButton = 0;
 
+/* Camera controller shared variables & function pointers */
+int g_sre_cam_active = 0;
+float g_sre_cam_off_x = 0.0f;
+float g_sre_cam_off_y = 0.0f;
+float g_sre_cam_off_z = 0.0f;
+float g_sre_cam_aspect = 1.777778f;
+void (*g_Camera_SetPerspectiveProjection)(void* camera, float fov, float aspect, float near, float far) = 0;
+void (*g_orig_CameraController_Update)(void* self, float dt) = 0;
+void (*g_orig_SceneGrid_UpdateVisibleAreasWithCamera)(void* self, void* camera) = 0;
+
 /* =========================================================================
  * Helper: call a no-arg function at guest address and return void*
  *
@@ -302,4 +312,82 @@ void sre_caver_init(uint64_t swordigo_base) {
     IFACE(BoneControlledCollisionShapeComponent_Interface,0x1e7e88);
 
 #undef IFACE
+}
+
+/* Our guest-side CameraController::Update hook function */
+void sre_CameraController_Update(void* self, float dt) {
+    if (g_orig_CameraController_Update) {
+        g_orig_CameraController_Update(self, dt);
+    }
+
+    static int s_was_active = 0;
+
+    if (g_sre_cam_active) {
+        s_was_active = 1;
+        void* camera = *(void**)((char*)self + 0x58);
+        if (camera) {
+            float zoom = 1.0f + g_sre_cam_off_z / 600.0f;
+            if (zoom < 0.15f) zoom = 0.15f;
+            if (zoom > 5.0f) zoom = 5.0f;
+
+            float offset_x = zoom * g_sre_cam_off_x;
+            float offset_y = zoom * (300.0f + g_sre_cam_off_y);
+            float offset_z = zoom * 600.0f;
+
+            *(float*)((char*)self + 0x04) = offset_x;
+            *(float*)((char*)self + 0x08) = offset_y;
+            *(float*)((char*)self + 0x0c) = offset_z;
+
+            *(float*)((char*)self + 0x48) = 0.0f; // up_x
+            *(float*)((char*)self + 0x4c) = 1.0f; // up_y
+            *(float*)((char*)self + 0x50) = 0.0f; // up_z
+
+            if (g_Camera_SetPerspectiveProjection) {
+                // 45 degrees FOV = 0.78539816f rad
+                g_Camera_SetPerspectiveProjection(camera, 0.78539816f, g_sre_cam_aspect, 50.0f, 20000.0f);
+            }
+        }
+    } else if (s_was_active) {
+        s_was_active = 0;
+        void* camera = *(void**)((char*)self + 0x58);
+        if (camera) {
+            *(float*)((char*)self + 0x04) = 0.0f;
+            *(float*)((char*)self + 0x08) = 0.0f;
+            *(float*)((char*)self + 0x0c) = 1000.0f;
+
+            *(float*)((char*)self + 0x48) = 0.0f;
+            *(float*)((char*)self + 0x4c) = 1.0f;
+            *(float*)((char*)self + 0x50) = 0.0f;
+
+            if (g_Camera_SetPerspectiveProjection) {
+                // Vanilla values: 20 deg FOV (0.34906584f rad), aspect = 1.0f
+                g_Camera_SetPerspectiveProjection(camera, 0.34906584f, 1.0f, 50.0f, 20000.0f);
+            }
+        }
+    }
+}
+
+/* Our guest-side SceneGrid::UpdateVisibleAreasWithCamera hook function */
+void sre_SceneGrid_UpdateVisibleAreasWithCamera(void* self, void* camera) {
+    if (g_orig_SceneGrid_UpdateVisibleAreasWithCamera) {
+        g_orig_SceneGrid_UpdateVisibleAreasWithCamera(self, camera);
+    }
+
+    if (g_sre_cam_active) {
+        int layer_count = *(int*)self;
+        if (layer_count > 0) {
+            char** array = *(char***)((char*)self + 8);
+            if (array) {
+                for (int i = 0; i < layer_count; i++) {
+                    char* layer = array[i * 2]; // boost::shared_ptr is 16 bytes, index by i*2
+                    if (layer) {
+                        *(float*)(layer + 0x38) = -1000000.0f; // x
+                        *(float*)(layer + 0x3c) = -1000000.0f; // y
+                        *(float*)(layer + 0x40) = 2000000.0f;  // width
+                        *(float*)(layer + 0x44) = 2000000.0f;  // height
+                    }
+                }
+            }
+        }
+    }
 }

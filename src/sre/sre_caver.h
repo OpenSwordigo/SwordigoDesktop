@@ -256,6 +256,16 @@ extern pfn_GameSceneController_CanCastSkill g_sre_GameSceneController_CanCastSki
 typedef void (*pfn_GameSceneView_HideCinematicSkipButton)(void*, int);
 extern pfn_GameSceneView_HideCinematicSkipButton g_sre_GameSceneView_HideCinematicSkipButton;
 
+// CameraController shared globals & hook
+extern int g_sre_cam_active;
+extern float g_sre_cam_off_x;
+extern float g_sre_cam_off_y;
+extern float g_sre_cam_off_z;
+extern float g_sre_cam_aspect;
+extern void (*g_Camera_SetPerspectiveProjection)(void* camera, float fov, float aspect, float near, float far);
+extern void (*g_orig_CameraController_Update)(void* self, float dt);
+void sre_CameraController_Update(void* self, float dt);
+
 /* =========================================================================
  * SceneObject field accessors  (ARM64 offsets from SwKiwi scene_object.c)
  * =========================================================================
@@ -356,9 +366,17 @@ static inline void sre_transform_set_position(void* tc, float x, float y, float 
     $W(float, tc, 0x18, z);
 }
 
-/* =========================================================================
- * Initialise — call from sre_init()
- * ========================================================================= */
+extern int g_sre_cam_active;
+extern float g_sre_cam_off_x;
+extern float g_sre_cam_off_y;
+extern float g_sre_cam_off_z;
+extern float g_sre_cam_aspect;
+
+extern void (*g_orig_CameraController_Update)(void* self, float dt);
+extern void (*g_Camera_SetPerspectiveProjection)(void* self, float fov, float aspect, float near, float far);
+
+extern void (*g_orig_SceneGrid_UpdateVisibleAreasWithCamera)(void* self, void* camera);
+
 void sre_caver_init(uint64_t swordigo_base);
 
 #endif /* SRE_CAVER_H */

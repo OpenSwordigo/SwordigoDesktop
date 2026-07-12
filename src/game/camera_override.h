@@ -111,5 +111,8 @@ void cam_reset_accel();
 // Called once per frame AFTER drawApp
 void cam_apply(Emulator* emu, uint8_t* guest_mem);
 
+// Write camera states to SRE guest memory
+void cam_write_to_guest();
+
 // Draw camera debug overlay
 void cam_debug_string(char* out, int max_len);

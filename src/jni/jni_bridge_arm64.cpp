@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <unordered_map>
 #include <unordered_set>
+#include <sstream>
 #include <mutex>
 #include <sys/stat.h>
 #ifndef _WIN32
@@ -6055,7 +6056,15 @@ extern uint64_t g_sre_hero_pos_y_addr;
 extern uint64_t g_sre_hero_pos_z_addr;
 
 // UPGRADED SHADERS FOR GLES2 LIGHTING
+// NOTE: These are desktop GLSL 1.20 compatible — no ES precision qualifiers.
+// The GLES ES 'precision mediump float;' and similar qualifiers are syntax errors
+// on desktop OpenGL 2.1 Compatibility Profile (Mesa/Linux drivers).
+// We define them away as empty macros and always prepend the version header.
 const char* UPGRADED_VERT_SHADER = 
+    "#version 120\n"
+    "#define lowp\n"
+    "#define mediump\n"
+    "#define highp\n"
     "attribute vec4 position;\n"
     "attribute vec4 vertexColor;\n"
     "attribute vec2 texCoord;\n"
@@ -6071,6 +6080,10 @@ const char* UPGRADED_VERT_SHADER =
     "}\n";
 
 const char* UPGRADED_VERT_SHADER_COLOR = 
+    "#version 120\n"
+    "#define lowp\n"
+    "#define mediump\n"
+    "#define highp\n"
     "attribute vec4 position;\n"
     "attribute vec4 vertexColor;\n"
     "varying vec4 v_color;\n"
@@ -6083,7 +6096,10 @@ const char* UPGRADED_VERT_SHADER_COLOR =
     "}\n";
 
 const char* UPGRADED_FRAG_SHADER_TEXTURED = 
-    "precision mediump float;\n"
+    "#version 120\n"
+    "#define lowp\n"
+    "#define mediump\n"
+    "#define highp\n"
     "varying vec4 v_color;\n"
     "varying vec2 v_texCoord;\n"
     "varying vec3 v_world_pos;\n"
@@ -6103,7 +6119,10 @@ const char* UPGRADED_FRAG_SHADER_TEXTURED =
     "}\n";
 
 const char* UPGRADED_FRAG_SHADER_COLOR = 
-    "precision mediump float;\n"
+    "#version 120\n"
+    "#define lowp\n"
+    "#define mediump\n"
+    "#define highp\n"
     "varying vec4 v_color;\n"
     "varying vec3 v_world_pos;\n"
     "uniform vec3 u_light_pos;\n"
@@ -6118,6 +6137,38 @@ const char* UPGRADED_FRAG_SHADER_COLOR =
     "    gl_FragColor = vec4(v_color.rgb * final_light, v_color.a);\n"
     "}\n";
 
+// Helper: sanitize a guest GLES2 shader source for desktop GLSL 1.20 compatibility.
+// Strips 'precision X float;' / 'precision X int;' etc. (syntax errors on desktop)
+// and prepends '#version 120' plus compatibility macro defines.
+static std::string sanitize_gles2_shader(const std::string& src) {
+    static const char* DESKTOP_COMPAT_HEADER =
+        "#version 120\n"
+        "#define lowp\n"
+        "#define mediump\n"
+        "#define highp\n";
+    std::string out;
+    out.reserve(src.size() + 128);
+    // Tokenize lines, dropping 'precision ...' declarations
+    std::istringstream stream(src);
+    std::string line;
+    bool has_version = false;
+    while (std::getline(stream, line)) {
+        // Detect existing #version directive — skip it, we'll prepend our own
+        std::string trimmed = line;
+        size_t first = trimmed.find_first_not_of(" \t");
+        if (first != std::string::npos) trimmed = trimmed.substr(first);
+        if (trimmed.substr(0, 8) == "#version") {
+            has_version = true;
+            continue; // replace with our own
+        }
+        // Drop 'precision mediump float;' style lines
+        if (trimmed.substr(0, 9) == "precision") continue;
+        out += line;
+        out += '\n';
+    }
+    return std::string(DESKTOP_COMPAT_HEADER) + out;
+}
+
 static void bridge_glCreateShader(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     GLenum type = (GLenum)emu->get_reg(0);
@@ -6127,6 +6178,9 @@ static void bridge_glCreateShader(void* emu_ptr) {
     }
     emu->set_reg(0, shader);
 }
+
+// Per-shader sanitized source storage (lives until the next glShaderSource on that shader)
+static std::unordered_map<GLuint, std::string> g_sanitized_sources;
 
 static void bridge_glShaderSource(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
@@ -6154,7 +6208,8 @@ static void bridge_glShaderSource(void* emu_ptr) {
         } else {
             src = sources[0];
         }
-        // Upgrade flat shaders dynamically to support lighting/tinting
+        // Upgrade flat shaders dynamically to support lighting/tinting.
+        // All UPGRADED_ constants are already desktop GLSL 1.20 compatible.
         if (src.find("attribute vec4 position;") != std::string::npos) {
             if (src.find("attribute vec2 texCoord;") != std::string::npos) {
                 sources[0] = UPGRADED_VERT_SHADER;
@@ -6169,6 +6224,14 @@ static void bridge_glShaderSource(void* emu_ptr) {
         } else if (src.find("gl_FragColor =") != std::string::npos) {
             sources[0] = UPGRADED_FRAG_SHADER_COLOR;
             if (length_ptr != 0) lengths[0] = strlen(UPGRADED_FRAG_SHADER_COLOR);
+        } else {
+            // Unknown guest shader — sanitize it for desktop GLSL compatibility
+            // (strips ES precision qualifiers, adds #version 120 and compat macros)
+            std::string sanitized = sanitize_gles2_shader(src);
+            g_sanitized_sources[shader] = std::move(sanitized);
+            sources[0] = g_sanitized_sources[shader].c_str();
+            if (length_ptr != 0) lengths[0] = (GLint)g_sanitized_sources[shader].size();
+            printf("[GLES2] Sanitized guest shader %u for desktop GLSL compat\n", shader);
         }
     }
 
@@ -6182,6 +6245,20 @@ static void bridge_glCompileShader(void* emu_ptr) {
     GLuint shader = (GLuint)emu->get_reg(0);
     if (g_display_active) {
         glCompileShader(shader);
+        // Diagnostics: log compile errors so they are visible in stdout
+        GLint status = 0;
+        glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+        if (!status) {
+            GLint len = 0;
+            glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &len);
+            std::string log(len + 1, '\0');
+            glGetShaderInfoLog(shader, len, nullptr, &log[0]);
+            printf("[GLES2-ERR] glCompileShader(%u) FAILED:\n%s\n", shader, log.c_str());
+            fflush(stdout);
+        } else {
+            printf("[GLES2] glCompileShader(%u) OK\n", shader);
+            fflush(stdout);
+        }
     }
 }
 
@@ -6208,6 +6285,20 @@ static void bridge_glLinkProgram(void* emu_ptr) {
     GLuint program = (GLuint)emu->get_reg(0);
     if (g_display_active) {
         glLinkProgram(program);
+        // Diagnostics: log link errors so they are visible in stdout
+        GLint status = 0;
+        glGetProgramiv(program, GL_LINK_STATUS, &status);
+        if (!status) {
+            GLint len = 0;
+            glGetProgramiv(program, GL_INFO_LOG_LENGTH, &len);
+            std::string log(len + 1, '\0');
+            glGetProgramInfoLog(program, len, nullptr, &log[0]);
+            printf("[GLES2-ERR] glLinkProgram(%u) FAILED:\n%s\n", program, log.c_str());
+            fflush(stdout);
+        } else {
+            printf("[GLES2] glLinkProgram(%u) OK\n", program);
+            fflush(stdout);
+        }
     }
 }
 
