@@ -29,6 +29,7 @@
  */
 
 #include "pvr_loader.h"
+#include "pvrtc_decoder.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -219,18 +220,25 @@ GLuint pvr_load_texture(const char* path, int* out_width, int* out_height) {
     
     int width = 0, height = 0;
     const uint8_t* pixel_data = nullptr;
-    bool is_etc1 = false;
+    int format_type = -1;
+    
+    uint32_t gl_format = 0x1908; // GL_RGBA
+    uint32_t gl_type = 0x1401; // GL_UNSIGNED_BYTE
+    int bpp = 4;
+    char c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    uint8_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
     
     /* Try PVR v3 first */
     const PVRv3Header* v3 = (const PVRv3Header*)file_data.data();
     if (v3->version == PVR3_VERSION) {
         width = v3->width;
         height = v3->height;
-        is_etc1 = ((v3->pixel_format & 0xFFFFFFFF) == PVR3_PIXEL_FORMAT_ETC1);
         pixel_data = file_data.data() + sizeof(PVRv3Header) + v3->metadata_size;
+        format_type = pvr::ParsePVRv3Format(v3->pixel_format, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
         
         std::cout << "[PVR] v3 format: " << width << "x" << height 
-                  << " pixel_format=" << (v3->pixel_format & 0xFFFFFFFF)
+                  << " pixel_format=" << v3->pixel_format
+                  << " format_type=" << format_type
                   << " mips=" << v3->mip_count << std::endl;
     }
     /* Try PVR v2 */
@@ -239,33 +247,12 @@ GLuint pvr_load_texture(const char* path, int* out_width, int* out_height) {
         if (v2->magic == PVR2_MAGIC || v2->header_size == 44) {
             width = v2->width;
             height = v2->height;
-            /* v2 format field is in the lower byte of flags.
-             * Known ETC1 codes:
-             *   0x06 = ETC_RGB_4BPP (legacy enum)
-             *   0x12 = ETC1 (PowerVR SDK ePVRTPF_ETC1 = 18)
-             *   0x36 = ETC_RGB_4BPP (alternate code)
-             * Upper bits are metadata flags (mipmaps, twiddle, alpha) */
-            uint32_t fmt = v2->flags & 0xFF;
-            is_etc1 = (fmt == 0x36 || fmt == 0x06 || fmt == 0x12);
-            
-            /* If format isn't recognized but file is valid PVR v2,
-             * try ETC1 anyway — Swordigo only uses ETC1 */
-            if (!is_etc1 && (v2->magic == PVR2_MAGIC) && width > 0 && height > 0 
-                && width <= 4096 && height <= 4096) {
-                size_t expected_etc1_size = (size_t)((width + 3) / 4) * ((height + 3) / 4) * 8;
-                size_t available = file_size - v2->header_size;
-                if (available >= expected_etc1_size) {
-                    std::cout << "[PVR] v2 unknown format 0x" << std::hex << fmt 
-                              << std::dec << " — trying ETC1 (data size matches)" << std::endl;
-                    is_etc1 = true;
-                }
-            }
-            
             pixel_data = file_data.data() + v2->header_size;
+            format_type = pvr::ParsePVRv2Format(v2->flags, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
             
             std::cout << "[PVR] v2 format: " << width << "x" << height 
                       << " flags=0x" << std::hex << v2->flags << std::dec 
-                      << " fmt=0x" << std::hex << fmt << std::dec << std::endl;
+                      << " format_type=" << format_type << std::endl;
         } else {
             std::cerr << "[PVR] Unknown PVR version: 0x" 
                       << std::hex << v3->version << std::dec << std::endl;
@@ -273,8 +260,8 @@ GLuint pvr_load_texture(const char* path, int* out_width, int* out_height) {
         }
     }
     
-    if (!is_etc1) {
-        std::cerr << "[PVR] Unsupported pixel format (not ETC1)" << std::endl;
+    if (format_type < 0) {
+        std::cerr << "[PVR] Unsupported format type: " << format_type << std::endl;
         return 0;
     }
     
@@ -283,9 +270,27 @@ GLuint pvr_load_texture(const char* path, int* out_width, int* out_height) {
         return 0;
     }
     
-    /* Decode ETC1 → RGBA */
-    std::vector<uint8_t> rgba;
-    if (!decode_etc1_data(pixel_data, width, height, rgba)) {
+    /* Decode to RGBA8888 */
+    std::vector<uint8_t> rgba(width * height * 4, 255);
+    bool decode_success = false;
+    
+    if (format_type == 1) { // ETC1
+        pvr::PVRTDecompressETC(pixel_data, width, height, rgba.data(), 6);
+        decode_success = true;
+    } else if (format_type == 2 || format_type == 3) { // PVRTC
+        uint32_t do2bitMode = (format_type == 2) ? 1 : 0;
+        pvr::PVRTDecompressPVRTC(pixel_data, do2bitMode, width, height, rgba.data());
+        decode_success = true;
+    } else if (format_type >= 4 && format_type <= 6) { // DXT
+        uint32_t dxt_fmt = (format_type == 4) ? 1 : ((format_type == 5) ? 3 : 5);
+        pvr::PVRTDecompressDXT(pixel_data, width, height, rgba.data(), dxt_fmt);
+        decode_success = true;
+    } else if (format_type == 10) { // Uncompressed
+        decode_success = pvr::PVRTDecodeUncompressed(pixel_data, width, height, c0, c1, c2, c3, d0, d1, d2, d3, rgba.data());
+    }
+    
+    if (!decode_success) {
+        std::cerr << "[PVR] Decoding failed for format_type: " << format_type << std::endl;
         return 0;
     }
     
@@ -304,7 +309,7 @@ GLuint pvr_load_texture(const char* path, int* out_width, int* out_height) {
     if (out_height) *out_height = height;
     
     std::cout << "[PVR] Uploaded " << width << "x" << height 
-              << " → GL texture " << tex << std::endl;
+              << " → GL texture " << tex << " (format_type=" << format_type << ")" << std::endl;
     
     return tex;
 }

@@ -1636,8 +1636,12 @@ LaunchConfig show_launcher(BinarySelector& selector) {
         icon_cfg.GlyphMinAdvanceX = font_size_main;
         icon_cfg.GlyphOffset = ImVec2(0, 2);
         
-        // Search paths for Inter font
+        // Search paths for Megalopolis / Inter font
         std::string inter_paths[] = {
+            "src/assets/fonts/MegalopolisExtra-Regular.otf",
+            get_data_path("src/assets/fonts/MegalopolisExtra-Regular.otf"),
+            get_user_data_dir() + "/launcher/fonts/MegalopolisExtra-Regular.otf",
+            get_user_data_dir() + "/src/assets/fonts/MegalopolisExtra-Regular.otf",
             get_data_path("src/assets/fonts/Inter-Regular.ttf"),
             get_user_data_dir() + "/launcher/fonts/Inter-Regular.ttf",
             get_user_data_dir() + "/src/assets/fonts/Inter-Regular.ttf",

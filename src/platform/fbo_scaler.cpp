@@ -1728,9 +1728,9 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
     switch (p) {
         case PostFXPreset::OFF:
             s.enabled = true;
-            s.ssao = true; s.ssao_radius = 0.032f; s.ssao_intensity = 1.8f;
-            s.shadow_intensity = 0.35f;
-            s.shadow_softness = 0.002f;
+            s.ssao = true; s.ssao_radius = 0.042f; s.ssao_intensity = 2.5f;
+            s.shadow_intensity = 0.425f;
+            s.shadow_softness = 0.004f;
             s.shadow_light_x = 0.3f;
             s.shadow_light_y = -0.8f;
             s.color_adjust = true;
@@ -1747,8 +1747,8 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
 
     // SSAO — gentle contact depth, preserve Swordigo's soft geometry
     s.ssao = true;
-    s.ssao_radius = 0.026f;
-    s.ssao_intensity = 1.15f;
+    s.ssao_radius = 0.036f;
+    s.ssao_intensity = 1.35f;
 
     // God rays — atmospheric, not dominant
     s.god_rays = true;
@@ -1779,7 +1779,7 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
     s.sharpen_strength = 0.11f;
 
     // Extremely subtle lens separation
-    s.chromatic_aberration = true;
+    s.chromatic_aberration = false;
     s.ca_offset = 0.00035f;
 
     // Controlled bloom — only actual luminous/highlight regions

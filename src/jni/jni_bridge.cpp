@@ -2064,12 +2064,18 @@ void bridge_fopen(void* emu_ptr) {
     const char* path = (const char*)(memory + path_ptr);
     const char* mode = (const char*)(memory + mode_ptr);
     
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+    
     // Always log write-mode opens for save debugging
     bool is_write = (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'));
     if (is_write) {
         // std::cout << "[File] fopen(\"" << path << "\", \"" << mode << "\") [WRITE]" << std::endl;
         try {
-            fs::create_directories(fs::path(path).parent_path());
+            fs::create_directories(fs::path(resolved_path).parent_path());
         } catch (...) {
             // Ignore failure
         }
@@ -2077,18 +2083,18 @@ void bridge_fopen(void* emu_ptr) {
         // std::cout << "[File] fopen(\"" << path << "\", \"" << mode << "\")" << std::endl;
     }
     
-    FILE* f = fopen(path, mode);
+    FILE* f = fopen(resolved_path.c_str(), mode);
     if (!f && !is_write) {
         // Try fallback logic for texture/asset naming variants
-        const char* ext = strrchr(path, '.');
+        const char* ext = strrchr(resolved_path.c_str(), '.');
         if (ext) {
             char base[512];
-            strncpy(base, path, ext - path);
-            base[ext - path] = '\0';
+            strncpy(base, resolved_path.c_str(), ext - resolved_path.c_str());
+            base[ext - resolved_path.c_str()] = '\0';
 
-            int is_tex_png = (strcmp(ext, ".png") == 0 && (ext - path > 4) && strcmp(ext - 4, ".tex.png") == 0);
+            int is_tex_png = (strcmp(ext, ".png") == 0 && (ext - resolved_path.c_str() > 4) && strcmp(ext - 4, ".tex.png") == 0);
             if (is_tex_png) {
-                base[ext - path - 4] = '\0';
+                base[ext - resolved_path.c_str() - 4] = '\0';
             }
 
             int blen = strlen(base);
@@ -2139,7 +2145,7 @@ void bridge_fopen(void* emu_ptr) {
                 }
             }
             if (f && !emu->quiet_mode) {
-                printf("[AssetMgr/fopen] Resolved fallback: %s -> %s\n", path, alt);
+                // printf("[AssetMgr/fopen] Resolved fallback: %s -> %s\n", path, alt);
             }
         }
     }
@@ -2247,8 +2253,15 @@ void bridge_mkdir(void* emu_ptr) {
     uint32_t path_ptr = emu->get_reg(0);
     uint32_t mode = emu->get_reg(1);
     const char* path = (const char*)(memory + path_ptr);
-    // std::cout << "[File] mkdir(\"" << path << "\", " << std::oct << mode << std::dec << ")" << std::endl;
-    int result = mkdir(path, (mode_t)mode);
+    
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+
+    // std::cout << "[File] mkdir(\"" << path << "\" -> \"" << resolved_path << "\", " << std::oct << mode << std::dec << ")" << std::endl;
+    int result = mkdir(resolved_path.c_str(), (mode_t)mode);
     if (result != 0 && errno == EEXIST) {
         // Directory already exists — treat as success (game does recursive mkdir)
         result = 0;
@@ -2264,7 +2277,18 @@ void bridge_rename(void* emu_ptr) {
     uint8_t* memory = emu->get_memory_base();
     const char* old_path = (const char*)(memory + emu->get_reg(0));
     const char* new_path = (const char*)(memory + emu->get_reg(1));
-    int result = rename(old_path, new_path);
+    
+    std::string resolved_old = old_path;
+    std::string resolved_new = new_path;
+    char resolved[512];
+    if (resolve_vfs_path(old_path, resolved, sizeof(resolved))) {
+        resolved_old = resolved;
+    }
+    if (resolve_vfs_path(new_path, resolved, sizeof(resolved))) {
+        resolved_new = resolved;
+    }
+
+    int result = rename(resolved_old.c_str(), resolved_new.c_str());
     if (result != 0) {
         std::cerr << "[File] rename(\"" << old_path << "\" -> \"" << new_path << "\") FAILED: " << strerror(errno) << std::endl;
     } else {
@@ -2277,7 +2301,14 @@ void bridge_remove(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
     const char* path = (const char*)(memory + emu->get_reg(0));
-    int result = remove(path);
+    
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+
+    int result = remove(resolved_path.c_str());
     if (result != 0 && errno != ENOENT) {
         std::cerr << "[File] remove(\"" << path << "\") FAILED: " << strerror(errno) << std::endl;
     }
@@ -2289,7 +2320,14 @@ void bridge_access(void* emu_ptr) {
     uint8_t* memory = emu->get_memory_base();
     const char* path = (const char*)(memory + emu->get_reg(0));
     int mode = (int)emu->get_reg(1);
-    int result = access(path, mode);
+    
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+
+    int result = access(resolved_path.c_str(), mode);
     emu->set_reg(0, (uint32_t)result);
 }
 
@@ -2297,7 +2335,14 @@ void bridge_unlink(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
     const char* path = (const char*)(memory + emu->get_reg(0));
-    int result = unlink(path);
+    
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+
+    int result = unlink(resolved_path.c_str());
     emu->set_reg(0, (uint32_t)result);
 }
 
@@ -2400,12 +2445,18 @@ void bridge_stat(void* emu_ptr) {
     uint32_t stat_buf_ptr = emu->get_reg(1);
     const char* path = (const char*)(memory + path_ptr);
     
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+    
 #ifdef _WIN32
     struct __stat64 st;
-    int result = _stat64(path, &st);
+    int result = _stat64(resolved_path.c_str(), &st);
 #else
     struct stat st;
-    int result = stat(path, &st);
+    int result = stat(resolved_path.c_str(), &st);
 #endif
 
     if (result == 0 && stat_buf_ptr != 0) {
@@ -2474,7 +2525,13 @@ void bridge_opendir(void* emu_ptr) {
         // std::cout << "[File] opendir(\"" << path << "\")" << std::endl;
     }
     
-    if (!fs::exists(path) || !fs::is_directory(path)) {
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+
+    if (!fs::exists(resolved_path) || !fs::is_directory(resolved_path)) {
         emu->set_reg(0, 0); // null
         return;
     }
@@ -2483,7 +2540,7 @@ void bridge_opendir(void* emu_ptr) {
     gd->guest_dirent_addr = g_guest_heap_ptr;
     g_guest_heap_ptr += (280 + 7) & ~7; // allocate 280 bytes in guest heap for dirent struct
     
-    for (const auto& entry : fs::directory_iterator(path)) {
+    for (const auto& entry : fs::directory_iterator(resolved_path)) {
         std::string name = entry.path().filename().string();
         uint8_t type = 8; // DT_REG default
         if (entry.is_directory()) {
@@ -4185,45 +4242,39 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
     const uint8_t* file_data = memory + file_data_ptr;
     
     int width = 0, height = 0;
-    int is_etc1 = 0, is_pvrtc = 0, pvrtc_bpp = 4;
     const uint8_t* pixel_data = nullptr;
+    int format_type = -1;
+    
+    uint32_t gl_format = GL_RGBA;
+    uint32_t gl_type = GL_UNSIGNED_BYTE;
+    int bpp = 4;
+    char c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    uint8_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
     
     // Parse PVR v3
     const HostPVRv3Header* v3 = (const HostPVRv3Header*)file_data;
     if (v3->version == 0x03525650) {
         width = v3->width;
         height = v3->height;
-        uint32_t fmt = v3->pixel_format & 0xFFFFFFFF;
-        if (fmt == 6) { // ETC1
-            is_etc1 = 1;
-        } else if (fmt == 0 || fmt == 1) { // PVRTC 2bpp
-            is_pvrtc = 1; pvrtc_bpp = 2;
-        } else if (fmt == 2 || fmt == 3) { // PVRTC 4bpp
-            is_pvrtc = 1; pvrtc_bpp = 4;
-        }
         pixel_data = file_data + sizeof(HostPVRv3Header) + v3->metadata_size;
+        format_type = pvr::ParsePVRv3Format(v3->pixel_format, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
     } else {
         // Parse PVR v2
         const HostPVRv2Header* v2 = (const HostPVRv2Header*)file_data;
         if (v2->magic == 0x21525650 || v2->header_size == 44) {
             width = v2->width;
             height = v2->height;
-            uint32_t fmt = v2->flags & 0xFF;
-            if (fmt == 0x36 || fmt == 0x06 || fmt == 0x12) {
-                is_etc1 = 1;
-            } else if (fmt == 0x0c || fmt == 0x18) {
-                is_pvrtc = 1; pvrtc_bpp = 2;
-            } else if (fmt == 0x0d || fmt == 0x19) {
-                is_pvrtc = 1; pvrtc_bpp = 4;
-            } else {
-                // Unknown, try ETC1 as default for Swordigo
-                is_etc1 = 1;
-            }
             pixel_data = file_data + v2->header_size;
+            format_type = pvr::ParsePVRv2Format(v2->flags, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
         } else {
             std::cerr << "[SRE-PVR32] Unknown PVR header magic 0x" << std::hex << v2->magic << std::dec << std::endl;
             return;
         }
+    }
+    
+    if (format_type < 0) {
+        std::cerr << "[SRE-PVR32] Unsupported format decoding " << width << "x" << height << std::endl;
+        return;
     }
     
     if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
@@ -4248,26 +4299,25 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
     glBindTexture(GL_TEXTURE_2D, tex_name);
     
     std::vector<uint8_t> rgba(width * height * 4, 255);
+    bool decode_success = false;
     
-    if (is_etc1) {
-        uint32_t block_w = (width + 3) / 4;
-        uint32_t block_h = (height + 3) / 4;
-        for (uint32_t by = 0; by < block_h; by++) {
-            for (uint32_t bx = 0; bx < block_w; bx++) {
-                uint8_t block_rgba[4 * 4 * 4];
-                decode_etc1_block(pixel_data + (by * block_w + bx) * 8, block_rgba, 4 * 4);
-                for (int row = 0; row < 4 && (by * 4 + row) < height; row++) {
-                    for (int col = 0; col < 4 && (bx * 4 + col) < width; col++) {
-                        memcpy(&rgba[((by * 4 + row) * width + (bx * 4 + col)) * 4],
-                               &block_rgba[row * 16 + col * 4], 4);
-                    }
-                }
-            }
-        }
-    } else if (is_pvrtc) {
-        pvr::PVRTDecompressPVRTC(pixel_data, (pvrtc_bpp == 2) ? 1 : 0, width, height, rgba.data());
-    } else {
-        std::cerr << "[SRE-PVR32] Unsupported format decoding " << width << "x" << height << std::endl;
+    if (format_type == 1) { // ETC1
+        pvr::PVRTDecompressETC(pixel_data, width, height, rgba.data(), 6);
+        decode_success = true;
+    } else if (format_type == 2 || format_type == 3) { // PVRTC
+        uint32_t do2bitMode = (format_type == 2) ? 1 : 0;
+        pvr::PVRTDecompressPVRTC(pixel_data, do2bitMode, width, height, rgba.data());
+        decode_success = true;
+    } else if (format_type >= 4 && format_type <= 6) { // DXT
+        uint32_t dxt_fmt = (format_type == 4) ? 1 : ((format_type == 5) ? 3 : 5);
+        pvr::PVRTDecompressDXT(pixel_data, width, height, rgba.data(), dxt_fmt);
+        decode_success = true;
+    } else if (format_type == 10) { // Uncompressed
+        decode_success = pvr::PVRTDecodeUncompressed(pixel_data, width, height, c0, c1, c2, c3, d0, d1, d2, d3, rgba.data());
+    }
+    
+    if (!decode_success) {
+        std::cerr << "[SRE-PVR32] Decoding failed for format_type: " << format_type << std::endl;
         return;
     }
     
@@ -4285,7 +4335,7 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
     }
     
     std::cout << "[SRE-PVR32] Successfully loaded and uploaded " << width << "x" << height 
-              << " PVR to GL texture " << tex_name << " (Format: " << (is_etc1 ? "ETC1" : "PVRTC") << ", Size: " << file_size << " bytes)" << std::endl;
+              << " PVR to GL texture " << tex_name << " (Format Type: " << format_type << ", Size: " << file_size << " bytes)" << std::endl;
 }
 
 void bridge_gl_tex_parameteri(void* emu_ptr) {

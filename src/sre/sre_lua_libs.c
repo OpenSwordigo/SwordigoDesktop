@@ -45,6 +45,14 @@ pfn_lua_pushinteger    g_lua_pushinteger    = 0;
 pfn_lua_concat         g_lua_concat         = 0;
 pfn_lua_pushlstring    g_lua_pushlstring    = 0;
 pfn_lua_setmetatable   g_lua_setmetatable   = 0;
+pfn_lua_close          g_lua_close          = 0;
+pfn_lua_dump           g_lua_dump           = 0;
+pfn_lua_atpanic        g_lua_atpanic        = 0;
+pfn_lua_getmetatable   g_lua_getmetatable   = 0;
+pfn_lua_rawequal       g_lua_rawequal       = 0;
+pfn_lua_equal          g_lua_equal          = 0;
+pfn_lua_lessthan       g_lua_lessthan       = 0;
+pfn_lua_isuserdata     g_lua_isuserdata     = 0;
 
 /* Extended init — called from host after sre_init_lua */
 typedef struct {
@@ -68,6 +76,14 @@ typedef struct {
     sre_u64 lua_concat;
     sre_u64 lua_pushlstring;
     sre_u64 lua_setmetatable;
+    sre_u64 lua_close;
+    sre_u64 lua_dump;
+    sre_u64 lua_atpanic;
+    sre_u64 lua_getmetatable;
+    sre_u64 lua_rawequal;
+    sre_u64 lua_equal;
+    sre_u64 lua_lessthan;
+    sre_u64 lua_isuserdata;
 } SreLuaExtAddrs;
 
 void sre_init_lua_ext(SreLuaExtAddrs* a) {
@@ -91,6 +107,14 @@ void sre_init_lua_ext(SreLuaExtAddrs* a) {
     g_lua_concat         = (pfn_lua_concat)a->lua_concat;
     g_lua_pushlstring    = (pfn_lua_pushlstring)a->lua_pushlstring;
     g_lua_setmetatable   = (pfn_lua_setmetatable)a->lua_setmetatable;
+    g_lua_close          = (pfn_lua_close)a->lua_close;
+    g_lua_dump           = (pfn_lua_dump)a->lua_dump;
+    g_lua_atpanic        = (pfn_lua_atpanic)a->lua_atpanic;
+    g_lua_getmetatable   = (pfn_lua_getmetatable)a->lua_getmetatable;
+    g_lua_rawequal       = (pfn_lua_rawequal)a->lua_rawequal;
+    g_lua_equal          = (pfn_lua_equal)a->lua_equal;
+    g_lua_lessthan       = (pfn_lua_lessthan)a->lua_lessthan;
+    g_lua_isuserdata     = (pfn_lua_isuserdata)a->lua_isuserdata;
 }
 
 
@@ -1215,63 +1239,151 @@ static int pb_read_varint(const unsigned char** p, const unsigned char* end, uin
     return 0;
 }
 
+static int safe_contains(const unsigned char* data, size_t data_len, const char* needle) {
+    size_t needle_len = 0;
+    while (needle[needle_len]) needle_len++;
+    if (needle_len > data_len) return 0;
+    
+    for (size_t i = 0; i <= data_len - needle_len; i++) {
+        int match = 1;
+        for (size_t j = 0; j < needle_len; j++) {
+            if (data[i + j] != (unsigned char)needle[j]) {
+                match = 0;
+                break;
+            }
+        }
+        if (match) return 1;
+    }
+    return 0;
+}
+
+static int scan_proto_recursive(const unsigned char* p, const unsigned char* end, const char** out_lua, size_t* out_len) {
+    while (p < end) {
+        uint64_t key;
+        if (!pb_read_varint(&p, end, &key)) break;
+        int wire = key & 7;
+        
+        if (wire == 2) {
+            uint64_t len;
+            if (!pb_read_varint(&p, end, &len)) break;
+            if (p + len > end) break;
+            
+            // Check if this payload starts with the precompiled Lua signature: \033Lua
+            if (len >= 4 && p[0] == 0x1b && p[1] == 'L' && p[2] == 'u' && p[3] == 'a') {
+                *out_lua = (const char*)p;
+                *out_len = (size_t)len;
+                return 1;
+            }
+            
+            // Recursively scan this length-delimited payload
+            if (scan_proto_recursive(p, p + len, out_lua, out_len)) {
+                return 1;
+            }
+            
+            p += len;
+        } else if (wire == 0) {
+            uint64_t dummy;
+            if (!pb_read_varint(&p, end, &dummy)) break;
+        } else if (wire == 1) {
+            p += 8;
+        } else if (wire == 5) {
+            p += 4;
+        } else {
+            break;
+        }
+    }
+    return 0;
+}
+
+static int scan_proto_text_fallback_recursive(const unsigned char* p, const unsigned char* end, const char** out_lua, size_t* out_len) {
+    const unsigned char* best_str = NULL;
+    size_t best_len = 0;
+    const unsigned char* cur = p;
+    
+    while (cur < end) {
+        uint64_t key;
+        if (!pb_read_varint(&cur, end, &key)) break;
+        int wire = key & 7;
+        
+        if (wire == 2) {
+            uint64_t len;
+            if (!pb_read_varint(&cur, end, &len)) break;
+            if (cur + len > end) break;
+            
+            if (len > best_len) {
+                int is_text = 1;
+                for (size_t i = 0; i < len; i++) {
+                    unsigned char c = cur[i];
+                    if (c < 32 && c != '\n' && c != '\r' && c != '\t') {
+                        is_text = 0;
+                        break;
+                    }
+                }
+                if (is_text) {
+                    int has_lua_marker = 0;
+                    if (safe_contains(cur, len, "local ") ||
+                        safe_contains(cur, len, "function") ||
+                        safe_contains(cur, len, "end") ||
+                        safe_contains(cur, len, "--") ||
+                        safe_contains(cur, len, "=")) {
+                        has_lua_marker = 1;
+                    }
+                    if (has_lua_marker) {
+                        best_str = cur;
+                        best_len = (size_t)len;
+                    }
+                }
+            }
+            
+            const char* sub_str = NULL;
+            size_t sub_len = 0;
+            if (scan_proto_text_fallback_recursive(cur, cur + len, &sub_str, &sub_len)) {
+                if (sub_len > best_len) {
+                    best_str = (const unsigned char*)sub_str;
+                    best_len = sub_len;
+                }
+            }
+            
+            cur += len;
+        } else if (wire == 0) {
+            uint64_t dummy;
+            if (!pb_read_varint(&cur, end, &dummy)) break;
+        } else if (wire == 1) {
+            cur += 8;
+        } else if (wire == 5) {
+            cur += 4;
+        } else {
+            break;
+        }
+    }
+    
+    if (best_str && best_len > 0) {
+        *out_lua = (const char*)best_str;
+        *out_len = best_len;
+        return 1;
+    }
+    return 0;
+}
+
 int sre_scl_extract_lua(const char* buf, size_t size, const char** out_lua, size_t* out_len) {
     if (!buf || size == 0) return 0;
 
-    /* Quick heuristic: if the first byte could not be a valid protobuf tag (wire 0-5),
-     * or the file starts with ASCII text chars like 'P' (Program{), skip to text mode. */
     unsigned char first = (unsigned char)buf[0];
     int wire0 = first & 7;
-    int is_likely_proto = (wire0 <= 5) && (first >= 0x08);  /* valid varint tag byte range */
+    int is_likely_proto = (wire0 <= 5) && (first >= 0x08);
 
     if (is_likely_proto) {
         const unsigned char* p = (const unsigned char*)buf;
         const unsigned char* end = p + size;
-
-        while (p < end) {
-            uint64_t key;
-            if (!pb_read_varint(&p, end, &key)) break;
-            int field = key >> 3;
-            int wire  = key & 7;
-
-            if (wire == 2) {
-                uint64_t len;
-                if (!pb_read_varint(&p, end, &len)) break;
-                if (p + len > end) break;
-
-                if (field == 5) { /* Program message */
-                    const unsigned char* prog_p   = p;
-                    const unsigned char* prog_end = p + len;
-                    while (prog_p < prog_end) {
-                        uint64_t pkey;
-                        if (!pb_read_varint(&prog_p, prog_end, &pkey)) break;
-                        int pfield = pkey >> 3;
-                        int pwire  = pkey & 7;
-                        if (pwire == 2) {
-                            uint64_t plen;
-                            if (!pb_read_varint(&prog_p, prog_end, &plen)) break;
-                            if (prog_p + plen > prog_end) break;
-                            if (pfield == 1 || pfield == 2 || pfield == 3) { /* Source (1/2) or CompiledCode (3) */
-                                *out_lua = (const char*)prog_p;
-                                *out_len = (size_t)plen;
-                                return 1;
-                            }
-                            prog_p += plen;
-                        } else if (pwire == 0) {
-                            uint64_t dummy;
-                            if (!pb_read_varint(&prog_p, prog_end, &dummy)) break;
-                        } else if (pwire == 1) { prog_p += 8; }
-                          else if (pwire == 5) { prog_p += 4; }
-                          else break;
-                    }
-                }
-                p += len;
-            } else if (wire == 0) {
-                uint64_t dummy;
-                if (!pb_read_varint(&p, end, &dummy)) break;
-            } else if (wire == 1) { p += 8; }
-              else if (wire == 5) { p += 4; }
-              else break;
+        
+        // Pass 1: recursive bytecode search
+        if (scan_proto_recursive(p, end, out_lua, out_len)) {
+            return 1;
+        }
+        
+        // Pass 2: recursive text fallback search
+        if (scan_proto_text_fallback_recursive(p, end, out_lua, out_len)) {
+            return 1;
         }
     }
 

@@ -2853,7 +2853,15 @@ void load_and_boot_arm64() {
                         {"lua_pushinteger", "_Z15lua_pushintegerP9lua_Statel"},
                         {"lua_concat",      "_Z10lua_concatP9lua_Statei"},
                         {"lua_pushlstring", "_Z15lua_pushlstringP9lua_StatePKcm"},
-                        {"lua_setmetatable","_Z17lua_setmetatableP9lua_Statei"},
+                        {"lua_setmetatable","_Z16lua_setmetatableP9lua_Statei"},
+                        {"lua_close",       "_Z9lua_closeP9lua_State"},
+                        {"lua_dump",        "_Z8lua_dumpP9lua_StatePFiS0_PKvmPvES3_"},
+                        {"lua_atpanic",     "_Z11lua_atpanicP9lua_StatePFiS0_E"},
+                        {"lua_getmetatable","_Z16lua_getmetatableP9lua_Statei"},
+                        {"lua_rawequal",    "_Z12lua_rawequalP9lua_Stateii"},
+                        {"lua_equal",       "_Z9lua_equalP9lua_Stateii"},
+                        {"lua_lessthan",    "_Z12lua_lessthanP9lua_Stateii"},
+                        {"lua_isuserdata",  "_Z14lua_isuserdataP9lua_Statei"},
                     };
                     const int NUM_LUA_EXT_SYMS = sizeof(lua_ext_syms) / sizeof(lua_ext_syms[0]);
 
@@ -3017,7 +3025,15 @@ void load_and_boot_arm64() {
                     {"lua_pushinteger", "_Z15lua_pushintegerP9lua_Statel"},
                     {"lua_concat",      "_Z10lua_concatP9lua_Statei"},
                     {"lua_pushlstring", "_Z15lua_pushlstringP9lua_StatePKcm"},
-                    {"lua_setmetatable","_Z17lua_setmetatableP9lua_Statei"},
+                    {"lua_setmetatable","_Z16lua_setmetatableP9lua_Statei"},
+                    {"lua_close",       "_Z9lua_closeP9lua_State"},
+                    {"lua_dump",        "_Z8lua_dumpP9lua_StatePFiS0_PKvmPvES3_"},
+                    {"lua_atpanic",     "_Z11lua_atpanicP9lua_StatePFiS0_E"},
+                    {"lua_getmetatable","_Z16lua_getmetatableP9lua_Statei"},
+                    {"lua_rawequal",    "_Z12lua_rawequalP9lua_Stateii"},
+                    {"lua_equal",       "_Z9lua_equalP9lua_Stateii"},
+                    {"lua_lessthan",    "_Z12lua_lessthanP9lua_Stateii"},
+                    {"lua_isuserdata",  "_Z14lua_isuserdataP9lua_Statei"},
                     // New standard Lua/LuaL functions
                     {"luaL_newstate",   "_Z13luaL_newstatev"},
                     {"luaL_loadstring", "_Z15luaL_loadstringP9lua_StatePKc"},

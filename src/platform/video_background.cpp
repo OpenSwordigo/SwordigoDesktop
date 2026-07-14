@@ -32,37 +32,71 @@ namespace VideoBackground {
     static std::unordered_map<uint32_t, PlayerState> g_players;
 
     void register_texture_maybe(uint32_t tex_id, const std::string& asset_filename, int width, int height) {
-        // Only process .tex.png assets
         std::string base = asset_filename;
-        size_t pos = base.rfind(".tex.png");
-        if (pos == std::string::npos) return;
+        // Strip texture extensions
+        std::string clean_bare = asset_filename;
+        std::vector<std::string> extensions = { ".tex.png", ".pvr.png", ".png", ".pvr", ".jpg", ".jpeg" };
+        for (const auto& ext : extensions) {
+            if (clean_bare.size() >= ext.size() && clean_bare.compare(clean_bare.size() - ext.size(), ext.size(), ext) == 0) {
+                clean_bare = clean_bare.substr(0, clean_bare.size() - ext.size());
+                break;
+            }
+        }
 
-        // Derive the bare name (no extension) and parent dir
-        std::string bare = base.substr(0, pos);  // e.g. "resources/grasslandsbackground_day_2x"
-        std::string assets_root = get_user_data_dir() + "assets/";
+        // Strip virtual folder prefixes
+        if (clean_bare.rfind("assets/resources/", 0) == 0) {
+            clean_bare = clean_bare.substr(17);
+        } else if (clean_bare.rfind("resources/", 0) == 0) {
+            clean_bare = clean_bare.substr(10);
+        }
 
-        // Probe 1: same directory as the .tex.png  (e.g. assets/resources/<name>.mp4)
-        // Probe 2: background/ subdirectory         (e.g. assets/resources/background/<name>.mp4)
+        // Get filename only
+        std::string filename_only = clean_bare;
+        size_t last_slash = clean_bare.rfind('/');
+        if (last_slash != std::string::npos) {
+            filename_only = clean_bare.substr(last_slash + 1);
+        }
+
+        // Generate name variations (with and without _2x suffix) to handle DPI/Retina asset mismatches
+        std::vector<std::string> bares = { clean_bare };
+        size_t pos_2x = clean_bare.rfind("_2x");
+        if (pos_2x != std::string::npos && pos_2x == clean_bare.size() - 3) {
+            bares.push_back(clean_bare.substr(0, clean_bare.size() - 3));
+        } else {
+            bares.push_back(clean_bare + "_2x");
+        }
+
+        std::vector<std::string> filenames = { filename_only };
+        size_t pos_2x_f = filename_only.rfind("_2x");
+        if (pos_2x_f != std::string::npos && pos_2x_f == filename_only.size() - 3) {
+            filenames.push_back(filename_only.substr(0, filename_only.size() - 3));
+        } else {
+            filenames.push_back(filename_only + "_2x");
+        }
+
         std::string mp4_path;
         {
-            std::string candidate1 = get_data_path("assets/" + bare + ".mp4");
-            std::string candidate2;
-
-            // Build candidate2: insert "background/" before the filename
-            size_t slash = bare.rfind('/');
-            if (slash != std::string::npos) {
-                candidate2 = get_data_path("assets/" + bare.substr(0, slash + 1) + "background/" + bare.substr(slash + 1) + ".mp4");
-            } else {
-                candidate2 = get_data_path("assets/background/" + bare + ".mp4");
+            std::vector<std::string> candidates;
+            for (const auto& b : bares) {
+                candidates.push_back(get_data_path("assets/resources/" + b + ".mp4"));
+                candidates.push_back(get_data_path("assets/resources/background/" + b + ".mp4"));
+                candidates.push_back(get_data_path("assets/resources/backgrounds/" + b + ".mp4"));
+            }
+            for (const auto& f : filenames) {
+                candidates.push_back(get_data_path("assets/resources/background/" + f + ".mp4"));
+                candidates.push_back(get_data_path("assets/resources/backgrounds/" + f + ".mp4"));
             }
 
-            if (std::filesystem::exists(candidate1)) {
-                mp4_path = candidate1;
-            } else if (std::filesystem::exists(candidate2)) {
-                mp4_path = candidate2;
-            } else {
+            for (const auto& cand : candidates) {
+                if (std::filesystem::exists(cand)) {
+                    mp4_path = cand;
+                    break;
+                }
+            }
+
+            if (mp4_path.empty()) {
                 // No video companion found. Try to sample the vanilla texture if it's a background texture.
-                if (base.find("background") != std::string::npos || base.find("bg") != std::string::npos) {
+                if (base.find("background") != std::string::npos || base.find("bg") != std::string::npos || base.find("menu") != std::string::npos || base.find("back") != std::string::npos) {
                     std::string vanilla_path = get_data_path("assets/" + base);
                     if (std::filesystem::exists(vanilla_path)) {
                         SDL_Surface* surf = IMG_Load(vanilla_path.c_str());

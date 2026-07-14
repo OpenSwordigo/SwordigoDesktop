@@ -279,6 +279,14 @@ SreHookEntry sre_hook_table[] = {
     { 0, "lua_pushthread" },
     { 0, "lua_status" },
     { 0, "lua_gc" },
+    { 0, "lua_close" },
+    { 0, "lua_dump" },
+    { 0, "lua_atpanic" },
+    { 0, "lua_getmetatable" },
+    { 0, "lua_rawequal" },
+    { 0, "lua_equal" },
+    { 0, "lua_lessthan" },
+    { 0, "lua_isuserdata" },
     
     /* Sentinel — end of table */
     { 0, 0, 0 }

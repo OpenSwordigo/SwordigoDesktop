@@ -5748,7 +5748,7 @@ void sre_mini_ensure_injected(lua_State* L) {
     );
 
     /* Load edgetest.scl dynamically if present */
-    sre_load_edgetest_scl(L);
+    // sre_load_edgetest_scl(L);
 
     /* Load serialization and database libraries */
     sre_load_srlz_lua(L);

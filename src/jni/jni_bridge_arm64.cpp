@@ -2418,7 +2418,14 @@ static void bridge_remove(void* emu_ptr) {
     uint8_t* memory = emu->get_memory_base();
     uint32_t path_ptr = emu->get_reg(0);
     const char* path = (const char*)(memory + path_ptr);
-    emu->set_reg(0, remove(path));
+    
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+    
+    emu->set_reg(0, remove(resolved_path.c_str()));
 }
 
 static void bridge_vsprintf(void* emu_ptr) {
@@ -2744,90 +2751,87 @@ static bool try_decode_pvr_from_fd(int real_fd, PVRGzBuffer& out) {
     }
 
     int width = 0, height = 0;
-    bool is_etc1 = false, is_pvrtc = false, is_uncompressed = false;
-    int pvrtc_bpp = 4;
-    GLenum gl_format = GL_RGBA;
-    GLenum gl_type = GL_UNSIGNED_BYTE;
-    int bpp = 4;
-    int caver_format = 1;
     const uint8_t* pixel_data = nullptr;
+    int format_type = -1;
+
+    uint32_t gl_format = 0x1908; // GL_RGBA
+    uint32_t gl_type = 0x1401; // GL_UNSIGNED_BYTE
+    int bpp = 4;
+    char c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    uint8_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+    int caver_format = 1;
 
     // PVR v3: magic 0x03525650 ('PVR\x03' LE)
     const HostPVRv3Header* v3 = (const HostPVRv3Header*)data;
     if (data_sz >= sizeof(HostPVRv3Header) && v3->version == 0x03525650) {
         width = v3->width; height = v3->height;
-        uint64_t pixel_format = v3->pixel_format;
-        if (parse_pvr_uncompressed_format(pixel_format, gl_format, gl_type, bpp, caver_format)) {
-            is_uncompressed = true;
-        } else {
-            uint32_t fmt_low = pixel_format & 0xFFFFFFFF;
-            if (fmt_low == 6) { is_etc1 = true; }
-            else if (fmt_low == 0 || fmt_low == 1) { is_pvrtc = true; pvrtc_bpp = 2; }
-            else if (fmt_low == 2 || fmt_low == 3) { is_pvrtc = true; pvrtc_bpp = 4; }
-        }
         pixel_data = data + sizeof(HostPVRv3Header) + v3->metadata_size;
+        format_type = pvr::ParsePVRv3Format(v3->pixel_format, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
     } else {
         // PVR v2: magic 0x21525650 ('PVR!')
         const HostPVRv2Header* v2 = (const HostPVRv2Header*)data;
-        if (data_sz >= sizeof(HostPVRv2Header) &&
-            (v2->magic == 0x21525650 || v2->header_size == 44)) {
+        if (data_sz >= sizeof(HostPVRv2Header) && (v2->magic == 0x21525650 || v2->header_size == 44)) {
             width = v2->width; height = v2->height;
-            uint32_t fmt = v2->flags & 0xFF;
-            if (parse_legacy_pvr_uncompressed_format(v2->flags, gl_format, gl_type, bpp, caver_format)) {
-                is_uncompressed = true;
-            } else if (fmt == 0x36 || fmt == 0x06 || fmt == 0x12) { is_etc1 = true; }
-            else if (fmt == 0x0c || fmt == 0x18) { is_pvrtc = true; pvrtc_bpp = 2; }
-            else if (fmt == 0x0d || fmt == 0x19) { is_pvrtc = true; pvrtc_bpp = 4; }
-            else { is_etc1 = true; }  // assume ETC1
             pixel_data = data + v2->header_size;
+            format_type = pvr::ParsePVRv2Format(v2->flags, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
         } else {
             return false;  // not a PVR
         }
     }
 
+    if (format_type < 0) return false;
     if (width <= 0 || height <= 0 || width > 4096 || height > 4096) return false;
     if (!pixel_data || pixel_data >= data + data_sz) return false;
 
-    /* Decode into pixels */
-    std::vector<uint8_t> rgba;
+    // Map format_type to caver_format
+    if (format_type == 1) { // ETC1
+        caver_format = 1;
+    } else if (format_type == 2 || format_type == 3) { // PVRTC
+        caver_format = 1;
+    } else if (format_type >= 4 && format_type <= 6) { // DXT
+        caver_format = 1;
+    } else if (format_type == 10) { // Uncompressed
+        if (c0 == 'r' && c1 == 'g' && c2 == 'b' && c3 == 'a' && d0 == 8 && d1 == 8 && d2 == 8 && d3 == 8) caver_format = 1;
+        else if (c0 == 'b' && c1 == 'g' && c2 == 'r' && c3 == 'a' && d0 == 8 && d1 == 8 && d2 == 8 && d3 == 8) caver_format = 1;
+        else if (c0 == 'l' && c1 == 'a' && d0 == 8 && d1 == 8) caver_format = 4;
+        else if (c0 == 'l' && d0 == 8) caver_format = 6;
+        else if (c0 == 'a' && d0 == 8) caver_format = 7;
+        else if (c0 == 'r' && c1 == 'g' && c2 == 'b' && d0 == 5 && d1 == 6 && d2 == 5) caver_format = 5;
+        else if (c0 == 'r' && c1 == 'g' && c2 == 'b' && c3 == 'a' && d0 == 4 && d1 == 4 && d2 == 4 && d3 == 4) caver_format = 2;
+        else if (c0 == 'r' && c1 == 'g' && c2 == 'b' && c3 == 'a' && d0 == 5 && d1 == 5 && d2 == 5 && d3 == 1) caver_format = 3;
+        else caver_format = 1;
+    }
 
-    if (is_uncompressed) {
+    std::vector<uint8_t> rgba;
+    if (format_type == 10) { // Uncompressed: assign directly
         rgba.assign(pixel_data, pixel_data + width * height * bpp);
-        if (gl_format == GL_BGRA) { // BGRA -> swap to RGBA
+        if (gl_format == 0x80E1) { // GL_BGRA -> swap to RGBA
             for (size_t i = 0; i < rgba.size(); i += 4) {
                 uint8_t b = rgba[i];
                 rgba[i] = rgba[i+2];
                 rgba[i+2] = b;
             }
-            gl_format = GL_RGBA;
             caver_format = 1;
         }
-    } else if (is_etc1) {
-        rgba.assign(width * height * 4, 0xFF);
-        uint32_t block_w = (width + 3) / 4;
-        uint32_t block_h = (height + 3) / 4;
-        for (uint32_t by = 0; by < block_h; by++) {
-            for (uint32_t bx = 0; bx < block_w; bx++) {
-                uint8_t blk[64];
-                decode_etc1_block(pixel_data + (by * block_w + bx) * 8, blk, 4 * 4);
-                for (int row = 0; row < 4 && (int)(by*4+row) < height; row++)
-                    for (int col = 0; col < 4 && (int)(bx*4+col) < width; col++)
-                        memcpy(&rgba[((by*4+row)*width+(bx*4+col))*4],
-                               &blk[row*16+col*4], 4);
-            }
-        }
-    } else if (is_pvrtc) {
-        rgba.assign(width * height * 4, 0xFF);
-        pvr::PVRTDecompressPVRTC(pixel_data, (pvrtc_bpp==2)?1:0, width, height, rgba.data());
     } else {
-        return false;
+        // Decode to RGBA8888
+        rgba.assign(width * height * 4, 0xFF);
+        bool decode_success = false;
+        if (format_type == 1) { // ETC1
+            pvr::PVRTDecompressETC(pixel_data, width, height, rgba.data(), 6);
+            decode_success = true;
+        } else if (format_type == 2 || format_type == 3) { // PVRTC
+            uint32_t do2bitMode = (format_type == 2) ? 1 : 0;
+            pvr::PVRTDecompressPVRTC(pixel_data, do2bitMode, width, height, rgba.data());
+            decode_success = true;
+        } else if (format_type >= 4 && format_type <= 6) { // DXT
+            uint32_t dxt_fmt = (format_type == 4) ? 1 : ((format_type == 5) ? 3 : 5);
+            pvr::PVRTDecompressDXT(pixel_data, width, height, rgba.data(), dxt_fmt);
+            decode_success = true;
+        }
+        if (!decode_success) return false;
     }
 
-    /* Prepend the TEX binary header that BinaryFile::ReadInt32 expects:
-     *   int32 pixelFormat  — Caver PixelFormat enum
-     *   int32 width
-     *   int32 height
-     * then raw pixels follow. */
     out.pixels.resize(12 + rgba.size());
     uint32_t hdr[3] = { (uint32_t)caver_format, (uint32_t)width, (uint32_t)height };
     memcpy(out.pixels.data(),       hdr,       12);
@@ -2943,23 +2947,22 @@ static void bridge_fopen(void* emu_ptr) {
     const char* path = (const char*)(memory + path_ptr);
     const char* mode = (const char*)(memory + mode_ptr);
 
-    // Resolve relative asset paths to the absolute base directory
+    // Resolve virtual paths using VFS translation first
     std::string resolved_path = path;
-    bool is_write = (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'));
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    } else if (path[0] != '/' && (strncmp(path, "resources/", 10) == 0 || strncmp(path, "assets/", 7) == 0)) {
+        // Resolve relative asset paths to the absolute base directory
+        resolved_path = std::string(get_assets_base_path()) + "/" + path;
+    }
 
+    bool is_write = (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'));
     if (is_write) {
-        if (path[0] != '/' && (strncmp(path, "resources/", 10) == 0 || strncmp(path, "assets/", 7) == 0)) {
-            resolved_path = std::string(get_assets_base_path()) + "/" + path;
-        }
         try {
             fs::create_directories(fs::path(resolved_path).parent_path());
         } catch (...) {
             // Ignore failure
-        }
-    } else {
-        char resolved[512];
-        if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
-            resolved_path = resolved;
         }
     }
     
@@ -2970,7 +2973,7 @@ static void bridge_fopen(void* emu_ptr) {
         g_file_handles[handle] = f;
         emu->set_reg(0, handle);
         if (!emu->quiet_mode) {
-            printf("[AssetMgr/fopen] Opened: %s -> %s (handle=%u)\n", path, resolved_path.c_str(), handle);
+            // printf("[AssetMgr/fopen] Opened: %s -> %s (handle=%u)\n", path, resolved_path.c_str(), handle);
         }
     } else {
         emu->set_reg(0, 0);
@@ -3129,8 +3132,15 @@ static void bridge_mkdir(void* emu_ptr) {
     uint32_t path_ptr = emu->get_reg(0);
     uint32_t mode = emu->get_reg(1);
     const char* path = (const char*)(memory + path_ptr);
-    std::cout << "[File] mkdir(\"" << path << "\", " << std::oct << mode << std::dec << ")" << std::endl;
-    int result = mkdir(path, (mode_t)mode);
+    
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+
+    std::cout << "[File] mkdir(\"" << path << "\" -> \"" << resolved_path << "\", " << std::oct << mode << std::dec << ")" << std::endl;
+    int result = mkdir(resolved_path.c_str(), (mode_t)mode);
     if (result != 0 && errno == EEXIST) {
         // Directory already exists — treat as success (game does recursive mkdir)
         result = 0;
@@ -3146,7 +3156,18 @@ static void bridge_rename(void* emu_ptr) {
     uint8_t* memory = emu->get_memory_base();
     const char* old_path = (const char*)(memory + emu->get_reg(0));
     const char* new_path = (const char*)(memory + emu->get_reg(1));
-    int result = rename(old_path, new_path);
+    
+    std::string resolved_old = old_path;
+    std::string resolved_new = new_path;
+    char resolved[512];
+    if (resolve_vfs_path(old_path, resolved, sizeof(resolved))) {
+        resolved_old = resolved;
+    }
+    if (resolve_vfs_path(new_path, resolved, sizeof(resolved))) {
+        resolved_new = resolved;
+    }
+
+    int result = rename(resolved_old.c_str(), resolved_new.c_str());
     if (result != 0) {
         std::cerr << "[File] rename(\"" << old_path << "\" -> \"" << new_path << "\") FAILED: " << strerror(errno) << std::endl;
     } else {
@@ -3161,7 +3182,14 @@ static void bridge_access(void* emu_ptr) {
     uint8_t* memory = emu->get_memory_base();
     const char* path = (const char*)(memory + emu->get_reg(0));
     int mode = (int)emu->get_reg(1);
-    int result = access(path, mode);
+    
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+
+    int result = access(resolved_path.c_str(), mode);
     emu->set_reg(0, (uint32_t)result);
 }
 
@@ -3169,7 +3197,14 @@ static void bridge_unlink(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
     const char* path = (const char*)(memory + emu->get_reg(0));
-    int result = unlink(path);
+    
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+
+    int result = unlink(resolved_path.c_str());
     emu->set_reg(0, (uint32_t)result);
 }
 
@@ -3374,12 +3409,18 @@ static void bridge_stat(void* emu_ptr) {
     uint32_t stat_buf_ptr = emu->get_reg(1);
     const char* path = (const char*)(memory + path_ptr);
     
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+
 #ifdef _WIN32
     struct __stat64 st;
-    int result = _stat64(path, &st);
+    int result = _stat64(resolved_path.c_str(), &st);
 #else
     struct stat st;
-    int result = stat(path, &st);
+    int result = stat(resolved_path.c_str(), &st);
 #endif
 
     if (result == 0 && stat_buf_ptr != 0) {
@@ -3420,7 +3461,7 @@ static void bridge_stat(void* emu_ptr) {
     }
     
     if (!emu->quiet_mode) {
-        std::cout << "[File] stat(\"" << path << "\") -> " << result 
+        std::cout << "[File] stat(\"" << path << "\" -> \"" << resolved_path << "\") -> " << result 
                   << " (mode: 0x" << std::hex << st.st_mode << std::dec 
                   << ", size: " << st.st_size << ")" << std::endl;
     }
@@ -3448,7 +3489,13 @@ static void bridge_opendir(void* emu_ptr) {
         std::cout << "[File] opendir(\"" << path << "\")" << std::endl;
     }
     
-    if (!fs::exists(path) || !fs::is_directory(path)) {
+    std::string resolved_path = path;
+    char resolved[512];
+    if (resolve_vfs_path(path, resolved, sizeof(resolved))) {
+        resolved_path = resolved;
+    }
+
+    if (!fs::exists(resolved_path) || !fs::is_directory(resolved_path)) {
         emu->set_reg(0, 0); // null
         return;
     }
@@ -3457,7 +3504,7 @@ static void bridge_opendir(void* emu_ptr) {
     gd->guest_dirent_addr = g_guest_heap_ptr;
     g_guest_heap_ptr += (280 + 7) & ~7; // allocate 280 bytes in guest heap for dirent struct
     
-    for (const auto& entry : fs::directory_iterator(path)) {
+    for (const auto& entry : fs::directory_iterator(resolved_path)) {
         std::string name = entry.path().filename().string();
         uint8_t type = 8; // DT_REG default
         if (entry.is_directory()) {
@@ -5710,62 +5757,64 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
     const uint8_t* file_data = memory + file_data_ptr;
     
     int width = 0, height = 0;
-    int is_etc1 = 0, is_pvrtc = 0, pvrtc_bpp = 4;
-    int is_uncompressed = 0;
-    GLenum gl_format = GL_RGBA;
-    GLenum gl_type = GL_UNSIGNED_BYTE;
-    int bpp = 4;
-    int caver_format = 1;
     const uint8_t* pixel_data = nullptr;
+    int format_type = -1;
+    
+    uint32_t gl_format = GL_RGBA;
+    uint32_t gl_type = GL_UNSIGNED_BYTE;
+    int bpp = 4;
+    char c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    uint8_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+    int caver_format = 1;
     
     // Parse PVR v3
     const HostPVRv3Header* v3 = (const HostPVRv3Header*)file_data;
     if (v3->version == 0x03525650) {
         width = v3->width;
         height = v3->height;
-        uint64_t pixel_format = v3->pixel_format;
-        if (parse_pvr_uncompressed_format(pixel_format, gl_format, gl_type, bpp, caver_format)) {
-            is_uncompressed = 1;
-        } else {
-            uint32_t fmt_low = pixel_format & 0xFFFFFFFF;
-            if (fmt_low == 6) { // ETC1
-                is_etc1 = 1;
-            } else if (fmt_low == 0 || fmt_low == 1) { // PVRTC 2bpp
-                is_pvrtc = 1; pvrtc_bpp = 2;
-            } else if (fmt_low == 2 || fmt_low == 3) { // PVRTC 4bpp
-                is_pvrtc = 1; pvrtc_bpp = 4;
-            }
-        }
         pixel_data = file_data + sizeof(HostPVRv3Header) + v3->metadata_size;
+        format_type = pvr::ParsePVRv3Format(v3->pixel_format, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
     } else {
         // Parse PVR v2
         const HostPVRv2Header* v2 = (const HostPVRv2Header*)file_data;
         if (v2->magic == 0x21525650 || v2->header_size == 44) {
             width = v2->width;
             height = v2->height;
-            uint32_t fmt = v2->flags & 0xFF;
-            if (parse_legacy_pvr_uncompressed_format(v2->flags, gl_format, gl_type, bpp, caver_format)) {
-                is_uncompressed = 1;
-            } else if (fmt == 0x36 || fmt == 0x06 || fmt == 0x12) {
-                is_etc1 = 1;
-            } else if (fmt == 0x0c || fmt == 0x18) {
-                is_pvrtc = 1; pvrtc_bpp = 2;
-            } else if (fmt == 0x0d || fmt == 0x19) {
-                is_pvrtc = 1; pvrtc_bpp = 4;
-            } else {
-                // Unknown, try ETC1 as default for Swordigo
-                is_etc1 = 1;
-            }
             pixel_data = file_data + v2->header_size;
+            format_type = pvr::ParsePVRv2Format(v2->flags, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
         } else {
             std::cerr << "[SRE-PVR] Unknown PVR header magic 0x" << std::hex << v3->version << std::dec << std::endl;
             return;
         }
     }
     
+    if (format_type < 0) {
+        std::cerr << "[SRE-PVR] Unsupported format decoding " << width << "x" << height << std::endl;
+        return;
+    }
+    
     if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
         std::cerr << "[SRE-PVR] Invalid PVR dimensions " << width << "x" << height << std::endl;
         return;
+    }
+    
+    // Map format_type to caver_format
+    if (format_type == 1) { // ETC1
+        caver_format = 1;
+    } else if (format_type == 2 || format_type == 3) { // PVRTC
+        caver_format = 1;
+    } else if (format_type >= 4 && format_type <= 6) { // DXT
+        caver_format = 1;
+    } else if (format_type == 10) { // Uncompressed
+        if (c0 == 'r' && c1 == 'g' && c2 == 'b' && c3 == 'a' && d0 == 8 && d1 == 8 && d2 == 8 && d3 == 8) caver_format = 1;
+        else if (c0 == 'b' && c1 == 'g' && c2 == 'r' && c3 == 'a' && d0 == 8 && d1 == 8 && d2 == 8 && d3 == 8) caver_format = 1;
+        else if (c0 == 'l' && c1 == 'a' && d0 == 8 && d1 == 8) caver_format = 4;
+        else if (c0 == 'l' && d0 == 8) caver_format = 6;
+        else if (c0 == 'a' && d0 == 8) caver_format = 7;
+        else if (c0 == 'r' && c1 == 'g' && c2 == 'b' && d0 == 5 && d1 == 6 && d2 == 5) caver_format = 5;
+        else if (c0 == 'r' && c1 == 'g' && c2 == 'b' && c3 == 'a' && d0 == 4 && d1 == 4 && d2 == 4 && d3 == 4) caver_format = 2;
+        else if (c0 == 'r' && c1 == 'g' && c2 == 'b' && c3 == 'a' && d0 == 5 && d1 == 5 && d2 == 5 && d3 == 1) caver_format = 3;
+        else caver_format = 1;
     }
     
     // Generate texture ID if not already generated
@@ -5790,43 +5839,42 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
     const uint8_t* upload_pixels = nullptr;
     std::vector<uint8_t> rgba;
     
-    if (is_uncompressed) {
-        upload_pixels = pixel_data;
+    if (format_type == 10) { // Uncompressed
+        rgba.assign(pixel_data, pixel_data + width * height * bpp);
+        upload_pixels = rgba.data();
         if (gl_format == GL_BGRA) { // BGRA -> swap to RGBA
-            rgba.assign(pixel_data, pixel_data + width * height * 4);
             for (size_t i = 0; i < rgba.size(); i += 4) {
                 uint8_t b = rgba[i];
                 rgba[i] = rgba[i+2];
                 rgba[i+2] = b;
             }
-            upload_pixels = rgba.data();
             gl_format = GL_RGBA;
             caver_format = 1;
         }
-    } else if (is_etc1) {
+    } else {
+        // Decode to RGBA8888
         rgba.assign(width * height * 4, 255);
-        uint32_t block_w = (width + 3) / 4;
-        uint32_t block_h = (height + 3) / 4;
-        for (uint32_t by = 0; by < block_h; by++) {
-            for (uint32_t bx = 0; bx < block_w; bx++) {
-                uint8_t block_rgba[4 * 4 * 4];
-                decode_etc1_block(pixel_data + (by * block_w + bx) * 8, block_rgba, 4 * 4);
-                for (int row = 0; row < 4 && (by * 4 + row) < height; row++) {
-                    for (int col = 0; col < 4 && (bx * 4 + col) < width; col++) {
-                        memcpy(&rgba[((by * 4 + row) * width + (bx * 4 + col)) * 4],
-                               &block_rgba[row * 16 + col * 4], 4);
-                    }
-                }
-            }
+        bool decode_success = false;
+        if (format_type == 1) { // ETC1
+            pvr::PVRTDecompressETC(pixel_data, width, height, rgba.data(), 6);
+            decode_success = true;
+        } else if (format_type == 2 || format_type == 3) { // PVRTC
+            uint32_t do2bitMode = (format_type == 2) ? 1 : 0;
+            pvr::PVRTDecompressPVRTC(pixel_data, do2bitMode, width, height, rgba.data());
+            decode_success = true;
+        } else if (format_type >= 4 && format_type <= 6) { // DXT
+            uint32_t dxt_fmt = (format_type == 4) ? 1 : ((format_type == 5) ? 3 : 5);
+            pvr::PVRTDecompressDXT(pixel_data, width, height, rgba.data(), dxt_fmt);
+            decode_success = true;
+        }
+        
+        if (!decode_success) {
+            std::cerr << "[SRE-PVR] Decoding failed for format_type: " << format_type << std::endl;
+            return;
         }
         upload_pixels = rgba.data();
-    } else if (is_pvrtc) {
-        rgba.assign(width * height * 4, 255);
-        pvr::PVRTDecompressPVRTC(pixel_data, (pvrtc_bpp == 2) ? 1 : 0, width, height, rgba.data());
-        upload_pixels = rgba.data();
-    } else {
-        std::cerr << "[SRE-PVR] Unsupported format decoding " << width << "x" << height << std::endl;
-        return;
+        gl_format = GL_RGBA;
+        gl_type = GL_UNSIGNED_BYTE;
     }
     
     glTexImage2D(GL_TEXTURE_2D, 0, gl_format, width, height, 0, gl_format, gl_type, upload_pixels);

@@ -169,18 +169,30 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
     }
     if (dpi_scale < 1.0f) dpi_scale = 1.0f;
 
+    // Intelligent layout scaling relative to window size
+    float layout_scale = 1.0f;
+    if (wh >= 1440) {
+        layout_scale = 1.5f;
+    } else if (wh >= 1080) {
+        layout_scale = 1.25f;
+    } else {
+        layout_scale = 1.0f;
+    }
+
     // Find font files
     std::string main_font_path, button_font_path, fa_path;
     const char* home_val = getenv("HOME");
     std::string home_dir = home_val ? home_val : "";
 
     std::vector<std::string> main_font_candidates = {
+        "src/assets/fonts/MegalopolisExtra-Regular.otf",
         "src/assets/fonts/Redaction10-Regular.otf",
         "src/assets/fonts/Inter-Regular.ttf",
         "/usr/share/swordigo-desktop/src/assets/fonts/Redaction10-Regular.otf",
         "/usr/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf"
     };
     if (!home_dir.empty()) {
+        main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/MegalopolisExtra-Regular.otf");
         main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Redaction10-Regular.otf");
         main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf");
         main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop-launcher/src/assets/fonts/Redaction10-Regular.otf");
@@ -198,12 +210,14 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
     }
 
     std::vector<std::string> button_font_candidates = {
+        "src/assets/fonts/MegalopolisExtra-Regular.otf",
         "src/assets/fonts/Redaction10-Bold.otf",
         "src/assets/fonts/Inter-Regular.ttf",
         "/usr/share/swordigo-desktop/src/assets/fonts/Redaction10-Bold.otf",
         "/usr/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf"
     };
     if (!home_dir.empty()) {
+        button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/MegalopolisExtra-Regular.otf");
         button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Redaction10-Bold.otf");
         button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf");
         button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop-launcher/src/assets/fonts/Redaction10-Bold.otf");
@@ -281,9 +295,12 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
 
     apply_swordfare_theme();
 
-    // Scale ImGui styles according to the high DPI scale factor
+    // Scale ImGui styles according to layout scale rather than full physical DPI scale
     ImGuiStyle& style = ImGui::GetStyle();
-    style.ScaleAllSizes(dpi_scale);
+    style.ScaleAllSizes(layout_scale);
+
+    // Apply global font scale to make rasterized high-res fonts display at the correct logical size
+    io.FontGlobalScale = layout_scale / dpi_scale;
 
     ImGui_ImplSDL3_InitForOpenGL(window, gl_ctx);
     ImGui_ImplOpenGL3_Init("#version 330 core");
@@ -359,9 +376,19 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
 
     static bool expanded = false;
 
+    // Intelligent layout scaling relative to window size
+    float layout_scale = 1.0f;
+    if (st.win_h >= 1440) {
+        layout_scale = 1.5f;
+    } else if (st.win_h >= 1080) {
+        layout_scale = 1.25f;
+    } else {
+        layout_scale = 1.0f;
+    }
+
     // -- Window position (top-left, draggable) --
     ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(expanded ? 410 : 200, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2((expanded ? 410 : 200) * layout_scale, 0), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.85f);
 
     ImGuiWindowFlags wflags =
@@ -387,8 +414,8 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
         ImGui::Text("%s", fps_label);
         ImGui::PopStyleColor();
 
-        ImGui::SameLine(expanded ? 355 : 155);
-        if (ImGui::Button(expanded ? " < ##exp" : " > ##exp", ImVec2(30, 20))) {
+        ImGui::SameLine((expanded ? 355 : 155) * layout_scale);
+        if (ImGui::Button(expanded ? " < ##exp" : " > ##exp", ImVec2(30 * layout_scale, 20 * layout_scale))) {
             expanded = !expanded;
         }
     }
@@ -408,7 +435,7 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
         // -- Render stats table --
         if (ImGui::CollapsingHeader("Render Stats", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (ImGui::BeginTable("rendertable", 2, ImGuiTableFlags_None)) {
-                ImGui::TableSetupColumn("Key",   ImGuiTableColumnFlags_WidthFixed, 140);
+                ImGui::TableSetupColumn("Key",   ImGuiTableColumnFlags_WidthFixed, 140 * layout_scale);
                 ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
 
                 auto row = [](const char* key, const char* fmt, ...) {
@@ -445,7 +472,7 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
         // -- System info --
         if (ImGui::CollapsingHeader("System & Modding", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (ImGui::BeginTable("systable", 2, ImGuiTableFlags_None)) {
-                ImGui::TableSetupColumn("Key",   ImGuiTableColumnFlags_WidthFixed, 140);
+                ImGui::TableSetupColumn("Key",   ImGuiTableColumnFlags_WidthFixed, 140 * layout_scale);
                 ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
 
                 auto row = [](const char* key, const char* fmt, ...) {

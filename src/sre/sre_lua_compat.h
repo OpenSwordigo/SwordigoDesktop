@@ -68,6 +68,14 @@
 #define lua_concat g_lua_concat
 #define lua_pushlstring g_lua_pushlstring
 #define lua_setmetatable g_lua_setmetatable
+#define lua_close g_lua_close
+#define lua_dump g_lua_dump
+#define lua_atpanic g_lua_atpanic
+#define lua_getmetatable g_lua_getmetatable
+#define lua_rawequal g_lua_rawequal
+#define lua_equal g_lua_equal
+#define lua_lessthan g_lua_lessthan
+#define lua_isuserdata g_lua_isuserdata
 
 /* Avoid duplicate macro warnings for standard helper macros */
 #undef lua_tostring

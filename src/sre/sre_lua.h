@@ -105,6 +105,14 @@ typedef void  (*pfn_lua_pushinteger)(lua_State* L, int64_t n);
 typedef void  (*pfn_lua_concat)(lua_State* L, int n);
 typedef void  (*pfn_lua_pushlstring)(lua_State* L, const char* s, size_t len);
 typedef int   (*pfn_lua_setmetatable)(lua_State* L, int idx);
+typedef void  (*pfn_lua_close)(lua_State* L);
+typedef int   (*pfn_lua_dump)(lua_State* L, int (*writer)(lua_State*, const void*, size_t, void*), void* data);
+typedef int (*(*pfn_lua_atpanic)(lua_State* L, int (*panicf)(lua_State*)))(lua_State*);
+typedef int   (*pfn_lua_getmetatable)(lua_State* L, int idx);
+typedef int   (*pfn_lua_rawequal)(lua_State* L, int idx1, int idx2);
+typedef int   (*pfn_lua_equal)(lua_State* L, int idx1, int idx2);
+typedef int   (*pfn_lua_lessthan)(lua_State* L, int idx1, int idx2);
+typedef int   (*pfn_lua_isuserdata)(lua_State* L, int idx);
 
 /* Extended globals (set by sre_init_lua_ext) */
 extern pfn_lua_pushvalue   g_lua_pushvalue;
@@ -127,6 +135,14 @@ extern pfn_lua_pushinteger g_lua_pushinteger;
 extern pfn_lua_concat      g_lua_concat;
 extern pfn_lua_pushlstring g_lua_pushlstring;
 extern pfn_lua_setmetatable g_lua_setmetatable;
+extern pfn_lua_close       g_lua_close;
+extern pfn_lua_dump        g_lua_dump;
+extern pfn_lua_atpanic     g_lua_atpanic;
+extern pfn_lua_getmetatable g_lua_getmetatable;
+extern pfn_lua_rawequal    g_lua_rawequal;
+extern pfn_lua_equal       g_lua_equal;
+extern pfn_lua_lessthan    g_lua_lessthan;
+extern pfn_lua_isuserdata  g_lua_isuserdata;
 
 #ifndef lua_h
 /* Convenience macros */
