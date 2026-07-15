@@ -26,6 +26,8 @@ float    g_cam_off_y     = 0.0f;
 float    g_cam_off_z     = 0.0f;
 bool     g_cam_smooth    = false;   // false = instant, true = smooth interp
 float    g_cam_speed_base= 90.0f;  // Units per second at 1x speed
+bool     g_cam_pov_mode  = false;
+float    g_cam_pov_facing = 1.0f;
 
 CamPreset g_cam_presets[5] = {};    // All initialized to {0,0,0,false}
 
@@ -76,6 +78,7 @@ void cam_set_active(bool active) {
     s_accel_timer = 0.0f;
     if (!active) {
         g_cam_off_x = g_cam_off_y = g_cam_off_z = 0.0f;
+        g_cam_pov_mode = false;
         mod_toast("Camera: Game Control", 1.5f);
         std::cout << "[Camera] Override DISABLED" << std::endl;
     } else {
@@ -175,6 +178,8 @@ void cam_write_to_guest() {
     static uint64_t off_y_addr = 0;
     static uint64_t off_z_addr = 0;
     static uint64_t aspect_addr = 0;
+    static uint64_t pov_mode_addr = 0;
+    static uint64_t pov_facing_addr = 0;
 
     if (active_addr == 0) {
         active_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_active");
@@ -182,12 +187,16 @@ void cam_write_to_guest() {
         off_y_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_off_y");
         off_z_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_off_z");
         aspect_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_aspect");
+        pov_mode_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_pov_mode");
+        pov_facing_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_pov_facing");
     }
 
     if (active_addr) *(int*)(g_guest_memory + active_addr) = g_cam_active ? 1 : 0;
     if (off_x_addr) *(float*)(g_guest_memory + off_x_addr) = g_cam_off_x;
     if (off_y_addr) *(float*)(g_guest_memory + off_y_addr) = g_cam_off_y;
     if (off_z_addr) *(float*)(g_guest_memory + off_z_addr) = g_cam_off_z;
+    if (pov_mode_addr) *(int*)(g_guest_memory + pov_mode_addr) = g_cam_pov_mode ? 1 : 0;
+    if (pov_facing_addr) *(float*)(g_guest_memory + pov_facing_addr) = g_cam_pov_facing;
     if (aspect_addr) {
         extern int g_win_w;
         extern int g_win_h;

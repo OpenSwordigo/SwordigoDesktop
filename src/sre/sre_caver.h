@@ -395,6 +395,8 @@ extern float g_sre_cam_off_x;
 extern float g_sre_cam_off_y;
 extern float g_sre_cam_off_z;
 extern float g_sre_cam_aspect;
+extern int g_sre_cam_pov_mode;
+extern float g_sre_cam_pov_facing;
 
 extern void (*g_orig_CameraController_Update)(void* self, float dt);
 extern void (*g_Camera_SetPerspectiveProjection)(void* self, float fov, float aspect, float near, float far);

@@ -174,6 +174,8 @@ float g_sre_cam_off_x = 0.0f;
 float g_sre_cam_off_y = 0.0f;
 float g_sre_cam_off_z = 0.0f;
 float g_sre_cam_aspect = 1.777778f;
+int g_sre_cam_pov_mode = 0;
+float g_sre_cam_pov_facing = 1.0f;
 void (*g_Camera_SetPerspectiveProjection)(void* camera, float fov, float aspect, float near, float far) = 0;
 void (*g_orig_CameraController_Update)(void* self, float dt) = 0;
 void (*g_orig_SceneGrid_UpdateVisibleAreasWithCamera)(void* self, void* camera) = 0;
@@ -346,25 +348,55 @@ void sre_CameraController_Update(void* self, float dt) {
         s_was_active = 1;
         void* camera = *(void**)((char*)self + 0x58);
         if (camera) {
-            float zoom = 1.0f + g_sre_cam_off_z / 600.0f;
-            if (zoom < 0.15f) zoom = 0.15f;
-            if (zoom > 5.0f) zoom = 5.0f;
+            if (g_sre_cam_pov_mode) {
+                extern volatile float g_sre_hero_pos_x;
+                extern volatile float g_sre_hero_pos_y;
+                extern volatile float g_sre_hero_pos_z;
 
-            float offset_x = zoom * g_sre_cam_off_x;
-            float offset_y = zoom * (300.0f + g_sre_cam_off_y);
-            float offset_z = zoom * 600.0f;
+                float cam_x = g_sre_hero_pos_x;
+                float cam_y = g_sre_hero_pos_y + 75.0f; // Eye level height
+                float cam_z = g_sre_hero_pos_z;
 
-            *(float*)((char*)self + 0x04) = offset_x;
-            *(float*)((char*)self + 0x08) = offset_y;
-            *(float*)((char*)self + 0x0c) = offset_z;
+                *(float*)((char*)camera + 0x10) = cam_x;
+                *(float*)((char*)camera + 0x14) = cam_y;
+                *(float*)((char*)camera + 0x18) = cam_z;
 
-            *(float*)((char*)self + 0x48) = 0.0f; // up_x
-            *(float*)((char*)self + 0x4c) = 1.0f; // up_y
-            *(float*)((char*)self + 0x50) = 0.0f; // up_z
+                // Rotate around Y axis to face left/right
+                float qx = 0.0f;
+                float qy = (g_sre_cam_pov_facing > 0.0f) ? -0.70710678f : 0.70710678f;
+                float qz = 0.0f;
+                float qw = 0.70710678f;
 
-            if (g_Camera_SetPerspectiveProjection) {
-                // 45 degrees FOV = 0.78539816f rad
-                g_Camera_SetPerspectiveProjection(camera, 0.78539816f, g_sre_cam_aspect, 50.0f, 20000.0f);
+                *(float*)((char*)camera + 0x1c) = qx;
+                *(float*)((char*)camera + 0x20) = qy;
+                *(float*)((char*)camera + 0x24) = qz;
+                *(float*)((char*)camera + 0x28) = qw;
+
+                if (g_Camera_SetPerspectiveProjection) {
+                    // First-person perspective FOV (approx 70 degrees)
+                    g_Camera_SetPerspectiveProjection(camera, 1.22173f, g_sre_cam_aspect, 50.0f, 20000.0f);
+                }
+            } else {
+                float zoom = 1.0f + g_sre_cam_off_z / 600.0f;
+                if (zoom < 0.15f) zoom = 0.15f;
+                if (zoom > 5.0f) zoom = 5.0f;
+
+                float offset_x = zoom * g_sre_cam_off_x;
+                float offset_y = zoom * (300.0f + g_sre_cam_off_y);
+                float offset_z = zoom * 600.0f;
+
+                *(float*)((char*)self + 0x04) = offset_x;
+                *(float*)((char*)self + 0x08) = offset_y;
+                *(float*)((char*)self + 0x0c) = offset_z;
+
+                *(float*)((char*)self + 0x48) = 0.0f; // up_x
+                *(float*)((char*)self + 0x4c) = 1.0f; // up_y
+                *(float*)((char*)self + 0x50) = 0.0f; // up_z
+
+                if (g_Camera_SetPerspectiveProjection) {
+                    // 45 degrees FOV = 0.78539816f rad
+                    g_Camera_SetPerspectiveProjection(camera, 0.78539816f, g_sre_cam_aspect, 50.0f, 20000.0f);
+                }
             }
         }
     } else if (s_was_active) {

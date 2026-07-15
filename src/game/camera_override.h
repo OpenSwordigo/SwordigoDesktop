@@ -68,6 +68,8 @@ extern float     g_cam_off_y;       // Y offset (vertical height)
 extern float     g_cam_off_z;       // Z offset (depth/zoom)
 extern bool      g_cam_smooth;      // Smooth interpolation mode
 extern float     g_cam_speed_base;  // Base movement speed (units/sec)
+extern bool      g_cam_pov_mode;    // Hero POV camera mode enabled
+extern float     g_cam_pov_facing;  // Facing direction multiplier (+1.0f or -1.0f)
 
 // ---------------------------------------------------------------
 // Camera preset slot

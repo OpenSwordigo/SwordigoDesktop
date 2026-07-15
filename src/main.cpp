@@ -1830,6 +1830,16 @@ void load_and_boot() {
                                 cam_toggle();
                                 break;
                             }
+                            if (event.key.key == SDLK_M && !event.key.repeat) {
+                                if (g_cam_active) {
+                                    g_cam_pov_mode = !g_cam_pov_mode;
+                                    char msg[64];
+                                    snprintf(msg, sizeof(msg), "Camera POV: %s", g_cam_pov_mode ? "ON" : "OFF");
+                                    mod_toast(msg, 1.5f);
+                                    cam_write_to_guest();
+                                }
+                                break;
+                            }
                             if (event.key.key == SDLK_F6 && !event.key.repeat) {
                                 g_postfx_preset = static_cast<PostFXPreset>(
                                     (static_cast<int>(g_postfx_preset) + 1) % static_cast<int>(PostFXPreset::COUNT)
@@ -2004,6 +2014,12 @@ void load_and_boot() {
                                 bool controls_hidden = false;
                                 if (sre_controls_hidden_addr) {
                                     controls_hidden = (*(int*)(g_guest_memory + sre_controls_hidden_addr) != 0);
+                                }
+                                if (event.key.key == SDLK_A || event.key.key == SDLK_D) {
+                                    if (is_down && g_cam_active && g_cam_pov_mode) {
+                                        g_cam_pov_facing = (event.key.key == SDLK_A) ? -1.0f : 1.0f;
+                                        cam_write_to_guest();
+                                    }
                                 }
                                 if (controls_hidden) {
                                     break;
@@ -5144,6 +5160,12 @@ void load_and_boot_arm64() {
                                       << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
                             break;
                         case SDL_EVENT_KEY_DOWN:
+                            if (event.key.key == SDLK_A || event.key.key == SDLK_D) {
+                                if (g_cam_active && g_cam_pov_mode) {
+                                    g_cam_pov_facing = (event.key.key == SDLK_A) ? -1.0f : 1.0f;
+                                    cam_write_to_guest();
+                                }
+                            }
                             if (should_block_keyboard()) {
                                 bool is_toggle = (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3 || event.key.key == SDLK_F4 || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE);
                                 if (!is_toggle) break;
@@ -5189,6 +5211,16 @@ void load_and_boot_arm64() {
                                 break;
                             }
                             if (event.key.key == SDLK_F5 && !event.key.repeat) { cam_toggle(); break; }
+                            if (event.key.key == SDLK_M && !event.key.repeat) {
+                                if (g_cam_active) {
+                                    g_cam_pov_mode = !g_cam_pov_mode;
+                                    char msg[64];
+                                    snprintf(msg, sizeof(msg), "Camera POV: %s", g_cam_pov_mode ? "ON" : "OFF");
+                                    mod_toast(msg, 1.5f);
+                                    cam_write_to_guest();
+                                }
+                                break;
+                            }
                             if (event.key.key == SDLK_F6 && !event.key.repeat) {
                                 g_postfx_preset = static_cast<PostFXPreset>(
                                     (static_cast<int>(g_postfx_preset) + 1) % static_cast<int>(PostFXPreset::COUNT)

@@ -247,15 +247,10 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
     /* Synchronize global camera coordinates using hero position fallback disabled */
     if (ctrl_ptr != 0) {
         void* hero = *(void**)(ctrl_ptr + 0xd8); // Hero SceneObject*
-        if (hero != 0 && TransformComponent_Interface != 0) {
-            void* tc = g_SceneObject_ComponentWithInterface(hero, TransformComponent_Interface);
-            if (tc != 0) {
-                float hx = 0.0f, hy = 0.0f, hz = 0.0f;
-                sre_transform_get_position(tc, &hx, &hy, &hz);
-                g_sre_hero_pos_x = hx;
-                g_sre_hero_pos_y = hy;
-                g_sre_hero_pos_z = hz;
-            }
+        if (hero != 0) {
+            g_sre_hero_pos_x = *(float*)((char*)hero + 0x70);
+            g_sre_hero_pos_y = *(float*)((char*)hero + 0x74);
+            g_sre_hero_pos_z = *(float*)((char*)hero + 0x78);
         }
     }
     
