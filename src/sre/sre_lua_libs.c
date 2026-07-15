@@ -1473,10 +1473,11 @@ static int sre_loadfile(lua_State* L) {
     const char* chunk_buf = buf;
     size_t chunk_len = nread;
     sre_scl_extract_lua(buf, nread, &chunk_buf, &chunk_len);
-
+    /*
     if (filename && strstr(filename, "bc.scl")) {
         sre_patch_bc_scl(chunk_buf, chunk_len);
     }
+    */
 
     /* Use loadstring(contents, chunkname) from Lua globals to compile */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "loadstring");
@@ -1570,10 +1571,11 @@ static int sre_dofile(lua_State* L) {
     const char* chunk_buf = buf;
     size_t chunk_len = nread;
     sre_scl_extract_lua(buf, nread, &chunk_buf, &chunk_len);
-
+    /*
     if (filename && strstr(filename, "bc.scl")) {
         sre_patch_bc_scl(chunk_buf, chunk_len);
     }
+    */
 
     /* Compile via loadstring */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "loadstring");

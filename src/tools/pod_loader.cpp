@@ -542,14 +542,12 @@ static void readSceneBlock(const uint8_t* data, size_t size, size_t& off, PODMod
                 break;
             case eSceneNumTextures:
                 if (len >= 4) {
-                    uint32_t count = read_u32(data, size, off);
-                    model.texture_filenames.reserve(count);
+                    model.texture_filenames.reserve(read_u32(data, size, off));
                 } else off += len;
                 break;
             case eSceneNumMaterials:
                 if (len >= 4) {
-                    uint32_t count = read_u32(data, size, off);
-                    model.materials.reserve(count);
+                    model.materials.reserve(read_u32(data, size, off));
                 } else off += len;
                 break;
             case eSceneNumFrames:

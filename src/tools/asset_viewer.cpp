@@ -33,6 +33,7 @@
 #include "tools/av_renderer.h"
 #include "tools/av_audio.h"
 #include "tools/scene_loader.h"
+#include <zlib.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +44,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
+
+#include <map>
 
 namespace fs = std::filesystem;
 
@@ -152,6 +155,12 @@ struct ViewerState {
     // Scene preview
     av::SceneData scene;
     int           selected_object = -1;
+    bool          scene_visualize_mode = false;
+    std::map<std::string, av::PODModel> scene_model_cache;
+    std::map<std::string, std::vector<av::GPUMesh>> scene_gpu_mesh_cache;
+    std::map<std::string, std::vector<GLuint>> scene_texture_cache;
+    std::vector<std::vector<av::GPUMesh>> scene_ground_gpu_meshes;
+    std::vector<std::vector<GLuint>> scene_ground_textures;
 
     // Checkerboard texture (for transparency)
     GLuint checker_tex = 0;
@@ -171,6 +180,8 @@ struct ViewerState {
 };
 
 static ViewerState g_state;
+
+static bool load_scene_model_to_cache(ViewerState& st, const std::string& mesh_name, const std::string& scene_dir_path);
 
 // ============================================================================
 // Helpers
@@ -342,6 +353,36 @@ static void free_preview_resources(ViewerState& st) {
     st.selected_object = -1;
     st.highlighted_mesh = -1;
 
+    for (auto& vec : st.scene_ground_gpu_meshes) {
+        for (auto& m : vec) {
+            av::free_mesh(m);
+        }
+    }
+    st.scene_ground_gpu_meshes.clear();
+
+    for (auto& vec : st.scene_ground_textures) {
+        for (auto tex : vec) {
+            if (tex) glDeleteTextures(1, &tex);
+        }
+    }
+    st.scene_ground_textures.clear();
+
+    for (auto& pair : st.scene_gpu_mesh_cache) {
+        for (auto& m : pair.second) {
+            av::free_mesh(m);
+        }
+    }
+    st.scene_gpu_mesh_cache.clear();
+
+    for (auto& pair : st.scene_texture_cache) {
+        for (auto tex : pair.second) {
+            if (tex) glDeleteTextures(1, &tex);
+        }
+    }
+    st.scene_texture_cache.clear();
+    st.scene_model_cache.clear();
+    st.scene_visualize_mode = false;
+
     st.preview_type = PREVIEW_NONE;
     st.status_msg.clear();
 }
@@ -350,39 +391,126 @@ static void free_preview_resources(ViewerState& st) {
 // File selection / loading
 // ============================================================================
 
+static GLuint load_tex_png(const std::string& path, int* out_w, int* out_h, std::string& format_str) {
+    gzFile file = gzopen(path.c_str(), "rb");
+    if (!file) return 0;
+
+    uint32_t header[3];
+    int read = gzread(file, header, 12);
+    if (read != 12) {
+        gzclose(file);
+        return 0;
+    }
+
+    uint32_t img_type = header[0];
+    uint32_t width = header[1];
+    uint32_t height = header[2];
+
+    *out_w = (int)width;
+    *out_h = (int)height;
+
+    int bpp = 0;
+    if (img_type == 1) {
+        bpp = 4;
+        format_str = "RGBA8888 (.tex.png)";
+    } else if (img_type == 3 || img_type == 5) {
+        bpp = 2;
+        format_str = (img_type == 3) ? "RGBA4444 (.tex.png)" : "RGB565 (.tex.png)";
+    } else {
+        gzclose(file);
+        return 0;
+    }
+
+    std::vector<uint8_t> raw_data(width * height * bpp);
+    int data_read = gzread(file, raw_data.data(), (unsigned int)raw_data.size());
+    gzclose(file);
+
+    if (data_read != (int)raw_data.size()) {
+        return 0;
+    }
+
+    GLuint tex_id = 0;
+    glGenTextures(1, &tex_id);
+    glBindTexture(GL_TEXTURE_2D, tex_id);
+
+    if (img_type == 1) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)width, (GLsizei)height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, raw_data.data());
+    } else if (img_type == 3) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)width, (GLsizei)height, 0,
+                     GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, raw_data.data());
+    } else if (img_type == 5) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, (GLsizei)width, (GLsizei)height, 0,
+                     GL_RGB, GL_UNSIGNED_SHORT_5_6_5, raw_data.data());
+    }
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    return tex_id;
+}
+
+static GLuint load_texture_file(const std::string& path, int* out_w = nullptr, int* out_h = nullptr, std::string* out_format = nullptr) {
+    std::string ext = fs::path(path).extension().string();
+    for (auto& c : ext) c = (char)tolower((unsigned char)c);
+
+    std::string low_path = path;
+    for (auto& c : low_path) c = (char)tolower((unsigned char)c);
+
+    bool is_tex_png = (low_path.size() >= 8 && low_path.substr(low_path.size() - 8) == ".tex.png");
+
+    if (is_tex_png) {
+        int w = 0, h = 0;
+        std::string format;
+        GLuint tex = load_tex_png(path, &w, &h, format);
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        if (out_format) *out_format = format;
+        return tex;
+    }
+
+    if (ext == ".pvr") {
+        int w = 0, h = 0;
+        GLuint tex = pvr_load_texture(path.c_str(), &w, &h);
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        if (out_format) *out_format = "ETC1/PVRTC (PVR)";
+        return tex;
+    }
+
+    SDL_Surface* surf = IMG_Load(path.c_str());
+    if (!surf) return 0;
+
+    SDL_Surface* conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
+    SDL_DestroySurface(surf);
+    if (!conv) return 0;
+
+    GLuint tex_id = 0;
+    glGenTextures(1, &tex_id);
+    glBindTexture(GL_TEXTURE_2D, tex_id);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, conv->w, conv->h, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, conv->pixels);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    if (out_w) *out_w = conv->w;
+    if (out_h) *out_h = conv->h;
+    if (out_format) *out_format = "RGBA8 (standard)";
+
+    SDL_DestroySurface(conv);
+    return tex_id;
+}
+
 static void try_load_matching_texture(ViewerState& st, const std::string& pod_path) {
     fs::path p(pod_path);
     std::string stem = p.stem().string();
     fs::path dir = p.parent_path();
 
-    const char* suffixes[] = {"_2x.pvr", ".pvr", "_2x.png", ".png"};
+    const char* suffixes[] = {"_2x.tex.png", ".tex.png", "_2x.pvr", ".pvr", "_2x.png", ".png"};
     for (auto& suf : suffixes) {
         fs::path candidate = dir / (stem + suf);
         if (fs::exists(candidate)) {
-            std::string cpath = candidate.string();
-            std::string ext = candidate.extension().string();
-            for (auto& c : ext) c = (char)tolower((unsigned char)c);
-
-            if (ext == ".pvr") {
-                st.model_texture = pvr_load_texture(cpath.c_str(), nullptr, nullptr);
-            } else {
-                SDL_Surface* surf = IMG_Load(cpath.c_str());
-                if (surf) {
-                    SDL_Surface* conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
-                    SDL_DestroySurface(surf);
-                    if (conv) {
-                        GLuint tex;
-                        glGenTextures(1, &tex);
-                        glBindTexture(GL_TEXTURE_2D, tex);
-                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, conv->w, conv->h, 0,
-                                     GL_RGBA, GL_UNSIGNED_BYTE, conv->pixels);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                        st.model_texture = tex;
-                        SDL_DestroySurface(conv);
-                    }
-                }
-            }
+            st.model_texture = load_texture_file(candidate.string());
             if (st.model_texture) return;
         }
     }
@@ -404,33 +532,7 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
     switch (fe.type) {
     case FTYPE_TEXTURE: {
         st.preview_type = PREVIEW_TEXTURE;
-        std::string ext = fs::path(fe.name).extension().string();
-        for (auto& c : ext) c = (char)tolower((unsigned char)c);
-
-        if (ext == ".pvr") {
-            st.preview_tex = pvr_load_texture(fe.full_path.c_str(), &st.tex_w, &st.tex_h);
-            st.tex_format_str = "ETC1/PVRTC (PVR)";
-        } else {
-            SDL_Surface* surf = IMG_Load(fe.full_path.c_str());
-            if (surf) {
-                SDL_Surface* conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
-                SDL_DestroySurface(surf);
-                if (conv) {
-                    GLuint tex;
-                    glGenTextures(1, &tex);
-                    glBindTexture(GL_TEXTURE_2D, tex);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, conv->w, conv->h, 0,
-                                 GL_RGBA, GL_UNSIGNED_BYTE, conv->pixels);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                    st.preview_tex = tex;
-                    st.tex_w = conv->w;
-                    st.tex_h = conv->h;
-                    st.tex_format_str = "RGBA8 (" + std::string(ext.c_str() + 1) + ")";
-                    SDL_DestroySurface(conv);
-                }
-            }
-        }
+        st.preview_tex = load_texture_file(fe.full_path, &st.tex_w, &st.tex_h, &st.tex_format_str);
         if (st.preview_tex)
             st.status_msg = "Loaded " + fe.name + " — " + std::to_string(st.tex_w) + "x" + std::to_string(st.tex_h);
         else
@@ -478,9 +580,11 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
             fs::path tex_path = model_dir / tex_name;
             std::string stem = tex_path.stem().string();
 
-            // Candidates list (original name, PVRTC 2x/1x, PNG 2x/1x)
+            // Candidates list (original name, tex.png, PVR, PNG)
             std::vector<fs::path> candidates = {
                 tex_path,
+                model_dir / (stem + "_2x.tex.png"),
+                model_dir / (stem + ".tex.png"),
                 model_dir / (stem + "_2x.pvr"),
                 model_dir / (stem + ".pvr"),
                 model_dir / (stem + "_2x.png"),
@@ -491,28 +595,7 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
             bool found = false;
             for (const auto& cand : candidates) {
                 if (fs::exists(cand)) {
-                    std::string cpath = cand.string();
-                    std::string ext = cand.extension().string();
-                    for (auto& c : ext) c = (char)tolower((unsigned char)c);
-
-                    if (ext == ".pvr") {
-                        tex_id = pvr_load_texture(cpath.c_str(), nullptr, nullptr);
-                    } else {
-                        SDL_Surface* surf = IMG_Load(cpath.c_str());
-                        if (surf) {
-                            SDL_Surface* conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
-                            SDL_DestroySurface(surf);
-                            if (conv) {
-                                glGenTextures(1, &tex_id);
-                                glBindTexture(GL_TEXTURE_2D, tex_id);
-                                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, conv->w, conv->h, 0,
-                                             GL_RGBA, GL_UNSIGNED_BYTE, conv->pixels);
-                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                                SDL_DestroySurface(conv);
-                            }
-                        }
-                    }
+                    tex_id = load_texture_file(cand.string());
                     if (tex_id) {
                         found = true;
                         break;
@@ -550,6 +633,35 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
         if (st.scene.objects.empty()) {
             st.status_msg = "Failed to parse " + fe.name;
         } else {
+            st.scene_model_cache.clear();
+            st.scene_gpu_mesh_cache.clear();
+            st.scene_texture_cache.clear();
+            st.scene_visualize_mode = false;
+
+            fs::path scene_dir = fs::path(fe.full_path).parent_path();
+            for (const auto& obj : st.scene.objects) {
+                if (!obj.mesh_name.empty()) {
+                    load_scene_model_to_cache(st, obj.mesh_name, scene_dir.string());
+                }
+                if (!obj.background_name.empty()) {
+                    load_scene_model_to_cache(st, obj.background_name, scene_dir.string());
+                }
+            }
+
+            st.camera = av::Camera{};
+            float bounds_center_x = (st.scene.bounds_min[0] + st.scene.bounds_max[0]) * 0.5f;
+            float bounds_center_y = (st.scene.bounds_min[1] + st.scene.bounds_max[1]) * 0.5f;
+            float bounds_center_z = (st.scene.bounds_min[2] + st.scene.bounds_max[2]) * 0.5f;
+            st.camera.target[0] = bounds_center_x;
+            st.camera.target[1] = bounds_center_y;
+            st.camera.target[2] = bounds_center_z;
+
+            float dx = st.scene.bounds_max[0] - st.scene.bounds_min[0];
+            float dy = st.scene.bounds_max[1] - st.scene.bounds_min[1];
+            float dz = st.scene.bounds_max[2] - st.scene.bounds_min[2];
+            st.camera.distance = std::sqrt(dx*dx + dy*dy + dz*dz) * 1.2f;
+            if (st.camera.distance < 5.0f) st.camera.distance = 25.0f;
+
             char buf[256];
             snprintf(buf, sizeof(buf), "Loaded %s — %d objects",
                      fe.name.c_str(), (int)st.scene.objects.size());
@@ -1038,6 +1150,336 @@ static void draw_audio_player(ViewerState& st) {
     ImGui::PopItemWidth();
 }
 
+static bool load_scene_model_to_cache(ViewerState& st, const std::string& mesh_name, const std::string& scene_dir_path) {
+    if (st.scene_model_cache.count(mesh_name)) return true;
+
+    fs::path scene_dir(scene_dir_path);
+    std::vector<fs::path> search_paths = {
+        scene_dir / mesh_name,
+        scene_dir.parent_path() / mesh_name,
+        scene_dir.parent_path() / "models" / mesh_name,
+        scene_dir.parent_path() / "resources" / mesh_name,
+        fs::path(g_assets_dir) / "resources" / mesh_name,
+        fs::path(g_assets_dir) / "resources" / "models" / mesh_name
+    };
+
+    fs::path resolved_path;
+    for (const auto& path : search_paths) {
+        if (fs::exists(path)) {
+            resolved_path = path;
+            break;
+        }
+    }
+
+    if (resolved_path.empty()) {
+        return false;
+    }
+
+    av::PODModel model = av::pod_load(resolved_path.string());
+    if (model.meshes.empty()) return false;
+
+    std::vector<av::GPUMesh> gpu_meshes;
+    for (auto& mesh : model.meshes) {
+        const float*    pos = mesh.positions.empty()  ? nullptr : mesh.positions.data();
+        const float*    nrm = mesh.normals.empty()    ? nullptr : mesh.normals.data();
+        const float*    uv  = mesh.uvs.empty()        ? nullptr : mesh.uvs.data();
+        const uint16_t* idx = mesh.indices.empty()    ? nullptr : mesh.indices.data();
+        av::GPUMesh gm = av::upload_mesh(pos, nrm, uv, mesh.num_vertices,
+                                          idx, (int)mesh.indices.size());
+        gpu_meshes.push_back(gm);
+    }
+
+    std::vector<GLuint> model_textures;
+    fs::path model_dir = resolved_path.parent_path();
+    for (const auto& tex_name : model.texture_filenames) {
+        if (tex_name.empty()) {
+            model_textures.push_back(0);
+            continue;
+        }
+        fs::path tex_path = model_dir / tex_name;
+        std::string stem = tex_path.stem().string();
+
+        std::vector<fs::path> candidates = {
+            tex_path,
+            model_dir / (stem + "_2x.tex.png"),
+            model_dir / (stem + ".tex.png"),
+            model_dir / (stem + "_2x.pvr"),
+            model_dir / (stem + ".pvr"),
+            model_dir / (stem + "_2x.png"),
+            model_dir / (stem + ".png")
+        };
+
+        GLuint tex_id = 0;
+        for (const auto& cand : candidates) {
+            if (fs::exists(cand)) {
+                tex_id = load_texture_file(cand.string());
+                if (tex_id) break;
+            }
+        }
+        model_textures.push_back(tex_id);
+    }
+
+    if (model_textures.empty() || (model_textures.size() == 1 && model_textures[0] == 0)) {
+        std::string stem = resolved_path.stem().string();
+        std::vector<fs::path> candidates = {
+            model_dir / (stem + "_2x.pvr"),
+            model_dir / (stem + ".pvr"),
+            model_dir / (stem + "_2x.png"),
+            model_dir / (stem + ".png")
+        };
+        GLuint tex_id = 0;
+        for (const auto& cand : candidates) {
+            if (fs::exists(cand)) {
+                std::string cpath = cand.string();
+                std::string ext = cand.extension().string();
+                for (auto& c : ext) c = (char)tolower((unsigned char)c);
+                if (ext == ".pvr") {
+                    tex_id = pvr_load_texture(cpath.c_str(), nullptr, nullptr);
+                } else {
+                    SDL_Surface* surf = IMG_Load(cpath.c_str());
+                    if (surf) {
+                        SDL_Surface* conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
+                        SDL_DestroySurface(surf);
+                        if (conv) {
+                            glGenTextures(1, &tex_id);
+                            glBindTexture(GL_TEXTURE_2D, tex_id);
+                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, conv->w, conv->h, 0,
+                                         GL_RGBA, GL_UNSIGNED_BYTE, conv->pixels);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                            SDL_DestroySurface(conv);
+                        }
+                    }
+                }
+                if (tex_id) break;
+            }
+        }
+        if (tex_id) {
+            if (model_textures.empty()) model_textures.push_back(tex_id);
+            else model_textures[0] = tex_id;
+        }
+    }
+
+    st.scene_model_cache[mesh_name] = std::move(model);
+    st.scene_gpu_mesh_cache[mesh_name] = std::move(gpu_meshes);
+    st.scene_texture_cache[mesh_name] = std::move(model_textures);
+
+    return true;
+}
+
+static void upload_scene_ground_meshes(ViewerState& st, const std::string& scene_dir_path) {
+    st.scene_ground_gpu_meshes.clear();
+    st.scene_ground_textures.clear();
+
+    st.scene_ground_gpu_meshes.resize(st.scene.objects.size());
+    st.scene_ground_textures.resize(st.scene.objects.size());
+
+    fs::path scene_dir(scene_dir_path);
+
+    for (size_t idx = 0; idx < st.scene.objects.size(); ++idx) {
+        const auto& obj = st.scene.objects[idx];
+        for (size_t gi = 0; gi < obj.ground_meshes.size(); ++gi) {
+            const auto& mesh = obj.ground_meshes[gi];
+            const float*    pos = mesh.positions.empty()  ? nullptr : mesh.positions.data();
+            const float*    nrm = mesh.normals.empty()    ? nullptr : mesh.normals.data();
+            const float*    uv  = mesh.uvs.empty()        ? nullptr : mesh.uvs.data();
+            const uint16_t* idx_ptr = mesh.indices.empty() ? nullptr : mesh.indices.data();
+            av::GPUMesh gm = av::upload_mesh(pos, nrm, uv, mesh.num_vertices,
+                                              idx_ptr, (int)mesh.indices.size());
+            st.scene_ground_gpu_meshes[idx].push_back(gm);
+
+            std::string tex_name = obj.ground_mesh_textures[gi];
+            GLuint tex_id = 0;
+            if (!tex_name.empty()) {
+                fs::path tex_path = scene_dir / tex_name;
+                std::string stem = tex_path.stem().string();
+
+                std::vector<fs::path> candidates = {
+                    tex_path,
+                    scene_dir.parent_path() / tex_name,
+                    scene_dir.parent_path() / "textures" / tex_name,
+                    scene_dir.parent_path() / "models" / tex_name,
+                    fs::path(g_assets_dir) / "resources" / tex_name,
+                    scene_dir / (stem + "_2x.tex.png"),
+                    scene_dir / (stem + ".tex.png"),
+                    scene_dir / (stem + "_2x.pvr"),
+                    scene_dir / (stem + ".pvr"),
+                    scene_dir / (stem + "_2x.png"),
+                    scene_dir / (stem + ".png"),
+                    scene_dir.parent_path() / (stem + "_2x.tex.png"),
+                    scene_dir.parent_path() / (stem + ".tex.png"),
+                    scene_dir.parent_path() / (stem + "_2x.pvr"),
+                    scene_dir.parent_path() / (stem + ".pvr"),
+                    scene_dir.parent_path() / (stem + "_2x.png"),
+                    scene_dir.parent_path() / (stem + ".png")
+                };
+
+                for (const auto& cand : candidates) {
+                    if (fs::exists(cand)) {
+                        tex_id = load_texture_file(cand.string());
+                        if (tex_id) break;
+                    }
+                }
+            }
+            st.scene_ground_textures[idx].push_back(tex_id);
+        }
+    }
+}
+
+static void draw_scene_visualizer(ViewerState& st) {
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    int w = (int)avail.x;
+    int h = (int)avail.y;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+
+    if (!st.fbo) {
+        st.fbo = av::create_fbo(w, h, &st.fbo_tex);
+        st.fbo_w = w; st.fbo_h = h;
+    } else if (w != st.fbo_w || h != st.fbo_h) {
+        av::resize_fbo(st.fbo, w, h, &st.fbo_tex);
+        st.fbo_w = w; st.fbo_h = h;
+    }
+
+    av::begin_3d(st.fbo, w, h, st.camera);
+    av::render_grid(100.0f, st.scene.bounds_min[1]);
+
+    float white[4] = {1, 1, 1, 1};
+    float highlight[4] = {0.4f, 0.7f, 1.0f, 1.0f};
+
+    for (int idx = 0; idx < (int)st.scene.objects.size(); ++idx) {
+        const auto& obj = st.scene.objects[idx];
+
+        float T[16], R[16], S[16], temp[16], obj_mat[16];
+        av::mat4_translate(T, obj.pos_x, obj.pos_y, obj.pos_z);
+        av::mat4_rotate_y(R, obj.rot_y);
+        
+        av::mat4_identity(S);
+        S[0] = obj.scale_x;
+        S[5] = obj.scale_y;
+        S[10] = obj.scale_z;
+
+        av::mat4_multiply(temp, T, R);
+        av::mat4_multiply(obj_mat, temp, S);
+
+        // Draw embedded ground meshes (if any)
+        if (idx < (int)st.scene_ground_gpu_meshes.size()) {
+            const auto& gm_vec = st.scene_ground_gpu_meshes[idx];
+            const auto& tex_vec = st.scene_ground_textures[idx];
+            for (size_t gi = 0; gi < gm_vec.size(); ++gi) {
+                auto& gm = const_cast<av::GPUMesh&>(gm_vec[gi]);
+                if (st.show_textured && gi < tex_vec.size()) {
+                    gm.texture_id = tex_vec[gi];
+                } else {
+                    gm.texture_id = 0;
+                }
+
+                float* col = (idx == st.selected_object) ? highlight : white;
+                av::render_mesh(gm, obj_mat, col, false);
+
+                if (st.show_wireframe) {
+                    float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
+                    av::render_mesh(gm, obj_mat, wire_col, true);
+                }
+            }
+        }
+
+        std::string mname = obj.mesh_name.empty() ? obj.background_name : obj.mesh_name;
+        if (mname.empty()) continue;
+
+        if (!st.scene_model_cache.count(mname)) continue;
+
+        const auto& model = st.scene_model_cache[mname];
+        const auto& gpu_meshes = st.scene_gpu_mesh_cache[mname];
+        const auto& textures = st.scene_texture_cache[mname];
+
+        if (!model.nodes.empty()) {
+            for (int ni = 0; ni < (int)model.nodes.size(); ni++) {
+                const auto& node = model.nodes[ni];
+                if (node.object_index < 0 || node.object_index >= (int)gpu_meshes.size()) continue;
+
+                auto& gm = const_cast<av::GPUMesh&>(gpu_meshes[node.object_index]);
+                if (st.show_textured) {
+                    int mat_idx = node.material_index;
+                    int tex_idx = -1;
+                    if (mat_idx >= 0 && mat_idx < (int)model.materials.size()) {
+                        tex_idx = model.materials[mat_idx].diffuse_texture_index;
+                    }
+                    if (tex_idx >= 0 && tex_idx < (int)textures.size()) {
+                        gm.texture_id = textures[tex_idx];
+                    } else if (!textures.empty()) {
+                        gm.texture_id = textures[0];
+                    } else {
+                        gm.texture_id = 0;
+                    }
+                } else {
+                    gm.texture_id = 0;
+                }
+
+                float node_matrix[16], final_matrix[16];
+                av::get_node_matrix(model, ni, 0, node_matrix);
+                av::mat4_multiply(final_matrix, obj_mat, node_matrix);
+
+                float* col = (idx == st.selected_object) ? highlight : white;
+                av::render_mesh(gm, final_matrix, col, false);
+
+                if (st.show_wireframe) {
+                    float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
+                    av::render_mesh(gm, final_matrix, wire_col, true);
+                }
+            }
+        } else {
+            for (int mi = 0; mi < (int)gpu_meshes.size(); mi++) {
+                auto& gm = const_cast<av::GPUMesh&>(gpu_meshes[mi]);
+                if (st.show_textured && !textures.empty()) {
+                    gm.texture_id = textures[0];
+                } else {
+                    gm.texture_id = 0;
+                }
+
+                float* col = (idx == st.selected_object) ? highlight : white;
+                av::render_mesh(gm, obj_mat, col, false);
+
+                if (st.show_wireframe) {
+                    float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
+                    av::render_mesh(gm, obj_mat, wire_col, true);
+                }
+            }
+        }
+    }
+    av::end_3d();
+
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImGui::Image((ImTextureID)(intptr_t)st.fbo_tex, ImVec2((float)w, (float)h), ImVec2(0, 1), ImVec2(1, 0));
+
+    if (ImGui::IsItemHovered()) {
+        ImGuiIO& io = ImGui::GetIO();
+
+        if (io.MouseWheel != 0.0f) {
+            st.camera.distance *= (1.0f - io.MouseWheel * 0.1f);
+            if (st.camera.distance < 0.1f) st.camera.distance = 0.1f;
+            if (st.camera.distance > 2000.0f) st.camera.distance = 2000.0f;
+        }
+
+        if (ImGui::IsMouseDragging(0)) {
+            ImVec2 delta = io.MouseDelta;
+            st.camera.yaw   += delta.x * 0.5f;
+            st.camera.pitch += delta.y * 0.5f;
+            if (st.camera.pitch >  89.0f) st.camera.pitch =  89.0f;
+            if (st.camera.pitch < -89.0f) st.camera.pitch = -89.0f;
+        }
+
+        if (ImGui::IsMouseDragging(1)) {
+            ImVec2 delta = io.MouseDelta;
+            float scale = st.camera.distance * 0.003f;
+            float yaw_rad = st.camera.yaw * 3.14159f / 180.0f;
+            st.camera.target[0] -= (cosf(yaw_rad) * delta.x) * scale;
+            st.camera.target[2] -= (-sinf(yaw_rad) * delta.x) * scale;
+            st.camera.target[1] += delta.y * scale;
+        }
+    }
+}
+
 // ============================================================================
 // UI: Center panel dispatcher
 // ============================================================================
@@ -1046,7 +1488,13 @@ static void draw_center_panel(ViewerState& st) {
     switch (st.preview_type) {
         case PREVIEW_MODEL:   draw_model_viewport(st);  break;
         case PREVIEW_TEXTURE: draw_texture_preview(st);  break;
-        case PREVIEW_SCENE:   draw_scene_inspector(st);  break;
+        case PREVIEW_SCENE:
+            if (st.scene_visualize_mode) {
+                draw_scene_visualizer(st);
+            } else {
+                draw_scene_inspector(st);
+            }
+            break;
         case PREVIEW_AUDIO:   draw_audio_player(st);     break;
         default: {
             ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -1216,6 +1664,18 @@ static void draw_properties_panel(ViewerState& st) {
     case PREVIEW_SCENE: {
         ImGui::Text("Objects: %d", (int)st.scene.objects.size());
         ImGui::Separator();
+        
+        if (st.scene_visualize_mode) {
+            if (ImGui::Button("Switch to Tree Inspector")) {
+                st.scene_visualize_mode = false;
+            }
+        } else {
+            if (ImGui::Button("Switch to 3D Visualizer")) {
+                st.scene_visualize_mode = true;
+            }
+        }
+        ImGui::Separator();
+
         if (st.selected_object >= 0 && st.selected_object < (int)st.scene.objects.size()) {
             auto& obj = st.scene.objects[st.selected_object];
             ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Selected Object");
@@ -1365,6 +1825,18 @@ static bool handle_shortcuts(ViewerState& st) {
             st.camera.target[2] = st.model.center_z;
             st.camera.distance  = st.model.radius * 2.5f;
             if (st.camera.distance < 1.0f) st.camera.distance = 3.0f;
+        } else if (st.preview_type == PREVIEW_SCENE) {
+            float bounds_center_x = (st.scene.bounds_min[0] + st.scene.bounds_max[0]) * 0.5f;
+            float bounds_center_y = (st.scene.bounds_min[1] + st.scene.bounds_max[1]) * 0.5f;
+            float bounds_center_z = (st.scene.bounds_min[2] + st.scene.bounds_max[2]) * 0.5f;
+            st.camera.target[0] = bounds_center_x;
+            st.camera.target[1] = bounds_center_y;
+            st.camera.target[2] = bounds_center_z;
+            float dx = st.scene.bounds_max[0] - st.scene.bounds_min[0];
+            float dy = st.scene.bounds_max[1] - st.scene.bounds_min[1];
+            float dz = st.scene.bounds_max[2] - st.scene.bounds_min[2];
+            st.camera.distance = std::sqrt(dx*dx + dy*dy + dz*dz) * 1.2f;
+            if (st.camera.distance < 5.0f) st.camera.distance = 25.0f;
         }
     }
 
@@ -1626,6 +2098,18 @@ int main(int argc, char* argv[]) {
                         g_state.camera.target[2] = g_state.model.center_z;
                         g_state.camera.distance  = g_state.model.radius * 2.5f;
                         if (g_state.camera.distance < 1.0f) g_state.camera.distance = 3.0f;
+                    } else if (g_state.preview_type == PREVIEW_SCENE) {
+                        float bounds_center_x = (g_state.scene.bounds_min[0] + g_state.scene.bounds_max[0]) * 0.5f;
+                        float bounds_center_y = (g_state.scene.bounds_min[1] + g_state.scene.bounds_max[1]) * 0.5f;
+                        float bounds_center_z = (g_state.scene.bounds_min[2] + g_state.scene.bounds_max[2]) * 0.5f;
+                        g_state.camera.target[0] = bounds_center_x;
+                        g_state.camera.target[1] = bounds_center_y;
+                        g_state.camera.target[2] = bounds_center_z;
+                        float dx = g_state.scene.bounds_max[0] - g_state.scene.bounds_min[0];
+                        float dy = g_state.scene.bounds_max[1] - g_state.scene.bounds_min[1];
+                        float dz = g_state.scene.bounds_max[2] - g_state.scene.bounds_min[2];
+                        g_state.camera.distance = std::sqrt(dx*dx + dy*dy + dz*dz) * 1.2f;
+                        if (g_state.camera.distance < 5.0f) g_state.camera.distance = 25.0f;
                     }
                 }
                 ImGui::EndMenu();

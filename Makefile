@@ -218,7 +218,7 @@ AV_SRCS := src/tools/asset_viewer.cpp \
     src/imgui/imgui_tables.cpp src/imgui/imgui_widgets.cpp \
     src/imgui/backends/imgui_impl_sdl3.cpp src/imgui/backends/imgui_impl_opengl3.cpp
 AV_OBJS := $(patsubst src/%.cpp, build/%.o, $(AV_SRCS))
-AV_LIBS := $(SDL3_LIBS) $(SDL3I_LIBS) -lGL
+AV_LIBS := $(SDL3_LIBS) $(SDL3I_LIBS) -lGL $(ZLIB_LIBS)
 
 ruby: $(AV_OBJS)
 	@echo "[LINK] $@"

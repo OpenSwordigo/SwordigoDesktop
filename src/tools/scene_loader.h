@@ -16,6 +16,7 @@
 
 #include <string>
 #include <vector>
+#include "tools/pod_loader.h"
 
 namespace av {
 
@@ -44,6 +45,10 @@ struct SceneObject {
     std::string mesh_name;       // .POD model name if MeshRenderer found
     std::string texture_name;    // texture name if found in component data
     std::string background_name; // background model if Background component
+
+    // Embedded GroundMesh meshes and textures
+    std::vector<PODMesh> ground_meshes;
+    std::vector<std::string> ground_mesh_textures;
 };
 
 // ============================================================

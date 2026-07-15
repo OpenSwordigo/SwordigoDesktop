@@ -384,7 +384,7 @@ void sre_init(uint64_t swordigo_base, uint64_t empty_bss_off) {
         config_ret = sre_config_load_toml("/Assets/resources/mini.toml", &config);
     }
     
-    /* Diagnostic: scan the compiled is.scl to verify if the button strings exist in it */
+    /*
     extern char g_sre_vfs_path_assets[512];
     char scl_path[512];
     snprintf(scl_path, sizeof(scl_path), "%s/resources/is.scl", g_sre_vfs_path_assets);
@@ -421,6 +421,7 @@ void sre_init(uint64_t swordigo_base, uint64_t empty_bss_off) {
             fclose(f_diag);
         }
     }
+    */
 
     if (config_ret == 0) {
         strncpy(g_sre_mod_name, config.mod_name, sizeof(g_sre_mod_name) - 1);
