@@ -25,6 +25,17 @@ typedef void SceneController;
 typedef void Component;
 
 /* =========================================================================
+ * FloatColor — Caver::FloatColor (4 × float, matching SwKiWi types.h)
+ * Used by SwingableWeaponComponent::SetGlowColor
+ * ========================================================================= */
+typedef struct {
+    float R;
+    float G;
+    float B;
+    float A;
+} SreFloatColor;
+
+/* =========================================================================
  * ARM64 struct field accessor macros
  * =========================================================================
  * $F(type, ptr, offset) — read field at byte offset
@@ -255,6 +266,19 @@ extern pfn_GameSceneController_CanCastSkill g_sre_GameSceneController_CanCastSki
 // GameSceneView
 typedef void (*pfn_GameSceneView_HideCinematicSkipButton)(void*, int);
 extern pfn_GameSceneView_HideCinematicSkipButton g_sre_GameSceneView_HideCinematicSkipButton;
+
+/* =========================================================================
+ * SwingableWeaponComponent glow helpers
+ *
+ * SetGlowColor:     _ZN5Caver24SwingableWeaponComponent12SetGlowColorENS_10FloatColorE
+ *                   GhidraDecomp ARM64 address: 0x00228d01
+ * SetGlowIntensity: _ZN5Caver24SwingableWeaponComponent16SetGlowIntensityEf
+ *                   GhidraDecomp ARM64 address: 0x00228c49
+ * ========================================================================= */
+typedef void (*pfn_SwingableWeapon_SetGlowColor)(void* swc, SreFloatColor* color);
+typedef void (*pfn_SwingableWeapon_SetGlowIntensity)(void* swc, float intensity);
+extern pfn_SwingableWeapon_SetGlowColor    g_SwingableWeapon_SetGlowColor;
+extern pfn_SwingableWeapon_SetGlowIntensity g_SwingableWeapon_SetGlowIntensity;
 
 // CameraController shared globals & hook
 extern int g_sre_cam_active;

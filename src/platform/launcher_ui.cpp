@@ -971,12 +971,12 @@ static void DrawDetailPanel(BinarySelector& selector, int selected,
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open instance folder in file manager");
 
     ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_EYE "  Asset Viewer", ImVec2(btn_w, 36))) {
+    if (ImGui::Button(ICON_FA_EYE "  Ruby Viewer", ImVec2(btn_w, 36))) {
         pid_t pid = fork();
         if (pid == 0) {
             // Try local build first, then installed path
-            execlp("./asset_viewer", "asset_viewer", nullptr);
-            execlp("asset_viewer", "asset_viewer", nullptr);
+            execlp("./ruby", "ruby", nullptr);
+            execlp("ruby", "ruby", nullptr);
             _exit(1);
         }
     }
@@ -1640,12 +1640,16 @@ LaunchConfig show_launcher(BinarySelector& selector) {
         std::string inter_paths[] = {
             "src/assets/fonts/MegalopolisExtra-Regular.otf",
             get_data_path("src/assets/fonts/MegalopolisExtra-Regular.otf"),
-            get_user_data_dir() + "/launcher/fonts/MegalopolisExtra-Regular.otf",
-            get_user_data_dir() + "/src/assets/fonts/MegalopolisExtra-Regular.otf",
+            get_user_data_dir() + "launcher/fonts/MegalopolisExtra-Regular.otf",
+            get_user_data_dir() + "src/assets/fonts/MegalopolisExtra-Regular.otf",
             get_data_path("src/assets/fonts/Inter-Regular.ttf"),
-            get_user_data_dir() + "/launcher/fonts/Inter-Regular.ttf",
-            get_user_data_dir() + "/src/assets/fonts/Inter-Regular.ttf",
+            get_user_data_dir() + "launcher/fonts/Inter-Regular.ttf",
+            get_user_data_dir() + "src/assets/fonts/Inter-Regular.ttf",
             "src/assets/fonts/Inter-Regular.ttf",
+            "/usr/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
+            "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
+            "/usr/local/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
+            "/usr/local/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
             "/usr/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf",
         };
         
@@ -1654,17 +1658,23 @@ LaunchConfig show_launcher(BinarySelector& selector) {
             "src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
             get_data_path("src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf"),
             // launcher/ subfolder (RPM/DEB friendly)
-            get_user_data_dir() + "/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
-            get_user_data_dir() + "/launcher/fonts/fa-solid-900.ttf",
-            get_user_data_dir() + "/launcher/fonts/fa-solid-900.otf",
+            get_user_data_dir() + "launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+            get_user_data_dir() + "launcher/fonts/fa-solid-900.ttf",
+            get_user_data_dir() + "launcher/fonts/fa-solid-900.otf",
             // FA6/FA7 in fonts directory (legacy/simple naming)
             "src/assets/fonts/fa-solid-900.ttf",
             "src/assets/fonts/fa-solid-900.otf",
             get_data_path("src/assets/fonts/fa-solid-900.ttf"),
             get_data_path("src/assets/fonts/fa-solid-900.otf"),
-            get_user_data_dir() + "/src/assets/fonts/fa-solid-900.ttf",
-            get_user_data_dir() + "/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
-            // System install paths
+            get_user_data_dir() + "src/assets/fonts/fa-solid-900.ttf",
+            get_user_data_dir() + "src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+            // System install paths (RPM/DEB friendly launcher/ subfolders)
+            "/usr/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+            "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf",
+            "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.otf",
+            "/usr/local/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+            "/usr/local/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf",
+            "/usr/local/share/swordigo-desktop/launcher/fonts/fa-solid-900.otf",
             "/usr/share/swordigo-desktop/src/assets/fonts/fa-solid-900.ttf",
             "/usr/share/swordigo-desktop/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
         };
@@ -1736,17 +1746,17 @@ LaunchConfig show_launcher(BinarySelector& selector) {
             tex = LoadTextureFromFile((std::string("src/assets/") + sub).c_str(), &w, &h);
             // Try 2: launcher/ subfolder in user data dir (RPM/DEB friendly)
             if (!tex) {
-                std::string p2 = get_user_data_dir() + "/launcher/" + sub;
+                std::string p2 = get_user_data_dir() + "launcher/" + sub;
                 tex = LoadTextureFromFile(p2.c_str(), &w, &h);
             }
             // Try 3: user data dir src/assets (legacy layout)
             if (!tex) {
-                std::string p3 = get_user_data_dir() + "/src/assets/" + sub;
+                std::string p3 = get_user_data_dir() + "src/assets/" + sub;
                 tex = LoadTextureFromFile(p3.c_str(), &w, &h);
             }
             // Try 3b: user data dir /assets/ (original fallback)
             if (!tex) {
-                std::string p3b = get_user_data_dir() + "/assets/" + sub;
+                std::string p3b = get_user_data_dir() + "assets/" + sub;
                 tex = LoadTextureFromFile(p3b.c_str(), &w, &h);
             }
             // Try 4: via get_data_path (resolves system install paths)
@@ -1759,10 +1769,25 @@ LaunchConfig show_launcher(BinarySelector& selector) {
                 std::string p5 = get_data_path(std::string("src/assets/") + sub);
                 tex = LoadTextureFromFile(p5.c_str(), &w, &h);
             }
+            // Try 5b: launcher/ folder under get_data_path
+            if (!tex) {
+                std::string p5b = get_data_path(std::string("launcher/") + sub);
+                tex = LoadTextureFromFile(p5b.c_str(), &w, &h);
+            }
             // Try 6: system install path (deb/rpm packages)
             if (!tex) {
-                std::string p6 = std::string("/usr/share/swordigo-desktop/src/assets/") + sub;
+                std::string p6 = std::string("/usr/share/swordigo-desktop/launcher/") + sub;
                 tex = LoadTextureFromFile(p6.c_str(), &w, &h);
+            }
+            // Try 6b: local system install path
+            if (!tex) {
+                std::string p6b = std::string("/usr/local/share/swordigo-desktop/launcher/") + sub;
+                tex = LoadTextureFromFile(p6b.c_str(), &w, &h);
+            }
+            // Try 7: fallback to old packaging paths
+            if (!tex) {
+                std::string p7 = std::string("/usr/share/swordigo-desktop/src/assets/") + sub;
+                tex = LoadTextureFromFile(p7.c_str(), &w, &h);
             }
             if (ow) *ow = w;
             if (oh) *oh = h;

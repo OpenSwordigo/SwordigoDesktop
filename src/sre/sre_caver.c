@@ -178,6 +178,14 @@ void (*g_Camera_SetPerspectiveProjection)(void* camera, float fov, float aspect,
 void (*g_orig_CameraController_Update)(void* self, float dt) = 0;
 void (*g_orig_SceneGrid_UpdateVisibleAreasWithCamera)(void* self, void* camera) = 0;
 
+/* SwingableWeaponComponent glow function pointers
+ * Addresses from GhidraDecomp (ARM64, libswordigo_v1.4.12.so, base 0x0):
+ *   SetGlowIntensity  0x00228c49
+ *   SetGlowColor      0x00228d01
+ */
+pfn_SwingableWeapon_SetGlowColor     g_SwingableWeapon_SetGlowColor     = 0;
+pfn_SwingableWeapon_SetGlowIntensity g_SwingableWeapon_SetGlowIntensity = 0;
+
 /* =========================================================================
  * Helper: call a no-arg function at guest address and return void*
  *
@@ -312,6 +320,18 @@ void sre_caver_init(uint64_t swordigo_base) {
     IFACE(BoneControlledCollisionShapeComponent_Interface,0x1e7e88);
 
 #undef IFACE
+
+    /* SwingableWeaponComponent glow helpers
+     * Source: GhidraDecomp ARM64 libswordigo_v1.4.12.so (base 0x0)
+     * Symbol: _ZN5Caver24SwingableWeaponComponent16SetGlowIntensityEf */
+    if (!g_SwingableWeapon_SetGlowIntensity)
+        g_SwingableWeapon_SetGlowIntensity =
+            (pfn_SwingableWeapon_SetGlowIntensity)(swordigo_base + 0x228c49);
+
+    /* Symbol: _ZN5Caver24SwingableWeaponComponent12SetGlowColorENS_10FloatColorE */
+    if (!g_SwingableWeapon_SetGlowColor)
+        g_SwingableWeapon_SetGlowColor =
+            (pfn_SwingableWeapon_SetGlowColor)(swordigo_base + 0x228d01);
 }
 
 /* Our guest-side CameraController::Update hook function */

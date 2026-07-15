@@ -52,6 +52,7 @@ struct SwordfareDebugStats {
     int     mouse_x       = 0, mouse_y = 0;
     float   cam_x         = 0.0f, cam_y = 0.0f, cam_z = 0.0f;
     float   cam_zoom      = 1.0f;
+    float   hero_x        = 0.0f, hero_y = 0.0f, hero_z = 0.0f;
     bool    cam_active    = false;
     bool    typing_mode   = false;
     bool    game_paused   = false;
@@ -62,6 +63,8 @@ struct SwordfareDebugStats {
     const char* speed_label    = "1×";
     const char* graphics_api   = "OpenGL";
 };
+
+struct ImGuiInputTextCallbackData;
 
 // ---------------------------------------------------------------------------
 // SwordfareGUI — main class
@@ -156,6 +159,8 @@ private:
     bool load_save(const std::string& path);
     bool write_save(const std::string& path);
     void console_submit(const std::string& cmd); // write to guest + set pending
+    static int console_input_callback(ImGuiInputTextCallbackData* data);
+    int on_console_input_callback(ImGuiInputTextCallbackData* data);
 
     SDL_Window*   m_window   = nullptr;
     SDL_GLContext m_gl_ctx   = nullptr;

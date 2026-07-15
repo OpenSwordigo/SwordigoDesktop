@@ -113,6 +113,11 @@ void render_grid(float size, float y_level);
 /// End the 3D render pass (unbind FBO, restore viewport).
 void end_3d();
 
+// Global lighting parameters (can be adjusted by GUI)
+extern float g_light_dir[3];
+extern float g_light_color[3];
+extern float g_ambient_color[3];
+
 // ============================================================================
 // Math helpers (column-major 4x4 matrices, right-handed coordinate system)
 // ============================================================================

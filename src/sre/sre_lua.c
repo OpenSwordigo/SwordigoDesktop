@@ -829,28 +829,18 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
      * while preserving the countdown state across frames so bolts/timers fire
      * at the correct time.
      *
-     * Saved after our timer logic above: may be 0 (timer fired, Lua finished)
-     * or 1 (timer still counting / Lua re-slept after resume). */
+     * Performance note: the sre_setjmp / recovery_push / recovery_pop wrap
+     * that previously existed here has been intentionally removed. Because we
+     * set isSuspended = 0 above, the original's coroutine-resume branch is
+     * never entered for *this* state, so it cannot call lua_resume and cannot
+     * panic/longjmp. Wrapping it with setjmp was therefore dead overhead on
+     * every frame. The lua_resume setjmp inside the isSuspended==1 block
+     * above (which IS a real call site) is retained unchanged. */
     if (g_orig_ProgramState_Update != 0) {
         int saved_suspended = PS_GET(self, PS_IS_SUSPENDED, int);
         PS_SET(self, PS_IS_SUSPENDED, int, 0);  /* suppress original's timer for *this* */
 
-        lua_State* L2 = PS_GET(self, PS_LUA_STATE, lua_State*);
-        if (L2 != NULL) {
-            int d = recovery_push(L2);
-            if (d < 0) {
-                g_orig_ProgramState_Update(self, deltaTime);
-            } else if (sre_setjmp(g_sre_recovery_stack[d].buf) != 0) {
-                recovery_pop(d);
-                PS_SET(self, PS_COMPLETED, char, 1);
-                saved_suspended = 0;  /* completed — don't restore suspended */
-            } else {
-                g_orig_ProgramState_Update(self, deltaTime);
-                recovery_pop(d);
-            }
-        } else {
-            g_orig_ProgramState_Update(self, deltaTime);
-        }
+        g_orig_ProgramState_Update(self, deltaTime);
 
         /* Restore: the original only iterates/cleans children, it never
          * modifies isSuspended for *this* when we passed isSuspended=0.

@@ -1,27 +1,5 @@
 // pod_loader.cpp — PowerVR POD model parser implementation
-//
-// POD binary format overview:
-//   Each chunk:  uint32_t tag | uint32_t length | [length bytes of data]
-//   Container blocks have length == 0 and are closed by a chunk whose
-//   tag == (open_tag | 0x80000000).
-//
-// Tag ranges used by Swordigo PODs:
-//   1000        Version string
-//   2000-2099   Scene-level metadata
-//   2012        Mesh container (opens a mesh block)
-//   6000-6099   Mesh-level metadata
-//   6006/6014   Interleaved vertex data container
-//   6007        Face index container
-//   6008        Vertex position container
-//   6009        Vertex normal container
-//   9000-9003   Data-element descriptors (Type/N/Stride/Payload)
-//
-// Interleaved vertex layout (Swordigo):
-//   float3 position  (12 bytes)
-//   float3 normal    (12 bytes)
-//   float2 uv        ( 8 bytes)
-//   ─────────────────────────
-//   total stride = 32 bytes per vertex
+// Reference: com/powervr/pod/PODLoader.as & EPODIdentifiers.as
 
 #include "pod_loader.h"
 
@@ -29,229 +7,264 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iostream>
+#include <vector>
 
 namespace av {
 
-// ─── POD tag constants ───────────────────────────────────────────────
+// ─── Tag Constants from SDK ──────────────────────────────────────────
+static constexpr uint32_t kEndTagMask = 0x80000000u;
 
-// Container close-bit (OR'd with open tag to mark end-of-container)
-static constexpr uint32_t kEndTagBit = 0x80000000u;
+// Identifiers
+static constexpr uint32_t eFormatVersion               = 1000;
+static constexpr uint32_t eScene                        = 1001;
 
-// Scene-level tags
-static constexpr uint32_t kTagVersion   = 1000;
-static constexpr uint32_t kTagNumMesh   = 2004;
-static constexpr uint32_t kTagNumFrame  = 2009;
-static constexpr uint32_t kTagMesh      = 2012;  // container
+// Scene parameters
+static constexpr uint32_t eSceneNumMeshes               = 2004;
+static constexpr uint32_t eSceneNumNodes                = 2005;
+static constexpr uint32_t eSceneNumMeshNodes            = 2006;
+static constexpr uint32_t eSceneNumTextures             = 2007;
+static constexpr uint32_t eSceneNumMaterials            = 2008;
+static constexpr uint32_t eSceneNumFrames               = 2009;
+static constexpr uint32_t eSceneMesh                    = 2012;
+static constexpr uint32_t eSceneNode                    = 2013;
+static constexpr uint32_t eSceneTexture                 = 2014;
+static constexpr uint32_t eSceneMaterial                = 2015;
 
-// Mesh-level tags
-static constexpr uint32_t kTagNumVerts  = 6000;
-static constexpr uint32_t kTagNumFaces  = 6001;
-static constexpr uint32_t kTagInterleaved    = 6006;  // container
-static constexpr uint32_t kTagInterleavedAlt = 6014;  // alternate interleaved container
-static constexpr uint32_t kTagFaces     = 6007;  // container
-static constexpr uint32_t kTagVertices  = 6008;  // container
-static constexpr uint32_t kTagNormals   = 6009;  // container
+// Material properties
+static constexpr uint32_t eMaterialName                 = 3000;
+static constexpr uint32_t eMaterialDiffuseTextureIndex  = 3001;
 
-// Data-element tags (inside face/vertex/normal/interleaved containers)
-static constexpr uint32_t kTagDataType    = 9000;
-static constexpr uint32_t kTagDataN       = 9001;
-static constexpr uint32_t kTagDataStride  = 9002;
-static constexpr uint32_t kTagDataPayload = 9003;
+// Texture properties
+static constexpr uint32_t eTextureFilename              = 4000;
 
-// ─── Helpers ─────────────────────────────────────────────────────────
+// Node properties
+static constexpr uint32_t eNodeIndex                    = 5000;
+static constexpr uint32_t eNodeName                     = 5001;
+static constexpr uint32_t eNodeMaterialIndex            = 5002;
+static constexpr uint32_t eNodeParentIndex              = 5003;
+static constexpr uint32_t eNodePosition                 = 5004;
+static constexpr uint32_t eNodeRotation                 = 5005;
+static constexpr uint32_t eNodeScale                    = 5006;
+static constexpr uint32_t eNodeAnimationPosition        = 5007;
+static constexpr uint32_t eNodeAnimationRotation        = 5008;
+static constexpr uint32_t eNodeAnimationScale           = 5009;
+static constexpr uint32_t eNodeMatrix                   = 5010;
+static constexpr uint32_t eNodeAnimationMatrix           = 5011;
+static constexpr uint32_t eNodeAnimationFlags            = 5012;
+static constexpr uint32_t eNodeAnimationPositionIndex   = 5013;
+static constexpr uint32_t eNodeAnimationRotationIndex   = 5014;
+static constexpr uint32_t eNodeAnimationScaleIndex      = 5015;
+static constexpr uint32_t eNodeAnimationMatrixIndex     = 5016;
 
-// Read a little-endian uint32 from the buffer at offset.  Returns 0
-// and sets offset past end if out of bounds.
+// Mesh properties
+static constexpr uint32_t eMeshNumVertices              = 6000;
+static constexpr uint32_t eMeshNumFaces                 = 6001;
+static constexpr uint32_t eMeshNumUVWChannels            = 6002;
+static constexpr uint32_t eMeshVertexIndexList          = 6003;
+static constexpr uint32_t eMeshVertexList               = 6006;
+static constexpr uint32_t eMeshNormalList               = 6007;
+static constexpr uint32_t eMeshUVWList                  = 6010;
+static constexpr uint32_t eMeshInteravedDataList        = 6014;
+
+// Vertex Block fields
+static constexpr uint32_t eBlockDataType                = 9000;
+static constexpr uint32_t eBlockNumComponents           = 9001;
+static constexpr uint32_t eBlockStride                  = 9002;
+static constexpr uint32_t eBlockData                    = 9003;
+
+// Helper to safely read values
 static uint32_t read_u32(const uint8_t* data, size_t size, size_t& off) {
     if (off + 4 > size) { off = size; return 0; }
-    uint32_t v;
-    std::memcpy(&v, data + off, 4);
+    uint32_t val;
+    std::memcpy(&val, data + off, 4);
     off += 4;
-    return v;
+    return val;
 }
 
-static uint16_t read_u16(const uint8_t* data, size_t size, size_t& off) {
-    if (off + 2 > size) { off = size; return 0; }
-    uint16_t v;
-    std::memcpy(&v, data + off, 2);
-    off += 2;
-    return v;
+static float read_float(const uint8_t* data, size_t size, size_t& off) {
+    if (off + 4 > size) { off = size; return 0.0f; }
+    float val;
+    std::memcpy(&val, data + off, 4);
+    off += 4;
+    return val;
 }
 
-// ─── Data-element accumulator ────────────────────────────────────────
-// Used while parsing a 6007/6008/6009/6006 container's child chunks.
+static std::vector<float> read_float_array(const uint8_t* data, size_t len, size_t& off) {
+    std::vector<float> val(len / 4);
+    if (len > 0) {
+        std::memcpy(val.data(), data + off, len);
+        off += len;
+    }
+    return val;
+}
+
+static std::vector<uint32_t> read_u32_array(const uint8_t* data, size_t len, size_t& off) {
+    std::vector<uint32_t> val(len / 4);
+    if (len > 0) {
+        std::memcpy(val.data(), data + off, len);
+        off += len;
+    }
+    return val;
+}
+
+// Data Element structure mirroring SDK's Block elements
 struct DataElement {
-    uint32_t type   = 0;   // 9000: data type enum
-    uint32_t n      = 0;   // 9001: components per element
-    uint32_t stride = 0;   // 9002: byte stride between elements
+    uint32_t type = 0;
+    uint32_t num_components = 0;
+    uint32_t stride = 0;
     const uint8_t* payload = nullptr;
-    size_t payload_size    = 0;
+    size_t payload_size = 0;
 };
 
-// ─── Mesh parser state ───────────────────────────────────────────────
-
-struct MeshState {
-    int num_vertices = 0;
-    int num_faces    = 0;
-
-    // Non-interleaved components
-    DataElement face_data;
-    DataElement vert_data;
-    DataElement norm_data;
-
-    // Interleaved
-    DataElement interleaved_data;
-    bool has_interleaved = false;
-};
-
-// Parse a data-element container (faces / vertices / normals / interleaved).
-// Reads child chunks until the matching end-tag.
-static void parse_data_container(const uint8_t* data, size_t size,
-                                 size_t& off, uint32_t end_tag,
-                                 DataElement& out)
-{
+// Parse a vertex block container (e.g. vertices, normals, uvs)
+static void parse_vertex_block(const uint8_t* data, size_t size, size_t& off, uint32_t block_id, DataElement& out) {
+    uint32_t end_tag = block_id | kEndTagMask;
     while (off < size) {
         uint32_t tag = read_u32(data, size, off);
         uint32_t len = read_u32(data, size, off);
+        if (off + len > size) len = size - off;
 
-        if (tag == end_tag) return;  // closing tag
+        if (tag == end_tag) return;
 
         switch (tag) {
-            case kTagDataType:
+            case eBlockDataType:
                 if (len >= 4) out.type = read_u32(data, size, off);
                 else off += len;
                 break;
-            case kTagDataN:
-                if (len >= 4) out.n = read_u32(data, size, off);
+            case eBlockNumComponents:
+                if (len >= 4) out.num_components = read_u32(data, size, off);
                 else off += len;
                 break;
-            case kTagDataStride:
+            case eBlockStride:
                 if (len >= 4) out.stride = read_u32(data, size, off);
                 else off += len;
                 break;
-            case kTagDataPayload:
-                out.payload      = data + off;
+            case eBlockData:
+                out.payload = data + off;
                 out.payload_size = len;
                 off += len;
                 break;
             default:
-                off += len;  // skip unknown
+                off += len;
                 break;
         }
     }
 }
 
-// Extract indices from a DataElement into a PODMesh.
-// Handles uint16 (type==0 or stride==2) and uint32 (type==1 or stride==4).
-static void extract_indices(const DataElement& de, int num_faces, PODMesh& mesh) {
-    if (!de.payload || de.payload_size == 0) return;
-
-    const int index_count = num_faces * 3;
-    mesh.indices.reserve(static_cast<size_t>(index_count));
-
-    // Determine index width: use stride if set, else fall back to type field.
-    // type 0 = uint16, type 1 = uint32 (common PowerVR convention).
-    bool is_u32 = false;
-    if (de.stride == 4)      is_u32 = true;
-    else if (de.stride == 2) is_u32 = false;
-    else if (de.type == 1)   is_u32 = true;
-
-    if (is_u32) {
-        const size_t effective_stride = (de.stride > 0) ? de.stride : 4u;
-        for (int i = 0; i < index_count; ++i) {
-            size_t byte_off = static_cast<size_t>(i) * effective_stride;
-            if (byte_off + 4 > de.payload_size) break;
-            uint32_t idx;
-            std::memcpy(&idx, de.payload + byte_off, 4);
-            mesh.indices.push_back(static_cast<uint16_t>(idx));
-        }
-    } else {
-        const size_t effective_stride = (de.stride > 0) ? de.stride : 2u;
-        for (int i = 0; i < index_count; ++i) {
-            size_t byte_off = static_cast<size_t>(i) * effective_stride;
-            if (byte_off + 2 > de.payload_size) break;
-            uint16_t idx;
-            std::memcpy(&idx, de.payload + byte_off, 2);
-            mesh.indices.push_back(idx);
-        }
-    }
-}
-
-// Extract float components from a non-interleaved DataElement.
-static void extract_floats(const DataElement& de, int num_verts,
-                           int components, std::vector<float>& out)
+// Convert diverse vertex components (interleaved or standalone) to floats
+static std::vector<float> unpack_vertex_data(
+    const uint8_t* interleaved_payload, size_t interleaved_size,
+    const DataElement& de, int num_vertices, int num_components) 
 {
-    if (!de.payload || de.payload_size == 0) return;
+    std::vector<float> result(num_vertices * num_components, 0.0f);
+    if (num_vertices <= 0 || num_components <= 0) return result;
 
-    const int n = (de.n > 0) ? static_cast<int>(de.n) : components;
-    const size_t effective_stride =
-        (de.stride > 0) ? de.stride : static_cast<size_t>(n) * sizeof(float);
+    const uint8_t* src_ptr = nullptr;
+    const uint8_t* limit_ptr = nullptr;
+    size_t stride = de.stride;
 
-    out.reserve(static_cast<size_t>(num_verts) * static_cast<size_t>(components));
+    if (interleaved_payload != nullptr) {
+        // Interleaved: payload is a 4-byte offset into interleaved data block
+        uint32_t offset = 0;
+        if (de.payload && de.payload_size >= 4) {
+            std::memcpy(&offset, de.payload, 4);
+        }
+        if (offset >= interleaved_size) return result;
+        src_ptr = interleaved_payload + offset;
+        limit_ptr = interleaved_payload + interleaved_size;
+    } else {
+        // Non-interleaved: payload contains the actual elements directly
+        src_ptr = de.payload;
+        limit_ptr = de.payload ? (de.payload + de.payload_size) : nullptr;
+    }
 
-    for (int i = 0; i < num_verts; ++i) {
-        size_t byte_off = static_cast<size_t>(i) * effective_stride;
-        for (int c = 0; c < components; ++c) {
-            size_t elem_off = byte_off + static_cast<size_t>(c) * sizeof(float);
-            if (elem_off + sizeof(float) > de.payload_size) {
-                out.push_back(0.0f);
-                continue;
+    if (!src_ptr || !limit_ptr) return result;
+
+    uint32_t type = de.type;
+    size_t comp_size = 4;
+    if (type == 1) comp_size = 4; // float
+    else if (type == 2 || type == 17) comp_size = 4; // int / uint
+    else if (type == 3 || type == 11 || type == 12 || type == 16) comp_size = 2; // short / ushort
+    else if (type == 10 || type == 13 || type == 14 || type == 15) comp_size = 1; // byte / ubyte
+
+    if (stride == 0) {
+        stride = num_components * comp_size;
+    }
+
+    for (int i = 0; i < num_vertices; ++i) {
+        const uint8_t* vert_ptr = src_ptr + i * stride;
+        if (vert_ptr + stride > limit_ptr) break;
+
+        for (int c = 0; c < num_components; ++c) {
+            const uint8_t* comp_ptr = vert_ptr + c * comp_size;
+            if (comp_ptr + comp_size > limit_ptr) continue;
+
+            float val = 0.0f;
+            if (type == 1) { // Float
+                std::memcpy(&val, comp_ptr, 4);
+            } else if (type == 3) { // Unsigned Short
+                uint16_t v; std::memcpy(&v, comp_ptr, 2);
+                val = static_cast<float>(v);
+            } else if (type == 16) { // Unsigned Short Normalized
+                uint16_t v; std::memcpy(&v, comp_ptr, 2);
+                val = static_cast<float>(v) / 65535.0f;
+            } else if (type == 11) { // Signed Short
+                int16_t v; std::memcpy(&v, comp_ptr, 2);
+                val = static_cast<float>(v);
+            } else if (type == 12) { // Signed Short Normalized
+                int16_t v; std::memcpy(&v, comp_ptr, 2);
+                val = static_cast<float>(v) / 32767.0f;
+            } else if (type == 10) { // Unsigned Byte
+                val = static_cast<float>(comp_ptr[0]);
+            } else if (type == 15) { // Unsigned Byte Normalized
+                val = static_cast<float>(comp_ptr[0]) / 255.0f;
+            } else if (type == 13) { // Signed Byte
+                val = static_cast<float>(static_cast<int8_t>(comp_ptr[0]));
+            } else if (type == 14) { // Signed Byte Normalized
+                val = static_cast<float>(static_cast<int8_t>(comp_ptr[0])) / 127.0f;
+            } else if (type == 2) { // Signed Int
+                int32_t v; std::memcpy(&v, comp_ptr, 4);
+                val = static_cast<float>(v);
+            } else if (type == 17) { // Unsigned Int
+                uint32_t v; std::memcpy(&v, comp_ptr, 4);
+                val = static_cast<float>(v);
             }
-            float v;
-            std::memcpy(&v, de.payload + elem_off, sizeof(float));
-            out.push_back(v);
+            result[i * num_components + c] = val;
         }
     }
+    return result;
 }
 
-// Deinterleave Swordigo's 32-byte interleaved vertex layout into
-// separate position / normal / UV arrays.
-static void deinterleave(const DataElement& de, int num_verts, PODMesh& mesh) {
+// Parse indices (Face Index List)
+static void parse_indices(const DataElement& de, int num_faces, PODMesh& mesh) {
     if (!de.payload || de.payload_size == 0) return;
+    int index_count = num_faces * 3;
+    mesh.indices.reserve(index_count);
 
-    // Determine stride — Swordigo uses 32 bytes (pos3 + norm3 + uv2).
-    const size_t stride = (de.stride > 0) ? de.stride : 32u;
-
-    mesh.positions.reserve(static_cast<size_t>(num_verts) * 3);
-    mesh.normals.reserve(static_cast<size_t>(num_verts) * 3);
-    mesh.uvs.reserve(static_cast<size_t>(num_verts) * 2);
-
-    for (int i = 0; i < num_verts; ++i) {
-        size_t base = static_cast<size_t>(i) * stride;
-
-        // Position: offset 0, 3 floats
-        for (int c = 0; c < 3; ++c) {
-            size_t off = base + static_cast<size_t>(c) * sizeof(float);
-            float v = 0.0f;
-            if (off + sizeof(float) <= de.payload_size)
-                std::memcpy(&v, de.payload + off, sizeof(float));
-            mesh.positions.push_back(v);
+    if (de.type == 3 || de.stride == 2) { // Unsigned Short
+        for (int i = 0; i < index_count; i++) {
+            if (i * 2 + 2 > (int)de.payload_size) break;
+            uint16_t val;
+            std::memcpy(&val, de.payload + i * 2, 2);
+            mesh.indices.push_back(val);
         }
-
-        // Normal: offset 12, 3 floats
-        for (int c = 0; c < 3; ++c) {
-            size_t off = base + 12 + static_cast<size_t>(c) * sizeof(float);
-            float v = 0.0f;
-            if (off + sizeof(float) <= de.payload_size)
-                std::memcpy(&v, de.payload + off, sizeof(float));
-            mesh.normals.push_back(v);
-        }
-
-        // UV: offset 24, 2 floats
-        for (int c = 0; c < 2; ++c) {
-            size_t off = base + 24 + static_cast<size_t>(c) * sizeof(float);
-            float v = 0.0f;
-            if (off + sizeof(float) <= de.payload_size)
-                std::memcpy(&v, de.payload + off, sizeof(float));
-            mesh.uvs.push_back(v);
+    } else { // Unsigned Int / 32-bit Indices
+        for (int i = 0; i < index_count; i++) {
+            if (i * 4 + 4 > (int)de.payload_size) break;
+            uint32_t val;
+            std::memcpy(&val, de.payload + i * 4, 4);
+            mesh.indices.push_back(static_cast<uint16_t>(val & 0xFFFF));
         }
     }
 }
 
-// Compute axis-aligned bounding box for a single mesh.
+// Compute single mesh AABB bounding box
 static void compute_mesh_aabb(PODMesh& mesh) {
-    const size_t n = mesh.positions.size() / 3;
-    for (size_t i = 0; i < n; ++i) {
+    if (mesh.positions.empty()) return;
+    mesh.min_x = mesh.min_y = mesh.min_z = 1e9f;
+    mesh.max_x = mesh.max_y = mesh.max_z = -1e9f;
+    for (size_t i = 0; i < mesh.positions.size() / 3; ++i) {
         float x = mesh.positions[i * 3 + 0];
         float y = mesh.positions[i * 3 + 1];
         float z = mesh.positions[i * 3 + 2];
@@ -264,85 +277,306 @@ static void compute_mesh_aabb(PODMesh& mesh) {
     }
 }
 
-// ─── Mesh container parser ──────────────────────────────────────────
+// readMeshBlock Implementation
+static PODMesh readMeshBlock(const uint8_t* data, size_t size, size_t& off) {
+    PODMesh mesh;
+    uint32_t end_tag = eSceneMesh | kEndTagMask;
 
-static PODMesh parse_mesh(const uint8_t* data, size_t size, size_t& off) {
-    MeshState ms;
-    const uint32_t mesh_end_tag = kTagMesh | kEndTagBit;
+    const uint8_t* interleaved_payload = nullptr;
+    size_t interleaved_size = 0;
+
+    DataElement idx_element;
+    DataElement pos_element;
+    DataElement nrm_element;
+    DataElement uv_element; // first UV channel
 
     while (off < size) {
         uint32_t tag = read_u32(data, size, off);
         uint32_t len = read_u32(data, size, off);
+        if (off + len > size) len = size - off;
 
-        if (tag == mesh_end_tag) break;  // end of mesh container
+        if (tag == end_tag) break;
 
         switch (tag) {
-            case kTagNumVerts:
-                if (len >= 4) ms.num_vertices = static_cast<int>(read_u32(data, size, off));
-                else off += len;
+            case eMeshNumVertices:
+                mesh.num_vertices = static_cast<int>(read_u32(data, size, off));
                 break;
-
-            case kTagNumFaces:
-                if (len >= 4) ms.num_faces = static_cast<int>(read_u32(data, size, off));
-                else off += len;
+            case eMeshNumFaces:
+                mesh.num_faces = static_cast<int>(read_u32(data, size, off));
                 break;
-
-            case kTagFaces:  // container, len == 0
-                parse_data_container(data, size, off,
-                                     kTagFaces | kEndTagBit, ms.face_data);
+            case eMeshInteravedDataList:
+                interleaved_payload = data + off;
+                interleaved_size = len;
+                off += len;
                 break;
-
-            case kTagVertices:  // container
-                parse_data_container(data, size, off,
-                                     kTagVertices | kEndTagBit, ms.vert_data);
+            case eMeshVertexIndexList:
+                parse_vertex_block(data, size, off, tag, idx_element);
                 break;
-
-            case kTagNormals:  // container
-                parse_data_container(data, size, off,
-                                     kTagNormals | kEndTagBit, ms.norm_data);
+            case eMeshVertexList:
+                parse_vertex_block(data, size, off, tag, pos_element);
                 break;
-
-            case kTagInterleaved:     // container
-            case kTagInterleavedAlt:  // alternate tag for interleaved data
-                parse_data_container(data, size, off,
-                                     tag | kEndTagBit, ms.interleaved_data);
-                ms.has_interleaved = true;
+            case eMeshNormalList:
+                parse_vertex_block(data, size, off, tag, nrm_element);
                 break;
-
+            case eMeshUVWList: {
+                DataElement current_uv;
+                parse_vertex_block(data, size, off, tag, current_uv);
+                if (uv_element.payload == nullptr) {
+                    uv_element = current_uv; // Store the first UV channel
+                }
+                break;
+            }
             default:
-                // Unknown leaf — skip its payload
                 off += len;
                 break;
         }
     }
 
-    // ── Build PODMesh from accumulated state ────────────────────────
-    PODMesh mesh;
-    mesh.num_vertices = ms.num_vertices;
-    mesh.num_faces    = ms.num_faces;
+    // Now convert and unpack elements
+    parse_indices(idx_element, mesh.num_faces, mesh);
 
-    // Indices
-    extract_indices(ms.face_data, ms.num_faces, mesh);
+    mesh.positions = unpack_vertex_data(interleaved_payload, interleaved_size, pos_element, mesh.num_vertices, 3);
+    mesh.normals   = unpack_vertex_data(interleaved_payload, interleaved_size, nrm_element, mesh.num_vertices, 3);
+    mesh.uvs       = unpack_vertex_data(interleaved_payload, interleaved_size, uv_element,  mesh.num_vertices, 2);
 
-    // Vertex attributes
-    if (ms.has_interleaved && ms.interleaved_data.payload) {
-        deinterleave(ms.interleaved_data, ms.num_vertices, mesh);
-    } else {
-        // Non-interleaved: separate position / normal containers
-        extract_floats(ms.vert_data, ms.num_vertices, 3, mesh.positions);
-        extract_floats(ms.norm_data, ms.num_vertices, 3, mesh.normals);
-    }
-
-    // Per-mesh AABB
-    if (!mesh.positions.empty()) {
-        compute_mesh_aabb(mesh);
-    }
+    compute_mesh_aabb(mesh);
 
     return mesh;
 }
 
-// ─── Top-level parser ────────────────────────────────────────────────
+// readNodeBlock Implementation
+static PODNode readNodeBlock(const uint8_t* data, size_t size, size_t& off) {
+    PODNode node;
+    uint32_t end_tag = eSceneNode | kEndTagMask;
 
+    bool is_old_format = false;
+    float pos[3] = {0,0,0};
+    float rot[4] = {0,0,0,1};
+    float scl[3] = {1,1,1};
+    float mat[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+
+    while (off < size) {
+        uint32_t tag = read_u32(data, size, off);
+        uint32_t len = read_u32(data, size, off);
+        if (off + len > size) len = size - off;
+
+        if (tag == end_tag) break;
+
+        switch (tag) {
+            case eNodeIndex:
+                node.object_index = static_cast<int>(read_u32(data, size, off));
+                break;
+            case eNodeName:
+                if (len > 0) {
+                    node.name.assign(reinterpret_cast<const char*>(data + off), strnlen(reinterpret_cast<const char*>(data + off), len));
+                }
+                off += len;
+                break;
+            case eNodeMaterialIndex:
+                node.material_index = static_cast<int>(read_u32(data, size, off));
+                break;
+            case eNodeParentIndex:
+                node.parent_index = static_cast<int>(read_u32(data, size, off));
+                break;
+            case eNodePosition: // static translation
+                if (len >= 12) {
+                    pos[0] = read_float(data, size, off);
+                    pos[1] = read_float(data, size, off);
+                    pos[2] = read_float(data, size, off);
+                    is_old_format = true;
+                    off += (len - 12);
+                } else off += len;
+                break;
+            case eNodeRotation: // static rotation
+                if (len >= 16) {
+                    rot[0] = read_float(data, size, off);
+                    rot[1] = read_float(data, size, off);
+                    rot[2] = read_float(data, size, off);
+                    rot[3] = read_float(data, size, off);
+                    is_old_format = true;
+                    off += (len - 16);
+                } else off += len;
+                break;
+            case eNodeScale: // static scale
+                if (len >= 12) {
+                    scl[0] = read_float(data, size, off);
+                    scl[1] = read_float(data, size, off);
+                    scl[2] = read_float(data, size, off);
+                    is_old_format = true;
+                    off += (len - 12);
+                } else off += len;
+                break;
+            case eNodeMatrix: // static matrix
+                if (len >= 64) {
+                    for (int i = 0; i < 16; i++) mat[i] = read_float(data, size, off);
+                    is_old_format = true;
+                    off += (len - 64);
+                } else off += len;
+                break;
+            case eNodeAnimationPosition:
+                node.anim_translation = read_float_array(data, len, off);
+                break;
+            case eNodeAnimationRotation:
+                node.anim_rotation = read_float_array(data, len, off);
+                break;
+            case eNodeAnimationScale:
+                node.anim_scale = read_float_array(data, len, off);
+                break;
+            case eNodeAnimationMatrix:
+                node.anim_matrix = read_float_array(data, len, off);
+                break;
+            case eNodeAnimationFlags:
+                node.anim_flags = read_u32(data, size, off);
+                break;
+            case eNodeAnimationPositionIndex:
+                node.anim_translation_idx = read_u32_array(data, len, off);
+                break;
+            case eNodeAnimationRotationIndex:
+                node.anim_rotation_idx = read_u32_array(data, len, off);
+                break;
+            case eNodeAnimationScaleIndex:
+                node.anim_scale_idx = read_u32_array(data, len, off);
+                break;
+            case eNodeAnimationMatrixIndex:
+                node.anim_matrix_idx = read_u32_array(data, len, off);
+                break;
+            default:
+                off += len;
+                break;
+        }
+    }
+
+    if (is_old_format) {
+        node.has_translation = true;
+        std::memcpy(node.translation, pos, 12);
+        node.has_rotation = true;
+        std::memcpy(node.rotation, rot, 16);
+        node.has_scale = true;
+        std::memcpy(node.scale, scl, 12);
+        node.has_matrix = true;
+        std::memcpy(node.matrix, mat, 64);
+    }
+
+    return node;
+}
+
+// readTextureBlock Implementation
+static std::string readTextureBlock(const uint8_t* data, size_t size, size_t& off) {
+    std::string name;
+    uint32_t end_tag = eSceneTexture | kEndTagMask;
+    while (off < size) {
+        uint32_t tag = read_u32(data, size, off);
+        uint32_t len = read_u32(data, size, off);
+        if (off + len > size) len = size - off;
+
+        if (tag == end_tag) break;
+
+        if (tag == eTextureFilename) {
+            if (len > 0) {
+                name.assign(reinterpret_cast<const char*>(data + off), strnlen(reinterpret_cast<const char*>(data + off), len));
+            }
+            off += len;
+        } else {
+            off += len;
+        }
+    }
+    return name;
+}
+
+// readMaterialBlock Implementation
+static PODMaterial readMaterialBlock(const uint8_t* data, size_t size, size_t& off) {
+    PODMaterial mat;
+    uint32_t end_tag = eSceneMaterial | kEndTagMask;
+    while (off < size) {
+        uint32_t tag = read_u32(data, size, off);
+        uint32_t len = read_u32(data, size, off);
+        if (off + len > size) len = size - off;
+
+        if (tag == end_tag) break;
+
+        switch (tag) {
+            case eMaterialName:
+                if (len > 0) {
+                    mat.name.assign(reinterpret_cast<const char*>(data + off), strnlen(reinterpret_cast<const char*>(data + off), len));
+                }
+                off += len;
+                break;
+            case eMaterialDiffuseTextureIndex:
+                mat.diffuse_texture_index = static_cast<int>(read_u32(data, size, off));
+                break;
+            default:
+                off += len;
+                break;
+        }
+    }
+    return mat;
+}
+
+// readSceneBlock Implementation
+static void readSceneBlock(const uint8_t* data, size_t size, size_t& off, PODModel& model) {
+    uint32_t end_tag = eScene | kEndTagMask;
+    while (off < size) {
+        uint32_t tag = read_u32(data, size, off);
+        uint32_t len = read_u32(data, size, off);
+        if (off + len > size) len = size - off;
+
+        if (tag == end_tag) break;
+
+        switch (tag) {
+            case eSceneNumMeshes:
+                if (len >= 4) {
+                    uint32_t count = read_u32(data, size, off);
+                    model.meshes.reserve(count);
+                } else off += len;
+                break;
+            case eSceneNumNodes:
+                if (len >= 4) {
+                    uint32_t count = read_u32(data, size, off);
+                    model.nodes.reserve(count);
+                } else off += len;
+                break;
+            case eSceneNumMeshNodes:
+                if (len >= 4) {
+                    model.num_mesh_nodes = static_cast<int>(read_u32(data, size, off));
+                } else off += len;
+                break;
+            case eSceneNumTextures:
+                if (len >= 4) {
+                    uint32_t count = read_u32(data, size, off);
+                    model.texture_filenames.reserve(count);
+                } else off += len;
+                break;
+            case eSceneNumMaterials:
+                if (len >= 4) {
+                    uint32_t count = read_u32(data, size, off);
+                    model.materials.reserve(count);
+                } else off += len;
+                break;
+            case eSceneNumFrames:
+                if (len >= 4) {
+                    model.num_frames = static_cast<int>(read_u32(data, size, off));
+                } else off += len;
+                break;
+            case eSceneMesh:
+                model.meshes.push_back(readMeshBlock(data, size, off));
+                break;
+            case eSceneNode:
+                model.nodes.push_back(readNodeBlock(data, size, off));
+                break;
+            case eSceneTexture:
+                model.texture_filenames.push_back(readTextureBlock(data, size, off));
+                break;
+            case eSceneMaterial:
+                model.materials.push_back(readMaterialBlock(data, size, off));
+                break;
+            default:
+                off += len;
+                break;
+        }
+    }
+}
+
+// Parse top-level structures in POD
 PODModel pod_parse(const uint8_t* data, size_t size) {
     PODModel model;
     size_t off = 0;
@@ -350,52 +584,21 @@ PODModel pod_parse(const uint8_t* data, size_t size) {
     while (off < size) {
         uint32_t tag = read_u32(data, size, off);
         uint32_t len = read_u32(data, size, off);
+        if (off + len > size) len = size - off;
 
-        // Check for end-tag bits — skip them at the top level
-        if (tag & kEndTagBit) {
+        if (tag == eFormatVersion) {
+            if (len > 0) {
+                model.version.assign(reinterpret_cast<const char*>(data + off), strnlen(reinterpret_cast<const char*>(data + off), len));
+            }
             off += len;
-            continue;
-        }
-
-        switch (tag) {
-            case kTagVersion:
-                if (len > 0 && off + len <= size) {
-                    // Version is a null-terminated string
-                    model.version.assign(
-                        reinterpret_cast<const char*>(data + off),
-                        strnlen(reinterpret_cast<const char*>(data + off), len));
-                }
-                off += len;
-                break;
-
-            case kTagNumMesh:
-                if (len >= 4) {
-                    uint32_t nm = read_u32(data, size, off);
-                    model.meshes.reserve(nm);
-                }
-                off += (len > 4 ? len - 4 : 0);
-                break;
-
-            case kTagNumFrame:
-                if (len >= 4) {
-                    model.num_frames = static_cast<int>(read_u32(data, size, off));
-                }
-                off += (len > 4 ? len - 4 : 0);
-                break;
-
-            case kTagMesh:
-                // Container with len == 0 — parse until matching end-tag
-                model.meshes.push_back(parse_mesh(data, size, off));
-                break;
-
-            default:
-                off += len;
-                break;
+        } else if (tag == eScene) {
+            readSceneBlock(data, size, off, model);
+        } else {
+            off += len;
         }
     }
 
-    // ── Aggregate stats and bounding geometry ───────────────────────
-
+    // Accumulate total bounding sphere and counts
     for (const auto& m : model.meshes) {
         model.total_vertices += m.num_vertices;
         model.total_faces    += m.num_faces;
@@ -410,7 +613,6 @@ PODModel pod_parse(const uint8_t* data, size_t size) {
         }
     }
 
-    // Bounding sphere: center of AABB, radius = half-diagonal
     if (model.total_vertices > 0) {
         model.center_x = (model.min_x + model.max_x) * 0.5f;
         model.center_y = (model.min_y + model.max_y) * 0.5f;
@@ -420,15 +622,11 @@ PODModel pod_parse(const uint8_t* data, size_t size) {
         float dy = model.max_y - model.min_y;
         float dz = model.max_z - model.min_z;
         model.radius = std::sqrt(dx * dx + dy * dy + dz * dz) * 0.5f;
-
-        // Guard against degenerate (zero-size) models
-        if (model.radius < 1e-6f) model.radius = 1.0f;
+        if (model.radius < 1e-5f) model.radius = 1.0f;
     }
 
     return model;
 }
-
-// ─── File loader ─────────────────────────────────────────────────────
 
 PODModel pod_load(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -441,9 +639,126 @@ PODModel pod_load(const std::string& path) {
     f.seekg(0);
     f.read(reinterpret_cast<char*>(buf.data()), fsize);
 
-    if (!f) return {};  // partial read
+    if (!f) return {};
 
     return pod_parse(buf.data(), buf.size());
+}
+
+// ─── Local Matrix Multiplication and Transformations ──────────────────
+static void local_mat4_identity(float m[16]) {
+    std::memset(m, 0, 16 * sizeof(float));
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+}
+
+static void local_mat4_mul(const float a[16], const float b[16], float out[16]) {
+    float tmp[16];
+    for (int c = 0; c < 4; c++) {
+        for (int r = 0; r < 4; r++) {
+            tmp[c * 4 + r] =
+                a[0 * 4 + r] * b[c * 4 + 0] +
+                a[1 * 4 + r] * b[c * 4 + 1] +
+                a[2 * 4 + r] * b[c * 4 + 2] +
+                a[3 * 4 + r] * b[c * 4 + 3];
+        }
+    }
+    std::memcpy(out, tmp, 16 * sizeof(float));
+}
+
+static void local_mat4_from_quat(const float q[4], float m[16]) {
+    float x = q[0], y = q[1], z = q[2], w = q[3];
+    m[0] = 1.0f - 2.0f * (y * y + z * z);
+    m[1] = 2.0f * (x * y + z * w);
+    m[2] = 2.0f * (x * z - y * w);
+    m[3] = 0.0f;
+
+    m[4] = 2.0f * (x * y - z * w);
+    m[5] = 1.0f - 2.0f * (x * x + z * z);
+    m[6] = 2.0f * (y * z + x * w);
+    m[7] = 0.0f;
+
+    m[8] = 2.0f * (x * z + y * w);
+    m[9] = 2.0f * (y * z - x * w);
+    m[10] = 1.0f - 2.0f * (x * x + y * y);
+    m[11] = 0.0f;
+
+    m[12] = 0.0f;
+    m[13] = 0.0f;
+    m[14] = 0.0f;
+    m[15] = 1.0f;
+}
+
+static void get_node_matrix_internal(const PODModel& model, int node_idx, int frame, float* mOut, int depth) {
+    if (depth > 64 || node_idx < 0 || node_idx >= (int)model.nodes.size()) {
+        std::memset(mOut, 0, 16 * sizeof(float));
+        mOut[0] = mOut[5] = mOut[10] = mOut[15] = 1.0f;
+        return;
+    }
+
+    const auto& node = model.nodes[node_idx];
+
+    float local[16];
+    local_mat4_identity(local);
+
+    if (!node.anim_matrix.empty()) {
+        int f_clamped = std::clamp(frame, 0, (int)node.anim_matrix.size() / 16 - 1);
+        std::memcpy(local, &node.anim_matrix[f_clamped * 16], sizeof(local));
+    } else if (node.has_matrix) {
+        std::memcpy(local, node.matrix, sizeof(local));
+    } else {
+        float S[16], R[16], T[16];
+        local_mat4_identity(S);
+        local_mat4_identity(R);
+        local_mat4_identity(T);
+
+        float t_val[3] = {node.translation[0], node.translation[1], node.translation[2]};
+        if (!node.anim_translation.empty()) {
+            int f_clamped = std::clamp(frame, 0, (int)node.anim_translation.size() / 3 - 1);
+            t_val[0] = node.anim_translation[f_clamped * 3 + 0];
+            t_val[1] = node.anim_translation[f_clamped * 3 + 1];
+            t_val[2] = node.anim_translation[f_clamped * 3 + 2];
+        }
+        T[12] = t_val[0];
+        T[13] = t_val[1];
+        T[14] = t_val[2];
+
+        float r_val[4] = {node.rotation[0], node.rotation[1], node.rotation[2], node.rotation[3]};
+        if (!node.anim_rotation.empty()) {
+            int f_clamped = std::clamp(frame, 0, (int)node.anim_rotation.size() / 4 - 1);
+            r_val[0] = node.anim_rotation[f_clamped * 4 + 0];
+            r_val[1] = node.anim_rotation[f_clamped * 4 + 1];
+            r_val[2] = node.anim_rotation[f_clamped * 4 + 2];
+            r_val[3] = node.anim_rotation[f_clamped * 4 + 3];
+        }
+        local_mat4_from_quat(r_val, R);
+
+        float s_val[3] = {node.scale[0], node.scale[1], node.scale[2]};
+        if (!node.anim_scale.empty()) {
+            int stride = (node.anim_scale.size() / std::max(1, model.num_frames) >= 7) ? 7 : 3;
+            int f_clamped = std::clamp(frame, 0, (int)node.anim_scale.size() / stride - 1);
+            s_val[0] = node.anim_scale[f_clamped * stride + 0];
+            s_val[1] = node.anim_scale[f_clamped * stride + 1];
+            s_val[2] = node.anim_scale[f_clamped * stride + 2];
+        }
+        S[0] = s_val[0];
+        S[5] = s_val[1];
+        S[10] = s_val[2];
+
+        float temp[16];
+        local_mat4_mul(T, R, temp);
+        local_mat4_mul(temp, S, local);
+    }
+
+    if (node.parent_index != -1 && node.parent_index != node_idx) {
+        float parent_world[16];
+        get_node_matrix_internal(model, node.parent_index, frame, parent_world, depth + 1);
+        local_mat4_mul(parent_world, local, mOut);
+    } else {
+        std::memcpy(mOut, local, sizeof(local));
+    }
+}
+
+void get_node_matrix(const PODModel& model, int node_idx, int frame, float* mOut) {
+    get_node_matrix_internal(model, node_idx, frame, mOut, 0);
 }
 
 } // namespace av

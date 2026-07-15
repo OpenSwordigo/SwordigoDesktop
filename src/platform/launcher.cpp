@@ -173,10 +173,55 @@ static bool hit(int mx, int my, float x, float y, float w, float h) {
 }
 
 // Load a PNG file as an OpenGL texture. Returns texture ID (0 on failure).
+// Automatically handles fallback system/local share paths under launcher/ for RPM/DEB packaging.
 static GLuint load_texture(const char* path) {
-    SDL_Surface* surf = IMG_Load(path);
+    std::string path_str(path);
+    std::string sub = path_str;
+    size_t pos = path_str.find("assets/");
+    if (pos != std::string::npos) {
+        sub = path_str.substr(pos + 7);
+    } else {
+        size_t last_slash = path_str.rfind('/');
+        if (last_slash != std::string::npos) {
+            sub = path_str.substr(last_slash + 1);
+        }
+    }
+
+    std::string resolved_path = path_str;
+    bool found = false;
+
+    // Check if the original path exists first
+    if (fs::exists(path_str) && !fs::is_directory(path_str)) {
+        resolved_path = path_str;
+        found = true;
+    }
+
+    // Otherwise probe our hierarchy (RPM/DEB post-install friendly)
+    if (!found) {
+        std::vector<std::string> candidates = {
+            "src/assets/" + sub,
+            get_user_data_dir() + "launcher/" + sub,
+            get_user_data_dir() + "src/assets/" + sub,
+            get_user_data_dir() + "assets/" + sub,
+            get_data_path("launcher/" + sub),
+            get_data_path("assets/" + sub),
+            get_data_path("src/assets/" + sub),
+            "/usr/share/swordigo-desktop/launcher/" + sub,
+            "/usr/local/share/swordigo-desktop/launcher/" + sub,
+            "/usr/share/swordigo-desktop/src/assets/" + sub
+        };
+        for (const auto& cand : candidates) {
+            if (fs::exists(cand) && !fs::is_directory(cand)) {
+                resolved_path = cand;
+                found = true;
+                break;
+            }
+        }
+    }
+
+    SDL_Surface* surf = IMG_Load(resolved_path.c_str());
     if (!surf) {
-        std::cerr << "[Launcher] Cannot load texture: " << path << std::endl;
+        std::cerr << "[Launcher] Cannot load texture: " << path << " (resolved to: " << resolved_path << ")" << std::endl;
         return 0;
     }
     // Convert to RGBA
@@ -194,7 +239,7 @@ static GLuint load_texture(const char* path) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba->w, rgba->h, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, rgba->pixels);
     SDL_DestroySurface(rgba);
-    std::cout << "[Launcher] Loaded texture: " << path << " -> " << tex << std::endl;
+    std::cout << "[Launcher] Loaded texture: " << path << " (resolved to: " << resolved_path << ") -> " << tex << std::endl;
     return tex;
 }
 
@@ -707,15 +752,15 @@ LaunchConfig show_launcher(BinarySelector& selector) {
                             // Asset Viewer button
                             float avbtn_y_click = sebtn_y_click - 8 - ofbtn_h;
                             if (hit(mouse_x, mouse_y, ofbtn_x, avbtn_y_click, ofbtn_w, ofbtn_h)) {
-                                // Launch asset_viewer as separate process
-                                std::string av_path = "./asset_viewer";
+                                // Launch ruby as separate process
+                                std::string av_path = "./ruby";
                                 if (!fs::exists(av_path)) {
                                     // Try next to the binary
                                     char exe_buf[4096];
                                     ssize_t len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
                                     if (len > 0) {
                                         exe_buf[len] = '\0';
-                                        av_path = fs::path(exe_buf).parent_path() / "asset_viewer";
+                                        av_path = fs::path(exe_buf).parent_path() / "ruby";
                                     }
                                 }
                                 if (fs::exists(av_path)) {
@@ -724,9 +769,9 @@ LaunchConfig show_launcher(BinarySelector& selector) {
                                         execlp(av_path.c_str(), av_path.c_str(), (char*)NULL);
                                         _exit(1);  // exec failed
                                     }
-                                    std::cout << "[Launcher] Launched asset_viewer" << std::endl;
+                                    std::cout << "[Launcher] Launched ruby" << std::endl;
                                 } else {
-                                    std::cerr << "[Launcher] asset_viewer not found — run 'make asset_viewer' first" << std::endl;
+                                    std::cerr << "[Launcher] ruby not found — run 'make ruby' first" << std::endl;
                                 }
                                 break;
                             }

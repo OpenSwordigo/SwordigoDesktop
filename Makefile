@@ -90,7 +90,7 @@ ALL_OBJS := $(CXX_OBJS) $(C_OBJS)
 DEPS := $(ALL_OBJS:.o=.d)
 
 # Default target
-all: swordigo_boot libsre.so
+all: swordigo_boot libsre.so ruby
 
 swordigo_boot: $(ALL_OBJS)
 	@echo "[LINK] $@"
@@ -205,23 +205,25 @@ install-sre: libsre.so
 	@echo "[SRE]  Installed to ~/.local/share/swordigo-desktop/engine/v1.4.12/arm64-v8a/"
 
 # =========================================================================
-# asset_viewer — Standalone asset browser/previewer tool
+# ruby — Standalone asset browser/previewer tool
 # =========================================================================
 # Separate binary with minimal dependencies (no unicorn, no game code).
 AV_SRCS := src/tools/asset_viewer.cpp \
     src/tools/pod_loader.cpp src/tools/av_renderer.cpp \
     src/tools/av_audio.cpp src/tools/scene_loader.cpp \
     src/platform/pvr_loader.cpp \
+    src/platform/data_path.cpp \
+    src/platform/pvrtc_decoder.cpp \
     src/imgui/imgui.cpp src/imgui/imgui_draw.cpp \
     src/imgui/imgui_tables.cpp src/imgui/imgui_widgets.cpp \
     src/imgui/backends/imgui_impl_sdl3.cpp src/imgui/backends/imgui_impl_opengl3.cpp
-AV_CXXFLAGS := -std=c++17 -g -O2 -Isrc -Isrc/imgui -Iinclude $(SDL3_CFLAGS) $(SDL3I_CFLAGS)
+AV_OBJS := $(patsubst src/%.cpp, build/%.o, $(AV_SRCS))
 AV_LIBS := $(SDL3_LIBS) $(SDL3I_LIBS) -lGL
 
-asset_viewer: $(AV_SRCS)
-	@echo "[AV]   Building asset_viewer"
-	@$(CXX) $(AV_CXXFLAGS) -o $@ $(AV_SRCS) $(AV_LIBS)
-	@echo "[AV]   Built asset_viewer — run with: ./asset_viewer"
+ruby: $(AV_OBJS)
+	@echo "[LINK] $@"
+	@$(CXX) -o $@ $^ $(AV_LIBS)
+	@echo "[AV]   Built ruby — run with: ./ruby"
 
 # C++ compile rule
 build/%.o: src/%.cpp
@@ -239,9 +241,9 @@ build/%.o: src/%.c
 -include $(DEPS)
 
 clean:
-	rm -f $(ALL_OBJS) $(DEPS) swordigo_boot libsre.so asset_viewer
+	rm -rf build swordigo_boot libsre.so ruby
 
-.PHONY: all clean install-sre asset_viewer dynarmic-build dynarmic-clean
+.PHONY: all clean install-sre ruby dynarmic-build dynarmic-clean
 
 # ========== Dynarmic Build from Source ==========
 # Run this ONCE before building with DYNARMIC=1

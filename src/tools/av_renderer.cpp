@@ -29,10 +29,10 @@ namespace av {
 static constexpr float PI = 3.14159265358979323846f;
 static constexpr float DEG2RAD = PI / 180.0f;
 
-// Default lighting (warm directional, slight cool ambient — Swordigo-faithful)
-static const float DEFAULT_LIGHT_DIR[3]   = { 0.577f,  0.577f,  0.577f };  // normalized (1,1,1)
-static const float DEFAULT_LIGHT_COLOR[3] = { 1.0f,    0.95f,   0.9f  };
-static const float DEFAULT_AMBIENT[3]     = { 0.30f,   0.30f,   0.35f };
+// Global lighting (warm directional, slight cool ambient — Swordigo-faithful by default)
+float g_light_dir[3]   = { 0.577f,  0.577f,  0.577f };  // normalized (1,1,1)
+float g_light_color[3] = { 1.0f,    0.95f,   0.9f  };
+float g_ambient_color[3]     = { 0.30f,   0.30f,   0.35f };
 
 // ============================================================================
 // Shader sources — GLSL 330 core
@@ -702,9 +702,9 @@ void render_mesh(const GPUMesh& mesh, const float* model_matrix,
     glUniformMatrix4fv(s_loc_model,     1, GL_FALSE, model);
     glUniformMatrix3fv(s_loc_normalmat, 1, GL_FALSE, nmat);
 
-    glUniform3fv(s_loc_light_dir, 1, DEFAULT_LIGHT_DIR);
-    glUniform3fv(s_loc_light_col, 1, DEFAULT_LIGHT_COLOR);
-    glUniform3fv(s_loc_ambient,   1, DEFAULT_AMBIENT);
+    glUniform3fv(s_loc_light_dir, 1, g_light_dir);
+    glUniform3fv(s_loc_light_col, 1, g_light_color);
+    glUniform3fv(s_loc_ambient,   1, g_ambient_color);
     glUniform4fv(s_loc_mat_color, 1, col);
     glUniform1f(s_loc_alpha,      col[3]);
 

@@ -1,16 +1,18 @@
-/* asset_viewer.cpp — Professional ImGui-based asset viewer for Swordigo Desktop
+/* asset_viewer.cpp — Ruby: Professional Asset Viewer & Editor for Swordigo Desktop
  *
  * Features:
- *   - File browser with search, type filtering, icons
- *   - 3D POD model viewport with orbit camera, wireframe, texturing
+ *   - Blender-like flat neutral dark theme (Blender style)
+ *   - FontAwesome 6/7 solid icons integration (merged with Inter font)
+ *   - Path Breadcrumbs + Absolute Path input bar for system-wide browsing
+ *   - Parameter parsing: opens directly to a file and selects/previews it
+ *   - Interactive lighting adjustments (elevation, azimuth, light & ambient colors)
  *   - PVR/PNG texture preview with zoom/pan and checkerboard background
+ *   - 3D POD model viewport with orbit camera, wireframe, texturing
  *   - Audio WAV playback with waveform visualization
  *   - Scene file inspection with object tree and component details
- *   - Properties panel with per-type metadata
- *   - Keyboard shortcuts: W(wireframe), T(textured), R(reset camera), Esc(quit)
  *
- * Build:  make asset_viewer
- * Usage:  ./asset_viewer [optional_start_directory]
+ * Build:  make ruby
+ * Usage:  ./ruby [optional_path_to_dir_or_file]
  */
 
 #include <SDL3/SDL.h>
@@ -25,6 +27,8 @@
 #include "backends/imgui_impl_opengl3.h"
 
 #include "platform/pvr_loader.h"
+#include "platform/data_path.h"
+#include "platform/IconsFontAwesome6.h"
 #include "tools/pod_loader.h"
 #include "tools/av_renderer.h"
 #include "tools/av_audio.h"
@@ -38,8 +42,31 @@
 #include <vector>
 #include <algorithm>
 #include <filesystem>
+#include <iostream>
 
 namespace fs = std::filesystem;
+
+std::string g_assets_dir = "assets";
+
+// --- Additional FontAwesome definitions ---
+#ifndef ICON_FA_PAUSE
+#define ICON_FA_PAUSE "\xef\x81\x8c"
+#endif
+#ifndef ICON_FA_STOP
+#define ICON_FA_STOP "\xef\x81\x8d"
+#endif
+#ifndef ICON_FA_FOLDER_OPEN
+#define ICON_FA_FOLDER_OPEN "\xef\x81\xbc"
+#endif
+#ifndef ICON_FA_WARNING
+#define ICON_FA_WARNING ICON_FA_TRIANGLE_EXCLAMATION
+#endif
+#ifndef ICON_FA_CHEVRON_RIGHT
+#define ICON_FA_CHEVRON_RIGHT "\xef\x81\x94"
+#endif
+#ifndef ICON_FA_WARNING
+#define ICON_FA_WARNING "\xef\x81\xb1"
+#endif
 
 // ============================================================================
 // Constants
@@ -47,9 +74,9 @@ namespace fs = std::filesystem;
 
 static const int   WIN_W             = 1400;
 static const int   WIN_H             = 900;
-static const char* WIN_TITLE         = "Swordigo Asset Viewer";
-static const float LEFT_PANEL_W      = 280.0f;
-static const float RIGHT_PANEL_W     = 300.0f;
+static const char* WIN_TITLE         = "Ruby - Swordigo Desktop Asset Viewer & Editor";
+static const float LEFT_PANEL_W      = 320.0f;
+static const float RIGHT_PANEL_W     = 320.0f;
 static const float STATUS_BAR_H      = 24.0f;
 static const char* GLSL_VERSION      = "#version 330";
 
@@ -69,14 +96,12 @@ struct FileEntry {
 };
 
 static int classify_file(const std::string& name) {
-    // Get extension, lowercase
     auto dot = name.rfind('.');
     if (dot == std::string::npos) return FTYPE_OTHER;
     std::string ext = name.substr(dot);
     for (auto& c : ext) c = (char)tolower((unsigned char)c);
 
     if (ext == ".pvr" || ext == ".png" || ext == ".jpg" || ext == ".jpeg") return FTYPE_TEXTURE;
-    // Also handle .tex.png pattern
     if (name.size() > 8) {
         std::string low = name;
         for (auto& c : low) c = (char)tolower((unsigned char)c);
@@ -135,6 +160,14 @@ struct ViewerState {
     std::string sel_name;
     std::string sel_path;
     size_t      sel_size = 0;
+
+    // Multi-texture & Animation Support
+    std::vector<GLuint>      model_textures;
+    std::vector<std::string> missing_textures;
+    int                      current_frame = 0;
+    bool                     anim_playing = false;
+    float                    anim_timer = 0.0f;
+    float                    anim_fps = 30.0f;
 };
 
 static ViewerState g_state;
@@ -245,7 +278,6 @@ static void refresh_directory(ViewerState& st) {
         if (a.name == "..") return true;
         if (b.name == "..") return false;
         if (a.is_dir != b.is_dir) return a.is_dir;
-        // Case-insensitive compare
         std::string la = a.name, lb = b.name;
         for (auto& c : la) c = (char)tolower((unsigned char)c);
         for (auto& c : lb) c = (char)tolower((unsigned char)c);
@@ -259,10 +291,7 @@ static void apply_filters(ViewerState& st) {
     for (auto& c : search_lower) c = (char)tolower((unsigned char)c);
 
     for (auto& f : st.files) {
-        // Type filter
         if (st.type_filter != 0 && !f.is_dir && f.type != st.type_filter) continue;
-
-        // Search filter
         if (!search_lower.empty()) {
             std::string name_lower = f.name;
             for (auto& c : name_lower) c = (char)tolower((unsigned char)c);
@@ -277,25 +306,38 @@ static void apply_filters(ViewerState& st) {
 // ============================================================================
 
 static void free_preview_resources(ViewerState& st) {
-    // Free GPU meshes
     for (auto& m : st.gpu_meshes) av::free_mesh(m);
     st.gpu_meshes.clear();
     st.model = av::PODModel{};
 
-    // Free preview texture
     if (st.preview_tex) { glDeleteTextures(1, &st.preview_tex); st.preview_tex = 0; }
     st.tex_w = st.tex_h = 0;
     st.tex_zoom = 1.0f;
     st.tex_pan_x = st.tex_pan_y = 0.0f;
     st.tex_format_str.clear();
 
-    // Free model texture
-    if (st.model_texture) { glDeleteTextures(1, &st.model_texture); st.model_texture = 0; }
+    if (st.model_texture) {
+        bool in_vector = false;
+        for (auto tex : st.model_textures) {
+            if (tex == st.model_texture) { in_vector = true; break; }
+        }
+        if (!in_vector) {
+            glDeleteTextures(1, &st.model_texture);
+        }
+        st.model_texture = 0;
+    }
 
-    // Stop audio
     av::audio_stop();
 
-    // Clear scene
+    for (auto tex : st.model_textures) {
+        if (tex) glDeleteTextures(1, &tex);
+    }
+    st.model_textures.clear();
+    st.missing_textures.clear();
+    st.current_frame = 0;
+    st.anim_playing = false;
+    st.anim_timer = 0.0f;
+
     st.scene = av::SceneData{};
     st.selected_object = -1;
     st.highlighted_mesh = -1;
@@ -309,12 +351,10 @@ static void free_preview_resources(ViewerState& st) {
 // ============================================================================
 
 static void try_load_matching_texture(ViewerState& st, const std::string& pod_path) {
-    // Given "somedir/model.POD", try "somedir/model_2x.pvr"
     fs::path p(pod_path);
     std::string stem = p.stem().string();
     fs::path dir = p.parent_path();
 
-    // Try _2x.pvr first, then .pvr, then _2x.png, then .png
     const char* suffixes[] = {"_2x.pvr", ".pvr", "_2x.png", ".png"};
     for (auto& suf : suffixes) {
         fs::path candidate = dir / (stem + suf);
@@ -326,10 +366,8 @@ static void try_load_matching_texture(ViewerState& st, const std::string& pod_pa
             if (ext == ".pvr") {
                 st.model_texture = pvr_load_texture(cpath.c_str(), nullptr, nullptr);
             } else {
-                // Use SDL_image for PNG
                 SDL_Surface* surf = IMG_Load(cpath.c_str());
                 if (surf) {
-                    // Convert to RGBA32
                     SDL_Surface* conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
                     SDL_DestroySurface(surf);
                     if (conv) {
@@ -371,7 +409,7 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
 
         if (ext == ".pvr") {
             st.preview_tex = pvr_load_texture(fe.full_path.c_str(), &st.tex_w, &st.tex_h);
-            st.tex_format_str = "ETC1 (PVR)";
+            st.tex_format_str = "ETC1/PVRTC (PVR)";
         } else {
             SDL_Surface* surf = IMG_Load(fe.full_path.c_str());
             if (surf) {
@@ -409,7 +447,6 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
             break;
         }
 
-        // Upload each mesh to the GPU
         for (auto& mesh : st.model.meshes) {
             const float*    pos = mesh.positions.empty()  ? nullptr : mesh.positions.data();
             const float*    nrm = mesh.normals.empty()    ? nullptr : mesh.normals.data();
@@ -420,7 +457,6 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
             st.gpu_meshes.push_back(gm);
         }
 
-        // Set camera to frame the model
         st.camera = av::Camera{};
         st.camera.target[0] = st.model.center_x;
         st.camera.target[1] = st.model.center_y;
@@ -428,12 +464,77 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
         st.camera.distance  = st.model.radius * 2.5f;
         if (st.camera.distance < 1.0f) st.camera.distance = 3.0f;
 
-        // Try auto-loading a matching texture
-        try_load_matching_texture(st, fe.full_path);
+        // Auto search dependencies of the POD model
+        st.model_textures.clear();
+        st.missing_textures.clear();
+        fs::path model_dir = fs::path(fe.full_path).parent_path();
 
-        // Bind texture to each GPU mesh
-        if (st.model_texture) {
-            for (auto& gm : st.gpu_meshes) gm.texture_id = st.model_texture;
+        for (const auto& tex_name : st.model.texture_filenames) {
+            if (tex_name.empty()) {
+                st.model_textures.push_back(0);
+                continue;
+            }
+
+            fs::path tex_path = model_dir / tex_name;
+            std::string stem = tex_path.stem().string();
+
+            // Candidates list (original name, PVRTC 2x/1x, PNG 2x/1x)
+            std::vector<fs::path> candidates = {
+                tex_path,
+                model_dir / (stem + "_2x.pvr"),
+                model_dir / (stem + ".pvr"),
+                model_dir / (stem + "_2x.png"),
+                model_dir / (stem + ".png")
+            };
+
+            GLuint tex_id = 0;
+            bool found = false;
+            for (const auto& cand : candidates) {
+                if (fs::exists(cand)) {
+                    std::string cpath = cand.string();
+                    std::string ext = cand.extension().string();
+                    for (auto& c : ext) c = (char)tolower((unsigned char)c);
+
+                    if (ext == ".pvr") {
+                        tex_id = pvr_load_texture(cpath.c_str(), nullptr, nullptr);
+                    } else {
+                        SDL_Surface* surf = IMG_Load(cpath.c_str());
+                        if (surf) {
+                            SDL_Surface* conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
+                            SDL_DestroySurface(surf);
+                            if (conv) {
+                                glGenTextures(1, &tex_id);
+                                glBindTexture(GL_TEXTURE_2D, tex_id);
+                                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, conv->w, conv->h, 0,
+                                             GL_RGBA, GL_UNSIGNED_BYTE, conv->pixels);
+                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                                SDL_DestroySurface(conv);
+                            }
+                        }
+                    }
+                    if (tex_id) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            if (found) {
+                st.model_textures.push_back(tex_id);
+            } else {
+                st.model_textures.push_back(0);
+                st.missing_textures.push_back(tex_name);
+            }
+        }
+
+        // Fallback to legacy matched texture search if no textures are found in model metadata
+        if (st.model_textures.empty() || (st.model_textures.size() == 1 && st.model_textures[0] == 0)) {
+            try_load_matching_texture(st, fe.full_path);
+            if (st.model_texture) {
+                if (st.model_textures.empty()) st.model_textures.push_back(st.model_texture);
+                else st.model_textures[0] = st.model_texture;
+            }
         }
 
         char buf[256];
@@ -479,11 +580,89 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
 }
 
 // ============================================================================
+// UI Path navigation breadcrumbs
+// ============================================================================
+
+static void draw_breadcrumbs(ViewerState& st) {
+    fs::path p(st.current_dir);
+    std::vector<fs::path> parts;
+    
+    std::error_code ec;
+    // Walk up the path hierarchy to parse folders
+    while (!p.empty() && p != p.root_path()) {
+        parts.push_back(p);
+        p = p.parent_path();
+    }
+    parts.push_back(p.root_path());
+    std::reverse(parts.begin(), parts.end());
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 2));
+    
+    // Quick shortcut button to local resources
+    if (ImGui::SmallButton(ICON_FA_FOLDER " Vanilla")) {
+        st.current_dir = expand_home("~/.local/share/swordigo-desktop/assets/resources/");
+        if (!fs::is_directory(st.current_dir, ec)) {
+            const char* home = getenv("HOME");
+            st.current_dir = home ? home : "/";
+        }
+        refresh_directory(st);
+        apply_filters(st);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
+
+    for (size_t i = 0; i < parts.size(); i++) {
+        std::string name = parts[i].filename().string();
+        if (name.empty()) {
+            name = "/";
+        }
+        if (i > 0) {
+            ImGui::SameLine();
+            ImGui::TextDisabled(ICON_FA_CHEVRON_RIGHT);
+            ImGui::SameLine();
+        }
+
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0)); // transparent flat button
+        if (ImGui::SmallButton(name.c_str())) {
+            st.current_dir = parts[i].string();
+            refresh_directory(st);
+            apply_filters(st);
+            ImGui::PopStyleColor();
+            break;
+        }
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopStyleVar();
+}
+
+// ============================================================================
 // UI: File browser panel (left)
 // ============================================================================
 
 static void draw_file_browser(ViewerState& st) {
     ImGui::BeginChild("FileBrowser", ImVec2(LEFT_PANEL_W, 0), ImGuiChildFlags_Borders);
+
+    // Absolute Path Input Bar
+    char path_buf[512];
+    strncpy(path_buf, st.current_dir.c_str(), sizeof(path_buf) - 1);
+    path_buf[sizeof(path_buf) - 1] = '\0';
+    
+    ImGui::PushItemWidth(-1);
+    if (ImGui::InputText("##folder_path", path_buf, sizeof(path_buf), ImGuiInputTextFlags_EnterReturnsTrue)) {
+        std::error_code ec;
+        if (fs::is_directory(path_buf, ec)) {
+            st.current_dir = path_buf;
+            refresh_directory(st);
+            apply_filters(st);
+        }
+    }
+    ImGui::PopItemWidth();
+
+    // Breadcrumbs Navigation
+    ImGui::Spacing();
+    draw_breadcrumbs(st);
+    ImGui::Spacing();
 
     // Search bar
     ImGui::PushItemWidth(-1);
@@ -493,11 +672,17 @@ static void draw_file_browser(ViewerState& st) {
 
     // Filter buttons
     ImGui::Spacing();
-    const char* labels[] = {"All", "Tex", "Model", "Scene", "Audio"};
+    const char* labels[] = {
+        ICON_FA_LAYER_GROUP " All",
+        ICON_FA_IMAGE " Tex",
+        ICON_FA_CUBE " Model",
+        ICON_FA_FILE " Scene",
+        ICON_FA_MUSIC " Audio"
+    };
     for (int i = 0; i < 5; i++) {
         if (i > 0) ImGui::SameLine();
         bool active = (st.type_filter == i);
-        if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.35f, 0.45f, 0.70f, 1.0f));
+        if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.28f, 0.45f, 0.70f, 1.0f)); // Blender highlighted Blue
         if (ImGui::SmallButton(labels[i])) {
             st.type_filter = i;
             search_changed = true;
@@ -513,14 +698,24 @@ static void draw_file_browser(ViewerState& st) {
     for (int i = 0; i < (int)st.filtered_files.size(); i++) {
         auto& f = st.filtered_files[i];
 
-        // Icon/color based on type
-        ImVec4 color(0.90f, 0.90f, 0.94f, 1.0f); // default text
-        const char* icon = "   ";
-        if (f.is_dir)                { icon = "\xF0\x9F\x93\x81 "; color = ImVec4(1.0f, 0.85f, 0.35f, 1.0f); } // 📁
-        else if (f.type == FTYPE_TEXTURE) { icon = "\xF0\x9F\x8E\xA8 "; color = ImVec4(0.45f, 0.85f, 0.45f, 1.0f); } // 🎨
-        else if (f.type == FTYPE_MODEL)   { icon = "\xF0\x9F\x94\xB7 "; color = ImVec4(0.45f, 0.65f, 1.0f, 1.0f); }  // 🔷
-        else if (f.type == FTYPE_SCENE)   { icon = "\xF0\x9F\x8F\x97 "; color = ImVec4(0.75f, 0.55f, 1.0f, 1.0f); }  // 🏗
-        else if (f.type == FTYPE_AUDIO)   { icon = "\xF0\x9F\x8E\xB5 "; color = ImVec4(1.0f, 0.65f, 0.30f, 1.0f); }  // 🎵
+        ImVec4 color(0.85f, 0.85f, 0.85f, 1.0f); // Default neutral gray
+        const char* icon = ICON_FA_FILE " ";
+        if (f.is_dir) {
+            icon = ICON_FA_FOLDER " ";
+            color = ImVec4(0.88f, 0.72f, 0.40f, 1.0f); // yellow folder
+        } else if (f.type == FTYPE_TEXTURE) {
+            icon = ICON_FA_IMAGE " ";
+            color = ImVec4(0.40f, 0.70f, 0.40f, 1.0f); // green texture
+        } else if (f.type == FTYPE_MODEL) {
+            icon = ICON_FA_CUBE " ";
+            color = ImVec4(0.40f, 0.60f, 0.88f, 1.0f); // blue model
+        } else if (f.type == FTYPE_SCENE) {
+            icon = ICON_FA_LAYER_GROUP " ";
+            color = ImVec4(0.70f, 0.50f, 0.88f, 1.0f); // purple scene
+        } else if (f.type == FTYPE_AUDIO) {
+            icon = ICON_FA_MUSIC " ";
+            color = ImVec4(0.88f, 0.60f, 0.30f, 1.0f); // orange audio
+        }
 
         ImGui::PushStyleColor(ImGuiCol_Text, color);
         char label[512];
@@ -528,12 +723,7 @@ static void draw_file_browser(ViewerState& st) {
         bool selected = (i == st.selected_idx);
         if (ImGui::Selectable(label, selected, ImGuiSelectableFlags_AllowDoubleClick)) {
             st.selected_idx = i;
-            if (ImGui::IsMouseDoubleClicked(0) || f.is_dir) {
-                select_file(st, f);
-            } else {
-                // Single click: load file preview
-                select_file(st, f);
-            }
+            select_file(st, f);
         }
         ImGui::PopStyleColor();
     }
@@ -553,7 +743,6 @@ static void draw_model_viewport(ViewerState& st) {
     if (w < 1) w = 1;
     if (h < 1) h = 1;
 
-    // Create or resize FBO
     if (!st.fbo) {
         st.fbo = av::create_fbo(w, h, &st.fbo_tex);
         st.fbo_w = w; st.fbo_h = h;
@@ -562,51 +751,105 @@ static void draw_model_viewport(ViewerState& st) {
         st.fbo_w = w; st.fbo_h = h;
     }
 
-    // Render the scene into FBO
     av::begin_3d(st.fbo, w, h, st.camera);
     av::render_grid(20.0f, st.model.min_y);
-
     float identity[16];
     av::mat4_identity(identity);
     float white[4] = {1, 1, 1, 1};
     float highlight[4] = {0.4f, 0.7f, 1.0f, 1.0f};
 
-    // Bind model texture if textured mode
-    for (int i = 0; i < (int)st.gpu_meshes.size(); i++) {
-        auto& gm = st.gpu_meshes[i];
-        if (st.show_textured && st.model_texture) {
-            gm.texture_id = st.model_texture;
-        } else {
-            gm.texture_id = 0;
+    if (!st.model.nodes.empty()) {
+        for (int i = 0; i < (int)st.model.nodes.size(); i++) {
+            const auto& node = st.model.nodes[i];
+            if (node.object_index < 0 || node.object_index >= (int)st.gpu_meshes.size()) continue;
+
+            auto& gm = st.gpu_meshes[node.object_index];
+            if (st.show_textured) {
+                int mat_idx = node.material_index;
+                int tex_idx = -1;
+                if (mat_idx >= 0 && mat_idx < (int)st.model.materials.size()) {
+                    tex_idx = st.model.materials[mat_idx].diffuse_texture_index;
+                }
+                if (tex_idx >= 0 && tex_idx < (int)st.model_textures.size()) {
+                    gm.texture_id = st.model_textures[tex_idx];
+                } else if (!st.model_textures.empty()) {
+                    gm.texture_id = st.model_textures[0];
+                } else {
+                    gm.texture_id = 0;
+                }
+            } else {
+                gm.texture_id = 0;
+            }
+
+            float node_matrix[16];
+            av::get_node_matrix(st.model, i, st.current_frame, node_matrix);
+
+            float* col = (node.object_index == st.highlighted_mesh) ? highlight : white;
+            av::render_mesh(gm, node_matrix, col, false);
+
+            if (st.show_wireframe) {
+                float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
+                av::render_mesh(gm, node_matrix, wire_col, true);
+            }
         }
+    } else {
+        // Fallback for models without nodes
+        for (int i = 0; i < (int)st.gpu_meshes.size(); i++) {
+            auto& gm = st.gpu_meshes[i];
+            if (st.show_textured && !st.model_textures.empty()) {
+                gm.texture_id = st.model_textures[0];
+            } else {
+                gm.texture_id = 0;
+            }
 
-        float* col = (i == st.highlighted_mesh) ? highlight : white;
-        av::render_mesh(gm, identity, col, false);
+            float* col = (i == st.highlighted_mesh) ? highlight : white;
+            av::render_mesh(gm, identity, col, false);
 
-        if (st.show_wireframe) {
-            float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
-            av::render_mesh(gm, identity, wire_col, true);
+            if (st.show_wireframe) {
+                float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
+                av::render_mesh(gm, identity, wire_col, true);
+            }
         }
     }
     av::end_3d();
 
-    // Display FBO as ImGui image
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImGui::Image((ImTextureID)(intptr_t)st.fbo_tex, ImVec2((float)w, (float)h),
-                 ImVec2(0, 1), ImVec2(1, 0)); // flip Y for OpenGL
+                 ImVec2(0, 1), ImVec2(1, 0));
 
-    // Mouse interaction on viewport
+    // Draw overlay if texture dependencies are missing
+    if (!st.missing_textures.empty()) {
+        ImGui::SetCursorScreenPos(ImVec2(pos.x + 10.0f, pos.y + 10.0f));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.20f, 0.11f, 0.11f, 0.85f)); // Semi-transparent dark red
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
+        
+        float overlay_h = st.missing_textures.size() > 4 ? 80.0f : 55.0f;
+        ImGui::BeginChild("##missing_warning", ImVec2((float)w - 20.0f, overlay_h), ImGuiChildFlags_Borders);
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), ICON_FA_WARNING " Warning: Missing Texture Dependencies!");
+        ImGui::SameLine();
+        ImGui::TextDisabled("| Please check dependencies:");
+        
+        ImGui::Spacing();
+        for (size_t k = 0; k < st.missing_textures.size(); k++) {
+            if (k > 0) ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.9f, 0.65f, 0.35f, 1.0f), " %s", st.missing_textures[k].c_str());
+        }
+        
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        ImGui::SetCursorScreenPos(ImVec2(pos.x, pos.y + (float)h)); // restore cursor
+    }
+
     if (ImGui::IsItemHovered()) {
         ImGuiIO& io = ImGui::GetIO();
 
-        // Scroll to zoom
         if (io.MouseWheel != 0.0f) {
             st.camera.distance *= (1.0f - io.MouseWheel * 0.1f);
             if (st.camera.distance < 0.1f) st.camera.distance = 0.1f;
             if (st.camera.distance > 500.0f) st.camera.distance = 500.0f;
         }
 
-        // Left drag: orbit
         if (ImGui::IsMouseDragging(0)) {
             ImVec2 delta = io.MouseDelta;
             st.camera.yaw   += delta.x * 0.5f;
@@ -615,14 +858,12 @@ static void draw_model_viewport(ViewerState& st) {
             if (st.camera.pitch < -89.0f) st.camera.pitch = -89.0f;
         }
 
-        // Right drag: pan
         if (ImGui::IsMouseDragging(1)) {
             ImVec2 delta = io.MouseDelta;
             float scale = st.camera.distance * 0.003f;
-            // Pan in camera-local XY plane
             float yaw_rad = st.camera.yaw * 3.14159f / 180.0f;
-            st.camera.target[0] -= (cosf(yaw_rad) * delta.x + sinf(yaw_rad) * 0) * scale;
-            st.camera.target[2] -= (-sinf(yaw_rad) * delta.x + cosf(yaw_rad) * 0) * scale;
+            st.camera.target[0] -= (cosf(yaw_rad) * delta.x) * scale;
+            st.camera.target[2] -= (-sinf(yaw_rad) * delta.x) * scale;
             st.camera.target[1] += delta.y * scale;
         }
     }
@@ -641,17 +882,15 @@ static void draw_texture_preview(ViewerState& st) {
     ImVec2 avail = ImGui::GetContentRegionAvail();
     ImVec2 img_size((float)st.tex_w * st.tex_zoom, (float)st.tex_h * st.tex_zoom);
 
-    // Center the image
     float off_x = (avail.x - img_size.x) * 0.5f + st.tex_pan_x;
     float off_y = (avail.y - img_size.y) * 0.5f + st.tex_pan_y;
 
-    // Draw checkerboard background behind the image area
     ImVec2 cursor = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    // Checkerboard behind texture
     ImVec2 img_min(cursor.x + off_x, cursor.y + off_y);
     ImVec2 img_max(img_min.x + img_size.x, img_min.y + img_size.y);
+    
     if (st.checker_tex) {
         float uv_scale_x = img_size.x / 32.0f;
         float uv_scale_y = img_size.y / 32.0f;
@@ -659,28 +898,23 @@ static void draw_texture_preview(ViewerState& st) {
                      img_min, img_max, ImVec2(0, 0), ImVec2(uv_scale_x, uv_scale_y));
     }
 
-    // Draw the actual texture
     dl->AddImage((ImTextureID)(intptr_t)st.preview_tex, img_min, img_max);
 
-    // Invisible button to capture mouse events
     ImGui::InvisibleButton("##tex_area", avail);
     if (ImGui::IsItemHovered()) {
         ImGuiIO& io = ImGui::GetIO();
-        // Scroll to zoom
         if (io.MouseWheel != 0.0f) {
             float old_zoom = st.tex_zoom;
             st.tex_zoom *= (1.0f + io.MouseWheel * 0.1f);
             if (st.tex_zoom < 0.1f) st.tex_zoom = 0.1f;
             if (st.tex_zoom > 32.0f) st.tex_zoom = 32.0f;
 
-            // Zoom towards mouse position
             float mx = io.MousePos.x - cursor.x - avail.x * 0.5f;
             float my = io.MousePos.y - cursor.y - avail.y * 0.5f;
             float factor = st.tex_zoom / old_zoom;
             st.tex_pan_x = mx - factor * (mx - st.tex_pan_x);
             st.tex_pan_y = my - factor * (my - st.tex_pan_y);
         }
-        // Drag to pan
         if (ImGui::IsMouseDragging(0)) {
             st.tex_pan_x += io.MouseDelta.x;
             st.tex_pan_y += io.MouseDelta.y;
@@ -713,17 +947,14 @@ static void draw_scene_inspector(ViewerState& st) {
         if (ImGui::IsItemClicked()) st.selected_object = i;
 
         if (open) {
-            // Transform
             ImGui::TextDisabled("Position: (%.2f, %.2f, %.2f)", obj.pos_x, obj.pos_y, obj.pos_z);
             ImGui::TextDisabled("Rotation: (%.2f, %.2f, %.2f)", obj.rot_x, obj.rot_y, obj.rot_z);
             ImGui::TextDisabled("Scale:    (%.2f, %.2f, %.2f)", obj.scale_x, obj.scale_y, obj.scale_z);
 
-            // Components
             for (auto& comp : obj.components) {
                 ImGui::BulletText("%s (id=%d)", comp.type_name.c_str(), comp.type_id);
             }
 
-            // Mesh/texture references
             if (!obj.mesh_name.empty())
                 ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), "Mesh: %s", obj.mesh_name.c_str());
             if (!obj.texture_name.empty())
@@ -747,26 +978,21 @@ static void draw_audio_player(ViewerState& st) {
     }
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
-
-    // Waveform display — takes most of the space
     float waveform_h = avail.y - 90.0f;
     if (waveform_h < 50.0f) waveform_h = 50.0f;
 
     if (!as.waveform.empty()) {
-        // Draw waveform with playback position indicator
         ImVec2 wf_pos = ImGui::GetCursorScreenPos();
-
         ImGui::PlotLines("##waveform", as.waveform.data(), (int)as.waveform.size(),
                          0, nullptr, -1.0f, 1.0f, ImVec2(avail.x, waveform_h));
 
-        // Playback position line
         if (as.duration > 0.0f) {
             float progress = as.position / as.duration;
             float line_x = wf_pos.x + progress * avail.x;
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->AddLine(ImVec2(line_x, wf_pos.y),
                         ImVec2(line_x, wf_pos.y + waveform_h),
-                        IM_COL32(255, 100, 50, 255), 2.0f);
+                        IM_COL32(71, 114, 179, 255), 2.0f); // Blender highlight blue
         }
     } else {
         ImGui::TextDisabled("No waveform data available.");
@@ -774,30 +1000,26 @@ static void draw_audio_player(ViewerState& st) {
     }
 
     ImGui::Spacing();
-
-    // Controls row
-    float button_w = 32.0f;
+    float button_w = 40.0f;
 
     // Play/Pause
     if (as.playing && !as.paused) {
-        if (ImGui::Button("\xE2\x8F\xB8", ImVec2(button_w, 0)))  // ⏸
+        if (ImGui::Button(ICON_FA_PAUSE, ImVec2(button_w, 0)))
             av::audio_pause();
     } else {
-        if (ImGui::Button("\xE2\x96\xB6", ImVec2(button_w, 0)))  // ▶
+        if (ImGui::Button(ICON_FA_PLAY, ImVec2(button_w, 0)))
             av::audio_play();
     }
     ImGui::SameLine();
 
     // Stop
-    if (ImGui::Button("\xE2\x8F\xB9", ImVec2(button_w, 0)))  // ⏹
+    if (ImGui::Button(ICON_FA_STOP, ImVec2(button_w, 0)))
         av::audio_stop();
     ImGui::SameLine();
 
-    // Time display
     ImGui::Text("%s / %s", format_time(as.position).c_str(), format_time(as.duration).c_str());
     ImGui::SameLine();
 
-    // Seek slider
     float seek_w = avail.x - 350.0f;
     if (seek_w < 100.0f) seek_w = 100.0f;
     ImGui::PushItemWidth(seek_w);
@@ -808,7 +1030,6 @@ static void draw_audio_player(ViewerState& st) {
     ImGui::PopItemWidth();
     ImGui::SameLine();
 
-    // Volume slider
     ImGui::PushItemWidth(100.0f);
     float vol = as.volume;
     if (ImGui::SliderFloat("##vol", &vol, 0.0f, 1.0f, "Vol:%.0f%%")) {
@@ -829,11 +1050,11 @@ static void draw_center_panel(ViewerState& st) {
         case PREVIEW_AUDIO:   draw_audio_player(st);     break;
         default: {
             ImVec2 avail = ImGui::GetContentRegionAvail();
-            ImVec2 text_size = ImGui::CalcTextSize("No file selected");
+            ImVec2 text_size = ImGui::CalcTextSize("Select a file on the left to preview");
             ImGui::SetCursorPos(ImVec2(
                 ImGui::GetCursorPosX() + (avail.x - text_size.x) * 0.5f,
                 ImGui::GetCursorPosY() + (avail.y - text_size.y) * 0.5f));
-            ImGui::TextDisabled("No file selected");
+            ImGui::TextDisabled("Select a file on the left to preview");
         } break;
     }
 }
@@ -845,16 +1066,15 @@ static void draw_center_panel(ViewerState& st) {
 static void draw_properties_panel(ViewerState& st) {
     ImGui::BeginChild("Properties", ImVec2(RIGHT_PANEL_W, 0), ImGuiChildFlags_Borders);
 
-    ImGui::TextColored(ImVec4(0.45f, 0.65f, 1.0f, 1.0f), "Properties");
+    ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Properties");
     ImGui::Separator();
 
     if (st.preview_type == PREVIEW_NONE && st.sel_name.empty()) {
-        ImGui::TextDisabled("Select a file to view properties.");
+        ImGui::TextDisabled("Select a file to view metadata.");
         ImGui::EndChild();
         return;
     }
 
-    // Common info
     ImGui::Text("Name: %s", st.sel_name.c_str());
     ImGui::Text("Size: %s", format_size(st.sel_size).c_str());
     ImGui::Text("Type: %s", filetype_label(
@@ -867,14 +1087,72 @@ static void draw_properties_panel(ViewerState& st) {
 
     switch (st.preview_type) {
     case PREVIEW_MODEL: {
-        ImGui::Text("Version: %s", st.model.version.c_str());
         ImGui::Text("Meshes:   %d", (int)st.model.meshes.size());
         ImGui::Text("Vertices: %d", st.model.total_vertices);
         ImGui::Text("Faces:    %d", st.model.total_faces);
         ImGui::Text("Frames:   %d", st.model.num_frames);
         ImGui::Separator();
 
-        // Bounding box
+        // Animation Player (Blender Style)
+        if (st.model.num_frames > 0) {
+            ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Animation Player");
+
+            if (st.anim_playing) {
+                if (ImGui::Button(ICON_FA_PAUSE " Pause")) st.anim_playing = false;
+            } else {
+                if (ImGui::Button(ICON_FA_PLAY " Play")) st.anim_playing = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Next")) {
+                st.current_frame = (st.current_frame + 1) % st.model.num_frames;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Prev")) {
+                st.current_frame = (st.current_frame - 1 + st.model.num_frames) % st.model.num_frames;
+            }
+
+            ImGui::SliderInt("Frame", &st.current_frame, 0, st.model.num_frames - 1);
+            ImGui::SliderFloat("FPS", &st.anim_fps, 1.0f, 120.0f, "%.0f");
+            ImGui::Separator();
+        }
+
+        // 3D Lighting Editor (Blender Style)
+        ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Interactive Lighting");
+        
+        static float el = 45.0f;
+        static float az = 45.0f;
+        
+        bool changed = false;
+        if (ImGui::SliderFloat("Elevation", &el, -90.0f, 90.0f, "%.1f°")) changed = true;
+        if (ImGui::SliderFloat("Azimuth", &az, -180.0f, 180.0f, "%.1f°")) changed = true;
+        
+        if (changed) {
+            float el_rad = el * 3.14159265f / 180.0f;
+            float az_rad = az * 3.14159265f / 180.0f;
+            av::g_light_dir[0] = cosf(el_rad) * sinf(az_rad);
+            av::g_light_dir[1] = sinf(el_rad);
+            av::g_light_dir[2] = cosf(el_rad) * cosf(az_rad);
+            
+            float len = sqrtf(av::g_light_dir[0]*av::g_light_dir[0] + av::g_light_dir[1]*av::g_light_dir[1] + av::g_light_dir[2]*av::g_light_dir[2]);
+            if (len > 0.0001f) {
+                av::g_light_dir[0] /= len;
+                av::g_light_dir[1] /= len;
+                av::g_light_dir[2] /= len;
+            }
+        }
+        
+        ImGui::ColorEdit3("Light Color", av::g_light_color);
+        ImGui::ColorEdit3("Ambient Color", av::g_ambient_color);
+        
+        if (ImGui::Button("Reset Lights")) {
+            el = 45.0f;
+            az = 45.0f;
+            av::g_light_dir[0] = 0.577f; av::g_light_dir[1] = 0.577f; av::g_light_dir[2] = 0.577f;
+            av::g_light_color[0] = 1.0f; av::g_light_color[1] = 0.95f; av::g_light_color[2] = 0.9f;
+            av::g_ambient_color[0] = 0.3f; av::g_ambient_color[1] = 0.3f; av::g_ambient_color[2] = 0.35f;
+        }
+        ImGui::Separator();
+
         if (ImGui::TreeNode("Bounding Box")) {
             ImGui::Text("Min: (%.3f, %.3f, %.3f)", st.model.min_x, st.model.min_y, st.model.min_z);
             ImGui::Text("Max: (%.3f, %.3f, %.3f)", st.model.max_x, st.model.max_y, st.model.max_z);
@@ -884,8 +1162,7 @@ static void draw_properties_panel(ViewerState& st) {
         }
         ImGui::Separator();
 
-        // Mesh list
-        if (ImGui::TreeNode("Meshes")) {
+        if (ImGui::TreeNode("Mesh Elements")) {
             for (int i = 0; i < (int)st.model.meshes.size(); i++) {
                 auto& m = st.model.meshes[i];
                 char lbl[64];
@@ -898,11 +1175,25 @@ static void draw_properties_panel(ViewerState& st) {
         }
         ImGui::Separator();
 
-        // Render controls
-        ImGui::TextColored(ImVec4(0.45f, 0.65f, 1.0f, 1.0f), "Render Controls");
-        ImGui::Checkbox("Textured", &st.show_textured);
-        ImGui::Checkbox("Wireframe", &st.show_wireframe);
-        ImGui::Text("Texture: %s", st.model_texture ? "Loaded" : "None");
+        ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Render Settings");
+        ImGui::Checkbox("Textured Mode", &st.show_textured);
+        ImGui::Checkbox("Wireframe Mode", &st.show_wireframe);
+
+        if (ImGui::TreeNode("Texture Dependencies")) {
+            for (size_t k = 0; k < st.model.texture_filenames.size(); k++) {
+                const auto& tname = st.model.texture_filenames[k];
+                bool is_missing = std::find(st.missing_textures.begin(), st.missing_textures.end(), tname) != st.missing_textures.end();
+                if (is_missing) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "[X] %s (MISSING!)", tname.c_str());
+                } else {
+                    ImGui::TextColored(ImVec4(0.4f, 0.85f, 0.4f, 1.0f), "[O] %s", tname.c_str());
+                }
+            }
+            if (st.model.texture_filenames.empty()) {
+                ImGui::TextDisabled("None (using matching texture)");
+            }
+            ImGui::TreePop();
+        }
     } break;
 
     case PREVIEW_TEXTURE: {
@@ -916,8 +1207,7 @@ static void draw_properties_panel(ViewerState& st) {
             st.tex_pan_x = st.tex_pan_y = 0.0f;
         }
         ImGui::SameLine();
-        if (ImGui::Button("Fit")) {
-            // Auto-fit zoom will be computed next frame based on avail size
+        if (ImGui::Button("Fit Screen")) {
             st.tex_zoom = 1.0f;
             st.tex_pan_x = st.tex_pan_y = 0.0f;
         }
@@ -928,7 +1218,7 @@ static void draw_properties_panel(ViewerState& st) {
         ImGui::Separator();
         if (st.selected_object >= 0 && st.selected_object < (int)st.scene.objects.size()) {
             auto& obj = st.scene.objects[st.selected_object];
-            ImGui::TextColored(ImVec4(0.45f, 0.65f, 1.0f, 1.0f), "Selected Object");
+            ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Selected Object");
             ImGui::Text("Name: %s", obj.name.c_str());
             ImGui::Text("Components: %d", (int)obj.components.size());
             ImGui::Separator();
@@ -967,10 +1257,8 @@ static void draw_status_bar(ViewerState& st) {
     ImGui::Separator();
     ImGui::BeginChild("StatusBar", ImVec2(0, STATUS_BAR_H));
 
-    // Left: directory
     ImGui::TextDisabled("%s", st.current_dir.c_str());
 
-    // Center: status
     if (!st.status_msg.empty()) {
         float text_w = ImGui::CalcTextSize(st.status_msg.c_str()).x;
         float avail = ImGui::GetContentRegionAvail().x;
@@ -978,7 +1266,6 @@ static void draw_status_bar(ViewerState& st) {
         ImGui::Text("%s", st.status_msg.c_str());
     }
 
-    // Right: shortcuts
     ImGui::SameLine(ImGui::GetContentRegionAvail().x - 200.0f + ImGui::GetCursorPosX());
     ImGui::TextDisabled("[W]ire [T]ex [R]eset [Esc]Quit");
 
@@ -986,46 +1273,75 @@ static void draw_status_bar(ViewerState& st) {
 }
 
 // ============================================================================
-// Apply ImGui theme
+// Apply Blender Theme (flat neutral gray dark style)
 // ============================================================================
 
-static void apply_theme() {
+static void apply_blender_theme(float dpi_scale) {
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding   = 0;
-    style.FrameRounding    = 4;
-    style.ScrollbarRounding = 6;
-    style.GrabRounding     = 3;
-    style.WindowBorderSize = 0;
-    style.FrameBorderSize  = 0;
-    style.ItemSpacing      = ImVec2(8, 6);
-    style.FramePadding     = ImVec2(8, 4);
+
+    style.WindowRounding    = 0.0f;
+    style.ChildRounding     = 0.0f;
+    style.FrameRounding     = 0.0f;
+    style.GrabRounding      = 0.0f;
+    style.PopupRounding     = 0.0f;
+    style.ScrollbarRounding = 0.0f;
+    style.TabRounding       = 0.0f;
+
+    style.FramePadding      = ImVec2(6, 4);
+    style.ItemSpacing       = ImVec2(8, 4);
+    style.ItemInnerSpacing  = ImVec2(6, 4);
+    style.ScrollbarSize     = 10.0f;
+    style.GrabMinSize       = 10.0f;
+    style.IndentSpacing     = 12.0f;
+
+    style.WindowBorderSize  = 0.0f;
+    style.ChildBorderSize   = 1.0f;
+    style.FrameBorderSize   = 1.0f;
+    style.PopupBorderSize   = 1.0f;
+    style.TabBorderSize     = 0.0f;
 
     ImVec4* c = style.Colors;
-    c[ImGuiCol_WindowBg]        = ImVec4(0.10f, 0.10f, 0.14f, 1.0f);
-    c[ImGuiCol_ChildBg]         = ImVec4(0.12f, 0.12f, 0.16f, 1.0f);
-    c[ImGuiCol_PopupBg]         = ImVec4(0.14f, 0.14f, 0.19f, 0.95f);
-    c[ImGuiCol_FrameBg]         = ImVec4(0.16f, 0.16f, 0.22f, 1.0f);
-    c[ImGuiCol_FrameBgHovered]  = ImVec4(0.22f, 0.22f, 0.30f, 1.0f);
-    c[ImGuiCol_FrameBgActive]   = ImVec4(0.28f, 0.28f, 0.38f, 1.0f);
-    c[ImGuiCol_TitleBg]         = ImVec4(0.08f, 0.08f, 0.11f, 1.0f);
-    c[ImGuiCol_TitleBgActive]   = ImVec4(0.12f, 0.12f, 0.17f, 1.0f);
-    c[ImGuiCol_Header]          = ImVec4(0.20f, 0.22f, 0.32f, 1.0f);
-    c[ImGuiCol_HeaderHovered]   = ImVec4(0.28f, 0.30f, 0.42f, 1.0f);
-    c[ImGuiCol_HeaderActive]    = ImVec4(0.34f, 0.36f, 0.48f, 1.0f);
-    c[ImGuiCol_Button]          = ImVec4(0.24f, 0.28f, 0.40f, 1.0f);
-    c[ImGuiCol_ButtonHovered]   = ImVec4(0.32f, 0.38f, 0.55f, 1.0f);
-    c[ImGuiCol_ButtonActive]    = ImVec4(0.40f, 0.45f, 0.62f, 1.0f);
-    c[ImGuiCol_Tab]             = ImVec4(0.16f, 0.16f, 0.22f, 1.0f);
-    c[ImGuiCol_TabHovered]      = ImVec4(0.28f, 0.30f, 0.42f, 1.0f);
-    c[ImGuiCol_TabActive]       = ImVec4(0.22f, 0.24f, 0.35f, 1.0f);
-    c[ImGuiCol_Separator]       = ImVec4(0.22f, 0.22f, 0.30f, 1.0f);
-    c[ImGuiCol_ScrollbarBg]     = ImVec4(0.10f, 0.10f, 0.14f, 1.0f);
-    c[ImGuiCol_ScrollbarGrab]   = ImVec4(0.30f, 0.30f, 0.40f, 1.0f);
-    c[ImGuiCol_CheckMark]       = ImVec4(0.45f, 0.65f, 1.0f, 1.0f);
-    c[ImGuiCol_SliderGrab]      = ImVec4(0.45f, 0.55f, 0.80f, 1.0f);
-    c[ImGuiCol_Text]            = ImVec4(0.90f, 0.90f, 0.94f, 1.0f);
-    c[ImGuiCol_TextDisabled]    = ImVec4(0.50f, 0.50f, 0.58f, 1.0f);
+
+    c[ImGuiCol_WindowBg]             = ImVec4(0.18f, 0.18f, 0.18f, 1.00f); // #2e2e2e
+    c[ImGuiCol_ChildBg]              = ImVec4(0.15f, 0.15f, 0.15f, 1.00f); // #262626
+    c[ImGuiCol_PopupBg]              = ImVec4(0.11f, 0.11f, 0.11f, 0.98f); // #1c1c1c
+    c[ImGuiCol_Border]               = ImVec4(0.09f, 0.09f, 0.09f, 0.50f); // #171717
+    c[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+
+    c[ImGuiCol_FrameBg]              = ImVec4(0.24f, 0.24f, 0.24f, 1.00f); // #3d3d3d
+    c[ImGuiCol_FrameBgHovered]       = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
+    c[ImGuiCol_FrameBgActive]        = ImVec4(0.35f, 0.35f, 0.35f, 1.00f);
+
+    c[ImGuiCol_TitleBg]              = ImVec4(0.18f, 0.18f, 0.18f, 1.00f);
+    c[ImGuiCol_TitleBgActive]        = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
+    c[ImGuiCol_TitleBgCollapsed]     = ImVec4(0.18f, 0.18f, 0.18f, 0.50f);
+
+    c[ImGuiCol_MenuBarBg]            = ImVec4(0.18f, 0.18f, 0.18f, 1.00f);
+
+    c[ImGuiCol_ScrollbarBg]          = ImVec4(0.12f, 0.12f, 0.12f, 0.30f);
+    c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.31f, 0.31f, 0.31f, 0.80f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.40f, 0.40f, 0.40f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.50f, 0.50f, 0.50f, 1.00f);
+
+    c[ImGuiCol_CheckMark]            = ImVec4(0.28f, 0.45f, 0.70f, 1.00f); // blender blue #4772b3
+    c[ImGuiCol_SliderGrab]           = ImVec4(0.31f, 0.31f, 0.31f, 1.00f);
+    c[ImGuiCol_SliderGrabActive]     = ImVec4(0.28f, 0.45f, 0.70f, 1.00f);
+
+    c[ImGuiCol_Button]               = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
+    c[ImGuiCol_ButtonHovered]        = ImVec4(0.31f, 0.31f, 0.31f, 1.00f);
+    c[ImGuiCol_ButtonActive]         = ImVec4(0.28f, 0.45f, 0.70f, 1.00f);
+
+    c[ImGuiCol_Header]               = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
+    c[ImGuiCol_HeaderHovered]        = ImVec4(0.28f, 0.45f, 0.70f, 0.40f);
+    c[ImGuiCol_HeaderActive]         = ImVec4(0.28f, 0.45f, 0.70f, 0.80f);
+
+    c[ImGuiCol_Separator]            = ImVec4(0.09f, 0.09f, 0.09f, 0.50f);
+    c[ImGuiCol_SeparatorHovered]     = ImVec4(0.28f, 0.45f, 0.70f, 0.60f);
+    c[ImGuiCol_SeparatorActive]      = ImVec4(0.28f, 0.45f, 0.70f, 1.00f);
+
+    c[ImGuiCol_Text]                 = ImVec4(0.85f, 0.85f, 0.85f, 1.00f);
+    c[ImGuiCol_TextDisabled]         = ImVec4(0.55f, 0.55f, 0.55f, 1.00f);
 }
 
 // ============================================================================
@@ -1036,16 +1352,11 @@ static bool handle_shortcuts(ViewerState& st) {
     ImGuiIO& io = ImGui::GetIO();
     if (io.WantCaptureKeyboard) return false;
 
-    // Escape: quit
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) return true;
 
-    // W: toggle wireframe
     if (ImGui::IsKeyPressed(ImGuiKey_W)) st.show_wireframe = !st.show_wireframe;
-
-    // T: toggle textured
     if (ImGui::IsKeyPressed(ImGuiKey_T)) st.show_textured = !st.show_textured;
 
-    // R: reset camera
     if (ImGui::IsKeyPressed(ImGuiKey_R)) {
         st.camera = av::Camera{};
         if (st.preview_type == PREVIEW_MODEL) {
@@ -1057,14 +1368,12 @@ static bool handle_shortcuts(ViewerState& st) {
         }
     }
 
-    // F1-F5: filter types
     if (ImGui::IsKeyPressed(ImGuiKey_F1)) { st.type_filter = 0; apply_filters(st); }
     if (ImGui::IsKeyPressed(ImGuiKey_F2)) { st.type_filter = 1; apply_filters(st); }
     if (ImGui::IsKeyPressed(ImGuiKey_F3)) { st.type_filter = 2; apply_filters(st); }
     if (ImGui::IsKeyPressed(ImGuiKey_F4)) { st.type_filter = 3; apply_filters(st); }
     if (ImGui::IsKeyPressed(ImGuiKey_F5)) { st.type_filter = 4; apply_filters(st); }
 
-    // Up/Down: navigate file list
     if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
         if (st.selected_idx > 0) {
             st.selected_idx--;
@@ -1078,7 +1387,6 @@ static bool handle_shortcuts(ViewerState& st) {
         }
     }
 
-    // Enter: open directory
     if (ImGui::IsKeyPressed(ImGuiKey_Enter)) {
         if (st.selected_idx >= 0 && st.selected_idx < (int)st.filtered_files.size()) {
             auto& f = st.filtered_files[st.selected_idx];
@@ -1086,7 +1394,6 @@ static bool handle_shortcuts(ViewerState& st) {
         }
     }
 
-    // Backspace: go up
     if (ImGui::IsKeyPressed(ImGuiKey_Backspace)) {
         fs::path parent = fs::path(st.current_dir).parent_path();
         if (!parent.empty() && parent != st.current_dir) {
@@ -1104,13 +1411,11 @@ static bool handle_shortcuts(ViewerState& st) {
 // ============================================================================
 
 int main(int argc, char* argv[]) {
-    // ── SDL init ────────────────────────────────────────────────────────
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
 
-    // OpenGL 3.3 core
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
@@ -1118,7 +1423,7 @@ int main(int argc, char* argv[]) {
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
     SDL_Window* window = SDL_CreateWindow(WIN_TITLE, WIN_W, WIN_H,
-                                          SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+                                          SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_Quit();
@@ -1135,18 +1440,85 @@ int main(int argc, char* argv[]) {
     SDL_GL_MakeCurrent(window, gl_ctx);
     SDL_GL_SetSwapInterval(1); // VSync
 
-    // ── ImGui init ──────────────────────────────────────────────────────
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    apply_theme();
+    float dpi_scale = 1.0f;
+    int display_id = SDL_GetDisplayForWindow(window);
+    if (display_id) {
+        float content_scale = SDL_GetDisplayContentScale(display_id);
+        if (content_scale > 0) dpi_scale = content_scale;
+    }
+    if (dpi_scale < 1.0f) dpi_scale = 1.0f;
+    if (dpi_scale > 3.0f) dpi_scale = 3.0f;
+
+    apply_blender_theme(dpi_scale);
 
     ImGui_ImplSDL3_InitForOpenGL(window, gl_ctx);
     ImGui_ImplOpenGL3_Init(GLSL_VERSION);
 
-    // ── Subsystem init ──────────────────────────────────────────────────
+    // Font loading — Inter + Font Awesome solid icons, DPI-aware
+    {
+        float font_size_main = 16.0f * dpi_scale;
+
+        ImFontConfig text_cfg;
+        text_cfg.OversampleH = 3;
+        text_cfg.OversampleV = 2;
+        text_cfg.PixelSnapH = true;
+
+        static const ImWchar icon_ranges[] = { ICON_FA_MIN, ICON_FA_MAX, 0 };
+        ImFontConfig icon_cfg;
+        icon_cfg.MergeMode = true;
+        icon_cfg.OversampleH = 2;
+        icon_cfg.OversampleV = 2;
+        icon_cfg.PixelSnapH = true;
+        icon_cfg.GlyphMinAdvanceX = font_size_main;
+        icon_cfg.GlyphOffset = ImVec2(0, 2);
+
+        std::string inter_paths[] = {
+            "src/assets/fonts/Inter-Regular.ttf",
+            get_data_path("src/assets/fonts/Inter-Regular.ttf"),
+            get_user_data_dir() + "launcher/fonts/Inter-Regular.ttf",
+            get_user_data_dir() + "src/assets/fonts/Inter-Regular.ttf",
+            "src/assets/fonts/MegalopolisExtra-Regular.otf",
+            "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
+        };
+
+        std::string fa_paths[] = {
+            get_user_data_dir() + "launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+            "/usr/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+            "src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+            get_data_path("src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf"),
+            get_user_data_dir() + "launcher/fonts/fa-solid-900.ttf",
+            get_user_data_dir() + "launcher/fonts/fa-solid-900.otf",
+            "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf",
+            "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.otf",
+            "src/assets/fonts/fa-solid-900.ttf",
+            "src/assets/fonts/fa-solid-900.otf",
+            get_data_path("src/assets/fonts/fa-solid-900.ttf"),
+            get_data_path("src/assets/fonts/fa-solid-900.otf"),
+        };
+
+        std::string inter_path, fa_path;
+        for (auto& fp : inter_paths) {
+            if (fs::exists(fp)) { inter_path = fp; break; }
+        }
+        for (auto& fp : fa_paths) {
+            if (fs::exists(fp)) { fa_path = fp; break; }
+        }
+
+        if (!inter_path.empty()) {
+            ImFont* font = io.Fonts->AddFontFromFileTTF(inter_path.c_str(), font_size_main, &text_cfg);
+            if (font && !fa_path.empty()) {
+                io.Fonts->AddFontFromFileTTF(fa_path.c_str(), font_size_main * 0.85f, &icon_cfg, icon_ranges);
+                std::cout << "[Ruby] FontAwesome icons merged successfully from: " << fa_path << std::endl;
+            }
+            io.FontGlobalScale = 1.0f / dpi_scale;
+        }
+    }
+
     if (!av::renderer_init()) {
         fprintf(stderr, "Failed to initialize renderer.\n");
     }
@@ -1154,29 +1526,50 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Failed to initialize audio.\n");
     }
 
-    // Checkerboard texture for alpha backgrounds
     g_state.checker_tex = create_checkerboard();
 
-    // ── Default directory ───────────────────────────────────────────────
+    // ── Parse startup folder/file parameter ─────────────────────────────
+    std::string start_path;
     if (argc > 1) {
-        g_state.current_dir = expand_home(argv[1]);
+        start_path = expand_home(argv[1]);
     } else {
-        g_state.current_dir = expand_home("~/.local/share/swordigo-desktop/assets/resources/");
+        start_path = expand_home("~/.local/share/swordigo-desktop/assets/resources/");
     }
-    // Fallback: if the directory doesn't exist, use home
-    if (!fs::is_directory(g_state.current_dir)) {
+
+    std::error_code ec;
+    if (fs::is_regular_file(start_path, ec)) {
+        g_state.current_dir = fs::path(start_path).parent_path().string();
+        refresh_directory(g_state);
+        apply_filters(g_state);
+        
+        std::string target_name = fs::path(start_path).filename().string();
+        for (int i = 0; i < (int)g_state.filtered_files.size(); i++) {
+            if (g_state.filtered_files[i].name == target_name) {
+                g_state.selected_idx = i;
+                select_file(g_state, g_state.filtered_files[i]);
+                break;
+            }
+        }
+    } else if (fs::is_directory(start_path, ec)) {
+        g_state.current_dir = start_path;
+        refresh_directory(g_state);
+        apply_filters(g_state);
+    } else {
         const char* home = getenv("HOME");
         g_state.current_dir = home ? home : "/";
+        refresh_directory(g_state);
+        apply_filters(g_state);
     }
 
-    refresh_directory(g_state);
-    apply_filters(g_state);
-    g_state.status_msg = "Ready — browse files on the left";
+    g_state.status_msg = "Ruby Ready — browse files on the left";
 
-    // ── Main loop ───────────────────────────────────────────────────────
+    Uint64 last_time = SDL_GetTicks();
     bool running = true;
     while (running) {
-        // Poll events
+        Uint64 current_time = SDL_GetTicks();
+        float dt = (current_time - last_time) / 1000.0f;
+        last_time = current_time;
+
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL3_ProcessEvent(&event);
@@ -1184,18 +1577,83 @@ int main(int argc, char* argv[]) {
             if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) running = false;
         }
 
-        // Update audio
         av::audio_update();
 
-        // Start ImGui frame
+        // Update animation frame rate-independently
+        if (g_state.preview_type == PREVIEW_MODEL && g_state.anim_playing && g_state.model.num_frames > 0) {
+            g_state.anim_timer += dt;
+            float step = 1.0f / g_state.anim_fps;
+            if (g_state.anim_timer >= step) {
+                int frames_to_advance = static_cast<int>(g_state.anim_timer / step);
+                g_state.current_frame = (g_state.current_frame + frames_to_advance) % g_state.model.num_frames;
+                g_state.anim_timer = fmodf(g_state.anim_timer, step);
+            }
+        }
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
 
-        // Keyboard shortcuts
         if (handle_shortcuts(g_state)) running = false;
 
-        // ── Fullscreen window ───────────────────────────────────────────
+        // Draw top Blender-style main menu bar
+        bool open_about = false;
+        if (ImGui::BeginMainMenuBar()) {
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("Open Vanilla Assets Folder")) {
+                    std::error_code ec;
+                    g_state.current_dir = expand_home("~/.local/share/swordigo-desktop/assets/resources/");
+                    if (!fs::is_directory(g_state.current_dir, ec)) {
+                        const char* home = getenv("HOME");
+                        g_state.current_dir = home ? home : "/";
+                    }
+                    refresh_directory(g_state);
+                    apply_filters(g_state);
+                }
+                if (ImGui::MenuItem("Exit", "Esc")) {
+                    running = false;
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("View")) {
+                ImGui::MenuItem("Textured Mode", "T", &g_state.show_textured);
+                ImGui::MenuItem("Wireframe Mode", "W", &g_state.show_wireframe);
+                if (ImGui::MenuItem("Reset Camera", "R")) {
+                    g_state.camera = av::Camera{};
+                    if (g_state.preview_type == PREVIEW_MODEL) {
+                        g_state.camera.target[0] = g_state.model.center_x;
+                        g_state.camera.target[1] = g_state.model.center_y;
+                        g_state.camera.target[2] = g_state.model.center_z;
+                        g_state.camera.distance  = g_state.model.radius * 2.5f;
+                        if (g_state.camera.distance < 1.0f) g_state.camera.distance = 3.0f;
+                    }
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Help")) {
+                if (ImGui::MenuItem("About Ruby")) {
+                    open_about = true;
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::EndMainMenuBar();
+        }
+
+        if (open_about) {
+            ImGui::OpenPopup("About Ruby");
+        }
+
+        // About Ruby Popup Modal
+        if (ImGui::BeginPopupModal("About Ruby", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Ruby - Swordigo Desktop Asset Viewer & Editor");
+            ImGui::Separator();
+            ImGui::Text("Remastered 3D POD model hierarchy, texture, scene and audio player.");
+            ImGui::Text("Credits: PowerVR Native SDK decompressors (MIT).");
+            ImGui::Spacing();
+            if (ImGui::Button("OK", ImVec2(120, 0))) { ImGui::CloseCurrentPopup(); }
+            ImGui::EndPopup();
+        }
+
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
         ImGui::SetNextWindowSize(vp->WorkSize);
@@ -1210,15 +1668,12 @@ int main(int argc, char* argv[]) {
         float total_h = ImGui::GetContentRegionAvail().y;
         float content_h = total_h - STATUS_BAR_H;
 
-        // ── Top content area (3 columns) ────────────────────────────────
         ImGui::BeginChild("ContentArea", ImVec2(0, content_h));
 
-        // Left panel: file browser
         draw_file_browser(g_state);
 
         ImGui::SameLine();
 
-        // Center panel: preview
         float center_w = ImGui::GetContentRegionAvail().x - RIGHT_PANEL_W;
         if (center_w < 100.0f) center_w = 100.0f;
         ImGui::BeginChild("CenterPanel", ImVec2(center_w, 0));
@@ -1227,28 +1682,24 @@ int main(int argc, char* argv[]) {
 
         ImGui::SameLine();
 
-        // Right panel: properties
         draw_properties_panel(g_state);
 
         ImGui::EndChild();
 
-        // ── Status bar ──────────────────────────────────────────────────
         draw_status_bar(g_state);
 
         ImGui::End();
 
-        // ── Render ──────────────────────────────────────────────────────
         ImGui::Render();
         int fb_w, fb_h;
         SDL_GetWindowSizeInPixels(window, &fb_w, &fb_h);
         glViewport(0, 0, fb_w, fb_h);
-        glClearColor(0.08f, 0.08f, 0.11f, 1.0f);
+        glClearColor(0.18f, 0.18f, 0.18f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(window);
     }
 
-    // ── Cleanup ─────────────────────────────────────────────────────────
     free_preview_resources(g_state);
 
     if (g_state.fbo) av::delete_fbo(g_state.fbo, g_state.fbo_tex);

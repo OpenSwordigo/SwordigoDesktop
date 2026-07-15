@@ -152,6 +152,10 @@ uint64_t g_sre_hero_pos_x_addr = 0;
 uint64_t g_sre_hero_pos_y_addr = 0;
 uint64_t g_sre_hero_pos_z_addr = 0;
 
+static uint64_t g_sre_cam_x_addr = 0;
+static uint64_t g_sre_cam_y_addr = 0;
+static uint64_t g_sre_cam_z_addr = 0;
+
 // SRE Background Renderer — guest addresses
 static uint64_t bg_mode_addr = 0;       // Guest addr of g_sre_bg_mode
 static uint64_t bg_brightness_addr = 0; // Guest addr of g_sre_bg_brightness
@@ -1581,10 +1585,13 @@ void load_and_boot() {
                     st.draw_h        = g_draw_h;
                     st.mouse_x       = mouse_x;
                     st.mouse_y       = mouse_y;
-                    st.cam_x         = g_cam_off_x;
-                    st.cam_y         = g_cam_off_y;
-                    st.cam_z         = g_cam_off_z;
+                    st.cam_x         = g_sre_cam_x_addr ? *(float*)(g_guest_memory + g_sre_cam_x_addr) : g_cam_off_x;
+                    st.cam_y         = g_sre_cam_y_addr ? *(float*)(g_guest_memory + g_sre_cam_y_addr) : g_cam_off_y;
+                    st.cam_z         = g_sre_cam_z_addr ? *(float*)(g_guest_memory + g_sre_cam_z_addr) : g_cam_off_z;
                     st.cam_zoom      = 1.0f;
+                    st.hero_x        = g_sre_hero_pos_x_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_x_addr) : 0.0f;
+                    st.hero_y        = g_sre_hero_pos_y_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_y_addr) : 0.0f;
+                    st.hero_z        = g_sre_hero_pos_z_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_z_addr) : 0.0f;
                     st.cam_active    = g_cam_active;
                     st.typing_mode   = g_typing_mode;
                     st.game_paused   = g_game_paused;
@@ -3889,6 +3896,11 @@ void load_and_boot_arm64() {
                 g_sre_hero_pos_x_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hero_pos_x");
                 g_sre_hero_pos_y_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hero_pos_y");
                 g_sre_hero_pos_z_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hero_pos_z");
+                
+                // Resolve camera coordinates
+                g_sre_cam_x_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_x");
+                g_sre_cam_y_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_y");
+                g_sre_cam_z_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_z");
 
                 std::cout << "[SRE] Music: load_name=0x" << std::hex << sre_music_load_name_addr
                           << " load_pending=0x" << sre_music_load_pending_addr
@@ -4995,10 +5007,13 @@ void load_and_boot_arm64() {
                     st.draw_h        = g_draw_h;
                     st.mouse_x       = mouse_x;
                     st.mouse_y       = mouse_y;
-                    st.cam_x         = g_cam_off_x;
-                    st.cam_y         = g_cam_off_y;
-                    st.cam_z         = g_cam_off_z;
+                    st.cam_x         = g_sre_cam_x_addr ? *(float*)(g_guest_memory + g_sre_cam_x_addr) : g_cam_off_x;
+                    st.cam_y         = g_sre_cam_y_addr ? *(float*)(g_guest_memory + g_sre_cam_y_addr) : g_cam_off_y;
+                    st.cam_z         = g_sre_cam_z_addr ? *(float*)(g_guest_memory + g_sre_cam_z_addr) : g_cam_off_z;
                     st.cam_zoom      = 1.0f;
+                    st.hero_x        = g_sre_hero_pos_x_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_x_addr) : 0.0f;
+                    st.hero_y        = g_sre_hero_pos_y_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_y_addr) : 0.0f;
+                    st.hero_z        = g_sre_hero_pos_z_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_z_addr) : 0.0f;
                     st.cam_active    = g_cam_active;
                     st.typing_mode   = g_typing_mode;
                     st.game_paused   = g_game_paused;

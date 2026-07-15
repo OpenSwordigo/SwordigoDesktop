@@ -188,10 +188,19 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
         "src/assets/fonts/MegalopolisExtra-Regular.otf",
         "src/assets/fonts/Redaction10-Regular.otf",
         "src/assets/fonts/Inter-Regular.ttf",
+        "/usr/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
+        "/usr/share/swordigo-desktop/launcher/fonts/Redaction10-Regular.otf",
+        "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
+        "/usr/local/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
+        "/usr/local/share/swordigo-desktop/launcher/fonts/Redaction10-Regular.otf",
+        "/usr/local/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
         "/usr/share/swordigo-desktop/src/assets/fonts/Redaction10-Regular.otf",
         "/usr/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf"
     };
     if (!home_dir.empty()) {
+        main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf");
+        main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/Redaction10-Regular.otf");
+        main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf");
         main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/MegalopolisExtra-Regular.otf");
         main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Redaction10-Regular.otf");
         main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf");
@@ -213,10 +222,19 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
         "src/assets/fonts/MegalopolisExtra-Regular.otf",
         "src/assets/fonts/Redaction10-Bold.otf",
         "src/assets/fonts/Inter-Regular.ttf",
+        "/usr/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
+        "/usr/share/swordigo-desktop/launcher/fonts/Redaction10-Bold.otf",
+        "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
+        "/usr/local/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
+        "/usr/local/share/swordigo-desktop/launcher/fonts/Redaction10-Bold.otf",
+        "/usr/local/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
         "/usr/share/swordigo-desktop/src/assets/fonts/Redaction10-Bold.otf",
         "/usr/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf"
     };
     if (!home_dir.empty()) {
+        button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf");
+        button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/Redaction10-Bold.otf");
+        button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf");
         button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/MegalopolisExtra-Regular.otf");
         button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Redaction10-Bold.otf");
         button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf");
@@ -237,10 +255,16 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
     std::vector<std::string> fa_candidates = {
         "src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
         "src/assets/fonts/fa-solid-900.ttf",
+        "/usr/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+        "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf",
+        "/usr/local/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+        "/usr/local/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf",
         "/usr/share/swordigo-desktop/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
         "/usr/share/swordigo-desktop/src/assets/fonts/fa-solid-900.ttf"
     };
     if (!home_dir.empty()) {
+        fa_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf");
+        fa_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf");
         fa_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf");
         fa_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/fa-solid-900.ttf");
         fa_candidates.push_back(home_dir + "/.local/share/swordigo-desktop-launcher/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf");
@@ -532,6 +556,8 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
                     ImGui::TextUnformatted("Hero Follow");
                     ImGui::PopStyleColor();
                 }
+
+                row("Hero Coords", "%.1f, %.1f, %.1f", st.hero_x, st.hero_y, st.hero_z);
 
                 ImGui::EndTable();
             }
@@ -2373,7 +2399,7 @@ void SwordfareGUI::init_lua_console(
     m_console_ready        = (buf_addr != 0);
 
     if (m_console_ready) {
-        m_console_history.push_back({"Swordigo Runtime  •  Lua 5.1  •  Full game state attached", false, false});
+        m_console_history.push_back({"Raijin  •  World's first Swordigo Lua console  •  Swordfare subsystem", false, false});
         m_console_history.push_back({"Type Lua and press Enter. Up/Down for history. Backtick (`) to close.", false, false});
     }
 }
@@ -2454,6 +2480,55 @@ bool SwordfareGUI::lua_console_key(SDL_Keycode key, const std::string& /*unused*
     return true; // consume all keys when console is open
 }
 
+int SwordfareGUI::console_input_callback(ImGuiInputTextCallbackData* data) {
+    SwordfareGUI* gui = (SwordfareGUI*)data->UserData;
+    return gui->on_console_input_callback(data);
+}
+
+int SwordfareGUI::on_console_input_callback(ImGuiInputTextCallbackData* data) {
+    // 1. History Recall via Up / Down arrow keys
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackHistory) {
+        int prev_idx = m_console_hist_idx;
+        if (data->EventKey == ImGuiKey_UpArrow) {
+            if (m_console_hist_idx < 0) {
+                m_console_hist_idx = (int)m_console_cmd_history.size() - 1;
+            } else if (m_console_hist_idx > 0) {
+                m_console_hist_idx--;
+            }
+        } else if (data->EventKey == ImGuiKey_DownArrow) {
+            if (m_console_hist_idx >= 0) {
+                m_console_hist_idx++;
+                if (m_console_hist_idx >= (int)m_console_cmd_history.size()) {
+                    m_console_hist_idx = -1;
+                }
+            }
+        }
+
+        if (prev_idx != m_console_hist_idx) {
+            std::string cmd = (m_console_hist_idx >= 0) ? m_console_cmd_history[m_console_hist_idx] : "";
+            data->DeleteChars(0, data->BufTextLen);
+            data->InsertChars(0, cmd.c_str());
+            data->CursorPos = data->SelectionStart = data->SelectionEnd = (int)cmd.size();
+        }
+    }
+
+    // 2. Tab completion / Indent
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackCompletion) {
+        // Insert 4 spaces at cursor position
+        data->InsertChars(data->CursorPos, "    ");
+    }
+
+    // 3. Ctrl+L to Clear Screen
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways) {
+        ImGuiIO& io = ImGui::GetIO();
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_L)) {
+            m_console_history.clear();
+        }
+    }
+
+    return 0;
+}
+
 void SwordfareGUI::draw_lua_console() {
     if (!m_initialized || !m_console_open || !m_console_ready) return;
 
@@ -2530,9 +2605,9 @@ void SwordfareGUI::draw_lua_console() {
         );
 
         ImGui::SetCursorPos(ImVec2(10.0f, 5.0f));
-        ImGui::TextColored(col_title, ICON_FA_TERMINAL " lua");
+        ImGui::TextColored(col_title, ICON_FA_TERMINAL " raijin");
         ImGui::SameLine(0, 2);
-        ImGui::TextColored(col_meta, "  swordigo-runtime v8  |  lua 5.1  |  full gamestate  |  ` to close");
+        ImGui::TextColored(col_meta, "  swordfare lua-console v8  |  lua 5.1  |  full gamestate  |  ` to close");
 
         float btn_x = W - 320.0f;
         ImGui::SameLine(btn_x);
@@ -2624,7 +2699,11 @@ void SwordfareGUI::draw_lua_console() {
             ImVec2(input_w, input_inner_h),
             ImGuiInputTextFlags_EnterReturnsTrue |
             ImGuiInputTextFlags_CtrlEnterForNewLine |
-            ImGuiInputTextFlags_EscapeClearsAll
+            ImGuiInputTextFlags_EscapeClearsAll |
+            ImGuiInputTextFlags_CallbackHistory |
+            ImGuiInputTextFlags_CallbackCompletion |
+            ImGuiInputTextFlags_CallbackAlways,
+            console_input_callback, this
         );
         ImGui::PopStyleVar();
         ImGui::PopStyleColor(2);
