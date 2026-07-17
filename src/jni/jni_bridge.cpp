@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <unordered_map>
+#include <deque>
 #include <unordered_set>
 #include <mutex>
 #include <thread>
@@ -30,6 +31,7 @@ namespace fs = std::filesystem;
 #include <GL/glext.h>
 #include <AL/al.h>
 #include <AL/alc.h>
+#include "platform/rgc.h"
 
 #ifdef VULKAN_BACKEND
 #include "platform/vulkan_backend.h"
@@ -163,6 +165,7 @@ void JniBridge::call_handler(uint32_t address, void* emu_ptr) {
 
 
 // --- Memory Allocator Bridges ---
+// --- Memory Allocator Bridges ---
 struct DeferredBlock {
     uint32_t addr;
     uint32_t size;
@@ -170,31 +173,114 @@ struct DeferredBlock {
 };
 static uint32_t g_guest_heap_ptr = 0x20000000; // Start heap at 512MB
 static std::unordered_map<uint32_t, uint32_t> g_guest_allocs;
-static std::vector<DeferredBlock> g_deferred_free_list;
+static std::deque<DeferredBlock> g_deferred_free_list;
 static uint64_t g_alloc_counter = 0;
 static std::mutex g_heap_mutex;
 
-static uint32_t host_malloc_locked(uint32_t size) {
-    size = (size + 7) & ~7;
-    // Only recycle if heap size exceeds 580MB (fast path O(1) bump allocator under 580MB)
-    if (g_guest_heap_ptr - 0x20000000 > 580ULL * 1024 * 1024) {
-        size_t search_limit = std::min(g_deferred_free_list.size(), (size_t)50);
-        for (size_t i = 0; i < search_limit; i++) {
-            const auto& db = g_deferred_free_list[i];
-            // Chronological list: if the oldest elements aren't ready yet, none are!
-            if (g_alloc_counter - db.alloc_index <= 15000) {
-                break; // Stop searching completely
-            }
-            if (db.size >= size && db.size <= size + 128) {
-                uint32_t addr = db.addr;
-                g_guest_allocs[addr] = size;
-                g_deferred_free_list.erase(g_deferred_free_list.begin() + i);
-                g_alloc_counter++;
-                return addr;
+static const uint32_t BUCKET_SIZES[] = {
+    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 
+    8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608
+};
+static const int NUM_BUCKETS = sizeof(BUCKET_SIZES) / sizeof(BUCKET_SIZES[0]);
+
+struct FreeBlock {
+    uint32_t addr;
+    uint32_t size;
+};
+static std::vector<FreeBlock> g_buckets[NUM_BUCKETS + 1];
+
+static int get_bucket_index(uint32_t size) {
+    for (int i = 0; i < NUM_BUCKETS; i++) {
+        if (size <= BUCKET_SIZES[i]) return i;
+    }
+    return -1;
+}
+
+static void add_free_block_locked(uint32_t addr, uint32_t size) {
+    int idx = -1;
+    for (int i = NUM_BUCKETS - 1; i >= 0; i--) {
+        if (size >= BUCKET_SIZES[i]) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == -1) idx = NUM_BUCKETS;
+    g_buckets[idx].push_back({addr, size});
+}
+
+static uint32_t find_free_block_locked(uint32_t size, uint32_t& found_size) {
+    int start_idx = get_bucket_index(size);
+    if (start_idx == -1) start_idx = NUM_BUCKETS;
+    
+    if (start_idx > 0 && start_idx - 1 < NUM_BUCKETS) {
+        int below_idx = start_idx - 1;
+        for (size_t i = 0; i < g_buckets[below_idx].size(); i++) {
+            if (g_buckets[below_idx][i].size >= size) {
+                FreeBlock fb = g_buckets[below_idx][i];
+                g_buckets[below_idx].erase(g_buckets[below_idx].begin() + i);
+                found_size = fb.size;
+                return fb.addr;
             }
         }
     }
-    uint32_t addr = g_guest_heap_ptr;
+    
+    for (int idx = start_idx; idx <= NUM_BUCKETS; idx++) {
+        if (g_buckets[idx].empty()) continue;
+        
+        if (idx < NUM_BUCKETS) {
+            FreeBlock fb = g_buckets[idx].back();
+            g_buckets[idx].pop_back();
+            found_size = fb.size;
+            return fb.addr;
+        } else {
+            int best_fit_idx = -1;
+            uint32_t best_fit_size = 0xFFFFFFFF;
+            for (size_t i = 0; i < g_buckets[idx].size(); i++) {
+                if (g_buckets[idx][i].size >= size && g_buckets[idx][i].size < best_fit_size) {
+                    best_fit_size = g_buckets[idx][i].size;
+                    best_fit_idx = (int)i;
+                }
+            }
+            if (best_fit_idx != -1) {
+                FreeBlock fb = g_buckets[idx][best_fit_idx];
+                g_buckets[idx].erase(g_buckets[idx].begin() + best_fit_idx);
+                found_size = fb.size;
+                return fb.addr;
+            }
+        }
+    }
+    return 0;
+}
+
+static uint32_t host_malloc_locked(uint32_t size) {
+    size = (size + 7) & ~7;
+    if (size == 0) size = 8;
+    
+    while (!g_deferred_free_list.empty()) {
+        const auto& db = g_deferred_free_list.front();
+        if (g_alloc_counter - db.alloc_index > 2000) {
+            add_free_block_locked(db.addr, db.size);
+            g_deferred_free_list.pop_front();
+        } else {
+            break;
+        }
+    }
+    
+    uint32_t found_size = 0;
+    uint32_t addr = find_free_block_locked(size, found_size);
+    if (addr != 0) {
+        if (found_size >= size + 16) {
+            uint32_t remainder_addr = addr + size;
+            uint32_t remainder_size = found_size - size;
+            add_free_block_locked(remainder_addr, remainder_size);
+            found_size = size;
+        }
+        g_guest_allocs[addr] = found_size;
+        g_alloc_counter++;
+        return addr;
+    }
+    
+    addr = g_guest_heap_ptr;
     g_guest_heap_ptr += size;
     g_guest_allocs[addr] = size;
     g_alloc_counter++;
@@ -217,8 +303,10 @@ static void host_free_locked(uint32_t ptr) {
 void bridge_malloc(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint32_t size = emu->get_reg(0);
+    uint32_t lr = emu->get_reg(14);
     std::lock_guard<std::mutex> lock(g_heap_mutex);
     uint32_t addr = host_malloc_locked(size);
+    RedstellGC::instance().track_alloc(addr, size, lr, "malloc");
     emu->set_reg(0, addr);
 }
 
@@ -227,9 +315,11 @@ void bridge_calloc(void* emu_ptr) {
     uint32_t num = emu->get_reg(0);
     uint32_t size = emu->get_reg(1);
     uint32_t total = num * size;
+    uint32_t lr = emu->get_reg(14);
     std::lock_guard<std::mutex> lock(g_heap_mutex);
     uint32_t addr = host_malloc_locked(total);
     std::memset(emu->get_memory_base() + addr, 0, total);
+    RedstellGC::instance().track_alloc(addr, total, lr, "calloc");
     emu->set_reg(0, addr);
 }
 
@@ -237,13 +327,16 @@ void bridge_realloc(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint32_t ptr = emu->get_reg(0);
     uint32_t size = emu->get_reg(1);
+    uint32_t lr = emu->get_reg(14);
     std::lock_guard<std::mutex> lock(g_heap_mutex);
     if (ptr == 0) {
         uint32_t addr = host_malloc_locked(size);
+        RedstellGC::instance().track_alloc(addr, size, lr, "realloc(new)");
         emu->set_reg(0, addr);
         return;
     }
     if (size == 0) {
+        RedstellGC::instance().track_free(ptr, lr);
         host_free_locked(ptr);
         emu->set_reg(0, 0);
         return;
@@ -256,6 +349,8 @@ void bridge_realloc(void* emu_ptr) {
         
         if (aligned_new_size <= aligned_old_size) {
             g_guest_allocs[ptr] = size;
+            RedstellGC::instance().track_free(ptr, lr);
+            RedstellGC::instance().track_alloc(ptr, size, lr, "realloc(inplace)");
             emu->set_reg(0, ptr);
             return;
         }
@@ -263,6 +358,8 @@ void bridge_realloc(void* emu_ptr) {
         if (ptr + aligned_old_size == g_guest_heap_ptr) {
             g_guest_heap_ptr = ptr + aligned_new_size;
             g_guest_allocs[ptr] = size;
+            RedstellGC::instance().track_free(ptr, lr);
+            RedstellGC::instance().track_alloc(ptr, size, lr, "realloc(extend)");
             emu->set_reg(0, ptr);
             return;
         }
@@ -272,13 +369,16 @@ void bridge_realloc(void* emu_ptr) {
         if (copy_size > 0) {
             std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, copy_size);
         }
+        RedstellGC::instance().track_free(ptr, lr);
         host_free_locked(ptr);
+        RedstellGC::instance().track_alloc(addr, size, lr, "realloc(move)");
         emu->set_reg(0, addr);
     } else {
         uint32_t addr = host_malloc_locked(size);
         if (size > 0) {
             std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, size);
         }
+        RedstellGC::instance().track_alloc(addr, size, lr, "realloc(fallback)");
         emu->set_reg(0, addr);
     }
 }
@@ -286,8 +386,10 @@ void bridge_realloc(void* emu_ptr) {
 void bridge_free(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint32_t ptr = emu->get_reg(0);
+    uint32_t lr = emu->get_reg(14); // R14 = LR
     if (ptr) {
         std::lock_guard<std::mutex> lock(g_heap_mutex);
+        RedstellGC::instance().track_free(ptr, lr);
         host_free_locked(ptr);
     }
 }
@@ -977,7 +1079,9 @@ void bridge_AAssetManager_open(void* emu_ptr) {
     }
     
     void* asset = AAssetManager_open_arm32(mgr, filename, emu->get_reg(2));
-    std::cout << "[ASSET] Open " << filename << (asset ? " -> SUCCESS" : " -> FAILED") << std::endl;
+    if (!emu->quiet_mode) {
+        std::cout << "[ASSET] Open " << filename << (asset ? " -> SUCCESS" : " -> FAILED") << std::endl;
+    }
     emu->set_reg(0, register_pointer(asset));
 }
 
@@ -2056,6 +2160,9 @@ void bridge_gzclose(void* emu_ptr) {
     }
 }
 
+static std::unordered_map<uint32_t, std::string> g_buffer_to_path;
+static std::mutex g_buffer_to_path_mutex;
+
 void bridge_fopen(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
@@ -2147,12 +2254,22 @@ void bridge_fopen(void* emu_ptr) {
             if (f && !emu->quiet_mode) {
                 // printf("[AssetMgr/fopen] Resolved fallback: %s -> %s\n", path, alt);
             }
+            if (f) {
+                resolved_path = alt;
+            }
         }
     }
 
     if (f) {
         uint32_t handle = g_next_file_handle++;
         g_file_handles[handle] = f;
+        RedstellGC::instance().track_file_open(handle, resolved_path.c_str());
+        
+        // PPD: Kick off asynchronous pre-decompression if it's a PVR texture
+        if (resolved_path.find(".pvr") != std::string::npos) {
+            RedstellGC::instance().ppd_preload_texture(resolved_path);
+        }
+        
         emu->set_reg(0, handle);
         if (is_write) {
             // std::cout << "[File]   -> OK (handle=" << handle << ")" << std::endl;
@@ -2169,6 +2286,7 @@ void bridge_fclose(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
     uint32_t handle = emu->get_reg(0);
     if (g_file_handles.count(handle)) {
+        RedstellGC::instance().track_file_close(handle);
         fflush(g_file_handles[handle]);  // Ensure data written to disk before close
         fclose(g_file_handles[handle]);
         g_file_handles.erase(handle);
@@ -2200,6 +2318,14 @@ void bridge_fread(void* emu_ptr) {
     uint32_t handle = emu->get_reg(3);
     if (g_file_handles.count(handle)) {
         size_t read = fread(memory + buf, elem_size, count, g_file_handles[handle]);
+        
+        // PPD: Associate buffer address with the texture file path
+        std::string path = RedstellGC::instance().get_file_path(handle);
+        if (!path.empty() && path.find(".pvr") != std::string::npos) {
+            std::lock_guard<std::mutex> lock(g_buffer_to_path_mutex);
+            g_buffer_to_path[buf] = path;
+        }
+        
         emu->set_reg(0, (uint32_t)read);
     } else {
         emu->set_reg(0, 0);
@@ -4239,47 +4365,65 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
         return;
     }
     
-    const uint8_t* file_data = memory + file_data_ptr;
+    RedstellGC::PPDTexture ppd_tex;
+    bool cache_hit = false;
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(g_buffer_to_path_mutex);
+        if (g_buffer_to_path.count(file_data_ptr)) {
+            path = g_buffer_to_path[file_data_ptr];
+            g_buffer_to_path.erase(file_data_ptr);
+        }
+    }
+    if (!path.empty()) {
+        cache_hit = RedstellGC::instance().ppd_get_texture(path, ppd_tex);
+    }
     
     int width = 0, height = 0;
     const uint8_t* pixel_data = nullptr;
     int format_type = -1;
-    
     uint32_t gl_format = GL_RGBA;
     uint32_t gl_type = GL_UNSIGNED_BYTE;
     int bpp = 4;
     char c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     uint8_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-    
-    // Parse PVR v3
-    const HostPVRv3Header* v3 = (const HostPVRv3Header*)file_data;
-    if (v3->version == 0x03525650) {
-        width = v3->width;
-        height = v3->height;
-        pixel_data = file_data + sizeof(HostPVRv3Header) + v3->metadata_size;
-        format_type = pvr::ParsePVRv3Format(v3->pixel_format, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
+    const uint8_t* upload_pixels = nullptr;
+    std::vector<uint8_t> rgba;
+
+    if (cache_hit) {
+        width = ppd_tex.width;
+        height = ppd_tex.height;
+        upload_pixels = ppd_tex.rgba.data();
     } else {
-        // Parse PVR v2
-        const HostPVRv2Header* v2 = (const HostPVRv2Header*)file_data;
-        if (v2->magic == 0x21525650 || v2->header_size == 44) {
-            width = v2->width;
-            height = v2->height;
-            pixel_data = file_data + v2->header_size;
-            format_type = pvr::ParsePVRv2Format(v2->flags, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
+        const uint8_t* file_data = memory + file_data_ptr;
+        const HostPVRv3Header* v3 = (const HostPVRv3Header*)file_data;
+        if (v3->version == 0x03525650) {
+            width = v3->width;
+            height = v3->height;
+            pixel_data = file_data + sizeof(HostPVRv3Header) + v3->metadata_size;
+            format_type = pvr::ParsePVRv3Format(v3->pixel_format, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
         } else {
-            std::cerr << "[SRE-PVR32] Unknown PVR header magic 0x" << std::hex << v2->magic << std::dec << std::endl;
+            const HostPVRv2Header* v2 = (const HostPVRv2Header*)file_data;
+            if (v2->magic == 0x21525650 || v2->header_size == 44) {
+                width = v2->width;
+                height = v2->height;
+                pixel_data = file_data + v2->header_size;
+                format_type = pvr::ParsePVRv2Format(v2->flags, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
+            } else {
+                std::cerr << "[SRE-PVR32] Unknown PVR header magic 0x" << std::hex << v2->magic << std::dec << std::endl;
+                return;
+            }
+        }
+        
+        if (format_type < 0) {
+            std::cerr << "[SRE-PVR32] Unsupported format decoding " << width << "x" << height << std::endl;
             return;
         }
-    }
-    
-    if (format_type < 0) {
-        std::cerr << "[SRE-PVR32] Unsupported format decoding " << width << "x" << height << std::endl;
-        return;
-    }
-    
-    if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
-        std::cerr << "[SRE-PVR32] Invalid PVR dimensions " << width << "x" << height << std::endl;
-        return;
+        
+        if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
+            std::cerr << "[SRE-PVR32] Invalid PVR dimensions " << width << "x" << height << std::endl;
+            return;
+        }
     }
     
     // Generate texture ID if not already generated
@@ -4298,30 +4442,34 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
     
     glBindTexture(GL_TEXTURE_2D, tex_name);
     
-    std::vector<uint8_t> rgba(width * height * 4, 255);
-    bool decode_success = false;
-    
-    if (format_type == 1) { // ETC1
-        pvr::PVRTDecompressETC(pixel_data, width, height, rgba.data(), 6);
-        decode_success = true;
-    } else if (format_type == 2 || format_type == 3) { // PVRTC
-        uint32_t do2bitMode = (format_type == 2) ? 1 : 0;
-        pvr::PVRTDecompressPVRTC(pixel_data, do2bitMode, width, height, rgba.data());
-        decode_success = true;
-    } else if (format_type >= 4 && format_type <= 6) { // DXT
-        uint32_t dxt_fmt = (format_type == 4) ? 1 : ((format_type == 5) ? 3 : 5);
-        pvr::PVRTDecompressDXT(pixel_data, width, height, rgba.data(), dxt_fmt);
-        decode_success = true;
-    } else if (format_type == 10) { // Uncompressed
-        decode_success = pvr::PVRTDecodeUncompressed(pixel_data, width, height, c0, c1, c2, c3, d0, d1, d2, d3, rgba.data());
+    if (cache_hit) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, upload_pixels);
+    } else {
+        rgba.assign(width * height * 4, 255);
+        bool decode_success = false;
+        
+        if (format_type == 1) { // ETC1
+            pvr::PVRTDecompressETC(pixel_data, width, height, rgba.data(), 6);
+            decode_success = true;
+        } else if (format_type == 2 || format_type == 3) { // PVRTC
+            uint32_t do2bitMode = (format_type == 2) ? 1 : 0;
+            pvr::PVRTDecompressPVRTC(pixel_data, do2bitMode, width, height, rgba.data());
+            decode_success = true;
+        } else if (format_type >= 4 && format_type <= 6) { // DXT
+            uint32_t dxt_fmt = (format_type == 4) ? 1 : ((format_type == 5) ? 3 : 5);
+            pvr::PVRTDecompressDXT(pixel_data, width, height, rgba.data(), dxt_fmt);
+            decode_success = true;
+        } else if (format_type == 10) { // Uncompressed
+            decode_success = pvr::PVRTDecodeUncompressed(pixel_data, width, height, c0, c1, c2, c3, d0, d1, d2, d3, rgba.data());
+        }
+        
+        if (!decode_success) {
+            std::cerr << "[SRE-PVR32] Decoding failed for format_type: " << format_type << std::endl;
+            return;
+        }
+        
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
     }
-    
-    if (!decode_success) {
-        std::cerr << "[SRE-PVR32] Decoding failed for format_type: " << format_type << std::endl;
-        return;
-    }
-    
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
@@ -4334,8 +4482,10 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
         *(uint32_t*)(memory + out_height_ptr) = height;
     }
     
-    std::cout << "[SRE-PVR32] Successfully loaded and uploaded " << width << "x" << height 
-              << " PVR to GL texture " << tex_name << " (Format Type: " << format_type << ", Size: " << file_size << " bytes)" << std::endl;
+    if (!emu->quiet_mode) {
+        std::cout << "[SRE-PVR32] Successfully loaded and uploaded " << width << "x" << height 
+                  << " PVR to GL texture " << tex_name << " (Format Type: " << format_type << ", Size: " << file_size << " bytes)" << std::endl;
+    }
 }
 
 void bridge_gl_tex_parameteri(void* emu_ptr) {
@@ -4782,6 +4932,113 @@ void bridge_gl_flush(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glFlush();
+}
+
+extern unsigned int fbo_get_fbo(); // from fbo_scaler.cpp
+
+static void bridge_gl_gen_framebuffers(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLsizei n = (GLsizei)emu->get_reg(0);
+    uint32_t ids_ptr = (uint32_t)emu->get_reg(1);
+    
+    if (!g_display_active || n <= 0 || n > 16) return;
+    
+    GLuint host_ids[16];
+    glGenFramebuffers(n, host_ids);
+    
+    uint32_t* guest_ids = (uint32_t*)(memory + ids_ptr);
+    for (int i = 0; i < n; i++) {
+        guest_ids[i] = host_ids[i];
+    }
+}
+
+static void bridge_gl_bind_framebuffer(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    GLenum target = (GLenum)emu->get_reg(0);
+    GLuint framebuffer = (GLuint)emu->get_reg(1);
+    
+    if (!g_display_active) return;
+    
+    if (framebuffer == 0) {
+        glBindFramebuffer(target, fbo_get_fbo());
+    } else {
+        glBindFramebuffer(target, framebuffer);
+    }
+}
+
+static void bridge_gl_delete_framebuffers(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLsizei n = (GLsizei)emu->get_reg(0);
+    uint32_t ids_ptr = (uint32_t)emu->get_reg(1);
+    
+    if (!g_display_active || n <= 0 || n > 16) return;
+    
+    GLuint host_ids[16];
+    uint32_t* guest_ids = (uint32_t*)(memory + ids_ptr);
+    for (int i = 0; i < n; i++) host_ids[i] = guest_ids[i];
+    
+    glDeleteFramebuffers(n, host_ids);
+}
+
+static void bridge_gl_framebuffer_texture2d(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    GLenum target = (GLenum)emu->get_reg(0);
+    GLenum attachment = (GLenum)emu->get_reg(1);
+    GLenum textarget = (GLenum)emu->get_reg(2);
+    GLuint texture = (GLuint)emu->get_reg(3);
+    uint32_t sp = emu->get_reg(13);
+    uint8_t* memory = emu->get_memory_base();
+    GLint level = (GLint)*(uint32_t*)(memory + sp);
+    
+    if (!g_display_active) return;
+    
+    glFramebufferTexture2D(target, attachment, textarget, texture, level);
+}
+
+static void bridge_gl_gen_renderbuffers(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLsizei n = (GLsizei)emu->get_reg(0);
+    uint32_t ids_ptr = (uint32_t)emu->get_reg(1);
+    if (!g_display_active || n <= 0 || n > 16) return;
+    GLuint host_ids[16];
+    glGenRenderbuffers(n, host_ids);
+    uint32_t* guest_ids = (uint32_t*)(memory + ids_ptr);
+    for (int i = 0; i < n; i++) guest_ids[i] = host_ids[i];
+}
+
+static void bridge_gl_bind_renderbuffer(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    if (!g_display_active) return;
+    glBindRenderbuffer((GLenum)emu->get_reg(0), (GLuint)emu->get_reg(1));
+}
+
+static void bridge_gl_renderbuffer_storage(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    if (!g_display_active) return;
+    glRenderbufferStorage((GLenum)emu->get_reg(0), (GLenum)emu->get_reg(1),
+                          (GLsizei)emu->get_reg(2), (GLsizei)emu->get_reg(3));
+}
+
+static void bridge_gl_framebuffer_renderbuffer(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    if (!g_display_active) return;
+    glFramebufferRenderbuffer((GLenum)emu->get_reg(0), (GLenum)emu->get_reg(1),
+                              (GLenum)emu->get_reg(2), (GLuint)emu->get_reg(3));
+}
+
+static void bridge_gl_delete_renderbuffers(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    GLsizei n = (GLsizei)emu->get_reg(0);
+    uint32_t ids_ptr = (uint32_t)emu->get_reg(1);
+    if (!g_display_active || n <= 0 || n > 16) return;
+    GLuint host_ids[16];
+    uint32_t* guest_ids = (uint32_t*)(memory + ids_ptr);
+    for (int i = 0; i < n; i++) host_ids[i] = guest_ids[i];
+    glDeleteRenderbuffers(n, host_ids);
 }
 
 void bridge_gl_finish(void* emu_ptr) {
@@ -5348,10 +5605,10 @@ void JniBridge::init_standard_bridges() {
     register_handler("glBufferSubData", bridge_gl_noop);
     register_handler("glDeleteTextures", bridge_gl_delete_textures);
     register_handler("glDeleteBuffers", bridge_gl_delete_buffers);
-    register_handler("glBindFramebuffer", bridge_gl_noop);
-    register_handler("glGenFramebuffers", bridge_glGenBuffers);
-    register_handler("glDeleteFramebuffers", bridge_gl_noop);
-    register_handler("glFramebufferTexture2D", bridge_gl_noop);
+    register_handler("glBindFramebuffer", bridge_gl_bind_framebuffer);
+    register_handler("glGenFramebuffers", bridge_gl_gen_framebuffers);
+    register_handler("glDeleteFramebuffers", bridge_gl_delete_framebuffers);
+    register_handler("glFramebufferTexture2D", bridge_gl_framebuffer_texture2d);
     register_handler("glCheckFramebufferStatus", bridge_gl_framebuffer_status);
     register_handler("glGenTextures", bridge_glGenTextures);
     register_handler("glGenBuffers", bridge_glGenBuffers);
@@ -5381,6 +5638,12 @@ void JniBridge::init_standard_bridges() {
     register_handler("glTexEnvi", bridge_glTexEnvi);
     register_handler("glTexEnvfv", bridge_glTexEnvfv);
     register_handler("glTexParameterf", bridge_gl_tex_parameterf);
+
+    register_handler("glGenRenderbuffers", bridge_gl_gen_renderbuffers);
+    register_handler("glBindRenderbuffer", bridge_gl_bind_renderbuffer);
+    register_handler("glRenderbufferStorage", bridge_gl_renderbuffer_storage);
+    register_handler("glFramebufferRenderbuffer", bridge_gl_framebuffer_renderbuffer);
+    register_handler("glDeleteRenderbuffers", bridge_gl_delete_renderbuffers);
 
     // EGL
     register_handler("eglGetDisplay", bridge_gl_noop);

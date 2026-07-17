@@ -17,6 +17,7 @@
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_sdl3.h"
 #include "imgui/backends/imgui_impl_opengl3.h"
+#include "platform/rgc.h"
 
 #include <cstring>
 #include <cmath>
@@ -25,6 +26,11 @@
 #include <filesystem>
 #include <iostream>
 #include <fstream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
 
 bool g_sre_overlay_blocking = false;
 
@@ -334,6 +340,7 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
 
 void SwordfareGUI::shutdown() {
     if (!m_initialized) return;
+    stop_tcp_server();
     ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_ctx));
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
@@ -375,8 +382,63 @@ bool SwordfareGUI::process_event(const SDL_Event& event) {
 // begin_frame / end_frame
 // ---------------------------------------------------------------------------
 
+void SwordfareGUI::update_console_backend() {
+    if (!m_console_ready || !m_guest_memory) return;
+
+    // ---- Poll and dispatch TCP client commands ----
+    if (m_tcp_running) {
+        // 1. Dispatch pending TCP command to the guest
+        m_tcp_mutex.lock();
+        bool has_cmd = !m_tcp_pending_cmd.empty();
+        m_tcp_mutex.unlock();
+
+        if (has_cmd) {
+            // Check if SRE is ready to accept a new command
+            int32_t pending = *(int32_t*)(m_guest_memory + m_console_pending_addr);
+            int32_t status = *(int32_t*)(m_guest_memory + m_console_status_addr);
+            if (pending == 0 && status == 0) {
+                m_tcp_mutex.lock();
+                std::string cmd = m_tcp_pending_cmd;
+                m_tcp_pending_cmd.clear();
+                m_tcp_mutex.unlock();
+
+                m_tcp_cmd_in_flight = true;
+                console_submit(cmd);
+            }
+        }
+    }
+
+    // ---- Unified SRE command result polling (Local GUI + TCP Console) ----
+    int32_t status = *(int32_t*)(m_guest_memory + m_console_status_addr);
+    if (status != 0) {
+        const char* result = (const char*)(m_guest_memory + m_console_result_addr);
+        std::string res_str = (result && result[0]) ? result : "";
+
+        // Feed to GUI console history
+        if (!res_str.empty()) {
+            m_console_history.push_back({res_str, (status == 2), false});
+            while ((int)m_console_history.size() > CONSOLE_MAX_HISTORY)
+                m_console_history.erase(m_console_history.begin());
+            m_console_scroll_bottom = true;
+        }
+
+        // If the command was sent by TCP, send the result back to the client
+        if (m_tcp_running && m_tcp_cmd_in_flight) {
+            m_tcp_cmd_in_flight = false;
+            int client_fd = m_tcp_client_fd.load();
+            if (client_fd >= 0) {
+                std::string output = res_str + "\n> ";
+                write(client_fd, output.c_str(), output.size());
+            }
+        }
+
+        *(int32_t*)(m_guest_memory + m_console_status_addr) = 0;
+    }
+}
+
 void SwordfareGUI::begin_frame() {
     if (!m_initialized) return;
+
     ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_ctx));
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
@@ -560,6 +622,69 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
                 row("Hero Coords", "%.1f, %.1f, %.1f", st.hero_x, st.hero_y, st.hero_z);
 
                 ImGui::EndTable();
+            }
+        }
+
+        ImGui::Spacing();
+
+        // -- Redstell GC Panel --
+        if (ImGui::CollapsingHeader("Redstell Garbage Collector", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::BeginTable("rgctable", 2, ImGuiTableFlags_None)) {
+                ImGui::TableSetupColumn("Key",   ImGuiTableColumnFlags_WidthFixed, 140 * layout_scale);
+                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+                auto row = [](const char* key, const char* fmt, ...) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.60f, 0.68f, 1.0f));
+                    ImGui::TextUnformatted(key);
+                    ImGui::PopStyleColor();
+                    ImGui::TableSetColumnIndex(1);
+                    char buf[256];
+                    va_list args;
+                    va_start(args, fmt);
+                    vsnprintf(buf, sizeof(buf), fmt, args);
+                    va_end(args);
+                    ImGui::TextUnformatted(buf);
+                };
+
+                auto& rgc = RedstellGC::instance();
+
+                row("Current RAM", "%.2f MB", (float)rgc.get_current_ram() / (1024.0f * 1024.0f));
+                row("Peak RAM", "%.2f MB", (float)rgc.get_peak_ram() / (1024.0f * 1024.0f));
+                row("Largest Alloc", "%.2f MB", (float)rgc.get_largest_allocation() / (1024.0f * 1024.0f));
+                row("Fragmentation", "%.1f%%", rgc.get_fragmentation_estimate() * 100.0f);
+                row("Alloc / Free Rate", "%lu / %lu per sec", (unsigned long)rgc.get_alloc_rate(), (unsigned long)rgc.get_free_rate());
+                row("Live Resources", "%lu", (unsigned long)rgc.get_resource_count());
+                row("Optimizations Done", "%lu", (unsigned long)rgc.get_optimizations_performed());
+                row("Pending Cleanups", "%u items", rgc.get_cleanup_queue_size());
+                row("Last GC Duration", "%.2f ms", rgc.get_last_cleanup_duration());
+
+                ImGui::EndTable();
+            }
+
+            // Resource Breakdown Sub-Header
+            if (ImGui::TreeNode("Resource Breakdown")) {
+                auto& rgc = RedstellGC::instance();
+                ImGui::BulletText("Textures: %u", rgc.get_texture_count());
+                ImGui::BulletText("POD Models: %u", rgc.get_pod_count());
+                ImGui::BulletText("Lua States/Objects: %u", rgc.get_lua_object_count());
+                ImGui::BulletText("OpenGL Handles: %u", rgc.get_opengl_count());
+                ImGui::BulletText("Audio Channels: %u", rgc.get_openal_count());
+                ImGui::BulletText("VFS File Handles: %u", rgc.get_open_file_count());
+                ImGui::TreePop();
+            }
+
+            // Recent Logs Sub-Header
+            if (ImGui::TreeNode("Subsystem Diagnostics")) {
+                auto logs = RedstellGC::instance().get_logs();
+                ImGui::BeginChild("RgcLogChild", ImVec2(0, 100 * layout_scale), true, ImGuiWindowFlags_HorizontalScrollbar);
+                for (int i = (int)logs.size() - 1; i >= 0; i--) {
+                    ImGui::TextColored(ImVec4(0.7f, 0.75f, 0.8f, 1.0f), "[%lu ms] %s", 
+                        (unsigned long)logs[i].timestamp, logs[i].message.c_str());
+                }
+                ImGui::EndChild();
+                ImGui::TreePop();
             }
         }
 
@@ -2414,6 +2539,22 @@ void SwordfareGUI::toggle_lua_console() {
 void SwordfareGUI::console_submit(const std::string& cmd) {
     if (cmd.empty() || !m_guest_memory || !m_console_buf_addr) return;
 
+    // Intercept 'openport' command
+    if (cmd == "openport" || cmd.rfind("openport ", 0) == 0) {
+        m_console_history.push_back({"> " + cmd, false, true});
+        int port = 12345;
+        if (cmd.size() > 9) {
+            try {
+                port = std::stoi(cmd.substr(9));
+            } catch (...) {
+                m_console_history.push_back({"[TCP-Console] Error: Invalid port number.", true, false});
+                return;
+            }
+        }
+        start_tcp_server(port);
+        return;
+    }
+
     m_console_history.push_back({"> " + cmd, false, true});
     while ((int)m_console_history.size() > CONSOLE_MAX_HISTORY)
         m_console_history.erase(m_console_history.begin());
@@ -2518,11 +2659,38 @@ int SwordfareGUI::on_console_input_callback(ImGuiInputTextCallbackData* data) {
         data->InsertChars(data->CursorPos, "    ");
     }
 
-    // 3. Ctrl+L to Clear Screen
+    // 3. Ctrl+L to Clear Screen & Ctrl+Up/Down for History Recall (for Multiline support)
     if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways) {
         ImGuiIO& io = ImGui::GetIO();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_L)) {
             m_console_history.clear();
+        }
+        
+        bool up_pressed = ImGui::IsKeyPressed(ImGuiKey_UpArrow);
+        bool down_pressed = ImGui::IsKeyPressed(ImGuiKey_DownArrow);
+        if (io.KeyCtrl && (up_pressed || down_pressed)) {
+            int prev_idx = m_console_hist_idx;
+            if (up_pressed) {
+                if (m_console_hist_idx < 0) {
+                    m_console_hist_idx = (int)m_console_cmd_history.size() - 1;
+                } else if (m_console_hist_idx > 0) {
+                    m_console_hist_idx--;
+                }
+            } else if (down_pressed) {
+                if (m_console_hist_idx >= 0) {
+                    m_console_hist_idx++;
+                    if (m_console_hist_idx >= (int)m_console_cmd_history.size()) {
+                        m_console_hist_idx = -1;
+                    }
+                }
+            }
+
+            if (prev_idx != m_console_hist_idx) {
+                std::string cmd = (m_console_hist_idx >= 0) ? m_console_cmd_history[m_console_hist_idx] : "";
+                data->DeleteChars(0, data->BufTextLen);
+                data->InsertChars(0, cmd.c_str());
+                data->CursorPos = data->SelectionStart = data->SelectionEnd = (int)cmd.size();
+            }
         }
     }
 
@@ -2531,19 +2699,6 @@ int SwordfareGUI::on_console_input_callback(ImGuiInputTextCallbackData* data) {
 
 void SwordfareGUI::draw_lua_console() {
     if (!m_initialized || !m_console_open || !m_console_ready) return;
-
-    // Poll SRE for completed execution
-    int status = *(int32_t*)(m_guest_memory + m_console_status_addr);
-    if (status != 0) {
-        const char* result = (const char*)(m_guest_memory + m_console_result_addr);
-        if (result && result[0]) {
-            m_console_history.push_back({std::string(result), (status == 2), false});
-            while ((int)m_console_history.size() > CONSOLE_MAX_HISTORY)
-                m_console_history.erase(m_console_history.begin());
-            m_console_scroll_bottom = true;
-        }
-        *(int32_t*)(m_guest_memory + m_console_status_addr) = 0;
-    }
 
     ImGuiIO& io = ImGui::GetIO();
     float W        = io.DisplaySize.x;
@@ -2694,17 +2849,18 @@ void SwordfareGUI::draw_lua_console() {
         ImGui::PushStyleColor(ImGuiCol_FrameBg, col_input_bg);
         ImGui::PushStyleColor(ImGuiCol_Border,  col_sep);
         ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+
         bool submit = ImGui::InputTextMultiline(
             "##input", m_console_input, sizeof(m_console_input),
             ImVec2(input_w, input_inner_h),
             ImGuiInputTextFlags_EnterReturnsTrue |
             ImGuiInputTextFlags_CtrlEnterForNewLine |
             ImGuiInputTextFlags_EscapeClearsAll |
-            ImGuiInputTextFlags_CallbackHistory |
             ImGuiInputTextFlags_CallbackCompletion |
             ImGuiInputTextFlags_CallbackAlways,
             console_input_callback, this
         );
+
         ImGui::PopStyleVar();
         ImGui::PopStyleColor(2);
 
@@ -2745,6 +2901,171 @@ void SwordfareGUI::draw_lua_console() {
     if (pushed_mono) ImGui::PopFont();
     ImGui::PopStyleVar(5);
     ImGui::PopStyleColor(8);
+}
+
+void SwordfareGUI::start_tcp_server(int port) {
+    stop_tcp_server();
+
+    m_tcp_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (m_tcp_server_fd < 0) {
+        m_console_history.push_back({"[TCP-Console] Error: Failed to create socket.", true, false});
+        return;
+    }
+
+    int opt = 1;
+    setsockopt(m_tcp_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+
+    if (bind(m_tcp_server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        m_console_history.push_back({"[TCP-Console] Error: Failed to bind to port " + std::to_string(port), true, false});
+        close(m_tcp_server_fd);
+        m_tcp_server_fd = -1;
+        return;
+    }
+
+    if (listen(m_tcp_server_fd, 3) < 0) {
+        m_console_history.push_back({"[TCP-Console] Error: Failed to listen on socket.", true, false});
+        close(m_tcp_server_fd);
+        m_tcp_server_fd = -1;
+        return;
+    }
+
+    m_tcp_running = true;
+    m_tcp_thread = std::thread(&SwordfareGUI::tcp_server_loop, this);
+    m_console_history.push_back({"[TCP-Console] Server started on port " + std::to_string(port) + ". Run 'nc localhost " + std::to_string(port) + "' to connect.", false, false});
+}
+
+void SwordfareGUI::stop_tcp_server() {
+    m_tcp_running = false;
+    if (m_tcp_server_fd >= 0) {
+        ::shutdown(m_tcp_server_fd, SHUT_RDWR);
+        close(m_tcp_server_fd);
+        m_tcp_server_fd = -1;
+    }
+    
+    int client_fd = m_tcp_client_fd.load();
+    if (client_fd >= 0) {
+        ::shutdown(client_fd, SHUT_RDWR);
+        close(client_fd);
+        m_tcp_client_fd = -1;
+    }
+
+    if (m_tcp_thread.joinable()) {
+        m_tcp_thread.join();
+    }
+}
+
+void SwordfareGUI::tcp_server_loop() {
+    while (m_tcp_running) {
+        sockaddr_in client_addr{};
+        socklen_t addr_len = sizeof(client_addr);
+        int client_fd = accept(m_tcp_server_fd, (struct sockaddr*)&client_addr, &addr_len);
+        if (client_fd < 0) {
+            if (!m_tcp_running) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        // Handle client connection (support one client at a time for simplicity)
+        int old_client = m_tcp_client_fd.exchange(client_fd);
+        if (old_client >= 0) {
+            const char* msg = "Another client connected. Disconnecting...\n";
+            write(old_client, msg, strlen(msg));
+            close(old_client);
+        }
+
+        // Welcome greeting
+        const char* greeting = 
+            "==========================================\n"
+            "   Swordigo TCP console session started   \n"
+            "==========================================\n"
+            "Type Lua commands here to run them in game.\n"
+            "Use 'Ctrl+L' (or send 'clear') to clear screen.\n"
+            "Type 'exit' or 'quit' to disconnect.\n\n"
+            "> ";
+        write(client_fd, greeting, strlen(greeting));
+
+        // Read loop for client commands
+        char read_buf[4096];
+        std::string line_accumulator;
+        while (m_tcp_running && m_tcp_client_fd.load() == client_fd) {
+            ssize_t bytes_read = read(client_fd, read_buf, sizeof(read_buf) - 1);
+            if (bytes_read <= 0) {
+                // Client disconnected or read error
+                break;
+            }
+            read_buf[bytes_read] = '\0';
+            line_accumulator += read_buf;
+
+            // Process any complete lines
+            size_t newline_pos;
+            while ((newline_pos = line_accumulator.find('\n')) != std::string::npos) {
+                std::string cmd = line_accumulator.substr(0, newline_pos);
+                line_accumulator.erase(0, newline_pos + 1);
+
+                // Strip carriage return if present
+                if (!cmd.empty() && cmd.back() == '\r') {
+                    cmd.pop_back();
+                }
+
+                // Strip leading/trailing whitespaces
+                size_t first = cmd.find_first_not_of(" \t");
+                if (first != std::string::npos) {
+                    cmd = cmd.substr(first);
+                    size_t last = cmd.find_last_not_of(" \t");
+                    cmd = cmd.substr(0, last + 1);
+                } else {
+                    cmd.clear();
+                }
+
+                if (cmd == "exit" || cmd == "quit") {
+                    const char* bye = "Goodbye!\n";
+                    write(client_fd, bye, strlen(bye));
+                    close(client_fd);
+                    m_tcp_client_fd.compare_exchange_strong(client_fd, -1);
+                    break;
+                }
+
+                if (cmd == "clear") {
+                    // Send ANSI clear screen command
+                    const char* clear_ansi = "\033[2J\033[H> ";
+                    write(client_fd, clear_ansi, strlen(clear_ansi));
+                    continue;
+                }
+
+                if (!cmd.empty()) {
+                    // Block until the previous command has been processed
+                    while (m_tcp_running && m_tcp_client_fd.load() == client_fd) {
+                        m_tcp_mutex.lock();
+                        bool empty = m_tcp_pending_cmd.empty();
+                        m_tcp_mutex.unlock();
+                        if (empty) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
+
+                    if (!m_tcp_running || m_tcp_client_fd.load() != client_fd) break;
+
+                    m_tcp_mutex.lock();
+                    m_tcp_pending_cmd = cmd;
+                    m_tcp_mutex.unlock();
+                } else {
+                    // Just print a new prompt if empty line is submitted
+                    const char* prompt = "> ";
+                    write(client_fd, prompt, strlen(prompt));
+                }
+            }
+        }
+
+        // Cleanup this client connection if we broke out of the read loop
+        if (m_tcp_client_fd.load() == client_fd) {
+            close(client_fd);
+            m_tcp_client_fd.store(-1);
+        }
+    }
 }
 
 

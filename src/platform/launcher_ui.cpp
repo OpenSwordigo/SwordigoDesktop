@@ -42,7 +42,7 @@ static void      DrawToolbar(bool& running, LaunchConfig& cfg, bool& show_option
 static void      DrawInstancePanel(BinarySelector& selector, int& selected, float width);
 static void      DrawDetailPanel(BinarySelector& selector, int selected,
                                  LaunchConfig& cfg, bool& running, int& api_sel,
-                                 int& engine_sel, bool& use_sre_sel, bool& show_save_editor, float mods_width);
+                                 int& engine_sel, bool& use_sre_sel, bool& adv_redstell_opts_sel, bool& show_save_editor, float mods_width);
 static void      DrawModsPanel(float width);
 static void      DrawStatusBar(int selected, const BinarySelector& selector);
 static void      DrawOptionsModal(bool& show_options);
@@ -761,7 +761,7 @@ static void DrawInstancePanel(BinarySelector& selector, int& selected, float wid
 
 static void DrawDetailPanel(BinarySelector& selector, int selected,
                             LaunchConfig& cfg, bool& running, int& api_sel,
-                            int& engine_sel, bool& use_sre_sel, bool& show_save_editor, float mods_width) {
+                            int& engine_sel, bool& use_sre_sel, bool& adv_redstell_opts_sel, bool& show_save_editor, float mods_width) {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     float inst_width = 260.0f;
     ImVec2 panel_pos(vp->WorkPos.x + inst_width, vp->WorkPos.y + TOOLBAR_H);
@@ -849,6 +849,7 @@ static void DrawDetailPanel(BinarySelector& selector, int selected,
         cfg.graphics_api = (api_sel == 0) ? GraphicsAPI::OPENGL : GraphicsAPI::VULKAN;
         cfg.use_dynarmic = (engine_sel == 1);
         cfg.use_sre = use_sre_sel;
+        cfg.advanced_redstell_opts = adv_redstell_opts_sel;
         cfg.selected_binary = b.filepath;
         cfg.assets_dir = b.assets_dir;
         cfg.game_type = b.game_type;
@@ -887,6 +888,14 @@ static void DrawDetailPanel(BinarySelector& selector, int selected,
         ImGui::PopStyleColor();
         ImGui::SameLine(180);
         ImGui::Checkbox("Enable SRE (libsre.so)", &use_sre_sel);
+    }
+
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.545f, 0.580f, 0.620f, 1.0f));
+        ImGui::Text(ICON_FA_WRENCH "  Memory Fixes");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(180);
+        ImGui::Checkbox("Advanced Redstell Optimisations", &adv_redstell_opts_sel);
     }
 
     ImGui::Spacing();
@@ -1810,6 +1819,7 @@ LaunchConfig show_launcher(BinarySelector& selector) {
     int api_sel = 0;        // 0 = OpenGL, 1 = Vulkan
     int engine_sel = 1;     // 0 = Unicorn, 1 = Dynarmic (default: JIT for performance)
     bool use_sre_sel = true; // whether to load libsre.so (user choice)
+    bool adv_redstell_opts_sel = false; // Advanced Redstell Optimisations (off by default)
     bool show_options = false;
     bool show_save_editor = false;
 
@@ -1836,6 +1846,7 @@ LaunchConfig show_launcher(BinarySelector& selector) {
                             cfg.graphics_api = (api_sel == 0) ? GraphicsAPI::OPENGL : GraphicsAPI::VULKAN;
                             cfg.use_dynarmic = (engine_sel == 1);
                             cfg.use_sre = use_sre_sel;
+                            cfg.advanced_redstell_opts = adv_redstell_opts_sel;
                             cfg.selected_binary = cur_bins[bin_sel].filepath;
                             cfg.assets_dir = cur_bins[bin_sel].assets_dir;
                             cfg.game_type = cur_bins[bin_sel].game_type;
@@ -1893,7 +1904,7 @@ LaunchConfig show_launcher(BinarySelector& selector) {
 
         DrawToolbar(running, cfg, show_options);
         DrawInstancePanel(selector, bin_sel, inst_panel_w);
-        DrawDetailPanel(selector, bin_sel, cfg, running, api_sel, engine_sel, use_sre_sel, show_save_editor, mods_panel_w);
+        DrawDetailPanel(selector, bin_sel, cfg, running, api_sel, engine_sel, use_sre_sel, adv_redstell_opts_sel, show_save_editor, mods_panel_w);
         DrawModsPanel(mods_panel_w);
         DrawStatusBar(bin_sel, selector);
 

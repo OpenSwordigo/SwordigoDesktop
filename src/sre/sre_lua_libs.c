@@ -25,6 +25,9 @@ extern void sre_log_lua_error(const char* source, const char* err_msg);
  * ========================================================================= */
 
 /* Global extended function pointers */
+pfn_lua_xmove          g_lua_xmove          = 0;
+pfn_lua_newthread      g_lua_newthread      = 0;
+pfn_lua_pushthread     g_lua_pushthread     = 0;
 pfn_lua_pushvalue      g_lua_pushvalue      = 0;
 pfn_lua_remove         g_lua_remove         = 0;
 pfn_lua_insert         g_lua_insert         = 0;
@@ -84,6 +87,9 @@ typedef struct {
     sre_u64 lua_equal;
     sre_u64 lua_lessthan;
     sre_u64 lua_isuserdata;
+    sre_u64 lua_xmove;
+    sre_u64 lua_newthread;
+    sre_u64 lua_pushthread;
 } SreLuaExtAddrs;
 
 void sre_init_lua_ext(SreLuaExtAddrs* a) {
@@ -115,6 +121,9 @@ void sre_init_lua_ext(SreLuaExtAddrs* a) {
     g_lua_equal          = (pfn_lua_equal)a->lua_equal;
     g_lua_lessthan       = (pfn_lua_lessthan)a->lua_lessthan;
     g_lua_isuserdata     = (pfn_lua_isuserdata)a->lua_isuserdata;
+    g_lua_xmove          = (pfn_lua_xmove)a->lua_xmove;
+    g_lua_newthread      = (pfn_lua_newthread)a->lua_newthread;
+    g_lua_pushthread     = (pfn_lua_pushthread)a->lua_pushthread;
 }
 
 

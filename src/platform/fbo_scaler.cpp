@@ -4,6 +4,7 @@
 #include <GL/glext.h>
 #include "pvr_loader.h"
 #include "platform/data_path.h"
+#include "jni/gl_render_state.h"   // GL state handshake — written by bridge, read here
 #include <iostream>
 #include <cstring>
 #include <cmath>
@@ -164,6 +165,18 @@ static GLint loc_portal_color = -1;
 static GLint loc_portal_time = -1;
 static GLint loc_portal_speed = -1;
 static GLint loc_portal_alpha = -1;
+
+// g_prog_composite — game-engine handshake uniforms
+// (driven by live GL state captured from the game's own GL calls)
+static GLint loc_comp_light0_pos      = -1; // vec4 — GL_LIGHT0 world position
+static GLint loc_comp_light0_diffuse  = -1; // vec4 — GL_LIGHT0 diffuse color
+static GLint loc_comp_light0_ambient  = -1; // vec4 — GL_LIGHT0 ambient color
+static GLint loc_comp_mat_diffuse     = -1; // vec4 — current material diffuse
+static GLint loc_comp_cur_color       = -1; // vec4 — current glColor4 vertex color
+static GLint loc_comp_player_world    = -1; // vec3 — hero world-space position
+static GLint loc_comp_modelview       = -1; // mat4 — current modelview shadow
+static GLint loc_comp_projection      = -1; // mat4 — current projection shadow
+static GLint loc_comp_light_model_amb = -1; // vec4 — glLightModel ambient
 
 // ======================= SHADER SOURCES =======================
 
@@ -711,6 +724,21 @@ uniform float u_bg_scale;       // background scale (larger = closer sky)
 uniform float u_shadow_lift;    // how much to brighten shadows (0.0-0.5)
 uniform float u_ambient_r, u_ambient_g, u_ambient_b;  // sky ambient color
 
+// === Game-Engine Light Handshake ===
+// These uniforms are fed directly from the live GL state captured by the
+// JNI bridge hooks (glLightfv, glMaterialfv, glLoadMatrixf, glColor4f).
+// They allow effects to be driven by the game's actual lighting rather
+// than static per-preset values.
+uniform vec4  u_light0_pos;      // GL_LIGHT0 position (w=0 directional, w=1 point)
+uniform vec4  u_light0_diffuse;  // GL_LIGHT0 diffuse color
+uniform vec4  u_light0_ambient;  // GL_LIGHT0 ambient color
+uniform vec4  u_light_model_amb; // glLightModel global ambient
+uniform vec4  u_mat_diffuse;     // current material diffuse (boss/char color)
+uniform vec4  u_cur_color;       // current glColor4 vertex color
+uniform vec3  u_player_world;    // hero world-space position (from SRE)
+uniform mat4  u_modelview;       // current modelview matrix
+uniform mat4  u_projection;      // current projection matrix
+
 in vec2 v_uv;
 out vec4 FragColor;
 
@@ -724,12 +752,51 @@ float linearize_depth(float d) {
     return (2.0 * n) / (f + n - d * (f - n));
 }
 
+// Derive a screen-space shadow direction from the live GL_LIGHT0 position.
+// When the game has a real directional light (w=0), we use its XY components
+// directly.  For point lights (w=1) we project the light relative to the
+// player world position so shadows always radiate away from the light.
+vec2 compute_light_dir_ss() {
+    if (u_light0_pos.w < 0.5) {
+        // Directional light — use XY as direction
+        return normalize(u_light0_pos.xy + vec2(0.0001));
+    } else {
+        // Point light — project light vs player into screen space using matrices
+        vec4 light_clip  = u_projection * u_modelview * vec4(u_light0_pos.xyz, 1.0);
+        vec4 player_clip = u_projection * u_modelview * vec4(u_player_world, 1.0);
+        vec2 light_ss  = (light_clip.xy  / light_clip.w)  * 0.5 + 0.5;
+        vec2 player_ss = (player_clip.xy / player_clip.w) * 0.5 + 0.5;
+        vec2 d = light_ss - player_ss;
+        float len = length(d);
+        return len > 0.001 ? d / len : u_shadow_light_dir;
+    }
+}
+
+// Derive tint from material diffuse and vertex color.
+// This lets the composite shader know when a boss/character has a custom
+// color applied (e.g. Fire Boss turning green, damage red flash).
+vec3 get_material_tint() {
+    // Both material diffuse and vertex color are 1,1,1 by default.
+    // Only blend when one of them is non-neutral.
+    vec3 md = u_mat_diffuse.rgb;
+    vec3 vc = u_cur_color.rgb;
+    // Cheap divergence check: if both are near-white, return neutral.
+    float md_diff = dot(abs(md - vec3(0.8)), vec3(1.0));
+    float vc_diff = dot(abs(vc - vec3(1.0)), vec3(1.0));
+    if (md_diff < 0.12 && vc_diff < 0.12) return vec3(1.0);
+    // Weight material diffuse heavier (it's set per-model, not per-vertex)
+    return clamp(md * 0.7 + vc * 0.3, vec3(0.0), vec3(1.0));
+}
+
 float compute_shadow_at(vec2 uv) {
     float my_depth = linearize_depth(texture(u_depth, uv).r);
     if (my_depth > 0.95) return 1.0;
     
     float shadow = 1.0;
-    vec3 ray_dir_3d = normalize(vec3(u_shadow_light_dir, u_shadow_sun_z));
+    // Use live-derived light direction if possible, else fall back to preset
+    vec2 live_dir = (u_light0_diffuse.r + u_light0_diffuse.g + u_light0_diffuse.b > 0.05)
+                     ? compute_light_dir_ss() : u_shadow_light_dir;
+    vec3 ray_dir_3d = normalize(vec3(live_dir, u_shadow_sun_z));
     vec2 step_uv  = ray_dir_3d.xy * u_shadow_softness;
     float step_z   = ray_dir_3d.z  * u_shadow_softness;
     
@@ -781,29 +848,18 @@ vec3 get_bumped_scene(vec2 uv) {
     // Compute bump gradient
     vec2 bump = vec2(h_r - h_l, h_u - h_d);
     
-    // 3D Parallax offset based on height gradient
-    // We displace the UV coordinate slightly opposite to the gradient
-    // this shifts bright texels relative to dark texels based on viewing angle
-    vec2 displaced_uv = uv - bump * 0.0018; // relief strength
-    
-    // Clamp to screen bounds
+    vec2 displaced_uv = uv - bump * 0.0018;
     displaced_uv = clamp(displaced_uv, vec2(0.0), vec2(1.0));
     
     vec3 col = texture(u_scene, displaced_uv).rgb;
     
-    // Pseudo-normal vector for local lighting
-    // z component represents slope steepness (1.0 is flat)
     vec3 normal = normalize(vec3(-bump.x * 2.0, -bump.y * 2.0, 1.0));
     
-    // Compute local directional light from the 3D sun position
-    // u_shadow_light_dir is the 2D direction of the light.
-    // -u_shadow_sun_z is the light's forward component.
-    vec3 light_dir_3d = normalize(vec3(u_shadow_light_dir, -u_shadow_sun_z));
-    
-    // Simple Lambertian diffuse bump reflection
+    // Use live light direction for bump shading too
+    vec2 live_dir = (u_light0_diffuse.r + u_light0_diffuse.g + u_light0_diffuse.b > 0.05)
+                     ? compute_light_dir_ss() : u_shadow_light_dir;
+    vec3 light_dir_3d = normalize(vec3(live_dir, -u_shadow_sun_z));
     float diff = clamp(dot(normal, light_dir_3d), 0.0, 1.0);
-    
-    // Apply soft bump lighting highlights and shadow crevices
     col *= (0.88 + 0.24 * diff);
     
     return col;
@@ -812,7 +868,7 @@ vec3 get_bumped_scene(vec2 uv) {
 void main() {
     vec3 scene = get_bumped_scene(v_uv);
     
-    // Apply SSAO with shadow lift — don't let AO darken too much
+    // Apply SSAO with shadow lift
     if (u_ao_enabled > 0.5) {
         float ao = texture(u_ao, v_uv).r;
         ao = mix(ao, 1.0, u_shadow_lift);
@@ -825,16 +881,26 @@ void main() {
         scene *= shadow;
     }
     
-    // Ambient sky color influence — subtly tint shadows with sky color
+    // Ambient sky color influence — combine preset sky + live GL light model ambient
     float luma = dot(scene, vec3(0.2126, 0.7152, 0.0722));
-    float shadow_mask = smoothstep(0.4, 0.1, luma);  // 1.0 in dark areas
-    vec3 ambient = vec3(u_ambient_r, u_ambient_g, u_ambient_b);
-    scene += ambient * shadow_mask * 0.10;  // slightly stronger sky fill
+    float shadow_mask = smoothstep(0.4, 0.1, luma);
+    vec3 sky_ambient  = vec3(u_ambient_r, u_ambient_g, u_ambient_b);
+    vec3 guest_ambient = u_light_model_amb.rgb;
+    vec3 ambient = mix(sky_ambient, sky_ambient * guest_ambient * 3.0, 0.35);
+    scene += ambient * shadow_mask * 0.10;
+    
+    // Material/vertex color tint — subtly push shadows toward the model's own color.
+    // This preserves boss color overrides (green Fire Boss etc.) in dark areas.
+    vec3 mat_tint = get_material_tint();
+    float dark_mask = smoothstep(0.5, 0.1, luma);  // only in dark regions
+    scene = mix(scene, scene * mat_tint, dark_mask * 0.25);
     
     // Apply God Rays (additive with tint)
     if (u_gr_enabled > 0.5) {
         vec3 rays = texture(u_godrays, v_uv).rgb;
         vec3 tint = vec3(u_gr_tint_r, u_gr_tint_g, u_gr_tint_b);
+        // Bias god-ray tint toward the actual diffuse light color
+        tint = mix(tint, u_light0_diffuse.rgb, 0.25);
         scene += rays * tint;
     }
     
@@ -850,10 +916,10 @@ void main() {
     
     // --- Saturation boost ---
     float luma2 = dot(scene, vec3(0.2126, 0.7152, 0.0722));
-    scene = mix(vec3(luma2), scene, 1.18);  // slightly more vivid
+    scene = mix(vec3(luma2), scene, 1.18);
     
     // --- Contrast micro-curve ---
-    scene = smoothstep(0.02, 1.0, scene);  // slight shadow lift in tone curve
+    scene = smoothstep(0.02, 1.0, scene);
     
     FragColor = vec4(clamp(scene, 0.0, 1.0), 1.0);
 }
@@ -1203,6 +1269,19 @@ bool fbo_init(int game_w, int game_h) {
         loc_portal_time       = glGetUniformLocation(g_prog_portal, "u_time");
         loc_portal_speed      = glGetUniformLocation(g_prog_portal, "u_speed");
         loc_portal_alpha      = glGetUniformLocation(g_prog_portal, "u_alpha");
+    }
+
+    // Game-engine handshake uniforms — composite shader
+    if (g_prog_composite) {
+        loc_comp_light0_pos      = glGetUniformLocation(g_prog_composite, "u_light0_pos");
+        loc_comp_light0_diffuse  = glGetUniformLocation(g_prog_composite, "u_light0_diffuse");
+        loc_comp_light0_ambient  = glGetUniformLocation(g_prog_composite, "u_light0_ambient");
+        loc_comp_light_model_amb = glGetUniformLocation(g_prog_composite, "u_light_model_amb");
+        loc_comp_mat_diffuse     = glGetUniformLocation(g_prog_composite, "u_mat_diffuse");
+        loc_comp_cur_color       = glGetUniformLocation(g_prog_composite, "u_cur_color");
+        loc_comp_player_world    = glGetUniformLocation(g_prog_composite, "u_player_world");
+        loc_comp_modelview       = glGetUniformLocation(g_prog_composite, "u_modelview");
+        loc_comp_projection      = glGetUniformLocation(g_prog_composite, "u_projection");
     }
 
     // --- Create fullscreen quad VAO/VBO (Optimization 2) ---
@@ -1561,6 +1640,36 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         if (loc_comp_tex_size != -1) {
             glUniform2f(loc_comp_tex_size, (float)g_game_w, (float)g_game_h);
         }
+
+        // ── Game-engine handshake — upload live GL state to composite shader ────
+        // Find the first enabled light (or fall back to light0 data as-is).
+        // This drives light-accurate shadow direction and diffuse tinting.
+        {
+            // Pick the first enabled light's data
+            int best = 0;
+            for (int li = 0; li < 8; li++) {
+                if (g_frame_lights[li].enabled) { best = li; break; }
+            }
+            if (loc_comp_light0_pos     != -1)
+                glUniform4fv(loc_comp_light0_pos,     1, g_frame_lights[best].position);
+            if (loc_comp_light0_diffuse != -1)
+                glUniform4fv(loc_comp_light0_diffuse, 1, g_frame_lights[best].diffuse);
+            if (loc_comp_light0_ambient != -1)
+                glUniform4fv(loc_comp_light0_ambient, 1, g_frame_lights[best].ambient);
+            if (loc_comp_light_model_amb != -1)
+                glUniform4fv(loc_comp_light_model_amb, 1, g_frame_light_model_ambient);
+            if (loc_comp_mat_diffuse    != -1)
+                glUniform4fv(loc_comp_mat_diffuse,    1, g_frame_material.diffuse);
+            if (loc_comp_cur_color      != -1)
+                glUniform4fv(loc_comp_cur_color,      1, g_current_color);
+            // Hero world position from host handshake
+            if (loc_comp_player_world   != -1)
+                glUniform3fv(loc_comp_player_world, 1, g_host_hero_pos);
+            if (loc_comp_modelview      != -1)
+                glUniformMatrix4fv(loc_comp_modelview,  1, GL_FALSE, g_current_modelview);
+            if (loc_comp_projection     != -1)
+                glUniformMatrix4fv(loc_comp_projection, 1, GL_FALSE, g_current_projection);
+        }
         draw_fsq();
 
         final_tex = g_postfx_tex;
@@ -1728,7 +1837,7 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
     switch (p) {
         case PostFXPreset::OFF:
             s.enabled = true;
-            s.ssao = true; s.ssao_radius = 0.042f; s.ssao_intensity = 2.5f;
+            s.ssao = true; s.ssao_radius = 0.042f; s.ssao_intensity = 2.1f;
             s.shadow_intensity = 0.425f;
             s.shadow_softness = 0.004f;
             s.shadow_light_x = 0.3f;
@@ -1737,7 +1846,7 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
             s.warmth = 0.18f;
             s.contrast = 1.13f;
             s.saturation = 1.15f;
-            s.brightness = 0.07f;
+            s.brightness = 0.14f;
             s.vignette = true;
             s.vignette_intensity = 0.35f;
             s.preset_name = "Low";
@@ -1761,14 +1870,14 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
 
     // Volumetric atmosphere
     s.volumetric_light = true;
-    s.volumetric_intensity = 0.18f;
+    s.volumetric_intensity = 0.24f;
 
     // Color grading — preserve Swordigo palette, enrich rather than replace
     s.color_adjust = true;
     s.warmth = 0.08f;
     s.contrast = 1.07f;
     s.saturation = 1.08f;
-    s.brightness = 0.035f;
+    s.brightness = 0.045f;
 
     // Very soft cinematic framing
     s.vignette = true;
@@ -1776,7 +1885,7 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
 
     // Crisp texture detail without ringing
     s.sharpen = true;
-    s.sharpen_strength = 0.11f;
+    s.sharpen_strength = 0.21f;
 
     // Extremely subtle lens separation
     s.chromatic_aberration = false;

@@ -56,7 +56,8 @@ SreHookEntry sre_hook_table[] = {
      * DISABLED FOR TESTING — let the native engine handle it to reduce
      * per-frame overhead. Lua resume errors will crash without this. */
      { 0, "sre_ProgramState_Update" },
-    // { 0, "sre_updateApplication" }, (Problamatic, Makes the game bricked , broken GUI and other stuff)
+     // { 0, "sre_ProgramState_destructor" },
+     // { 0, "sre_updateApplication" },
 
 
     /* luaD_throw — ROOT of all Lua error handling. Every Lua error goes
@@ -275,6 +276,7 @@ SreHookEntry sre_hook_table[] = {
     { 0, "luaopen_debug" },
     { 0, "luaL_openlibs" },
     { 0, "lua_newthread" },
+    { 0, "lua_xmove" },
     { 0, "lua_tothread" },
     { 0, "lua_pushthread" },
     { 0, "lua_status" },

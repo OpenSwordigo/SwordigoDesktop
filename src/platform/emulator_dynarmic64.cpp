@@ -315,12 +315,10 @@ EmulatorDynarmic64::EmulatorDynarmic64(uint8_t* guest_mem, uint64_t size)
     // Enable BlockLinking optimization for maximum emulation performance.
     config.optimizations = Dynarmic::all_safe_optimizations;
 
-    // IMPORTANT: Do NOT enable fastmem. Our guest memory is 3.5GB (0xE0000000)
-    // but the bridge trampoline region is at 0xFF000000 which is beyond the
-    // allocation. With fastmem, Dynarmic bypasses MemoryRead callbacks and
-    // directly accesses memory + vaddr, causing a segfault at bridge addresses.
-    // config.fastmem_pointer = ...  // DISABLED
-    // config.fastmem_address_space_bits = ...  // DISABLED
+    // Enable fastmem optimization since we mapped the entire 4GB virtual address space
+    // and filled the bridge and magic return regions with valid HLT instructions.
+    config.fastmem_pointer = (uintptr_t)memory;
+    config.fastmem_address_space_bits = 32;
 
     // TPIDR_EL0 storage
     config.tpidr_el0 = &tpidr_el0_value;
@@ -619,7 +617,7 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
         slow_count++;
         if (slow_count <= 30) {
             std::cerr << "[PERF/Dynarmic] SLOW call at 0x" << std::hex << start_pc << std::dec
-                      << " took " << (int)ms << "ms" << std::endl;
+                      << " took " << (int)ms << "ms (bridge_calls=" << bridge_calls << ")" << std::endl;
         }
     }
 

@@ -831,9 +831,6 @@ LUALIB_API int luaL_loadbuffer (lua_State *L, const char *buff, size_t size,
   ls.s = actual_buff;
   ls.size = actual_size;
   int status = lua_load(L, getS, &ls, name);
-  if (status != 0) {
-      fprintf(stderr, "[SRE-LUA]   -> COMPILE ERROR: %d (msg: %s)\n", status, lua_tostring(L, -1));
-  }
   return status;
 }
 
@@ -869,7 +866,14 @@ static int panic (lua_State *L) {
 
 LUALIB_API lua_State *luaL_newstate (void) {
   lua_State *L = lua_newstate(l_alloc, NULL);
-  if (L) lua_atpanic(L, &panic);
+  if (L) {
+    lua_atpanic(L, &panic);
+    /* commented out new capture suspect
+    extern lua_State* g_sre_last_lua_state;
+    extern void sre_mini_ensure_injected(lua_State* L);
+    g_sre_last_lua_state = L;
+    */
+  }
   return L;
 }
 

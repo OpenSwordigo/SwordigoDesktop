@@ -383,7 +383,6 @@ namespace VideoBackground {
 
 extern "C" void reset_void_fill_color() {
     g_void_fill_color.active = false;
-    std::cout << "[VideoBackground] Reset clear color (deactivated)" << std::endl;
 }
 
 

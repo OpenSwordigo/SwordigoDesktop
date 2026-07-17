@@ -62,9 +62,13 @@ CXX_SRCS := \
     src/platform/launcher_ui.cpp \
     src/platform/save_editor.cpp \
     src/platform/scl_parser.cpp \
+    src/tools/filerift.cpp \
+    src/tools/scene_schemas.cpp \
+    src/tools/boulder.cpp \
     src/platform/srt_overlay.cpp \
     src/platform/video_background.cpp \
     src/platform/swordfare_gui.cpp \
+    src/platform/rgc.cpp \
     src/platform/pvrtc_decoder.cpp \
     src/imgui/imgui.cpp \
     src/imgui/imgui_draw.cpp \
@@ -209,6 +213,7 @@ install-sre: libsre.so
 # =========================================================================
 # Separate binary with minimal dependencies (no unicorn, no game code).
 AV_SRCS := src/tools/asset_viewer.cpp \
+    src/tools/filerift.cpp src/tools/scene_schemas.cpp src/tools/boulder.cpp \
     src/tools/pod_loader.cpp src/tools/av_renderer.cpp \
     src/tools/av_audio.cpp src/tools/scene_loader.cpp \
     src/platform/pvr_loader.cpp \
@@ -218,7 +223,7 @@ AV_SRCS := src/tools/asset_viewer.cpp \
     src/imgui/imgui_tables.cpp src/imgui/imgui_widgets.cpp \
     src/imgui/backends/imgui_impl_sdl3.cpp src/imgui/backends/imgui_impl_opengl3.cpp
 AV_OBJS := $(patsubst src/%.cpp, build/%.o, $(AV_SRCS))
-AV_LIBS := $(SDL3_LIBS) $(SDL3I_LIBS) -lGL $(ZLIB_LIBS)
+AV_LIBS := $(SDL3_LIBS) $(SDL3I_LIBS) -lGL $(ZLIB_LIBS) -lutil
 
 ruby: $(AV_OBJS)
 	@echo "[LINK] $@"

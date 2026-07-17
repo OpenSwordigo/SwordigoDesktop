@@ -23,19 +23,8 @@ sudo dnf install unicorn-devel SDL3-devel SDL3_image-devel openal-soft-devel \
 
 **Ubuntu / Debian (24.04+):**
 ```bash
-sudo apt update
-
-sudo apt install \
-  libunicorn-dev \
-  libsdl3-dev \
-  libsdl3-image-dev \
-  libopenal-dev \
-  libgl-dev \
-  zlib1g-dev \
-  libvorbis-dev \
-  gcc-aarch64-linux-gnu \
-  cmake \
-  g++
+sudo apt install libunicorn-dev libsdl3-dev libsdl3-image-dev libopenal-dev \
+    libgl-dev zlib1g-dev libvorbis-dev gcc-aarch64-linux-gnu cmake g++
 ```
 
 **Arch Linux:**

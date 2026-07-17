@@ -21,8 +21,11 @@
 #include "sre.h"
 #include "sre_lua.h"
 
+extern uint64_t g_swordigo_base;
+
 /* ========== Lua API Function Pointers ========== */
 
+pfn_ProgramState_destructor g_orig_ProgramState_destructor = 0;
 pfn_lua_pcall       g_lua_pcall = 0;
 pfn_lua_resume      g_lua_resume = 0;
 pfn_lua_settop      g_lua_settop = 0;
@@ -524,6 +527,106 @@ static void sre_collect_returns(lua_State* L, int base) {
     g_lua_console_result[pos] = 0;
 }
 
+/* commented out coroutine console helpers to match old logic
+#define MAX_ACTIVE_COROUTINES 16
+typedef struct {
+    lua_State* co;
+    int is_active;
+    int report_result;
+} ConsoleCoroutine;
+
+static ConsoleCoroutine g_sre_console_coroutines[MAX_ACTIVE_COROUTINES] = {{0}};
+
+static void sre_add_console_coroutine(lua_State* co, int report_result) {
+    for (int i = 0; i < MAX_ACTIVE_COROUTINES; i++) {
+        if (!g_sre_console_coroutines[i].is_active) {
+            g_sre_console_coroutines[i].co = co;
+            g_sre_console_coroutines[i].is_active = 1;
+            g_sre_console_coroutines[i].report_result = report_result;
+            return;
+        }
+    }
+}
+
+static void sre_remove_coroutine_from_registry(lua_State* L, lua_State* co) {
+    if (!g_lua_getfield || !g_lua_type || !g_lua_pushthread || !g_lua_xmove || !g_lua_pushnil || !g_lua_settable || !g_lua_settop) return;
+    
+    int base = g_lua_gettop(L);
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "__sre_active_coroutines");
+    if (g_lua_type(L, -1) != LUA_TNIL) {
+        g_lua_pushthread(co);
+        g_lua_xmove(co, L, 1);
+        g_lua_pushnil(L);
+        g_lua_settable(L, -3);
+    }
+    g_lua_settop(L, base);
+}
+
+void sre_tick_console_coroutines(lua_State* L) {
+    if (!g_lua_resume || !g_lua_gettop || !g_lua_xmove || !g_lua_tolstring || !g_lua_pushcclosure || !g_lua_setfield || !g_lua_getfield || !g_lua_settop) return;
+
+    for (int i = 0; i < MAX_ACTIVE_COROUTINES; i++) {
+        if (g_sre_console_coroutines[i].is_active) {
+            lua_State* co = g_sre_console_coroutines[i].co;
+
+            int base = g_lua_gettop(L);
+            g_lua_getfield(L, LUA_GLOBALSINDEX, "print");
+            g_lua_pushcclosure(L, sre_console_print, 0);
+            g_lua_setfield(L, LUA_GLOBALSINDEX, "print");
+
+            int r = g_lua_resume(co, 0);
+
+            g_lua_settop(L, base + 1);
+            g_lua_setfield(L, LUA_GLOBALSINDEX, "print");
+            g_lua_settop(L, base);
+
+            if (r == 0) {
+                g_sre_console_coroutines[i].is_active = 0;
+
+                if (g_sre_console_coroutines[i].report_result) {
+                    int nres = g_lua_gettop(co);
+                    if (nres > 0) {
+                        g_lua_xmove(co, L, nres);
+                        sre_collect_returns(L, g_lua_gettop(L) - nres);
+                        g_lua_settop(L, g_lua_gettop(L) - nres);
+                    }
+                    
+                    if (!g_lua_console_result[0] && g_lua_console_print_buf[0]) {
+                        int p_len = strlen(g_lua_console_print_buf);
+                        while (p_len > 0 && g_lua_console_print_buf[p_len - 1] == '\n') {
+                            g_lua_console_print_buf[p_len - 1] = 0;
+                            p_len--;
+                        }
+                        sre_strcopy(g_lua_console_result, g_lua_console_print_buf, CONSOLE_BUF_SIZE);
+                    }
+                    
+                    if (!g_lua_console_result[0]) {
+                        g_lua_console_result[0] = 'O';
+                        g_lua_console_result[1] = 'K';
+                        g_lua_console_result[2] = 0;
+                    }
+                    g_lua_console_status = 1;
+                }
+
+                sre_remove_coroutine_from_registry(L, co);
+            } else if (r != LUA_YIELD) {
+                g_sre_console_coroutines[i].is_active = 0;
+
+                if (g_sre_console_coroutines[i].report_result) {
+                    const char* err = g_lua_tolstring ? g_lua_tolstring(co, -1, 0) : "runtime error";
+                    if (err) sre_strcopy(g_lua_console_result, err, CONSOLE_BUF_SIZE);
+                    else     sre_strcopy(g_lua_console_result, "runtime error", CONSOLE_BUF_SIZE);
+                    g_lua_console_status = 2;
+                }
+
+                sre_remove_coroutine_from_registry(L, co);
+            }
+        }
+    }
+}
+*/
+
+
 static void sre_run_console(lua_State* L) {
     if (!g_lua_getfield || !g_lua_pcall || !g_lua_pushstring || !g_lua_gettop) {
         sre_strcopy(g_lua_console_result, "ERR: Lua API not resolved", CONSOLE_BUF_SIZE);
@@ -628,6 +731,7 @@ static void sre_run_console(lua_State* L) {
 }
 
 
+
 /* ========== ProgramState::Execute replacement ========== 
  * Original: calls lua_call(L, nargs, 0) which aborts on error
  * Ours: calls lua_pcall(L, nargs, 0, 0) which catches errors
@@ -649,6 +753,7 @@ void sre_ProgramState_Execute(void* self, int stackIndex) {
         g_lua_console_pending = 0;
         sre_run_console(L);
     }
+
     
     /* Push recovery entry */
     int my_depth = recovery_push(L);
@@ -761,8 +866,11 @@ typedef void (*pfn_orig_Update)(void* self, float deltaTime);
 pfn_orig_Update g_orig_ProgramState_Update = 0;
 
 void sre_ProgramState_Update(void* self, float deltaTime) {
-    /* Capture lua_State and service the Lua console every frame */
+    /* L is needed throughout this function (timer countdown, lua_resume).
+     * Declare it unconditionally here. */
     lua_State* L = PS_GET(self, PS_LUA_STATE, lua_State*);
+
+    /* Capture lua_State and service the Lua console every frame */
     if (L) {
         g_sre_last_lua_state = L;
         if (__builtin_expect(g_lua_console_pending, 0)) {
@@ -869,17 +977,33 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
 typedef void (*pfn_orig_updateApp)(void* env, void* obj);
 pfn_orig_updateApp g_orig_updateApplication = 0;
 
-void sre_updateApplication(void* env, void* obj) {
-    /* Service Lua console before the frame update */
-    if (g_lua_console_pending && g_sre_last_lua_state) {
-        g_lua_console_pending = 0;
-        sre_run_console(g_sre_last_lua_state);
+void sre_updateApplication(void* env, void* obj, float dt) {
+    /* commented out to revert to old behavior
+    (void)env; (void)obj;
+    if (g_sre_last_lua_state) {
+        extern void sre_mini_ensure_injected(lua_State* L);
+        sre_mini_ensure_injected(g_sre_last_lua_state);
+
+        if (g_lua_console_pending) {
+            g_lua_console_pending = 0;
+            sre_run_console(g_sre_last_lua_state);
+        }
+        extern void sre_tick_console_coroutines(lua_State* L);
+        sre_tick_console_coroutines(g_sre_last_lua_state);
     }
-    /* Call-through to original */
-    if (g_orig_updateApplication) {
-        g_orig_updateApplication(env, obj);
+
+    void* active_state = *(void**)(g_swordigo_base + 0x6e9c20);
+    if (active_state != NULL) {
+        void** vtable = *(void***)active_state;
+        typedef void (*pfn_Update)(void* self, float dt);
+        pfn_Update update_func = (pfn_Update)vtable[13];
+        if (update_func) {
+            update_func(active_state, dt);
+        }
     }
+    */
 }
+
 
 /* ========== handleTouchEvent hook ==========
  * Symbol: Java_com_touchfoo_swordigo_Native_handleTouchEvent
@@ -910,4 +1034,28 @@ void sre_handleTouchEvent(void* env, void* obj, int action, int id, double time,
             g_orig_handleTouchEvent(env, obj, action, id, time, x, y, oldX, oldY, tapCount);
         }
     }
+}
+
+void sre_ProgramState_destructor(void* self) {
+    /* commented out to revert to old behavior
+    void* parent = *(void**)((char*)self + 8);
+
+    if (parent == NULL) {
+        lua_State* L = *(lua_State**)self;
+        if (L != NULL && L == g_sre_last_lua_state) {
+            g_sre_last_lua_state = NULL;
+        }
+    } else {
+        lua_State* parent_L = *(lua_State**)parent;
+        if (parent_L != NULL && g_lua_pushlightuserdata && g_lua_pushnil && g_lua_settable) {
+            g_lua_pushlightuserdata(parent_L, self);
+            g_lua_pushnil(parent_L);
+            g_lua_settable(parent_L, LUA_REGISTRYINDEX);
+        }
+    }
+
+    if (g_orig_ProgramState_destructor) {
+        g_orig_ProgramState_destructor(self);
+    }
+    */
 }

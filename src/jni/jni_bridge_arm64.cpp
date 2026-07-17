@@ -7,6 +7,7 @@
 
 #include "jni_bridge.h"
 #include "jni_bridge_arm64.h"
+#include "jni/gl_render_state.h"  // GL state handshake — bridge writes, FBO reads
 #include "platform/i_emulator_arm64.h"
 #include "platform/emulator_arm64.h"  // For backward compat — EmulatorArm64 inherits IEmulatorArm64
 #include "platform/io_thread.h"
@@ -15,11 +16,13 @@
 #include "platform/video_background.h"
 #include "platform/pvrtc_decoder.h"
 #include <iostream>
+#include <fstream>
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <unordered_map>
+#include <deque>
 #include <unordered_set>
 #include <sstream>
 #include <mutex>
@@ -38,6 +41,10 @@ namespace fs = std::filesystem;
 #include <time.h>
 #include <unistd.h>
 #include <thread>
+#include "platform/rgc.h"
+#include "loader/elf_loader_arm64.h"
+
+extern so_module_arm64 g_sre_mod;
 #include <cerrno>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -212,31 +219,147 @@ struct DeferredBlock {
 };
 static uint32_t g_guest_heap_ptr = 0x20000000; // Start heap at 512MB
 static std::unordered_map<uint32_t, uint32_t> g_guest_allocs;
-static std::vector<DeferredBlock> g_deferred_free_list;
+static std::vector<DeferredBlock> g_deferred_free_list_vector; // Original TVPG container
+static std::deque<DeferredBlock> g_deferred_free_list;
 static uint64_t g_alloc_counter = 0;
 static std::mutex g_heap_mutex;
 
-static uint32_t host_malloc_locked(uint32_t size) {
-    size = (size + 7) & ~7;
-    // Only recycle if heap size exceeds 2048MB (fast path O(1) bump allocator under 2GB)
-    if (g_guest_heap_ptr - 0x20000000 > 2048ULL * 1024 * 1024) {
-        size_t search_limit = std::min(g_deferred_free_list.size(), (size_t)50);
-        for (size_t i = 0; i < search_limit; i++) {
-            const auto& db = g_deferred_free_list[i];
-            // Chronological list: if the oldest elements aren't ready yet, none are!
-            if (g_alloc_counter - db.alloc_index <= 15000) {
-                break; // Stop searching completely
-            }
-            if (db.size >= size && db.size <= size + 128) {
-                uint32_t addr = db.addr;
-                g_guest_allocs[addr] = size;
-                g_deferred_free_list.erase(g_deferred_free_list.begin() + i);
-                g_alloc_counter++;
-                return addr;
+static const uint32_t BUCKET_SIZES[] = {
+    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 
+    8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608
+};
+static const int NUM_BUCKETS = sizeof(BUCKET_SIZES) / sizeof(BUCKET_SIZES[0]);
+
+struct FreeBlock {
+    uint32_t addr;
+    uint32_t size;
+};
+static std::vector<FreeBlock> g_buckets[NUM_BUCKETS + 1];
+
+static int get_bucket_index(uint32_t size) {
+    for (int i = 0; i < NUM_BUCKETS; i++) {
+        if (size <= BUCKET_SIZES[i]) return i;
+    }
+    return -1;
+}
+
+static void add_free_block_locked(uint32_t addr, uint32_t size) {
+    int idx = -1;
+    for (int i = NUM_BUCKETS - 1; i >= 0; i--) {
+        if (size >= BUCKET_SIZES[i]) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == -1) idx = NUM_BUCKETS;
+    g_buckets[idx].push_back({addr, size});
+}
+
+static uint32_t find_free_block_locked(uint32_t size, uint32_t& found_size) {
+    int start_idx = get_bucket_index(size);
+    if (start_idx == -1) start_idx = NUM_BUCKETS;
+    
+    if (start_idx > 0 && start_idx - 1 < NUM_BUCKETS) {
+        int below_idx = start_idx - 1;
+        for (size_t i = 0; i < g_buckets[below_idx].size(); i++) {
+            if (g_buckets[below_idx][i].size >= size) {
+                FreeBlock fb = g_buckets[below_idx][i];
+                g_buckets[below_idx].erase(g_buckets[below_idx].begin() + i);
+                found_size = fb.size;
+                return fb.addr;
             }
         }
     }
-    uint32_t addr = g_guest_heap_ptr;
+    
+    for (int idx = start_idx; idx <= NUM_BUCKETS; idx++) {
+        if (g_buckets[idx].empty()) continue;
+        
+        if (idx < NUM_BUCKETS) {
+            FreeBlock fb = g_buckets[idx].back();
+            g_buckets[idx].pop_back();
+            found_size = fb.size;
+            return fb.addr;
+        } else {
+            int best_fit_idx = -1;
+            uint32_t best_fit_size = 0xFFFFFFFF;
+            for (size_t i = 0; i < g_buckets[idx].size(); i++) {
+                if (g_buckets[idx][i].size >= size && g_buckets[idx][i].size < best_fit_size) {
+                    best_fit_size = g_buckets[idx][i].size;
+                    best_fit_idx = (int)i;
+                }
+            }
+            if (best_fit_idx != -1) {
+                FreeBlock fb = g_buckets[idx][best_fit_idx];
+                g_buckets[idx].erase(g_buckets[idx].begin() + best_fit_idx);
+                found_size = fb.size;
+                return fb.addr;
+            }
+        }
+    }
+    return 0;
+}
+
+extern bool g_advanced_redstell_opts;
+extern uint64_t g_sre_profile_addr;
+extern uint64_t g_sre_vfs_profile_addr;
+
+static uint32_t host_malloc_locked(uint32_t size) {
+    size = (size + 7) & ~7;
+    if (size == 0) size = 8;
+    
+    // === TVPG Original Config Allocator ===
+    if (!g_advanced_redstell_opts) {
+        // Only recycle if heap size exceeds 2048MB (fast path O(1) bump allocator under 2GB)
+        if (g_guest_heap_ptr - 0x20000000 > 2048ULL * 1024 * 1024) {
+            size_t search_limit = std::min(g_deferred_free_list_vector.size(), (size_t)50);
+            for (size_t i = 0; i < search_limit; i++) {
+                const auto& db = g_deferred_free_list_vector[i];
+                // Chronological list: if the oldest elements aren't ready yet, none are!
+                if (g_alloc_counter - db.alloc_index <= 15000) {
+                    break; // Stop searching completely
+                }
+                if (db.size >= size && db.size <= size + 128) {
+                    uint32_t addr = db.addr;
+                    g_guest_allocs[addr] = size;
+                    g_deferred_free_list_vector.erase(g_deferred_free_list_vector.begin() + i);
+                    g_alloc_counter++;
+                    return addr;
+                }
+            }
+        }
+        uint32_t addr = g_guest_heap_ptr;
+        g_guest_heap_ptr += size;
+        g_guest_allocs[addr] = size;
+        g_alloc_counter++;
+        return addr;
+    }
+
+    // === SRE Config Allocator ===
+    while (!g_deferred_free_list.empty()) {
+        const auto& db = g_deferred_free_list.front();
+        if (g_alloc_counter - db.alloc_index > 2000) {
+            add_free_block_locked(db.addr, db.size);
+            g_deferred_free_list.pop_front();
+        } else {
+            break;
+        }
+    }
+    
+    uint32_t found_size = 0;
+    uint32_t addr = find_free_block_locked(size, found_size);
+    if (addr != 0) {
+        if (found_size >= size + 16) {
+            uint32_t remainder_addr = addr + size;
+            uint32_t remainder_size = found_size - size;
+            add_free_block_locked(remainder_addr, remainder_size);
+            found_size = size;
+        }
+        g_guest_allocs[addr] = found_size;
+        g_alloc_counter++;
+        return addr;
+    }
+    
+    addr = g_guest_heap_ptr;
     g_guest_heap_ptr += size;
     g_guest_allocs[addr] = size;
     g_alloc_counter++;
@@ -251,9 +374,23 @@ static void host_free_locked(uint32_t ptr) {
         db.addr = ptr;
         db.size = (size + 7) & ~7;
         db.alloc_index = g_alloc_counter;
+        
+        // === TVPG Original Config Free ===
+        if (!g_advanced_redstell_opts) {
+            g_deferred_free_list_vector.push_back(db);
+            g_guest_allocs.erase(ptr);
+            return;
+        }
+
+        // === SRE Config Free ===
         g_deferred_free_list.push_back(db);
         g_guest_allocs.erase(ptr);
     }
+}
+
+extern "C" void rgc_reclaim_guest_memory(uint64_t addr) {
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
+    host_free_locked((uint32_t)addr);
 }
 
 static void bridge_malloc(void* emu_ptr) {
@@ -261,6 +398,14 @@ static void bridge_malloc(void* emu_ptr) {
     uint32_t size = emu->get_reg(0);
     std::lock_guard<std::mutex> lock(g_heap_mutex);
     uint32_t addr = host_malloc_locked(size);
+
+    if (g_advanced_redstell_opts) {
+        uint64_t lr = emu->get_reg(30);
+        if (g_sre_mod.base_addr != 0 && lr >= g_sre_mod.base_addr && lr < g_sre_mod.base_addr + g_sre_mod.mem_size) {
+            RedstellGC::instance().track_alloc(addr, size, lr, "malloc");
+        }
+    }
+
     emu->set_reg(0, addr);
 }
 
@@ -272,6 +417,14 @@ static void bridge_calloc(void* emu_ptr) {
     std::lock_guard<std::mutex> lock(g_heap_mutex);
     uint32_t addr = host_malloc_locked(total);
     std::memset(emu->get_memory_base() + addr, 0, total);
+
+    if (g_advanced_redstell_opts) {
+        uint64_t lr = emu->get_reg(30);
+        if (g_sre_mod.base_addr != 0 && lr >= g_sre_mod.base_addr && lr < g_sre_mod.base_addr + g_sre_mod.mem_size) {
+            RedstellGC::instance().track_alloc(addr, total, lr, "calloc");
+        }
+    }
+
     emu->set_reg(0, addr);
 }
 
@@ -280,12 +433,56 @@ static void bridge_realloc(void* emu_ptr) {
     uint32_t ptr = emu->get_reg(0);
     uint32_t size = emu->get_reg(1);
     std::lock_guard<std::mutex> lock(g_heap_mutex);
+
+    // --- TVPG Vanilla Realloc ---
+    if (!g_advanced_redstell_opts) {
+        if (ptr == 0) {
+            uint32_t addr = host_malloc_locked(size);
+            emu->set_reg(0, addr);
+            return;
+        }
+        if (size == 0) {
+            host_free_locked(ptr);
+            emu->set_reg(0, 0);
+            return;
+        }
+        
+        if (g_guest_allocs.count(ptr)) {
+            uint32_t old_size = g_guest_allocs[ptr];
+            uint32_t addr = host_malloc_locked(size);
+            uint32_t copy_size = (old_size < size) ? old_size : size;
+            if (copy_size > 0) {
+                std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, copy_size);
+            }
+            host_free_locked(ptr);
+            emu->set_reg(0, addr);
+        } else {
+            uint32_t addr = host_malloc_locked(size);
+            if (size > 0) {
+                std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, size);
+            }
+            emu->set_reg(0, addr);
+        }
+        return;
+    }
+
+    // --- SRE Tracked Realloc ---
+    uint64_t lr = emu->get_reg(30);
+    bool is_sre_alloc = (g_sre_mod.base_addr != 0 && lr >= g_sre_mod.base_addr && lr < g_sre_mod.base_addr + g_sre_mod.mem_size);
+    bool was_tracked = (ptr != 0 && RedstellGC::instance().is_tracked(ptr));
+
     if (ptr == 0) {
         uint32_t addr = host_malloc_locked(size);
+        if (is_sre_alloc) {
+            RedstellGC::instance().track_alloc(addr, size, lr, "realloc(new)");
+        }
         emu->set_reg(0, addr);
         return;
     }
     if (size == 0) {
+        if (was_tracked) {
+            RedstellGC::instance().track_free(ptr, lr);
+        }
         host_free_locked(ptr);
         emu->set_reg(0, 0);
         return;
@@ -298,6 +495,12 @@ static void bridge_realloc(void* emu_ptr) {
         
         if (aligned_new_size <= aligned_old_size) {
             g_guest_allocs[ptr] = size;
+            if (was_tracked) {
+                RedstellGC::instance().track_free(ptr, lr);
+            }
+            if (is_sre_alloc) {
+                RedstellGC::instance().track_alloc(ptr, size, lr, "realloc(inplace)");
+            }
             emu->set_reg(0, ptr);
             return;
         }
@@ -305,6 +508,12 @@ static void bridge_realloc(void* emu_ptr) {
         if (ptr + aligned_old_size == g_guest_heap_ptr) {
             g_guest_heap_ptr = ptr + aligned_new_size;
             g_guest_allocs[ptr] = size;
+            if (was_tracked) {
+                RedstellGC::instance().track_free(ptr, lr);
+            }
+            if (is_sre_alloc) {
+                RedstellGC::instance().track_alloc(ptr, size, lr, "realloc(extend)");
+            }
             emu->set_reg(0, ptr);
             return;
         }
@@ -314,12 +523,21 @@ static void bridge_realloc(void* emu_ptr) {
         if (copy_size > 0) {
             std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, copy_size);
         }
+        if (was_tracked) {
+            RedstellGC::instance().track_free(ptr, lr);
+        }
         host_free_locked(ptr);
+        if (is_sre_alloc) {
+            RedstellGC::instance().track_alloc(addr, size, lr, "realloc(move)");
+        }
         emu->set_reg(0, addr);
     } else {
         uint32_t addr = host_malloc_locked(size);
         if (size > 0) {
             std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, size);
+        }
+        if (is_sre_alloc) {
+            RedstellGC::instance().track_alloc(addr, size, lr, "realloc(fallback)");
         }
         emu->set_reg(0, addr);
     }
@@ -330,6 +548,14 @@ static void bridge_free(void* emu_ptr) {
     uint32_t ptr = emu->get_reg(0);
     if (ptr) {
         std::lock_guard<std::mutex> lock(g_heap_mutex);
+        
+        if (g_advanced_redstell_opts) {
+            uint64_t lr = emu->get_reg(30);
+            if (RedstellGC::instance().is_tracked(ptr)) {
+                RedstellGC::instance().track_free(ptr, lr);
+            }
+        }
+
         host_free_locked(ptr);
     }
 }
@@ -815,7 +1041,9 @@ static void bridge_AAssetManager_open(void* emu_ptr) {
     }
     
     void* asset = AAssetManager_open(mgr, filename, emu->get_reg(2));
-    std::cout << "[ASSET] Open " << filename << (asset ? " -> SUCCESS" : " -> FAILED") << std::endl;
+    if (!asset) {
+        std::cerr << "[ASSET] Open FAILED: " << filename << std::endl;
+    }
     emu->set_reg(0, register_pointer(asset));
 }
 
@@ -828,8 +1056,8 @@ static void bridge_AAsset_read(void* emu_ptr) {
     void* buf = (void*)(memory + emu->get_reg(1));
     uint32_t count = emu->get_reg(2);
     int read = AAsset_read(asset, buf, count);
-    if (read > 0 && !emu->quiet_mode) {
-        std::cout << "[Asset] READ: " << (asset ? asset->name : "NULL") << " (" << read << " bytes) to 0x" << std::hex << emu->get_reg(1) << std::dec << std::endl;
+    if (read < 0) {
+        std::cerr << "[Asset] READ FAILED: " << (asset ? asset->name : "NULL") << std::endl;
     }
     emu->set_reg(0, read);
 }
@@ -2840,8 +3068,11 @@ static bool try_decode_pvr_from_fd(int real_fd, PVRGzBuffer& out) {
     out.width  = width;
     out.height = height;
 
-    std::cerr << "[SRE-PVR] gzdopen: decoded PVR " << width << "x" << height
-              << " format=" << caver_format << " -> TEX stream" << std::endl;
+    extern IEmulatorArm64* g_emulator_64;
+    if (g_emulator_64 && !g_emulator_64->quiet_mode) {
+        std::cerr << "[SRE-PVR] gzdopen: decoded PVR " << width << "x" << height
+                  << " format=" << caver_format << " -> TEX stream" << std::endl;
+    }
     return true;
 }
 
@@ -2937,6 +3168,9 @@ static void bridge_gzclose(void* emu_ptr) {
         emu->set_reg(0, (uint32_t)-1);
     }
 }
+static std::unordered_map<uint32_t, std::string> g_buffer_to_path;
+static std::mutex g_buffer_to_path_mutex;
+
 extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_path, int max_len);
 
 static void bridge_fopen(void* emu_ptr) {
@@ -2971,6 +3205,13 @@ static void bridge_fopen(void* emu_ptr) {
     if (f) {
         uint32_t handle = g_next_file_handle++;
         g_file_handles[handle] = f;
+        RedstellGC::instance().track_file_open(handle, resolved_path.c_str());
+        
+        // PPD: Kick off asynchronous pre-decompression if it's a PVR texture
+        if (resolved_path.find(".pvr") != std::string::npos) {
+            RedstellGC::instance().ppd_preload_texture(resolved_path);
+        }
+        
         emu->set_reg(0, handle);
         if (!emu->quiet_mode) {
             // printf("[AssetMgr/fopen] Opened: %s -> %s (handle=%u)\n", path, resolved_path.c_str(), handle);
@@ -2988,6 +3229,7 @@ static void bridge_fclose(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t handle = emu->get_reg(0);
     if (g_file_handles.count(handle)) {
+        RedstellGC::instance().track_file_close(handle);
         fflush(g_file_handles[handle]);  // Ensure data written to disk before close
         fclose(g_file_handles[handle]);
         g_file_handles.erase(handle);
@@ -3019,6 +3261,14 @@ static void bridge_fread(void* emu_ptr) {
     uint32_t handle = emu->get_reg(3);
     if (g_file_handles.count(handle)) {
         size_t read = fread(memory + buf, elem_size, count, g_file_handles[handle]);
+        
+        // PPD: Associate buffer address with the texture file path
+        std::string path = RedstellGC::instance().get_file_path(handle);
+        if (!path.empty() && path.find(".pvr") != std::string::npos) {
+            std::lock_guard<std::mutex> lock(g_buffer_to_path_mutex);
+            g_buffer_to_path[buf] = path;
+        }
+        
         emu->set_reg(0, (uint32_t)read);
     } else {
         emu->set_reg(0, 0);
@@ -3167,11 +3417,95 @@ static void bridge_rename(void* emu_ptr) {
         resolved_new = resolved;
     }
 
+    // Ensure destination parent directory exists
+    size_t last_slash = resolved_new.find_last_of('/');
+    if (last_slash != std::string::npos) {
+        std::string parent_dir = resolved_new.substr(0, last_slash);
+        try {
+            fs::create_directories(parent_dir);
+        } catch (...) {}
+    }
+
+    // Write diagnostic logs to a debug file
+    std::ofstream log_file("/home/quantumcreeper/.local/share/swordigo-desktop/file_debug.log", std::ios::app);
+    if (log_file.is_open()) {
+        log_file << "--- rename request ---\n";
+        log_file << "old_path: " << old_path << "\n";
+        log_file << "new_path: " << new_path << "\n";
+        log_file << "resolved_old: " << resolved_old << "\n";
+        log_file << "resolved_new: " << resolved_new << "\n";
+        log_file << "resolved_old exists: " << (fs::exists(resolved_old) ? "YES" : "NO") << "\n";
+        log_file << "resolved_new parent exists: " << (last_slash != std::string::npos && fs::exists(resolved_new.substr(0, last_slash)) ? "YES" : "NO") << "\n";
+    }
+
     int result = rename(resolved_old.c_str(), resolved_new.c_str());
+    if (result != 0) {
+        if (log_file.is_open()) {
+            log_file << "rename syscall failed: " << strerror(errno) << " (errno " << errno << ")\n";
+        }
+        // Fallback: Copy and remove (cross-device/permissions fallback)
+        try {
+            if (fs::exists(resolved_old)) {
+                fs::copy_file(resolved_old, resolved_new, fs::copy_options::overwrite_existing);
+                fs::remove(resolved_old);
+                result = 0; // Success!
+                std::cout << "[File] rename fallback (copy+remove) succeeded for " << old_path << " -> " << new_path << std::endl;
+                if (log_file.is_open()) {
+                    log_file << "fallback copy+remove succeeded\n";
+                }
+            } else {
+                if (log_file.is_open()) {
+                    log_file << "fallback skipped: resolved_old does not exist\n";
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[File] rename fallback FAILED: " << e.what() << std::endl;
+            if (log_file.is_open()) {
+                log_file << "fallback exception: " << e.what() << "\n";
+            }
+        }
+    } else {
+        if (log_file.is_open()) {
+            log_file << "rename syscall succeeded\n";
+        }
+    }
+
     if (result != 0) {
         std::cerr << "[File] rename(\"" << old_path << "\" -> \"" << new_path << "\") FAILED: " << strerror(errno) << std::endl;
     } else {
         std::cout << "[File] rename(\"" << old_path << "\" -> \"" << new_path << "\") OK" << std::endl;
+        
+        // Dynamically update SRE profile ID upon successful creation of a new save slot
+        if (resolved_new.find(".gplayer") != std::string::npos && resolved_new.find("/save/Documents/") != std::string::npos) {
+            try {
+                fs::path p(resolved_new);
+                std::string profile_id = p.stem().string();
+                if (!profile_id.empty() && profile_id.find("_b") == std::string::npos) { // ignore backup saves
+                    set_active_profile_id(profile_id);
+                    uint8_t* memory = emu->get_memory_base();
+                    if (g_sre_profile_addr) {
+                        std::strncpy((char*)(memory + g_sre_profile_addr), profile_id.c_str(), 63);
+                        ((char*)(memory + g_sre_profile_addr))[63] = '\0';
+                    }
+                    if (g_sre_vfs_profile_addr) {
+                        std::strncpy((char*)(memory + g_sre_vfs_profile_addr), profile_id.c_str(), 63);
+                        ((char*)(memory + g_sre_vfs_profile_addr))[63] = '\0';
+                    }
+                    std::cout << "[SRE/Rename] Dynamically updated active profile ID to: " << profile_id << std::endl;
+                    if (log_file.is_open()) {
+                        log_file << "dynamic profile update to " << profile_id << " successful\n";
+                    }
+                }
+            } catch (const std::exception& e) {
+                if (log_file.is_open()) {
+                    log_file << "profile update exception: " << e.what() << "\n";
+                }
+            }
+        }
+    }
+    if (log_file.is_open()) {
+        log_file << "returning result: " << result << "\n\n";
+        log_file.close();
     }
     emu->set_reg(0, (uint32_t)result);
 }
@@ -3647,6 +3981,9 @@ static void bridge_alGenSources(void* emu_ptr) {
     
     std::vector<ALuint> host_sources(n);
     alGenSources(n, host_sources.data());
+    for (uint32_t i = 0; i < n; i++) {
+        RedstellGC::instance().track_al_gen_source(host_sources[i]);
+    }
     std::memcpy(memory + sources_ptr, host_sources.data(), n * sizeof(ALuint));
 }
 
@@ -3658,6 +3995,9 @@ static void bridge_alGenBuffers(void* emu_ptr) {
     
     std::vector<ALuint> host_buffers(n);
     alGenBuffers(n, host_buffers.data());
+    for (uint32_t i = 0; i < n; i++) {
+        RedstellGC::instance().track_al_gen_buffer(host_buffers[i]);
+    }
     std::memcpy(memory + buffers_ptr, host_buffers.data(), n * sizeof(ALuint));
 }
 
@@ -3764,6 +4104,9 @@ static void bridge_alDeleteSources(void* emu_ptr) {
     
     std::vector<ALuint> host_sources(n);
     std::memcpy(host_sources.data(), memory + sources_ptr, n * sizeof(ALuint));
+    for (uint32_t i = 0; i < n; i++) {
+        RedstellGC::instance().track_al_delete_source(host_sources[i]);
+    }
     alDeleteSources(n, host_sources.data());
 }
 
@@ -3775,6 +4118,9 @@ static void bridge_alDeleteBuffers(void* emu_ptr) {
     
     std::vector<ALuint> host_buffers(n);
     std::memcpy(host_buffers.data(), memory + buffers_ptr, n * sizeof(ALuint));
+    for (uint32_t i = 0; i < n; i++) {
+        RedstellGC::instance().track_al_delete_buffer(host_buffers[i]);
+    }
     alDeleteBuffers(n, host_buffers.data());
 }
 
@@ -4357,6 +4703,18 @@ static void bridge_glLightfv(void* emu_ptr) {
         float params[4];
         memcpy(params, memory + params_ptr, 16);
         glLightfv(light, pname, params);
+
+        // ── Handshake: capture light state for FBO shaders ────────────────
+        int li = (int)(light - GL_LIGHT0);
+        if (li >= 0 && li < 8) {
+            switch (pname) {
+                case GL_POSITION: memcpy(g_frame_lights[li].position, params, 16); break;
+                case GL_AMBIENT:  memcpy(g_frame_lights[li].ambient,  params, 16); break;
+                case GL_DIFFUSE:  memcpy(g_frame_lights[li].diffuse,  params, 16); break;
+                case GL_SPECULAR: memcpy(g_frame_lights[li].specular, params, 16); break;
+                default: break;
+            }
+        }
     }
 }
 
@@ -4393,6 +4751,10 @@ static void bridge_glLightModelfv(void* emu_ptr) {
         float params[4];
         memcpy(params, memory + params_ptr, 16);
         glLightModelfv(pname, params);
+
+        // ── Handshake: capture global ambient for FBO shaders ─────────────
+        if (pname == GL_LIGHT_MODEL_AMBIENT)
+            memcpy(g_frame_light_model_ambient, params, 16);
     }
 }
 
@@ -4443,6 +4805,18 @@ static void bridge_glMaterialfv(void* emu_ptr) {
         float params[4];
         memcpy(params, memory + params_ptr, 16);
         glMaterialfv(face, pname, params);
+
+        // ── Handshake: capture material state for FBO shaders ─────────────
+        // We track front-face materials only (Swordigo uses GL_FRONT).
+        if (face == GL_FRONT || face == GL_FRONT_AND_BACK) {
+            switch (pname) {
+                case GL_AMBIENT:  memcpy(g_frame_material.ambient,  params, 16); break;
+                case GL_DIFFUSE:  memcpy(g_frame_material.diffuse,  params, 16); break;
+                case GL_SPECULAR: memcpy(g_frame_material.specular, params, 16); break;
+                case GL_EMISSION: memcpy(g_frame_material.emission, params, 16); break;
+                default: break;
+            }
+        }
     }
 }
 
@@ -4460,6 +4834,9 @@ static void bridge_glColor4ub(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glColor4ub(r, g, b, a);
+    // ── Handshake: track current color (normalised) ───────────────────────
+    g_current_color[0] = r / 255.0f; g_current_color[1] = g / 255.0f;
+    g_current_color[2] = b / 255.0f; g_current_color[3] = a / 255.0f;
 }
 
 // --- Texture Environment ---
@@ -4723,6 +5100,13 @@ static void bridge_gl_load_identity(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glLoadIdentity();
+
+    // ── Handshake: reset matrix shadow to identity ─────────────────────────
+    static const float kIdentity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    if (g_current_matrix_mode == GL_MODELVIEW)
+        memcpy(g_current_modelview,  kIdentity, 64);
+    else if (g_current_matrix_mode == GL_PROJECTION)
+        memcpy(g_current_projection, kIdentity, 64);
 }
 
 static void bridge_gl_load_matrixf(void* emu_ptr) {
@@ -4819,6 +5203,14 @@ static void bridge_gl_load_matrixf(void* emu_ptr) {
     if (g_display_active) {
         glLoadMatrixf(m);
     }
+
+    // ── Handshake: shadow the matrix for FBO shaders ──────────────────────
+    // We only capture after the GL call so skipped (zero/NaN) matrices are
+    // not reflected in the shadow (those code paths returned early above).
+    if (g_current_matrix_mode == GL_MODELVIEW)
+        memcpy(g_current_modelview,  m, 64);
+    else if (g_current_matrix_mode == GL_PROJECTION)
+        memcpy(g_current_projection, m, 64);
 }
 
 static void bridge_gl_mult_matrixf(void* emu_ptr) {
@@ -5021,6 +5413,37 @@ struct {
     GLsizei nptr_stride;
 } g_gl_state;
 
+// ── GL Render-State Handshake ──────────────────────────────────────────────
+// These globals are written by the bridge hooks below every frame and
+// consumed by fbo_scaler.cpp during the composite / PostFX pass.
+// They give the PostFX pipeline accurate, live knowledge of what the game
+// engine is actually telling OpenGL — light positions, material colors,
+// current transform matrices, and the active vertex color — so post-
+// processing effects can be light-aware and scene-reactive rather than
+// relying purely on static per-preset settings.
+
+GuestLightState g_frame_lights[8] = {};
+float g_frame_light_model_ambient[4] = {0.2f, 0.2f, 0.2f, 1.0f};
+
+GuestMaterialState g_frame_material = {
+    {0.2f, 0.2f, 0.2f, 1.0f},   // ambient
+    {0.8f, 0.8f, 0.8f, 1.0f},   // diffuse
+    {0.0f, 0.0f, 0.0f, 1.0f},   // specular
+    {0.0f, 0.0f, 0.0f, 1.0f},   // emission
+    0.0f                         // shininess
+};
+
+// Column-major (OpenGL convention) matrix shadows
+float g_current_modelview[16]  = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+float g_current_projection[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+
+// Normalised RGBA vertex / model color — last value set by glColor4f/glColor4ub
+float g_current_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+// Host-side cached hero position (synchronized from guest memory each frame)
+float g_host_hero_pos[3] = {0.0f, 0.0f, 0.0f};
+
+
 // Color pointer tracking for draw batcher
 static bool g_color_array_enabled = false;
 static uint32_t g_color_ptr = 0;
@@ -5143,16 +5566,8 @@ static void bridge_gl_draw_arrays(void* emu_ptr) {
         // Fall through to direct draw if can't batch
     }
 
-    // Direct draw (fallback)
-    GLboolean was_lit = glIsEnabled(GL_LIGHTING);
-    if (was_lit) {
-        glDisable(GL_LIGHTING);
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-    }
-    
+    // Direct draw (fallback).
     glDrawArrays(mode, first, count);
-    
-    if (was_lit) glEnable(GL_LIGHTING);
 }
 
 static void bridge_gl_draw_elements(void* emu_ptr) {
@@ -5303,17 +5718,8 @@ static void bridge_gl_draw_elements(void* emu_ptr) {
     }
 
     if (g_display_active) {
-        // Fix: Disable lighting, set white color so MODULATE shows textures as-is
-        GLboolean was_lit = glIsEnabled(GL_LIGHTING);
-        if (was_lit) {
-            glDisable(GL_LIGHTING);
-            glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        }
-        
         uint8_t* memory = emu->get_memory_base();
         glDrawElements(mode, count, type, (const void*)(memory + indices_ptr));
-        
-        if (was_lit) glEnable(GL_LIGHTING);
     }
 }
 
@@ -5465,6 +5871,7 @@ static void bridge_gl_bind_texture(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t target = emu->get_reg(0);
     uint32_t tex_id = emu->get_reg(1);
+    tex_id = RedstellGC::instance().get_redirected_texture(tex_id);
     g_frame_stats.texture_binds++;
     g_frame_stats.last_bound_texture = tex_id;
     if (tex_id && !g_seen_textures.count(tex_id)) {
@@ -5549,6 +5956,12 @@ static void bridge_gl_tex_image_2d(void* emu_ptr) {
         const void* pixels = pixels_ptr ? (const void*)(memory + pixels_ptr) : nullptr;
         glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
         
+        size_t bpp = (format == GL_RGB) ? 3 : ((format == GL_ALPHA) ? 1 : 4);
+        RedstellGC::instance().track_gl_tex_image(
+            g_frame_stats.last_bound_texture, width, height, internalformat,
+            g_last_opened_asset, pixels, width * height * bpp
+        );
+
         // Tag the controls atlas texture and create a modified copy
         if (width >= 512 && height >= 512 && strstr(g_last_opened_asset, "ui_game_atlas") != nullptr
             && strstr(g_last_opened_asset, "ui_game2") == nullptr) {
@@ -5717,6 +6130,10 @@ static void bridge_gl_compressed_tex_image_2d(void* emu_ptr) {
         }
         
         glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        RedstellGC::instance().track_gl_tex_image(
+            g_frame_stats.last_bound_texture, width, height, GL_RGBA,
+            g_last_opened_asset, rgba.data(), rgba.size()
+        );
         std::cout << "[ETC1] Decoded " << width << "x" << height << " texture (" 
                   << (block_w * block_h) << " blocks)" << std::endl;
     } else if (internalformat == 0x8C00 || internalformat == 0x8C01 ||
@@ -5729,6 +6146,10 @@ static void bridge_gl_compressed_tex_image_2d(void* emu_ptr) {
         pvr::PVRTDecompressPVRTC(src, do2bitMode, width, height, rgba.data());
         
         glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        RedstellGC::instance().track_gl_tex_image(
+            g_frame_stats.last_bound_texture, width, height, GL_RGBA,
+            g_last_opened_asset, rgba.data(), rgba.size()
+        );
         std::cout << "[PVRTC] Decoded " << width << "x" << height << " texture (format=0x" 
                   << std::hex << internalformat << std::dec << ")" << std::endl;
     } else {
@@ -5754,67 +6175,122 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
         return;
     }
     
-    const uint8_t* file_data = memory + file_data_ptr;
+    RedstellGC::PPDTexture ppd_tex;
+    bool cache_hit = false;
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(g_buffer_to_path_mutex);
+        if (g_buffer_to_path.count(file_data_ptr)) {
+            path = g_buffer_to_path[file_data_ptr];
+            g_buffer_to_path.erase(file_data_ptr);
+        }
+    }
+    if (!path.empty()) {
+        cache_hit = RedstellGC::instance().ppd_get_texture(path, ppd_tex);
+    }
     
     int width = 0, height = 0;
     const uint8_t* pixel_data = nullptr;
     int format_type = -1;
-    
     uint32_t gl_format = GL_RGBA;
     uint32_t gl_type = GL_UNSIGNED_BYTE;
     int bpp = 4;
     char c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     uint8_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
     int caver_format = 1;
-    
-    // Parse PVR v3
-    const HostPVRv3Header* v3 = (const HostPVRv3Header*)file_data;
-    if (v3->version == 0x03525650) {
-        width = v3->width;
-        height = v3->height;
-        pixel_data = file_data + sizeof(HostPVRv3Header) + v3->metadata_size;
-        format_type = pvr::ParsePVRv3Format(v3->pixel_format, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
+    const uint8_t* upload_pixels = nullptr;
+    std::vector<uint8_t> rgba;
+
+    if (cache_hit) {
+        width = ppd_tex.width;
+        height = ppd_tex.height;
+        gl_format = ppd_tex.gl_format;
+        gl_type = ppd_tex.gl_type;
+        caver_format = ppd_tex.caver_format;
+        upload_pixels = ppd_tex.rgba.data();
     } else {
-        // Parse PVR v2
-        const HostPVRv2Header* v2 = (const HostPVRv2Header*)file_data;
-        if (v2->magic == 0x21525650 || v2->header_size == 44) {
-            width = v2->width;
-            height = v2->height;
-            pixel_data = file_data + v2->header_size;
-            format_type = pvr::ParsePVRv2Format(v2->flags, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
+        const uint8_t* file_data = memory + file_data_ptr;
+        const HostPVRv3Header* v3 = (const HostPVRv3Header*)file_data;
+        if (v3->version == 0x03525650) {
+            width = v3->width;
+            height = v3->height;
+            pixel_data = file_data + sizeof(HostPVRv3Header) + v3->metadata_size;
+            format_type = pvr::ParsePVRv3Format(v3->pixel_format, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
         } else {
-            std::cerr << "[SRE-PVR] Unknown PVR header magic 0x" << std::hex << v3->version << std::dec << std::endl;
+            const HostPVRv2Header* v2 = (const HostPVRv2Header*)file_data;
+            if (v2->magic == 0x21525650 || v2->header_size == 44) {
+                width = v2->width;
+                height = v2->height;
+                pixel_data = file_data + v2->header_size;
+                format_type = pvr::ParsePVRv2Format(v2->flags, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
+            } else {
+                std::cerr << "[SRE-PVR] Unknown PVR header magic 0x" << std::hex << v3->version << std::dec << std::endl;
+                return;
+            }
+        }
+        
+        if (format_type < 0) {
+            std::cerr << "[SRE-PVR] Unsupported format decoding " << width << "x" << height << std::endl;
             return;
         }
-    }
-    
-    if (format_type < 0) {
-        std::cerr << "[SRE-PVR] Unsupported format decoding " << width << "x" << height << std::endl;
-        return;
-    }
-    
-    if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
-        std::cerr << "[SRE-PVR] Invalid PVR dimensions " << width << "x" << height << std::endl;
-        return;
-    }
-    
-    // Map format_type to caver_format
-    if (format_type == 1) { // ETC1
-        caver_format = 1;
-    } else if (format_type == 2 || format_type == 3) { // PVRTC
-        caver_format = 1;
-    } else if (format_type >= 4 && format_type <= 6) { // DXT
-        caver_format = 1;
-    } else if (format_type == 10) { // Uncompressed
-        if (c0 == 'r' && c1 == 'g' && c2 == 'b' && c3 == 'a' && d0 == 8 && d1 == 8 && d2 == 8 && d3 == 8) caver_format = 1;
-        else if (c0 == 'b' && c1 == 'g' && c2 == 'r' && c3 == 'a' && d0 == 8 && d1 == 8 && d2 == 8 && d3 == 8) caver_format = 1;
-        else if (c0 == 'l' && c1 == 'a' && d0 == 8 && d1 == 8) caver_format = 4;
-        else if (c0 == 'l' && d0 == 8) caver_format = 6;
-        else if (c0 == 'a' && d0 == 8) caver_format = 7;
-        else if (c0 == 'r' && c1 == 'g' && c2 == 'b' && d0 == 5 && d1 == 6 && d2 == 5) caver_format = 5;
-        else if (c0 == 'r' && c1 == 'g' && c2 == 'b' && c3 == 'a' && d0 == 4 && d1 == 4 && d2 == 4 && d3 == 4) caver_format = 2;
-        else if (c0 == 'r' && c1 == 'g' && c2 == 'b' && c3 == 'a' && d0 == 5 && d1 == 5 && d2 == 5 && d3 == 1) caver_format = 3;
-        else caver_format = 1;
+        
+        if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
+            std::cerr << "[SRE-PVR] Invalid PVR dimensions " << width << "x" << height << std::endl;
+            return;
+        }
+        
+        if (format_type == 1) caver_format = 1;
+        else if (format_type == 2 || format_type == 3) caver_format = 1;
+        else if (format_type >= 4 && format_type <= 6) caver_format = 1;
+        else if (format_type == 10) {
+            if (c0 == 'r' && c1 == 'g' && c2 == 'b' && c3 == 'a' && d0 == 8 && d1 == 8 && d2 == 8 && d3 == 8) caver_format = 1;
+            else if (c0 == 'b' && c1 == 'g' && c2 == 'r' && c3 == 'a' && d0 == 8 && d1 == 8 && d2 == 8 && d3 == 8) caver_format = 1;
+            else if (c0 == 'l' && c1 == 'a' && d0 == 8 && d1 == 8) caver_format = 4;
+            else if (c0 == 'l' && d0 == 8) caver_format = 6;
+            else if (c0 == 'a' && d0 == 8) caver_format = 7;
+            else if (c0 == 'r' && c1 == 'g' && c2 == 'b' && d0 == 5 && d1 == 6 && d2 == 5) caver_format = 5;
+            else if (c0 == 'r' && c1 == 'g' && c2 == 'b' && c3 == 'a' && d0 == 4 && d1 == 4 && d2 == 4 && d3 == 4) caver_format = 2;
+            else if (c0 == 'r' && c1 == 'g' && c2 == 'b' && c3 == 'a' && d0 == 5 && d1 == 5 && d2 == 5 && d3 == 1) caver_format = 3;
+            else caver_format = 1;
+        }
+
+        if (format_type == 10) { // Uncompressed
+            rgba.assign(pixel_data, pixel_data + width * height * bpp);
+            upload_pixels = rgba.data();
+            if (gl_format == GL_BGRA) { // BGRA -> swap to RGBA
+                for (size_t i = 0; i < rgba.size(); i += 4) {
+                    uint8_t b = rgba[i];
+                    rgba[i] = rgba[i+2];
+                    rgba[i+2] = b;
+                }
+                gl_format = GL_RGBA;
+                caver_format = 1;
+            }
+        } else {
+            // Decode to RGBA8888
+            rgba.assign(width * height * 4, 255);
+            bool decode_success = false;
+            if (format_type == 1) { // ETC1
+                pvr::PVRTDecompressETC(pixel_data, width, height, rgba.data(), 6);
+                decode_success = true;
+            } else if (format_type == 2 || format_type == 3) { // PVRTC
+                uint32_t do2bitMode = (format_type == 2) ? 1 : 0;
+                pvr::PVRTDecompressPVRTC(pixel_data, do2bitMode, width, height, rgba.data());
+                decode_success = true;
+            } else if (format_type >= 4 && format_type <= 6) { // DXT
+                uint32_t dxt_fmt = (format_type == 4) ? 1 : ((format_type == 5) ? 3 : 5);
+                pvr::PVRTDecompressDXT(pixel_data, width, height, rgba.data(), dxt_fmt);
+                decode_success = true;
+            }
+            
+            if (!decode_success) {
+                std::cerr << "[SRE-PVR] Decoding failed for format_type: " << format_type << std::endl;
+                return;
+            }
+            upload_pixels = rgba.data();
+            gl_format = GL_RGBA;
+            gl_type = GL_UNSIGNED_BYTE;
+        }
     }
     
     // Generate texture ID if not already generated
@@ -5832,50 +6308,6 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
     }
     
     glBindTexture(GL_TEXTURE_2D, tex_name);
-
-    /* NOTE: We also set X0=0 (success) at the END of this function so the engine
-     * proceeds with UV setup. See set_reg(0,0) call below. */
-    
-    const uint8_t* upload_pixels = nullptr;
-    std::vector<uint8_t> rgba;
-    
-    if (format_type == 10) { // Uncompressed
-        rgba.assign(pixel_data, pixel_data + width * height * bpp);
-        upload_pixels = rgba.data();
-        if (gl_format == GL_BGRA) { // BGRA -> swap to RGBA
-            for (size_t i = 0; i < rgba.size(); i += 4) {
-                uint8_t b = rgba[i];
-                rgba[i] = rgba[i+2];
-                rgba[i+2] = b;
-            }
-            gl_format = GL_RGBA;
-            caver_format = 1;
-        }
-    } else {
-        // Decode to RGBA8888
-        rgba.assign(width * height * 4, 255);
-        bool decode_success = false;
-        if (format_type == 1) { // ETC1
-            pvr::PVRTDecompressETC(pixel_data, width, height, rgba.data(), 6);
-            decode_success = true;
-        } else if (format_type == 2 || format_type == 3) { // PVRTC
-            uint32_t do2bitMode = (format_type == 2) ? 1 : 0;
-            pvr::PVRTDecompressPVRTC(pixel_data, do2bitMode, width, height, rgba.data());
-            decode_success = true;
-        } else if (format_type >= 4 && format_type <= 6) { // DXT
-            uint32_t dxt_fmt = (format_type == 4) ? 1 : ((format_type == 5) ? 3 : 5);
-            pvr::PVRTDecompressDXT(pixel_data, width, height, rgba.data(), dxt_fmt);
-            decode_success = true;
-        }
-        
-        if (!decode_success) {
-            std::cerr << "[SRE-PVR] Decoding failed for format_type: " << format_type << std::endl;
-            return;
-        }
-        upload_pixels = rgba.data();
-        gl_format = GL_RGBA;
-        gl_type = GL_UNSIGNED_BYTE;
-    }
     
     glTexImage2D(GL_TEXTURE_2D, 0, gl_format, width, height, 0, gl_format, gl_type, upload_pixels);
     bool is_npot = ((width & (width - 1)) != 0) || ((height & (height - 1)) != 0);
@@ -5900,8 +6332,10 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
         *(int32_t*)(memory + image_ptr + 12) = (int32_t)caver_format; // format: caver_format
     }
 
-    std::cerr << "[SRE-PVR] Uploaded " << width << "x" << height
-              << " format=" << caver_format << " -> GL tex " << tex_name << std::endl;
+    if (!emu->quiet_mode) {
+        std::cerr << "[SRE-PVR] Uploaded " << width << "x" << height
+                  << " format=" << caver_format << " -> GL tex " << tex_name << std::endl;
+    }
 
     /* Return 0 = success so the engine proceeds with UV setup */
     emu->set_reg(0, 0);
@@ -5969,6 +6403,10 @@ static void bridge_gl_enable(void* emu_ptr) {
         }
     }
     if (g_display_active) glEnable(cap);
+
+    // ── Handshake: track per-light enable ────────────────────────────────
+    if (cap >= GL_LIGHT0 && cap <= GL_LIGHT7)
+        g_frame_lights[cap - GL_LIGHT0].enabled = true;
 }
 
 static void bridge_gl_disable(void* emu_ptr) {
@@ -5992,6 +6430,10 @@ static void bridge_gl_disable(void* emu_ptr) {
         }
     }
     if (g_display_active) glDisable(cap);
+
+    // ── Handshake: track per-light disable ───────────────────────────────
+    if (cap >= GL_LIGHT0 && cap <= GL_LIGHT7)
+        g_frame_lights[cap - GL_LIGHT0].enabled = false;
 }
 
 static void bridge_gl_blend_func(void* emu_ptr) {
@@ -6060,6 +6502,9 @@ static void bridge_gl_color4f(void* emu_ptr) {
         GL_DIAG("glColor4f(%f, %f, %f, %f)", r, g, b, a);
         glColor4f(r, g, b, a);
     }
+    // ── Handshake: track current color ────────────────────────────────────
+    g_current_color[0] = r; g_current_color[1] = g;
+    g_current_color[2] = b; g_current_color[3] = a;
 }
 
 static void bridge_gl_scissor(void* emu_ptr) {
@@ -6113,18 +6558,15 @@ const char* UPGRADED_VERT_SHADER =
     "#define lowp\n"
     "#define mediump\n"
     "#define highp\n"
-    "attribute vec4 position;\n"
-    "attribute vec4 vertexColor;\n"
-    "attribute vec2 texCoord;\n"
     "varying vec4 v_color;\n"
     "varying vec2 v_texCoord;\n"
     "varying vec3 v_world_pos;\n"
     "uniform mat4 mvpMatrix;\n"
     "void main() {\n"
-    "    v_color = vertexColor;\n"
-    "    v_texCoord = texCoord;\n"
-    "    v_world_pos = position.xyz;\n"
-    "    gl_Position = mvpMatrix * position;\n"
+    "    v_color = gl_Color;\n"
+    "    v_texCoord = gl_MultiTexCoord0.xy;\n"
+    "    v_world_pos = gl_Vertex.xyz;\n"
+    "    gl_Position = mvpMatrix * gl_Vertex;\n"
     "}\n";
 
 const char* UPGRADED_VERT_SHADER_COLOR = 
@@ -6132,15 +6574,13 @@ const char* UPGRADED_VERT_SHADER_COLOR =
     "#define lowp\n"
     "#define mediump\n"
     "#define highp\n"
-    "attribute vec4 position;\n"
-    "attribute vec4 vertexColor;\n"
     "varying vec4 v_color;\n"
     "varying vec3 v_world_pos;\n"
     "uniform mat4 mvpMatrix;\n"
     "void main() {\n"
-    "    v_color = vertexColor;\n"
-    "    v_world_pos = position.xyz;\n"
-    "    gl_Position = mvpMatrix * position;\n"
+    "    v_color = gl_Color;\n"
+    "    v_world_pos = gl_Vertex.xyz;\n"
+    "    gl_Position = mvpMatrix * gl_Vertex;\n"
     "}\n";
 
 const char* UPGRADED_FRAG_SHADER_TEXTURED = 
@@ -6150,21 +6590,16 @@ const char* UPGRADED_FRAG_SHADER_TEXTURED =
     "#define highp\n"
     "varying vec4 v_color;\n"
     "varying vec2 v_texCoord;\n"
-    "varying vec3 v_world_pos;\n"
     "uniform sampler2D s_texture;\n"
-    "uniform vec3 u_light_pos;\n"
-    "uniform vec3 u_light_color;\n"
-    "uniform vec3 u_ambient_color;\n"
-    "uniform float u_light_radius;\n"
     "void main() {\n"
-    "    vec4 tex_color = texture2D(s_texture, v_texCoord);\n"
-    "    vec4 base_color = tex_color * v_color;\n"
-    "    float dist = distance(v_world_pos, u_light_pos);\n"
-    "    float attenuation = clamp(1.0 - (dist / u_light_radius), 0.0, 1.0);\n"
-    "    vec3 diffuse = u_light_color * attenuation;\n"
-    "    vec3 final_light = clamp(u_ambient_color + diffuse, 0.0, 1.0);\n"
-    "    gl_FragColor = vec4(base_color.rgb * final_light, base_color.a);\n"
+    "    vec4 tex = texture2D(s_texture, v_texCoord);\n"
+    // Multiply texture by the vertex color (glColor4f / glColorPointer data).
+    // The game drives tanning, damage tints, and boss colors through vertex
+    // and material diffuse colors — we must NOT clobber them with a fake
+    // point-light model that multiplies by uninitialized uniforms (= black).
+    "    gl_FragColor = tex * v_color;\n"
     "}\n";
+
 
 const char* UPGRADED_FRAG_SHADER_COLOR = 
     "#version 120\n"
@@ -6172,18 +6607,11 @@ const char* UPGRADED_FRAG_SHADER_COLOR =
     "#define mediump\n"
     "#define highp\n"
     "varying vec4 v_color;\n"
-    "varying vec3 v_world_pos;\n"
-    "uniform vec3 u_light_pos;\n"
-    "uniform vec3 u_light_color;\n"
-    "uniform vec3 u_ambient_color;\n"
-    "uniform float u_light_radius;\n"
     "void main() {\n"
-    "    float dist = distance(v_world_pos, u_light_pos);\n"
-    "    float attenuation = clamp(1.0 - (dist / u_light_radius), 0.0, 1.0);\n"
-    "    vec3 diffuse = u_light_color * attenuation;\n"
-    "    vec3 final_light = clamp(u_ambient_color + diffuse, 0.0, 1.0);\n"
-    "    gl_FragColor = vec4(v_color.rgb * final_light, v_color.a);\n"
+    // Pass vertex color through directly — same rationale as TEXTURED variant.
+    "    gl_FragColor = v_color;\n"
     "}\n";
+
 
 // Helper: sanitize a guest GLES2 shader source for desktop GLSL 1.20 compatibility.
 // Strips 'precision X float;' / 'precision X int;' etc. (syntax errors on desktop)
@@ -6256,30 +6684,31 @@ static void bridge_glShaderSource(void* emu_ptr) {
         } else {
             src = sources[0];
         }
-        // Upgrade flat shaders dynamically to support lighting/tinting.
-        // All UPGRADED_ constants are already desktop GLSL 1.20 compatible.
+
+        // Upgrade known GLES 2.0 patterns to validated desktop GLSL so the shader
+        // pipeline produces correct output on the host OpenGL driver.
+        // For unknown patterns, fall back to sanitize_gles2_shader (#version 120 +
+        // precision stripping) — same behaviour as the original bridge code.
         if (src.find("attribute vec4 position;") != std::string::npos) {
             if (src.find("attribute vec2 texCoord;") != std::string::npos) {
                 sources[0] = UPGRADED_VERT_SHADER;
-                if (length_ptr != 0) lengths[0] = strlen(UPGRADED_VERT_SHADER);
+                if (length_ptr != 0) lengths[0] = (GLint)strlen(UPGRADED_VERT_SHADER);
             } else {
                 sources[0] = UPGRADED_VERT_SHADER_COLOR;
-                if (length_ptr != 0) lengths[0] = strlen(UPGRADED_VERT_SHADER_COLOR);
+                if (length_ptr != 0) lengths[0] = (GLint)strlen(UPGRADED_VERT_SHADER_COLOR);
             }
         } else if (src.find("texture2D") != std::string::npos) {
             sources[0] = UPGRADED_FRAG_SHADER_TEXTURED;
-            if (length_ptr != 0) lengths[0] = strlen(UPGRADED_FRAG_SHADER_TEXTURED);
+            if (length_ptr != 0) lengths[0] = (GLint)strlen(UPGRADED_FRAG_SHADER_TEXTURED);
         } else if (src.find("gl_FragColor =") != std::string::npos) {
             sources[0] = UPGRADED_FRAG_SHADER_COLOR;
-            if (length_ptr != 0) lengths[0] = strlen(UPGRADED_FRAG_SHADER_COLOR);
-        } else {
-            // Unknown guest shader — sanitize it for desktop GLSL compatibility
-            // (strips ES precision qualifiers, adds #version 120 and compat macros)
+            if (length_ptr != 0) lengths[0] = (GLint)strlen(UPGRADED_FRAG_SHADER_COLOR);
+        } else if (!src.empty()) {
+            // Unknown guest shader — sanitize for desktop GLSL compatibility
             std::string sanitized = sanitize_gles2_shader(src);
             g_sanitized_sources[shader] = std::move(sanitized);
             sources[0] = g_sanitized_sources[shader].c_str();
             if (length_ptr != 0) lengths[0] = (GLint)g_sanitized_sources[shader].size();
-            printf("[GLES2] Sanitized guest shader %u for desktop GLSL compat\n", shader);
         }
     }
 
@@ -6764,6 +7193,7 @@ static void bridge_glGenTextures(void* emu_ptr) {
             *(uint32_t*)(memory + textures_ptr + i * 4) = textures[i];
             GL_DIAG("  -> id[%d] = %d", i, textures[i]);
             TEX_LOG("  -> id[%u] = %u", i, textures[i]);
+            RedstellGC::instance().track_gl_gen_texture(textures[i]);
         }
     } else {
         static uint32_t next_tex = 1;
@@ -6771,6 +7201,7 @@ static void bridge_glGenTextures(void* emu_ptr) {
             *(uint32_t*)(memory + textures_ptr + i * 4) = next_tex++;
             GL_DIAG("  -> id[%d] = %d", i, next_tex - 1);
             TEX_LOG("  -> id[%u] = %u (stub)", i, next_tex - 1);
+            RedstellGC::instance().track_gl_gen_texture(next_tex - 1);
         }
     }
 }
@@ -6859,6 +7290,10 @@ static void bridge_gl_delete_textures(void* emu_ptr) {
     uint8_t* memory = emu->get_memory_base();
     uint32_t n = emu->get_reg(0);
     uint32_t textures_ptr = emu->get_reg(1);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t tid = *(uint32_t*)(memory + textures_ptr + i * 4);
+        RedstellGC::instance().track_gl_delete_texture(tid);
+    }
 #ifdef VULKAN_BACKEND
     if (g_graphics_api == GraphicsAPI::VULKAN) {
         g_vk_backend.delete_textures(n, (const uint32_t*)(memory + textures_ptr));
@@ -6926,7 +7361,7 @@ static void bridge_gl_finish(void* emu_ptr) {
 // careful not to conflict with the host's own FBO (from fbo_scaler).
 
 // Track the host FBO that fbo_scaler is using, so we can restore it
-extern GLuint g_game_fbo;  // from fbo_scaler.cpp
+extern unsigned int fbo_get_fbo();  // from fbo_scaler.cpp
 
 static void bridge_gl_gen_framebuffers(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
@@ -6959,7 +7394,7 @@ static void bridge_gl_bind_framebuffer(void* emu_ptr) {
     
     if (framebuffer == 0) {
         // Game unbinding FBO → bind back to host's game FBO (not FBO 0!)
-        glBindFramebuffer(target, g_game_fbo);
+        glBindFramebuffer(target, fbo_get_fbo());
     } else {
         glBindFramebuffer(target, framebuffer);
     }
@@ -7335,16 +7770,42 @@ static void bridge_time(void* emu_ptr) {
     emu->set_reg(0, (uint64_t)t);
 }
 
+static uint64_t g_guest_virtual_time_ns = 0;
+
+static void init_virtual_clock() {
+    if (g_guest_virtual_time_ns == 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        g_guest_virtual_time_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    }
+}
+
+extern "C" void advance_guest_virtual_clock(float dt) {
+    init_virtual_clock();
+    g_guest_virtual_time_ns += (uint64_t)(dt * 1000000000.0f);
+}
+
 static void bridge_clock_gettime(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
+    uint32_t clock_id = emu->get_reg(0);
     uint32_t tp_ptr = emu->get_reg(1);
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    
+    uint64_t ns;
+    if (clock_id == 0 || clock_id == 5) { // CLOCK_REALTIME or CLOCK_REALTIME_COARSE
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    } else {
+        // CLOCK_MONOTONIC etc. - use smooth virtual clock
+        init_virtual_clock();
+        ns = g_guest_virtual_time_ns;
+    }
+    
     if (tp_ptr) {
         // ARM64 struct timespec: { int64_t tv_sec; int64_t tv_nsec; }
-        *(int64_t*)(memory + tp_ptr)     = (int64_t)ts.tv_sec;
-        *(int64_t*)(memory + tp_ptr + 8) = (int64_t)ts.tv_nsec;
+        *(int64_t*)(memory + tp_ptr)     = (int64_t)(ns / 1000000000ULL);
+        *(int64_t*)(memory + tp_ptr + 8) = (int64_t)(ns % 1000000000ULL);
     }
     emu->set_reg(0, 0);
 }
@@ -7353,9 +7814,10 @@ static void bridge_gettimeofday(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
     uint32_t tv_ptr = emu->get_reg(0);
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
+    
     if (tv_ptr) {
+        struct timeval tv;
+        gettimeofday(&tv, nullptr);
         // ARM64 struct timeval: { int64_t tv_sec; int64_t tv_usec; }
         *(int64_t*)(memory + tv_ptr)     = (int64_t)tv.tv_sec;
         *(int64_t*)(memory + tv_ptr + 8) = (int64_t)tv.tv_usec;
@@ -8153,10 +8615,10 @@ void JniBridge64::init_standard_bridges() {
     register_handler("glDetachShader", bridge_glDetachShader);
     register_handler("glDeleteTextures", bridge_gl_delete_textures);
     register_handler("glDeleteBuffers", bridge_gl_delete_buffers);
-    register_handler("glBindFramebuffer", bridge_gl_noop);
-    register_handler("glGenFramebuffers", bridge_glGenBuffers);
-    register_handler("glDeleteFramebuffers", bridge_gl_noop);
-    register_handler("glFramebufferTexture2D", bridge_gl_noop);
+    register_handler("glBindFramebuffer", bridge_gl_bind_framebuffer);
+    register_handler("glGenFramebuffers", bridge_gl_gen_framebuffers);
+    register_handler("glDeleteFramebuffers", bridge_gl_delete_framebuffers);
+    register_handler("glFramebufferTexture2D", bridge_gl_framebuffer_texture2d);
     register_handler("glCheckFramebufferStatus", bridge_gl_framebuffer_status);
     register_handler("glGenTextures", bridge_glGenTextures);
     register_handler("glGenBuffers", bridge_glGenBuffers);
@@ -8192,11 +8654,11 @@ void JniBridge64::init_standard_bridges() {
     register_handler("eglSwapBuffers", bridge_gl_noop);
     register_handler("eglGetProcAddress", bridge_eglGetProcAddress);
 
-    // register_handler("glGenRenderbuffers", bridge_gl_gen_renderbuffers);
-    // register_handler("glBindRenderbuffer", bridge_gl_bind_renderbuffer);
-    // register_handler("glRenderbufferStorage", bridge_gl_renderbuffer_storage);
-    // register_handler("glFramebufferRenderbuffer", bridge_gl_framebuffer_renderbuffer);
-    // register_handler("glDeleteRenderbuffers", bridge_gl_delete_renderbuffers);
+    register_handler("glGenRenderbuffers", bridge_gl_gen_renderbuffers);
+    register_handler("glBindRenderbuffer", bridge_gl_bind_renderbuffer);
+    register_handler("glRenderbufferStorage", bridge_gl_renderbuffer_storage);
+    register_handler("glFramebufferRenderbuffer", bridge_gl_framebuffer_renderbuffer);
+    register_handler("glDeleteRenderbuffers", bridge_gl_delete_renderbuffers);
 
     // Luasocket support
     register_handler("socket", bridge_socket);

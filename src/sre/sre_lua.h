@@ -114,7 +114,14 @@ typedef int   (*pfn_lua_equal)(lua_State* L, int idx1, int idx2);
 typedef int   (*pfn_lua_lessthan)(lua_State* L, int idx1, int idx2);
 typedef int   (*pfn_lua_isuserdata)(lua_State* L, int idx);
 
+typedef void       (*pfn_lua_xmove)(lua_State* from, lua_State* to, int n);
+typedef lua_State* (*pfn_lua_newthread)(lua_State* L);
+typedef int        (*pfn_lua_pushthread)(lua_State* L);
+
 /* Extended globals (set by sre_init_lua_ext) */
+extern pfn_lua_xmove       g_lua_xmove;
+extern pfn_lua_newthread   g_lua_newthread;
+extern pfn_lua_pushthread  g_lua_pushthread;
 extern pfn_lua_pushvalue   g_lua_pushvalue;
 extern pfn_lua_remove      g_lua_remove;
 extern pfn_lua_insert      g_lua_insert;
@@ -149,6 +156,7 @@ extern pfn_lua_isuserdata  g_lua_isuserdata;
 #define lua_tostring(L, idx) g_lua_tolstring(L, idx, (sre_size_t*)0)
 #define lua_pop(L, n)        g_lua_settop(L, -(n)-1)
 #define lua_upvalueindex(i)  (LUA_GLOBALSINDEX - (i))
+#define lua_xmove            g_lua_xmove
 #endif
 
 /* ProgramState layout (ARM64, v1.4.12) */
@@ -165,5 +173,9 @@ extern pfn_lua_isuserdata  g_lua_isuserdata;
 /* Access ProgramState fields */
 #define PS_GET(self, offset, type)  (*(type*)((char*)(self) + (offset)))
 #define PS_SET(self, offset, type, val) (*(type*)((char*)(self) + (offset)) = (val))
+
+typedef void (*pfn_ProgramState_destructor)(void* self);
+extern pfn_ProgramState_destructor g_orig_ProgramState_destructor;
+void sre_ProgramState_destructor(void* self);
 
 #endif /* SRE_LUA_H */

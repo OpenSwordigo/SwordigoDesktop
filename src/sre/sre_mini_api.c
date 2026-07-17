@@ -3540,8 +3540,6 @@ static int stub_all_items_collected(lua_State* L);
 static int stub_itemdrop_item_identifier(lua_State* L);
 
 
-/* Assistant-added hero upvalue patch REMOVED */
-
 /* =========================================================================
  * Registration — inject Mini/LNI tables into a Lua state
  * ========================================================================= */
@@ -4372,9 +4370,6 @@ void sre_register_mini_api(lua_State* L) {
 #undef SAFE_SET_METHOD
 #undef SAFE_SET_NUMBER
 
-    /* Assistant-added hero-upvalue repair disabled */
-
-
     /* ---- fs (LuaFileSystem) ---- */
     g_lua_createtable(L, 0, 5);
     g_lua_pushcclosure(L, l_fs_mkdir, 0);
@@ -4404,36 +4399,82 @@ void sre_register_mini_api(lua_State* L) {
     g_lua_setfield(L, LUA_GLOBALSINDEX, "broken_socket");
 
     /* ---- Game table ---- */
-    /* Only create stub Game table if the engine hasn't already registered one.
-     * The engine's RegisterProgramLibrary provides Game with real C++
-     * implementations (SetCinematicMode, FadeIn, FadeOut, Flash, etc.).
-     * We must NOT overwrite those with our no-op stubs. */
+    /* The engine's RegisterProgramLibrary registers a real Game table at boot.
+     * We must NOT replace it — but we DO need to inject our own extensions
+     * (ShowNotification, CurrentLevelName, etc.) since the engine doesn't
+     * provide those. Either way, leave the table on the stack then pop it. */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "Game");
-    if (g_lua_type(L, -1) != 5) {  /* 5 = LUA_TTABLE */
+    if (g_lua_type(L, -1) != 5) {  /* 5 = LUA_TTABLE — engine table not yet ready */
         g_lua_settop(L, -2);  /* pop nil */
         g_lua_createtable(L, 0, 9);
+    }
+    /* Stack top is the Game table (existing or newly created). Inject our
+     * functions — only if not already present so we don't overwrite engine ones. */
+    g_lua_getfield(L, -1, "ShowNotification");
+    if (g_lua_type(L, -1) == 0) { /* nil — not present */
+        g_lua_settop(L, -2);
         g_lua_pushcclosure(L, l_game_show_notification, 0);
         g_lua_setfield(L, -2, "ShowNotification");
+    } else { g_lua_settop(L, -2); }
+
+    g_lua_getfield(L, -1, "CurrentLevelName");
+    if (g_lua_type(L, -1) == 0) {
+        g_lua_settop(L, -2);
         g_lua_pushcclosure(L, l_game_current_level_name, 0);
         g_lua_setfield(L, -2, "CurrentLevelName");
+    } else { g_lua_settop(L, -2); }
+
+    g_lua_getfield(L, -1, "SetCinematicMode");
+    if (g_lua_type(L, -1) == 0) {
+        g_lua_settop(L, -2);
         g_lua_pushcclosure(L, l_game_set_cinematic_mode, 0);
         g_lua_setfield(L, -2, "SetCinematicMode");
+    } else { g_lua_settop(L, -2); }
+
+    g_lua_getfield(L, -1, "FadeIn");
+    if (g_lua_type(L, -1) == 0) {
+        g_lua_settop(L, -2);
         g_lua_pushcclosure(L, l_game_fade_in, 0);
         g_lua_setfield(L, -2, "FadeIn");
+    } else { g_lua_settop(L, -2); }
+
+    g_lua_getfield(L, -1, "FadeOut");
+    if (g_lua_type(L, -1) == 0) {
+        g_lua_settop(L, -2);
         g_lua_pushcclosure(L, l_game_fade_out, 0);
         g_lua_setfield(L, -2, "FadeOut");
+    } else { g_lua_settop(L, -2); }
+
+    g_lua_getfield(L, -1, "Flash");
+    if (g_lua_type(L, -1) == 0) {
+        g_lua_settop(L, -2);
         g_lua_pushcclosure(L, l_game_flash, 0);
         g_lua_setfield(L, -2, "Flash");
+    } else { g_lua_settop(L, -2); }
+
+    g_lua_getfield(L, -1, "EnterPortal");
+    if (g_lua_type(L, -1) == 0) {
+        g_lua_settop(L, -2);
         g_lua_pushcclosure(L, l_game_enter_portal, 0);
         g_lua_setfield(L, -2, "EnterPortal");
+    } else { g_lua_settop(L, -2); }
+
+    g_lua_getfield(L, -1, "IncCounter");
+    if (g_lua_type(L, -1) == 0) {
+        g_lua_settop(L, -2);
         g_lua_pushcclosure(L, l_game_inc_counter, 0);
         g_lua_setfield(L, -2, "IncCounter");
+    } else { g_lua_settop(L, -2); }
+
+    g_lua_getfield(L, -1, "TitleForItem");
+    if (g_lua_type(L, -1) == 0) {
+        g_lua_settop(L, -2);
         g_lua_pushcclosure(L, l_game_title_for_item, 0);
         g_lua_setfield(L, -2, "TitleForItem");
-        g_lua_setfield(L, LUA_GLOBALSINDEX, "Game");
-    } else {
-        g_lua_settop(L, -2);  /* pop existing table — leave it untouched */
-    }
+    } else { g_lua_settop(L, -2); }
+
+    /* Set or update the global Game table */
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "Game");
 
     /* ---- Health table ---- */
     /* Same principle: only create stubs if the engine hasn't provided one. */
@@ -5258,6 +5299,17 @@ static void sre_load_db_lua(lua_State* L) {
 void sre_mini_ensure_injected(lua_State* L) {
     if (!L) return;
     if (!g_lua_createtable) return;  /* Lua API not ready */
+
+    /* Guard: only inject after luaopen_base has registered loadstring.
+     * Between luaL_newstate and RegisterProgramLibrary, loadstring doesn't
+     * exist yet. sre_eval_lua would silently no-op, leaving injection half-done
+     * and marking the state as injected. Skip entirely until base libs are up. */
+    if (g_lua_getfield && g_lua_type && g_lua_settop) {
+        g_lua_getfield(L, LUA_GLOBALSINDEX, "loadstring");
+        int has_loadstring = (g_lua_type(L, -1) == LUA_TFUNCTION);
+        g_lua_settop(L, -2); /* pop result */
+        if (!has_loadstring) return; /* luaopen_base not yet run — come back later */
+    }
 
 
     /* Install sre_hook_obj helper function — only defines the function,

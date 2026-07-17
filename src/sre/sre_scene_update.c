@@ -179,6 +179,9 @@ volatile uint64_t g_sre_gui_scene_view_ptr = 0;
  * This is a GUEST pointer (offset from guest memory base).
  * Host reads as: *(int*)(g_guest_memory + gamestate_ptr + OFFSET) */
 volatile uint64_t g_sre_gamestate_ptr = 0;
+volatile uint64_t g_sre_hero_obj = 0;
+volatile uint64_t g_sre_hero_health_comp = 0;
+volatile uint64_t g_sre_hero_mana_comp = 0;
 
 /* =========================================================================
  * Non-atomic shared_ptr refcount helpers
@@ -247,10 +250,26 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
     /* Synchronize global camera coordinates using hero position fallback disabled */
     if (ctrl_ptr != 0) {
         void* hero = *(void**)(ctrl_ptr + 0xd8); // Hero SceneObject*
+        g_sre_hero_obj = (uint64_t)hero;
         if (hero != 0) {
             g_sre_hero_pos_x = *(float*)((char*)hero + 0x70);
             g_sre_hero_pos_y = *(float*)((char*)hero + 0x74);
             g_sre_hero_pos_z = *(float*)((char*)hero + 0x78);
+
+            if (g_SceneObject_ComponentWithInterface && HealthComponent_Interface) {
+                g_sre_hero_health_comp = (uint64_t)g_SceneObject_ComponentWithInterface(hero, HealthComponent_Interface);
+            } else {
+                g_sre_hero_health_comp = 0;
+            }
+
+            if (g_SceneObject_ComponentWithInterface && ManaComponent_Interface) {
+                g_sre_hero_mana_comp = (uint64_t)g_SceneObject_ComponentWithInterface(hero, ManaComponent_Interface);
+            } else {
+                g_sre_hero_mana_comp = 0;
+            }
+        } else {
+            g_sre_hero_health_comp = 0;
+            g_sre_hero_mana_comp = 0;
         }
     }
     

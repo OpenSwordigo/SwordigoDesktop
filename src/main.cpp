@@ -1,6 +1,7 @@
 // Force rebuild: PostFXState struct changed in fbo_scaler.h
 #ifndef _WIN32
 #include <unistd.h>
+#include <sys/mman.h>
 #else
 #include <process.h>
 #include <windows.h>
@@ -28,6 +29,7 @@ namespace fs = std::filesystem;
 extern "C" void asset_manager_init_arm32(const char* base_path);
 #include "game/camera_override.h"
 #include "game/mod_tools.h"
+#include "platform/rgc.h"
 #include "game/sky_renderer.h"
 #include "platform/input_config.h"
 #include <cstring>
@@ -43,6 +45,7 @@ extern "C" void asset_manager_init_arm32(const char* base_path);
 #include "platform/fbo_scaler.h"
 #include "platform/io_thread.h"
 #include "platform/binary_selector.h"
+#include "platform/trampoline_mgr.h"
 #include "platform/launcher_ui.h"
 #include "platform/srt_overlay.h"
 #include "platform/save_editor.h"
@@ -92,6 +95,9 @@ IEmulatorArm64* g_emulator_64 = nullptr;
 bool g_is_arm64 = false;
 bool g_use_dynarmic = false;  // Set via --engine=dynarmic
 bool g_use_sre = true;        // Set via launcher or --no-sre
+bool g_advanced_redstell_opts = false; // Advanced Redstell Optimisations (off by default)
+uint64_t g_sre_profile_addr = 0;
+uint64_t g_sre_vfs_profile_addr = 0;
 GuiRenderer g_gui;
 SrtOverlay g_srt_overlay;
 InputConfig g_input_config;
@@ -121,6 +127,8 @@ static uint64_t g_lua_console_status_addr = 0;    // Guest addr of status (0=idl
 static uint64_t g_lua_console_print_addr = 0;     // Guest addr of captured print() output
 static bool     g_lua_console_ready = false;       // true when all addrs resolved
 // NOTE: console open state + history now owned by SwordfareGUI (draw_lua_console)
+static uint64_t g_sre_game_notification_addr = 0;
+static uint64_t g_sre_game_notification_pending_addr = 0;
 
 static bool should_block_keyboard() {
     if (g_graphics_api != GraphicsAPI::OPENGL) return false;
@@ -220,6 +228,16 @@ static uint64_t sre_gamestate_ptr_addr = 0;      // uint64_t — guest ptr to Ga
 static uint64_t sre_menu_active_addr = 0;        // int — bitfield, nonzero = menu open
 static uint64_t sre_text_input_active_addr = 0;  // int — nonzero = SRE text input active
 static uint64_t sre_hardmode_addr = 0;            // int — nonzero = hard mode (no frame cap, double-tick)
+
+// SRE Lua write-back — setters (SetLevel, SetExp, SetHealth, SetMana, SetCoins) store
+// their request here; the host game loop must poll and apply it to guest memory.
+static uint64_t sre_char_set_pending_addr = 0;   // int — nonzero when a Lua setter fired
+static uint64_t sre_char_set_field_addr   = 0;   // int — which field (1=level,2=exp,3=hp,4=mana,5=coins)
+static uint64_t sre_char_set_value_addr   = 0;   // int — the value to write
+
+static uint64_t sre_hero_obj_addr = 0;
+static uint64_t sre_hero_health_comp_addr = 0;
+static uint64_t sre_hero_mana_comp_addr = 0;
 
 // SRE ButtonController — guest addresses and layout struct
 #define SRE_BTN_MAX       128
@@ -503,10 +521,23 @@ void init_all() {
     // CRITICAL: calloc zero-initializes via OS lazy-zeroing (demand-paged).
     // new uint8_t[N] leaves garbage that causes 0xFFFFFFFF... in uninitialized
     // stack/BSS areas, creating corrupt 64-bit pointers on ARM64.
-    g_guest_memory = (uint8_t*)calloc(GUEST_MEM_SIZE, 1);
-    if (!g_guest_memory) {
-        std::cerr << "FATAL: Failed to allocate " << GUEST_MEM_SIZE << " bytes for guest memory" << std::endl;
+    // Allocate 4GB guest memory via mmap so we cover the 0xFF000000 bridge region safely.
+    g_guest_memory = (uint8_t*)mmap(nullptr, 0x100000000ULL, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (g_guest_memory == MAP_FAILED) {
+        std::cerr << "FATAL: Failed to allocate 4GB guest memory via mmap" << std::endl;
         exit(1);
+    }
+
+    // Fill bridge region (0xFF000000 to 0xFF100000) with HLT #0 (0xD4400000)
+    uint32_t* bridge_mem = (uint32_t*)(g_guest_memory + 0xFF000000ULL);
+    for (size_t i = 0; i < (0x100000 / 4); i++) {
+        bridge_mem[i] = 0xD4400000;
+    }
+
+    // Fill magic LR region (0xE0000000 to 0xE0001000) with HLT #0 (0xD4400000)
+    uint32_t* magic_lr_mem = (uint32_t*)(g_guest_memory + 0xE0000000ULL);
+    for (size_t i = 0; i < (0x1000 / 4); i++) {
+        magic_lr_mem[i] = 0xD4400000;
     }
     g_loader = new ElfLoader(g_guest_memory, GUEST_MEM_SIZE);
     g_loader_64 = new ElfLoaderArm64(g_guest_memory, GUEST_MEM_SIZE);
@@ -520,6 +551,9 @@ void init_all() {
     
     // Start async IO thread
     io_thread_start();
+
+    // Start Redstell Garbage Collector Subsystem
+    RedstellGC::instance().init();
 
     // Initialize FBO Scaler
     if (g_display_active) {
@@ -1265,6 +1299,7 @@ void load_and_boot() {
                     mod_toast("Stepped 1 frame", 0.8f);
                 }
             }
+            g_swordfare_gui.update_console_backend();
             // --- Death recovery: execv restart after ~3s ---
             // The death state machine is tied to Android's ad system and can't be
             // replicated (same issue as PS Vita port). Restart the process cleanly.
@@ -1640,6 +1675,7 @@ void load_and_boot() {
                 } else
 #endif
                 {
+                    RedstellGC::instance().process_main_thread_deletions();
                     g_display_ptr->swap();
                 }
                 
@@ -2328,7 +2364,7 @@ void load_and_boot() {
     }
 }
 
-static void copy_and_relocate(uint8_t* dest_cave, uint8_t* src_orig, uint64_t cave_vaddr, uint64_t orig_vaddr, int num_insns) {
+void copy_and_relocate(uint8_t* dest_cave, uint8_t* src_orig, uint64_t cave_vaddr, uint64_t orig_vaddr, int num_insns) {
     for (int i = 0; i < num_insns; i++) {
         uint32_t insn = *(uint32_t*)(src_orig + i * 4);
         uint64_t orig_pc = orig_vaddr + i * 4;
@@ -2418,6 +2454,8 @@ static void copy_and_relocate(uint8_t* dest_cave, uint8_t* src_orig, uint64_t ca
         *(uint32_t*)(dest_cave + i * 4) = insn;
     }
 }
+
+extern "C" void advance_guest_virtual_clock(float dt);
 
 void load_and_boot_arm64() {
     std::string so_path = get_data_path(g_lib_name);
@@ -2885,10 +2923,13 @@ void load_and_boot_arm64() {
                         {"lua_equal",       "_Z9lua_equalP9lua_Stateii"},
                         {"lua_lessthan",    "_Z12lua_lessthanP9lua_Stateii"},
                         {"lua_isuserdata",  "_Z14lua_isuserdataP9lua_Statei"},
+                        {"lua_xmove",       "_Z9lua_xmoveP9lua_StateS0_i"},
+                        {"lua_newthread",   "_Z13lua_newthreadP9lua_State"},
+                        {"lua_pushthread",  "_Z14lua_pushthreadP9lua_State"},
                     };
                     const int NUM_LUA_EXT_SYMS = sizeof(lua_ext_syms) / sizeof(lua_ext_syms[0]);
 
-                    // SreLuaExtAddrs: 20 × uint64_t = 160 bytes
+                    // SreLuaExtAddrs: 30 × uint64_t = 240 bytes
                     uint64_t lua_ext_addrs_guest = 0x48200;  // after lua_addrs
                     uint64_t* lua_ext_addrs = (uint64_t*)(g_guest_memory + lua_ext_addrs_guest);
 
@@ -2939,6 +2980,14 @@ void load_and_boot_arm64() {
                     // Instead: trampoline at lua_resume itself + relay stub for original.
                     //
 
+                    // ═══════════════════════════════════════════════════════════════
+                    // Initialize TrampolineMgr — owns all code-cave allocations.
+                    // This prevents cave overlaps (the old hard-coded address system
+                    // caused RenderingContext and updateApplication to share 0x3000300).
+                    // ═══════════════════════════════════════════════════════════════
+                    TrampolineMgr::instance().init(g_guest_memory, load_addr);
+
+                    // ─── lua_resume: first hook, gets the first arena slot ───────
                     {
                         uint64_t lua_resume_vaddr = g_loader_64->get_symbol_vaddr(
                             &g_main_mod_64, "_Z10lua_resumeP9lua_Statei");
@@ -2948,40 +2997,12 @@ void load_and_boot_arm64() {
                             &g_sre_mod, "g_lua_resume");
 
                         if (lua_resume_vaddr && safe_resume_vaddr && g_lua_resume_addr) {
-                            const uint64_t RELAY_CAVE = 0x3000000;  // unused guest memory
-
-                            // Step 1: Copy and relocate original first 16 bytes to relay stub
-                            uint8_t* orig = g_guest_memory + lua_resume_vaddr;
-                            uint8_t* cave = g_guest_memory + RELAY_CAVE;
-                            copy_and_relocate(cave, orig, RELAY_CAVE, lua_resume_vaddr, 4);
-
-                            // Step 2: Append jump-back: LDR X16, [PC,#8]; BR X16; .quad dest
-                            uint32_t* cave32 = (uint32_t*)(cave + 16);
-                            cave32[0] = 0x58000050;  // LDR X16, [PC, #8]
-                            cave32[1] = 0xD61F0200;  // BR X16
-                            *(uint64_t*)(cave32 + 2) = lua_resume_vaddr + 16;
-
-                            // Step 3: Update g_lua_resume to point to relay stub
-                            *(uint64_t*)(g_guest_memory + g_lua_resume_addr) = RELAY_CAVE;
-
-                            // Step 4: Write trampoline at lua_resume → sre_lua_resume_safe
-                            uint32_t* code = (uint32_t*)(g_guest_memory + lua_resume_vaddr);
-                            code[0] = 0x58000050;  // LDR X16, [PC, #8]
-                            code[1] = 0xD61F0200;  // BR X16
-                            *(uint64_t*)(code + 2) = safe_resume_vaddr;
-
-                            std::cout << "[SRE] lua_resume trampoline installed:" << std::endl;
-                            std::cout << "[SRE]   lua_resume @ 0x" << std::hex << lua_resume_vaddr
-                                      << " → sre_lua_resume_safe @ 0x" << safe_resume_vaddr << std::endl;
-                            std::cout << "[SRE]   relay stub @ 0x" << RELAY_CAVE
-                                      << " → lua_resume+16 @ 0x" << (lua_resume_vaddr + 16)
-                                      << std::dec << std::endl;
-
-                            // Print first 4 original instructions for verification
-                            uint32_t* saved = (uint32_t*)cave;
-                            std::cout << "[SRE]   saved insns: "
-                                      << std::hex << saved[0] << " " << saved[1] << " "
-                                      << saved[2] << " " << saved[3] << std::dec << std::endl;
+                            TrampolineMgr::instance().install_hook(
+                                "lua_resume",
+                                lua_resume_vaddr,
+                                safe_resume_vaddr,
+                                g_lua_resume_addr,
+                                4);
                         } else {
                             std::cerr << "[SRE] WARNING: lua_resume trampoline skipped"
                                       << " (resume=0x" << std::hex << lua_resume_vaddr
@@ -2996,6 +3017,7 @@ void load_and_boot_arm64() {
                 // Map from SRE symbol name → libswordigo mangled symbol name
                 struct SymHookMap { const char* sre_sym; const char* engine_sym; };
                 SymHookMap sym_hooks[] = {
+                    {"sre_ProgramState_destructor", "_ZN5Caver12ProgramStateD1Ev"},
                     {"sre_ProgramState_Execute", "_ZN5Caver12ProgramState7ExecuteEi"},
                     {"sre_ProgramState_Resume",  "_ZN5Caver12ProgramState6ResumeEi"},
                     {"sre_ProgramState_Update",  "_ZN5Caver12ProgramState6UpdateEf"},
@@ -3093,139 +3115,126 @@ void load_and_boot_arm64() {
                         uint64_t orig_func;      // reserved for future relay stubs
                     };
 
-                    // Pre-save __cxa_throw's first 16 bytes BEFORE the hook table
-                    // overwrites them with a trampoline. This relay stub lets
-                    // sre_cxa_throw fall through to the original when depth==0.
+                    // ─── Pre-save relays via TrampolineMgr (no magic addresses) ─
+                    // OLD: Hard-coded 0x3000040, 0x3000080, 0x3000300 etc.
+                    // NEW: TrampolineMgr allocs sequentially, no overlaps possible.
                     const uint64_t CXA_THROW_OFFSET = 0x51e108;
-                    const uint64_t CXA_RELAY = 0x3000040;  // code cave (after lua_resume relay)
                     uint64_t cxa_throw_vaddr = load_addr + CXA_THROW_OFFSET;
+                    uint64_t CXA_RELAY = TrampolineMgr::instance().reserve_cave("__cxa_throw_relay");
                     {
-                        uint8_t* orig_cxa = g_guest_memory + cxa_throw_vaddr;
-                        uint8_t* cave = g_guest_memory + CXA_RELAY;
-                        copy_and_relocate(cave, orig_cxa, CXA_RELAY, cxa_throw_vaddr, 4);
-                        uint32_t* cave32 = (uint32_t*)(cave + 16);
-                        cave32[0] = 0x58000050;  // LDR X16, [PC, #8]
-                        cave32[1] = 0xD61F0200;  // BR X16
-                        *(uint64_t*)(cave32 + 2) = cxa_throw_vaddr + 16;  // jump past trampoline
-
-                        uint32_t* saved = (uint32_t*)cave;
-                        std::cout << "[SRE] __cxa_throw relay pre-saved at 0x" << std::hex
-                                  << CXA_RELAY << " (insns: " << saved[0] << " " << saved[1]
-                                  << " " << saved[2] << " " << saved[3] << ")" 
-                                  << std::dec << std::endl;
+                        copy_and_relocate(g_guest_memory + CXA_RELAY,
+                                          g_guest_memory + cxa_throw_vaddr,
+                                          CXA_RELAY, cxa_throw_vaddr, 4);
+                        uint32_t* tail = (uint32_t*)(g_guest_memory + CXA_RELAY + 16);
+                        tail[0] = 0x58000050;
+                        tail[1] = 0xD61F0200;
+                        *(uint64_t*)(tail + 2) = cxa_throw_vaddr + 16;
+                        std::cout << "[SRE] __cxa_throw relay pre-saved @ 0x"
+                                  << std::hex << CXA_RELAY << std::dec << std::endl;
                     }
 
-                    // Pre-save ProgramState::Update's first 16 bytes for relay stub.
-                    // sre_ProgramState_Update handles the timer/resume safely, then
-                    // calls g_orig_ProgramState_Update for the child iteration loop.
-                    // (Same approach as SwKiwi: handle resume in hook, call original
-                    // with isSuspended=0 so it skips the resume and only does children.)
-                    const uint64_t UPDATE_RELAY = 0x3000080;  // code cave (after cxa_throw relay)
+                    // ProgramState::Update relay
+                    uint64_t UPDATE_RELAY = 0;
                     uint64_t update_vaddr = g_loader_64->get_symbol_vaddr(
                         &g_main_mod_64, "_ZN5Caver12ProgramState6UpdateEf");
                     if (update_vaddr) {
-                        uint8_t* orig_update = g_guest_memory + update_vaddr;
-                        uint8_t* cave = g_guest_memory + UPDATE_RELAY;
-                        copy_and_relocate(cave, orig_update, UPDATE_RELAY, update_vaddr, 4);
-                        uint32_t* cave32 = (uint32_t*)(cave + 16);
-                        cave32[0] = 0x58000050;  // LDR X16, [PC, #8]
-                        cave32[1] = 0xD61F0200;  // BR X16
-                        *(uint64_t*)(cave32 + 2) = update_vaddr + 16;
-
+                        UPDATE_RELAY = TrampolineMgr::instance().reserve_cave("ProgramState_Update_relay");
+                        copy_and_relocate(g_guest_memory + UPDATE_RELAY,
+                                          g_guest_memory + update_vaddr,
+                                          UPDATE_RELAY, update_vaddr, 4);
+                        uint32_t* tail = (uint32_t*)(g_guest_memory + UPDATE_RELAY + 16);
+                        tail[0] = 0x58000050;
+                        tail[1] = 0xD61F0200;
+                        *(uint64_t*)(tail + 2) = update_vaddr + 16;
                     }
 
-                    // Pre-save CameraController::Update's first 16 bytes for relay stub.
-                    const uint64_t CAM_UPDATE_RELAY = 0x3000340;
+                    // ─── Destructor relay ────────────────────────────────────────
+                    uint64_t destructor_vaddr = g_loader_64->get_symbol_vaddr(
+                        &g_main_mod_64, "_ZN5Caver12ProgramStateD1Ev");
+                    if (destructor_vaddr) {
+                        uint64_t g_orig_destructor_addr = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "g_orig_ProgramState_destructor");
+                        TrampolineMgr::instance().install_hook(
+                            "ProgramState_destructor",
+                            destructor_vaddr,
+                            g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_ProgramState_destructor"),
+                            g_orig_destructor_addr, 4);
+                    }
+
+                    // ─── CameraController::Update relay ──────────────────────────
                     uint64_t cam_update_vaddr = g_loader_64->get_symbol_vaddr(
                         &g_main_mod_64, "_ZN5Caver16CameraController6UpdateEf");
                     if (cam_update_vaddr) {
-                        uint8_t* orig_cam_update = g_guest_memory + cam_update_vaddr;
-                        uint8_t* cave = g_guest_memory + CAM_UPDATE_RELAY;
-                        copy_and_relocate(cave, orig_cam_update, CAM_UPDATE_RELAY, cam_update_vaddr, 4);
-                        uint32_t* cave32 = (uint32_t*)(cave + 16);
-                        cave32[0] = 0x58000050;  // LDR X16, [PC, #8]
-                        cave32[1] = 0xD61F0200;  // BR X16
-                        *(uint64_t*)(cave32 + 2) = cam_update_vaddr + 16;
-
                         uint64_t g_orig_cam_update_addr = g_loader_64->get_symbol_vaddr(
                             &g_sre_mod, "g_orig_CameraController_Update");
-                        if (g_orig_cam_update_addr) {
-                            *(uint64_t*)(g_guest_memory + g_orig_cam_update_addr) = CAM_UPDATE_RELAY;
-                            std::cout << "[SRE] g_orig_CameraController_Update → relay @ 0x"
-                                      << std::hex << CAM_UPDATE_RELAY << std::dec << std::endl;
-                        }
+                        uint64_t cam_cave = TrampolineMgr::instance().reserve_cave("CameraController_Update_relay");
+                        copy_and_relocate(g_guest_memory + cam_cave,
+                                          g_guest_memory + cam_update_vaddr,
+                                          cam_cave, cam_update_vaddr, 4);
+                        uint32_t* tail = (uint32_t*)(g_guest_memory + cam_cave + 16);
+                        tail[0] = 0x58000050; tail[1] = 0xD61F0200;
+                        *(uint64_t*)(tail + 2) = cam_update_vaddr + 16;
+                        if (g_orig_cam_update_addr)
+                            *(uint64_t*)(g_guest_memory + g_orig_cam_update_addr) = cam_cave;
+                        std::cout << "[SRE] g_orig_CameraController_Update → relay @ 0x"
+                                  << std::hex << cam_cave << std::dec << std::endl;
                     }
 
-                    // Pre-save SceneGrid::UpdateVisibleAreasWithCamera's first 16 bytes for relay stub.
-                    const uint64_t SCENEGRID_UPDATE_RELAY = 0x3000380;
+                    // ─── SceneGrid::UpdateVisibleAreasWithCamera relay ───────────
                     uint64_t scenegrid_update_vaddr = g_loader_64->get_symbol_vaddr(
                         &g_main_mod_64, "_ZN5Caver9SceneGrid28UpdateVisibleAreasWithCameraEPNS_6CameraE");
                     if (scenegrid_update_vaddr) {
-                        uint8_t* orig_sg_update = g_guest_memory + scenegrid_update_vaddr;
-                        uint8_t* cave = g_guest_memory + SCENEGRID_UPDATE_RELAY;
-                        copy_and_relocate(cave, orig_sg_update, SCENEGRID_UPDATE_RELAY, scenegrid_update_vaddr, 4);
-                        uint32_t* cave32 = (uint32_t*)(cave + 16);
-                        cave32[0] = 0x58000050;  // LDR X16, [PC, #8]
-                        cave32[1] = 0xD61F0200;  // BR X16
-                        *(uint64_t*)(cave32 + 2) = scenegrid_update_vaddr + 16;
-
                         uint64_t g_orig_sg_update_addr = g_loader_64->get_symbol_vaddr(
                             &g_sre_mod, "g_orig_SceneGrid_UpdateVisibleAreasWithCamera");
-                        if (g_orig_sg_update_addr) {
-                            *(uint64_t*)(g_guest_memory + g_orig_sg_update_addr) = SCENEGRID_UPDATE_RELAY;
-                            std::cout << "[SRE] g_orig_SceneGrid_UpdateVisibleAreasWithCamera → relay @ 0x"
-                                      << std::hex << SCENEGRID_UPDATE_RELAY << std::dec << std::endl;
-                        }
+                        uint64_t sg_cave = TrampolineMgr::instance().reserve_cave("SceneGrid_UpdateVis_relay");
+                        copy_and_relocate(g_guest_memory + sg_cave,
+                                          g_guest_memory + scenegrid_update_vaddr,
+                                          sg_cave, scenegrid_update_vaddr, 4);
+                        uint32_t* tail = (uint32_t*)(g_guest_memory + sg_cave + 16);
+                        tail[0] = 0x58000050; tail[1] = 0xD61F0200;
+                        *(uint64_t*)(tail + 2) = scenegrid_update_vaddr + 16;
+                        if (g_orig_sg_update_addr)
+                            *(uint64_t*)(g_guest_memory + g_orig_sg_update_addr) = sg_cave;
+                        std::cout << "[SRE] g_orig_SceneGrid_UpdateVisibleAreasWithCamera → relay @ 0x"
+                                  << std::hex << sg_cave << std::dec << std::endl;
                     }
 
-                    // ========= GUI Relay Stubs (table-driven) =========
-                    // For each hooked GUI function, save the original's first
-                    // 16 bytes to a code cave so our hook can call-through.
-                    // Adding a new GUI hook = one line here + one in sre_init.c.
+                    // ─── GUI relay stubs (TrampolineMgr — no hard-coded addresses) ──
+                    // Each entry gets its own fresh cave slot from the arena.
+                    // RenderingContext_C1 is included here; updateApplication gets its
+                    // own slot below — they NO LONGER share 0x3000300.
                     struct GuiRelay {
-                        uint64_t nm_offset;      // offset in libswordigo.so
-                        const char* orig_sym;    // g_orig_* symbol in libsre.so
-                        uint64_t cave_addr;      // code cave address
+                        uint64_t    nm_offset;
+                        const char* orig_sym;
                     };
-                    GuiRelay gui_relays[] = {
-                        { 0x4a28bc, "g_orig_GUIWindow_DrawRect",    0x30000C0 },
-                        { 0x49f310, "g_orig_GUIView_DrawRect",      0x3000100 },
-                        { 0x49565c, "g_orig_GUIButton_DrawRect",    0x3000140 },
-                        { 0x497aa0, "g_orig_GUILabel_DrawRect",     0x3000180 },
-                        { 0x497658, "g_orig_GUIFrameView_DrawRect", 0x30001C0 },
-                        { 0x491b54, "g_orig_GUIAlertView_DrawRect", 0x3000200 },
-                        { 0x49cd40, "g_orig_GUISlider_DrawRect",    0x3000240 },
-                        { 0x42bae4, "g_orig_NewMenuView_DrawRect",  0x3000280 },
-                        { 0x393094, "g_orig_MainMenuView_ButtonPressed", 0x30002C0 },
-                        { 0x2fc03c, "g_orig_RenderingContext_C1", 0x3000300 },
-                        /* CreditsVC relays — DISABLED for v6, Options menu WIP.
-                        { 0x38d604, "g_orig_CreditsVC_LoadView",         0x3000300 },
-                        { 0x38d904, "g_orig_CreditsVC_ButtonPressed",    0x3000340 },
-                        */
+                    const GuiRelay gui_relays[] = {
+                        { 0x4a28bc, "g_orig_GUIWindow_DrawRect"    },
+                        { 0x49f310, "g_orig_GUIView_DrawRect"      },
+                        { 0x49565c, "g_orig_GUIButton_DrawRect"    },
+                        { 0x497aa0, "g_orig_GUILabel_DrawRect"     },
+                        { 0x497658, "g_orig_GUIFrameView_DrawRect" },
+                        { 0x491b54, "g_orig_GUIAlertView_DrawRect" },
+                        { 0x49cd40, "g_orig_GUISlider_DrawRect"    },
+                        { 0x42bae4, "g_orig_NewMenuView_DrawRect"  },
+                        { 0x393094, "g_orig_MainMenuView_ButtonPressed" },
+                        { 0x2fc03c, "g_orig_RenderingContext_C1"   },
                     };
-                    for (auto& r : gui_relays) {
+                    for (const auto& r : gui_relays) {
                         uint64_t vaddr = g_main_mod_64.base_addr + r.nm_offset;
-                        uint8_t* orig = g_guest_memory + vaddr;
-                        uint8_t* cave = g_guest_memory + r.cave_addr;
-
-                        // Save and relocate first 4 instructions (16 bytes)
-                        copy_and_relocate(cave, orig, r.cave_addr, vaddr, 4);
-                        // Append: LDR X16, [PC, #8]; BR X16; .quad target+16
-                        uint32_t* c32 = (uint32_t*)(cave + 16);
-                        c32[0] = 0x58000050;  // LDR X16, [PC, #8]
-                        c32[1] = 0xD61F0200;  // BR X16
+                        uint64_t orig_sym_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, r.orig_sym);
+                        // Find the matching SRE hook function name (strip "g_orig_" prefix)
+                        // For GUI relay stubs we build the cave manually and point g_orig_* at it.
+                        uint64_t gr_cave = TrampolineMgr::instance().reserve_cave(r.orig_sym);
+                        copy_and_relocate(g_guest_memory + gr_cave,
+                                          g_guest_memory + vaddr,
+                                          gr_cave, vaddr, 4);
+                        uint32_t* c32 = (uint32_t*)(g_guest_memory + gr_cave + 16);
+                        c32[0] = 0x58000050; c32[1] = 0xD61F0200;
                         *(uint64_t*)(c32 + 2) = vaddr + 16;
-
-                        // Set g_orig_* in libsre.so
-                        uint64_t orig_addr = g_loader_64->get_symbol_vaddr(
-                            &g_sre_mod, r.orig_sym);
-                        if (orig_addr) {
-                            *(uint64_t*)(g_guest_memory + orig_addr) = r.cave_addr;
-                        }
-
+                        if (orig_sym_addr)
+                            *(uint64_t*)(g_guest_memory + orig_sym_addr) = gr_cave;
                         std::cout << "[SRE] Relay: " << r.orig_sym
-                                  << " @ 0x" << std::hex << r.cave_addr
-                                  << std::dec << std::endl;
+                                  << " @ 0x" << std::hex << gr_cave << std::dec << std::endl;
                     }
 
                     int installed = 0;
@@ -3432,29 +3441,15 @@ void load_and_boot_arm64() {
                     }
                     std::cout << "[SRE-Resolver] Dynamically resolved " << fn_resolved << " global engine functions." << std::endl;
 
-                    // Set up updateApplication relay stub for safe call-through
-                    const uint64_t UPDATE_APP_RELAY = 0x3000300;
-                    uint64_t update_app_vaddr = g_loader_64->get_symbol_vaddr(
-                        &g_main_mod_64, "Java_com_touchfoo_swordigo_Native_updateApplication");
-                    if (update_app_vaddr) {
-                        uint8_t* orig_update_app = g_guest_memory + update_app_vaddr;
-                        uint8_t* cave = g_guest_memory + UPDATE_APP_RELAY;
-                        copy_and_relocate(cave, orig_update_app, UPDATE_APP_RELAY, update_app_vaddr, 4);
-                        uint32_t* cave32 = (uint32_t*)(cave + 16);
-                        cave32[0] = 0x58000050;  // LDR X16, [PC, #8]
-                        cave32[1] = 0xD61F0200;  // BR X16
-                        *(uint64_t*)(cave32 + 2) = update_app_vaddr + 16;
-                        
-                        uint64_t g_orig_update_app_addr = g_loader_64->get_symbol_vaddr(
-                            &g_sre_mod, "g_orig_updateApplication");
-                        if (g_orig_update_app_addr) {
-                            *(uint64_t*)(g_guest_memory + g_orig_update_app_addr) = UPDATE_APP_RELAY;
-                            std::cout << "[SRE] g_orig_updateApplication → relay @ 0x"
-                                      << std::hex << UPDATE_APP_RELAY << std::dec << std::endl;
-                        }
-                    }
+                    // updateApplication hook completely removed. The CBZ instruction inside the 7-instruction
+                    // updateApplication wrapper has an offset limit of +-1MB. Relocating it to our cave region
+                    // (which is 29MB away) causes the offset to overflow/wrap, sending PC to 0x20010.
+                    // Since the original wrapper is safe, we don't hook it at all and run it natively.
 
-                    std::cout << "[SRE] Installed " << installed << "/" << hook_count 
+                    // ─── Final diagnostics ───────────────────────────────────────
+                    TrampolineMgr::instance().check_conflicts();
+                    TrampolineMgr::instance().dump();
+                    std::cout << "[SRE] Installed " << installed << "/" << hook_count
                               << " hooks successfully" << std::endl;
                 } else {
                     std::cerr << "[SRE] WARNING: Could not find hook table symbols" << std::endl;
@@ -3531,6 +3526,15 @@ void load_and_boot_arm64() {
                         std::cout << "[SRE] Achievement popup active (pending=0x" << std::hex 
                                   << ach_pending << ")" << std::dec << std::endl;
                     }
+                }
+
+                // Resolve game notification symbols
+                g_sre_game_notification_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_game_notification");
+                g_sre_game_notification_pending_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_game_notification_pending");
+                if (g_sre_game_notification_addr && g_sre_game_notification_pending_addr) {
+                    std::cout << "[SRE] Game notification polling active (buf=0x" << std::hex
+                              << g_sre_game_notification_addr << " pending=0x"
+                              << g_sre_game_notification_pending_addr << ")" << std::dec << std::endl;
                 }
 
                 // ========= Background Renderer Setup =========
@@ -3949,7 +3953,22 @@ void load_and_boot_arm64() {
                 sre_hardmode_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hardmode");
                 if (sre_hardmode_addr)
                     std::cout << "[SRE] Hardmode flag: 0x" << std::hex << sre_hardmode_addr << std::dec << std::endl;
-                
+
+                sre_char_set_pending_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_char_set_pending");
+                sre_char_set_field_addr   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_char_set_field");
+                sre_char_set_value_addr   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_char_set_value");
+                sre_hero_obj_addr         = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hero_obj");
+                sre_hero_health_comp_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hero_health_comp");
+                sre_hero_mana_comp_addr   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hero_mana_comp");
+
+                if (sre_char_set_pending_addr)
+                    std::cout << "[SRE] Lua write-back: pending=0x" << std::hex << sre_char_set_pending_addr
+                              << " field=0x" << sre_char_set_field_addr
+                              << " value=0x" << sre_char_set_value_addr << std::dec << std::endl;
+                else
+                    std::cout << "[SRE] WARNING: g_sre_char_set_pending not found — Lua stat setters will be no-ops" << std::endl;
+
+
                 // ButtonController — SRE-side button and overlay array for host rendering + hit-testing
                 sre_btn_array_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_buttons");
                 sre_overlay_array_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_overlays");
@@ -4004,6 +4023,7 @@ void load_and_boot_arm64() {
                     std::string ext_dir = data_base + "/external";
                     mkdir(ext_dir.c_str(), 0755);
                     mkdir(g_save_dir.c_str(), 0755);
+                    mkdir((g_save_dir + "/Documents").c_str(), 0755);
                     mkdir(g_cache_dir.c_str(), 0755);
                     
                     // Populate guest profile ID globals with the active save UUID.
@@ -4011,6 +4031,8 @@ void load_and_boot_arm64() {
                     // g_sre_vfs_profile_id → VFS levels 1 & 3 (profile-specific resources)
                     uint64_t profile_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_mod_profile_id");
                     uint64_t vfs_profile_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_vfs_profile_id");
+                    g_sre_profile_addr = profile_addr;
+                    g_sre_vfs_profile_addr = vfs_profile_addr;
                     if (profile_addr || vfs_profile_addr) {
                         std::string docs = g_save_dir + "/Documents";
                         if (fs::exists(docs) && fs::is_directory(docs)) {
@@ -4348,6 +4370,7 @@ void load_and_boot_arm64() {
             g_frame_stats.reset();
             
             Uint64 now_ticks = SDL_GetTicks();
+            Uint64 start_counter = SDL_GetPerformanceCounter();
             float dt_seconds = (now_ticks - last_ticks) / 1000.0f;
             if (dt_seconds > 0.1f) dt_seconds = 0.016666668f;
             if (dt_seconds < 0.001f) dt_seconds = 0.016666668f;
@@ -4425,6 +4448,9 @@ void load_and_boot_arm64() {
             memcpy(&dt_hex, &game_dt, 4);
 
             if (!g_game_paused || g_step_one_frame) {
+                // Advance virtual clock for gettimeofday/clock_gettime hooks
+                advance_guest_virtual_clock(game_dt);
+
                 // ARM64 AAPCS: float dt goes in S0, not X2
                 g_emulator_64->set_sreg(0, game_dt);
                 g_emulator_64->call(updateApp, {env_ptr, 0});
@@ -4433,6 +4459,7 @@ void load_and_boot_arm64() {
                     mod_toast("Stepped 1 frame", 0.8f);
                 }
             }
+            g_swordfare_gui.update_console_backend();
             
             // Render custom sky (after game frame, using depth buffer trick)
             if (g_sky.enabled && g_display_active) {
@@ -4503,6 +4530,115 @@ void load_and_boot_arm64() {
             if (sre_menu_active_addr) {
                 *(int32_t*)(g_guest_memory + sre_menu_active_addr) = 0;
             }
+
+            // ── SRE Lua write-back ─────────────────────────────────────────────
+            // Character.SetLevel / SetExp / SetHealth / SetMana / SetCoins all
+            // store a pending request in three guest-side volatile variables.
+            // The host must poll them here and write the value into the GameState
+            // structure so the change actually takes effect in emulated memory.
+            if (sre_char_set_pending_addr && sre_char_set_field_addr && sre_char_set_value_addr &&
+                g_guest_memory)
+            {
+                int pending = *(volatile int*)(g_guest_memory + sre_char_set_pending_addr);
+                if (pending) {
+                    int field = *(volatile int*)(g_guest_memory + sre_char_set_field_addr);
+                    int value = *(volatile int*)(g_guest_memory + sre_char_set_value_addr);
+
+                    // Clear the flag immediately so we don't double-apply
+                    *(volatile int*)(g_guest_memory + sre_char_set_pending_addr) = 0;
+
+                    if (sre_gamestate_ptr_addr) {
+                        uint64_t gs = *(uint64_t*)(g_guest_memory + sre_gamestate_ptr_addr);
+                        if (gs != 0) {
+                            char* gs_host = (char*)g_guest_memory + gs;
+                            uint64_t hero_obj = 0;
+                            uint64_t hero_health_comp = 0;
+                            uint64_t hero_mana_comp = 0;
+                            bool is_64bit = false;
+
+                            if (sre_hero_obj_addr) {
+                                is_64bit = true;
+                                hero_obj = *(uint64_t*)(g_guest_memory + sre_hero_obj_addr);
+                            }
+                            if (sre_hero_health_comp_addr) {
+                                hero_health_comp = *(uint64_t*)(g_guest_memory + sre_hero_health_comp_addr);
+                            }
+                            if (sre_hero_mana_comp_addr) {
+                                hero_mana_comp = *(uint64_t*)(g_guest_memory + sre_hero_mana_comp_addr);
+                            }
+
+                            extern uint32_t g_hero_obj;
+                            extern uint32_t g_hero_health_comp;
+                            extern uint32_t g_hero_mana_comp;
+
+                            uint64_t target_hero_obj = is_64bit ? hero_obj : g_hero_obj;
+                            uint64_t target_health_comp = is_64bit ? hero_health_comp : g_hero_health_comp;
+                            uint64_t target_mana_comp = is_64bit ? hero_mana_comp : g_hero_mana_comp;
+
+                            switch (field) {
+                                case 1: // level
+                                    *(int*)(gs_host + 0xB8) = value;
+                                    if (target_hero_obj) {
+                                        if (is_64bit) {
+                                            *(int*)(g_guest_memory + target_hero_obj + 0x64) = value;
+                                            *(int*)(g_guest_memory + target_hero_obj + 0x94) = value;
+                                        } else {
+                                            *(int*)(g_guest_memory + target_hero_obj + 0x64) = value;
+                                        }
+                                    }
+                                    printf("[SRE-WB] SetLevel -> %d\n", value);
+                                    break;
+                                case 2: // exp / XP
+                                    *(int*)(gs_host + 0xB4) = value;
+                                    if (target_hero_obj) {
+                                        if (is_64bit) {
+                                            *(int*)(g_guest_memory + target_hero_obj + 0x60) = value;
+                                            *(int*)(g_guest_memory + target_hero_obj + 0x90) = value;
+                                        } else {
+                                            *(int*)(g_guest_memory + target_hero_obj + 0x60) = value;
+                                        }
+                                    }
+                                    printf("[SRE-WB] SetExp -> %d\n", value);
+                                    break;
+                                case 3: // current HP
+                                    *(int*)(gs_host + 0xA8) = value;
+                                    if (target_health_comp) {
+                                        if (is_64bit) {
+                                            *(float*)(g_guest_memory + target_health_comp + 0x1c) = (float)value;
+                                            *(float*)(g_guest_memory + target_health_comp + 0x20) = (float)value;
+                                        } else {
+                                            *(int*)(g_guest_memory + target_health_comp + 0x7c) = value;
+                                            *(int*)(g_guest_memory + target_health_comp + 0x80) = value;
+                                        }
+                                    }
+                                    printf("[SRE-WB] SetHealth -> %d\n", value);
+                                    break;
+                                case 4: // current mana
+                                    *(int*)(gs_host + 0xAC) = value;
+                                    if (target_mana_comp) {
+                                        if (is_64bit) {
+                                            *(float*)(g_guest_memory + target_mana_comp + 0x1c) = (float)value;
+                                            *(float*)(g_guest_memory + target_mana_comp + 0x20) = (float)value;
+                                        } else {
+                                            *(int*)(g_guest_memory + target_mana_comp + 0x40) = value;
+                                        }
+                                    }
+                                    printf("[SRE-WB] SetMana -> %d\n", value);
+                                    break;
+                                case 5: // coins
+                                    *(int*)(gs_host + 0xB0) = value;
+                                    printf("[SRE-WB] SetCoins -> %d\n", value);
+                                    break;
+                                default:
+                                    printf("[SRE-WB] Unknown field %d (value=%d) — ignored\n", field, value);
+                                    break;
+                            }
+                        }
+                    }
+                }
+            }
+            // ── end SRE Lua write-back ─────────────────────────────────────────
+
             g_emulator_64->call(drawApp, {env_ptr, 0});
 
             if (g_display_active) {
@@ -4565,6 +4701,12 @@ void load_and_boot_arm64() {
                      *   Host: sre_menu_active_addr, postfx_user_preset, etc.
                      *         Reads flag, suppresses PostFX, restores on menu close
                      */
+
+                    // Handshake: copy guest hero position to host global for shader lighting
+                    extern float g_host_hero_pos[3];
+                    g_host_hero_pos[0] = g_sre_hero_pos_x_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_x_addr) : 0.0f;
+                    g_host_hero_pos[1] = g_sre_hero_pos_y_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_y_addr) : 0.0f;
+                    g_host_hero_pos[2] = g_sre_hero_pos_z_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_z_addr) : 0.0f;
 
                     fbo_end_game_and_blit(g_draw_w, g_draw_h, g_fbo_mode, &g_postfx);
                     
@@ -4973,6 +5115,16 @@ void load_and_boot_arm64() {
                 mod_render_overlay(g_gui, g_win_w, g_win_h, dt_seconds);
                 mod_achievement_poll(g_guest_memory, 1);  // offsets are absolute guest VA
                 mod_achievement_render(g_gui, g_win_w, g_win_h, dt_seconds);
+
+                // Poll game notifications
+                if (g_sre_game_notification_pending_addr && g_sre_game_notification_addr) {
+                    int* pending = (int*)(g_guest_memory + g_sre_game_notification_pending_addr);
+                    if (*pending) {
+                        char* msg = (char*)(g_guest_memory + g_sre_game_notification_addr);
+                        mod_toast(msg, 2.5f);
+                        *pending = 0;
+                    }
+                }
                 
                 
                 glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
@@ -5075,6 +5227,7 @@ void load_and_boot_arm64() {
                 } else
 #endif
                 {
+                    RedstellGC::instance().process_main_thread_deletions();
                     g_display_ptr->swap();
                 }
 
@@ -5090,11 +5243,26 @@ void load_and_boot_arm64() {
                         hardmode = *(volatile int*)(g_emulator_64->get_memory_base() + sre_hardmode_addr) != 0;
                     }
                     if (!hardmode) {
-                        const float TARGET_FRAME_TIME_MS = 1000.0f / 60.0f;  // ~16.67ms
-                        Uint64 frame_end = SDL_GetTicks();
-                        float frame_elapsed_ms = (float)(frame_end - now_ticks);
-                        if (frame_elapsed_ms < TARGET_FRAME_TIME_MS) {
-                            SDL_Delay((uint32_t)(TARGET_FRAME_TIME_MS - frame_elapsed_ms));
+                        Uint64 frequency = SDL_GetPerformanceFrequency();
+                        double target_seconds = 1.0 / 60.0;
+                        Uint64 target_ticks = (Uint64)(target_seconds * frequency);
+                        Uint64 current_ticks = SDL_GetPerformanceCounter() - start_counter;
+                        
+                        if (current_ticks < target_ticks) {
+                            Uint64 wait_ticks = target_ticks - current_ticks;
+                            double wait_ms = (double)wait_ticks * 1000.0 / frequency;
+                            
+                            // Sleep for the bulk of the duration (leaving 1.5ms for spin lock)
+                            if (wait_ms > 1.5) {
+                                SDL_Delay((Uint32)(wait_ms - 1.5));
+                            }
+                            
+                            // High-precision spin lock for the remaining time
+                            while (SDL_GetPerformanceCounter() - start_counter < target_ticks) {
+                                #if defined(__x86_64__) || defined(_M_X64)
+                                    __builtin_ia32_pause();
+                                #endif
+                            }
                         }
                     }
                 }
@@ -5968,6 +6136,7 @@ int main(int argc, char* argv[]) {
             g_assets_dir = lconf.assets_dir;
             g_use_dynarmic = lconf.use_dynarmic;
             g_use_sre = lconf.use_sre;
+            g_advanced_redstell_opts = lconf.advanced_redstell_opts;
             // Re-initialize the asset manager with the correct assets directory
             // (asset_manager_init was called at startup with the default "assets" path)
             asset_manager_init(get_data_path(g_assets_dir).c_str());
@@ -6101,6 +6270,7 @@ int main(int argc, char* argv[]) {
     }
     VideoBackground::cleanup();
     io_thread_stop();
+    RedstellGC::instance().shutdown();
     
     std::cout << "[Main] Swordigo — session complete." << std::endl;
     

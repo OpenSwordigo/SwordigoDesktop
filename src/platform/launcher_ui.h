@@ -16,6 +16,7 @@ struct LaunchConfig {
     bool should_launch = true;  // false if user closed the launcher
     bool use_dynarmic = false;  // false = Unicorn (default), true = Dynarmic JIT
     bool use_sre = true;        // whether to load libsre.so (user choice)
+    bool advanced_redstell_opts = false; // Advanced Redstell Optimisations (off by default)
 };
 
 // Show the unified launcher window and block until user clicks Launch or closes.

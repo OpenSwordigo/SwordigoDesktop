@@ -33,6 +33,9 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
 // ---------------------------------------------------------------------------
 // Debug stats snapshot (passed to draw_debug each frame)
@@ -148,6 +151,7 @@ public:
     bool is_lua_console_open() const { return m_console_open; }
     bool is_lua_console_ready() const { return m_console_ready; }
     void toggle_lua_console();
+    void update_console_backend();
 
     // Returns true if coordinates fall inside any active overlay, button, or console
     bool is_input_blocked(float mx, float my);
@@ -224,4 +228,17 @@ private:
     };
     bool                       m_script_manager_open = false;
     std::vector<LuaScriptMeta> m_script_list;
+
+    // ---- TCP Console Server (openport command) ----
+    void start_tcp_server(int port);
+    void stop_tcp_server();
+    void tcp_server_loop();
+
+    std::thread                m_tcp_thread;
+    std::atomic<bool>          m_tcp_running{false};
+    int                        m_tcp_server_fd = -1;
+    std::atomic<int>           m_tcp_client_fd{-1};
+    std::string                m_tcp_pending_cmd;
+    std::mutex                 m_tcp_mutex;
+    bool                       m_tcp_cmd_in_flight = false;
 };

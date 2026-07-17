@@ -23,6 +23,9 @@
 #include "asset_manager.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+extern void rgc_track_file_open(uint64_t handle, const char* path);
+extern void rgc_track_file_close(uint64_t handle);
 #include <string.h>
 #include <dirent.h>
 #ifdef _WIN32
@@ -116,7 +119,10 @@ static FILE* try_mod_overlay(const char* filename) {
     char* dd = get_user_data_dir_c();
     if (!dd) return NULL;
     char mods[512]; snprintf(mods, sizeof(mods), "%s/mods", dd);
-    DIR* d = opendir(mods); if (!d) return NULL;
+    DIR* d = opendir(mods);
+    if (!d) {
+        return NULL;
+    }
     struct dirent* de; FILE* f = NULL;
     while ((de = readdir(d)) != NULL) {
         if (de->d_name[0] == '.') continue;
@@ -299,6 +305,7 @@ AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
     a->fp = fp;
     strncpy(a->name, filename, sizeof(a->name) - 1);
     a->name[sizeof(a->name) - 1] = '\0';
+    rgc_track_file_open((uint64_t)a, filename);
     return a;
 }
 
@@ -310,6 +317,7 @@ int AAsset_read(AAsset* asset, void* buf, size_t count) {
 
 void AAsset_close(AAsset* asset) {
     if (!asset) return;
+    rgc_track_file_close((uint64_t)asset);
     if (asset->fp) fclose(asset->fp);
     free(asset);
 }
