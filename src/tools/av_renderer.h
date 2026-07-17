@@ -117,6 +117,7 @@ void end_3d();
 extern float g_light_dir[3];
 extern float g_light_color[3];
 extern float g_ambient_color[3];
+extern float g_clear_color[3];
 
 // ============================================================================
 // Math helpers (column-major 4x4 matrices, right-handed coordinate system)
@@ -127,6 +128,7 @@ void mat4_multiply(float out[16], const float a[16], const float b[16]);
 void mat4_translate(float out[16], float tx, float ty, float tz);
 void mat4_rotate_x(float out[16], float angle_deg);
 void mat4_rotate_y(float out[16], float angle_deg);
+void mat4_rotate_z(float out[16], float angle_deg);
 void mat4_perspective(float out[16], float fov_deg, float aspect,
                       float near_plane, float far_plane);
 void mat4_look_at(float out[16],

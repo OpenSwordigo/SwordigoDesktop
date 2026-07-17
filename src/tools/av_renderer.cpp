@@ -33,6 +33,7 @@ static constexpr float DEG2RAD = PI / 180.0f;
 float g_light_dir[3]   = { 0.577f,  0.577f,  0.577f };  // normalized (1,1,1)
 float g_light_color[3] = { 1.0f,    0.95f,   0.9f  };
 float g_ambient_color[3]     = { 0.30f,   0.30f,   0.35f };
+float g_clear_color[3]       = { 0.08f,   0.08f,   0.11f };
 
 // ============================================================================
 // Shader sources — GLSL 330 core
@@ -217,6 +218,14 @@ void mat4_rotate_y(float out[16], float angle_deg) {
     float c = cosf(rad), s = sinf(rad);
     out[0]  =  c;  out[2]  = -s;
     out[8]  =  s;  out[10] =  c;
+}
+
+void mat4_rotate_z(float out[16], float angle_deg) {
+    mat4_identity(out);
+    float rad = angle_deg * DEG2RAD;
+    float c = cosf(rad), s = sinf(rad);
+    out[0]  =  c;  out[1]  =  s;
+    out[4]  = -s;  out[5]  =  c;
 }
 
 void mat4_perspective(float out[16], float fov_deg, float aspect,
@@ -654,7 +663,7 @@ void begin_3d(unsigned int fbo, int w, int h, const Camera& cam) {
     glViewport(0, 0, w, h);
 
     // Clear with dark background
-    glClearColor(0.08f, 0.08f, 0.11f, 1.0f);
+    glClearColor(g_clear_color[0], g_clear_color[1], g_clear_color[2], 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     // Standard 3D state

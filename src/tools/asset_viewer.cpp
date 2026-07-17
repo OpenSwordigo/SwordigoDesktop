@@ -33,6 +33,7 @@
 #include "tools/av_renderer.h"
 #include "tools/av_audio.h"
 #include "tools/scene_loader.h"
+#include "tools/filerift.h"
 #include <zlib.h>
 
 #include <cstdio>
@@ -41,9 +42,14 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
 #include <iostream>
+#include <ctime>
 
 #include <map>
 
@@ -87,8 +93,8 @@ static const char* GLSL_VERSION      = "#version 330";
 // File entry & type classification
 // ============================================================================
 
-enum FileType { FTYPE_OTHER = 0, FTYPE_TEXTURE = 1, FTYPE_MODEL = 2, FTYPE_SCENE = 3, FTYPE_AUDIO = 4 };
-enum PreviewType { PREVIEW_NONE = 0, PREVIEW_TEXTURE, PREVIEW_MODEL, PREVIEW_SCENE, PREVIEW_AUDIO };
+enum FileType { FTYPE_OTHER = 0, FTYPE_TEXTURE = 1, FTYPE_MODEL = 2, FTYPE_SCENE = 3, FTYPE_AUDIO = 4, FTYPE_TEXT = 5 };
+enum PreviewType { PREVIEW_NONE = 0, PREVIEW_TEXTURE, PREVIEW_MODEL, PREVIEW_SCENE, PREVIEW_AUDIO, PREVIEW_TEXT = 5 };
 
 struct FileEntry {
     std::string name;
@@ -113,6 +119,14 @@ static int classify_file(const std::string& name) {
     if (ext == ".pod") return FTYPE_MODEL;
     if (ext == ".scene") return FTYPE_SCENE;
     if (ext == ".wav" || ext == ".ogg" || ext == ".mp3") return FTYPE_AUDIO;
+    if (ext == ".txt" || ext == ".lua" || ext == ".xml" || ext == ".plist" ||
+        ext == ".json" || ext == ".shader" || ext == ".vs" || ext == ".fs" ||
+        ext == ".cfg" || ext == ".ini" || ext == ".md" || ext == ".log" || ext == ".sh" ||
+        ext == ".cpp" || ext == ".h" || ext == ".c" ||
+        ext == ".scl" || ext == ".gdata" || ext == ".gstate" || ext == ".gplayer" ||
+        ext == ".gopt" || ext == ".sounds" || ext == ".scmap" || ext == ".atlas" || ext == ".fnt") {
+        return FTYPE_TEXT;
+    }
     return FTYPE_OTHER;
 }
 
@@ -177,6 +191,52 @@ struct ViewerState {
     bool                     anim_playing = false;
     float                    anim_timer = 0.0f;
     float                    anim_fps = 30.0f;
+
+    // Settings / Preferences
+    bool        show_settings = false;
+    int         ui_theme = 0; // 0 = Blender Dark, 1 = Ruby Cyber, 2 = ImGui Light, 3 = ImGui Classic
+    float       ui_font_scale = 1.0f;
+    bool        show_full_path_status = false;
+    bool        auto_refresh_dirs = true;
+    float       bg_color[3] = {0.08f, 0.08f, 0.11f};
+    bool        show_grid = true;
+    float       grid_size = 20.0f;
+    bool        enable_vsync = true;
+    float       cam_orbit_speed = 1.0f;
+    float       cam_zoom_speed = 1.0f;
+    float       cam_pan_speed = 1.0f;
+    bool        cam_invert_x = false;
+    bool        cam_invert_y = false;
+    bool        tex_pixel_art_mode = true;
+    bool        anim_autoplay = true;
+
+    // Asset Transformations
+    int         texture_rotation = 0; // 0, 90, 180, 270 degrees
+    bool        texture_flip_h = true;
+    bool        texture_flip_v = true;
+    float       texture_tint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float       model_rotate_x = 0.0f;
+    float       model_rotate_y = 0.0f;
+    float       model_rotate_z = 0.0f;
+    float       model_scale = 1.0f;
+
+    // Texture Reset & general file viewer content
+    bool        tex_reset_required = false;
+    std::string text_preview_content;
+    std::string text_edit_buffer;
+    bool        text_is_binary = false;
+    bool        text_select_mode = false;
+    bool        text_edit_modified = false;
+    ImFont*     mono_font = nullptr;
+    
+    // Bottom panel (Terminal / Logger)
+    bool                     show_bottom_panel = false;  // hidden by default, Ctrl+` to open
+    // PTY terminal state
+    int                      pty_master_fd   = -1;
+    pid_t                    pty_child_pid   = -1;
+    std::string              pty_output_buf; // raw bytes from PTY, stripped of control seqs
+    char                     terminal_input[512] = {};
+    bool                     terminal_scroll_to_bottom = false;
 };
 
 static ViewerState g_state;
@@ -210,6 +270,26 @@ static std::string format_time(float seconds) {
     int s = (int)seconds % 60;
     char buf[32]; snprintf(buf, sizeof(buf), "%d:%02d", m, s);
     return buf;
+}
+
+static std::vector<std::string> g_file_logs;
+static void log_file_event(const std::string& type, const std::string& message) {
+    time_t rawtime;
+    struct tm * timeinfo;
+    char time_str[32];
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+    if (timeinfo) {
+        strftime(time_str, sizeof(time_str), "%H:%M:%S", timeinfo);
+    } else {
+        strcpy(time_str, "00:00:00");
+    }
+    std::string line = "[" + std::string(time_str) + "] [" + type + "] " + message;
+    g_file_logs.push_back(line);
+    if (g_file_logs.size() > 500) {
+        g_file_logs.erase(g_file_logs.begin());
+    }
+    std::cout << "[RubyLog] " << line << std::endl;
 }
 
 static const char* filetype_label(int ft) {
@@ -383,6 +463,18 @@ static void free_preview_resources(ViewerState& st) {
     st.scene_model_cache.clear();
     st.scene_visualize_mode = false;
 
+    // Reset transformations
+    st.texture_rotation = 0;
+    st.texture_flip_h = true;
+    st.texture_flip_v = true;
+    st.texture_tint[0] = st.texture_tint[1] = st.texture_tint[2] = st.texture_tint[3] = 1.0f;
+    st.model_rotate_x = 0.0f;
+    st.model_rotate_y = 0.0f;
+    st.model_rotate_z = 0.0f;
+    st.model_scale = 1.0f;
+    st.text_preview_content.clear();
+    st.text_is_binary = false;
+
     st.preview_type = PREVIEW_NONE;
     st.status_msg.clear();
 }
@@ -532,11 +624,15 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
     switch (fe.type) {
     case FTYPE_TEXTURE: {
         st.preview_type = PREVIEW_TEXTURE;
+        st.tex_reset_required = true;
         st.preview_tex = load_texture_file(fe.full_path, &st.tex_w, &st.tex_h, &st.tex_format_str);
-        if (st.preview_tex)
+        if (st.preview_tex) {
             st.status_msg = "Loaded " + fe.name + " — " + std::to_string(st.tex_w) + "x" + std::to_string(st.tex_h);
-        else
+            log_file_event("TextureRead", "Loaded texture: " + fe.name + " (" + std::to_string(st.tex_w) + "x" + std::to_string(st.tex_h) + ", " + format_size(fe.size) + ")");
+        } else {
             st.status_msg = "Failed to load " + fe.name;
+            log_file_event("TextureRead", "ERROR: Failed to load texture: " + fe.name);
+        }
     } break;
 
     case FTYPE_MODEL: {
@@ -545,6 +641,7 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
 
         if (st.model.meshes.empty()) {
             st.status_msg = "Failed to load " + fe.name;
+            log_file_event("ModelRead", "ERROR: Failed to load model: " + fe.name);
             st.preview_type = PREVIEW_NONE;
             break;
         }
@@ -625,6 +722,7 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
                  fe.name.c_str(), (int)st.model.meshes.size(),
                  st.model.total_vertices, st.model.total_faces);
         st.status_msg = buf;
+        log_file_event("ModelRead", "Loaded model: " + fe.name + " (" + std::to_string(st.model.meshes.size()) + " mesh(es), " + std::to_string(st.model.total_vertices) + " vertices, " + format_size(fe.size) + ")");
     } break;
 
     case FTYPE_SCENE: {
@@ -632,6 +730,7 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
         st.scene = av::scene_load(fe.full_path);
         if (st.scene.objects.empty()) {
             st.status_msg = "Failed to parse " + fe.name;
+            log_file_event("SceneRead", "ERROR: Failed to parse scene file: " + fe.name);
         } else {
             st.scene_model_cache.clear();
             st.scene_gpu_mesh_cache.clear();
@@ -666,6 +765,7 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
             snprintf(buf, sizeof(buf), "Loaded %s — %d objects",
                      fe.name.c_str(), (int)st.scene.objects.size());
             st.status_msg = buf;
+            log_file_event("SceneRead", "Loaded scene: " + fe.name + " (" + std::to_string(st.scene.objects.size()) + " objects, " + format_size(fe.size) + ")");
         }
     } break;
 
@@ -678,16 +778,119 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
                      fe.name.c_str(), format_time(as.duration).c_str(),
                      as.sample_rate, as.bits_per_sample);
             st.status_msg = buf;
+            log_file_event("AudioRead", "Loaded audio: " + fe.name + " (" + format_time(as.duration) + ", " + std::to_string(as.sample_rate) + " Hz, " + format_size(fe.size) + ")");
         } else {
             st.status_msg = "Failed to load " + fe.name;
             st.preview_type = PREVIEW_NONE;
+            log_file_event("AudioRead", "ERROR: Failed to load audio: " + fe.name);
         }
     } break;
 
-    default:
-        st.preview_type = PREVIEW_NONE;
-        st.status_msg = fe.name + " — no preview available";
-        break;
+    case FTYPE_TEXT:
+    default: {
+        st.preview_type = PREVIEW_TEXT;
+        st.text_preview_content.clear();
+        st.text_is_binary = false;
+
+        auto dot = fe.full_path.rfind('.');
+        std::string ext = (dot != std::string::npos) ? fe.full_path.substr(dot) : "";
+        for (auto& c : ext) c = (char)tolower((unsigned char)c);
+        bool is_protobuf = (ext == ".scl" || ext == ".gdata" || ext == ".gstate" || 
+                            ext == ".gplayer" || ext == ".gopt" || ext == ".sounds" || 
+                            ext == ".scmap" || ext == ".atlas" || ext == ".fnt");
+        if (is_protobuf) {
+            std::ifstream f(fe.full_path, std::ios::binary);
+            if (f) {
+                std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                f.close();
+                st.text_preview_content = filerift::decode_protobuf(bytes, ext.substr(1));
+                st.status_msg = "Decoded " + fe.name + " via FileRift";
+                log_file_event("FileDecode", "Decoded binary Protobuf to markup: " + fe.name + " (" + format_size(fe.size) + ")");
+            } else {
+                st.text_preview_content = "Failed to open protobuf file.";
+                st.status_msg = "Error reading " + fe.name;
+                log_file_event("FileDecode", "ERROR: Failed to read protobuf file: " + fe.name);
+            }
+            break;
+        }
+
+        std::ifstream f(fe.full_path, std::ios::binary);
+        if (f) {
+            std::vector<char> buffer((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            if (buffer.empty()) {
+                st.text_preview_content = "(empty file)";
+                st.status_msg = "Opened " + fe.name + " (Empty)";
+                log_file_event("FileRead", "Opened empty text file: " + fe.name);
+            } else {
+                // Check if binary (null bytes or control chars in first 1024 bytes)
+                size_t check_len = std::min(buffer.size(), (size_t)1024);
+                for (size_t i = 0; i < check_len; ++i) {
+                    if (buffer[i] == '\0') {
+                        st.text_is_binary = true;
+                        break;
+                    }
+                }
+
+                if (st.text_is_binary) {
+                    // Generate formatted hex dump
+                    std::stringstream ss;
+                    for (size_t i = 0; i < buffer.size(); i += 16) {
+                        char addr_buf[16];
+                        snprintf(addr_buf, sizeof(addr_buf), "%08X  ", (unsigned int)i);
+                        ss << addr_buf;
+
+                        // Hex values
+                        for (size_t j = 0; j < 16; ++j) {
+                            if (i + j < buffer.size()) {
+                                char hex_buf[8];
+                                snprintf(hex_buf, sizeof(hex_buf), "%02X ", (unsigned char)buffer[i+j]);
+                                ss << hex_buf;
+                            } else {
+                                ss << "   ";
+                            }
+                            if (j == 7) ss << " "; // spacing between octets
+                        }
+                        ss << " |";
+
+                        // ASCII values
+                        for (size_t j = 0; j < 16; ++j) {
+                            if (i + j < buffer.size()) {
+                                char c = buffer[i+j];
+                                ss << ((c >= 32 && c <= 126) ? c : '.');
+                            }
+                        }
+                        ss << "|\n";
+
+                        if (ss.str().size() > 256 * 1024) { // limit size for performance
+                            ss << "... (truncated: file too large for Hex View) ...\n";
+                            break;
+                        }
+                    }
+                    st.text_preview_content = ss.str();
+                    st.status_msg = "Opened " + fe.name + " (Hex View)";
+                    log_file_event("FileRead", "Opened binary file in hex viewer: " + fe.name + " (" + format_size(fe.size) + ")");
+                } else {
+                    // Text file view
+                    // Limit text content size for safety
+                    if (buffer.size() > 512 * 1024) {
+                        st.text_preview_content = std::string(buffer.begin(), buffer.begin() + 512 * 1024) + "\n... (truncated: file too large) ...\n";
+                    } else {
+                        st.text_preview_content = std::string(buffer.begin(), buffer.end());
+                    }
+                    st.status_msg = "Opened " + fe.name + " (Text View)";
+                    log_file_event("FileRead", "Opened text file: " + fe.name + " (" + format_size(fe.size) + ")");
+                }
+            }
+        } else {
+            if (fe.is_dir) {
+                st.preview_type = PREVIEW_NONE;
+            } else {
+                st.preview_type = PREVIEW_NONE;
+                st.status_msg = "Failed to load " + fe.name;
+                log_file_event("FileRead", "ERROR: Failed to open file: " + fe.name);
+            }
+        }
+    } break;
     }
 }
 
@@ -789,9 +992,10 @@ static void draw_file_browser(ViewerState& st) {
         ICON_FA_IMAGE " Tex",
         ICON_FA_CUBE " Model",
         ICON_FA_FILE " Scene",
-        ICON_FA_MUSIC " Audio"
+        ICON_FA_MUSIC " Audio",
+        ICON_FA_CODE " Code"
     };
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         if (i > 0) ImGui::SameLine();
         bool active = (st.type_filter == i);
         if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.28f, 0.45f, 0.70f, 1.0f)); // Blender highlighted Blue
@@ -827,6 +1031,9 @@ static void draw_file_browser(ViewerState& st) {
         } else if (f.type == FTYPE_AUDIO) {
             icon = ICON_FA_MUSIC " ";
             color = ImVec4(0.88f, 0.60f, 0.30f, 1.0f); // orange audio
+        } else if (f.type == FTYPE_TEXT) {
+            icon = ICON_FA_CODE " ";
+            color = ImVec4(0.40f, 0.85f, 0.85f, 1.0f); // cyan text/code
         }
 
         ImGui::PushStyleColor(ImGuiCol_Text, color);
@@ -864,11 +1071,33 @@ static void draw_model_viewport(ViewerState& st) {
     }
 
     av::begin_3d(st.fbo, w, h, st.camera);
-    av::render_grid(20.0f, st.model.min_y);
+    if (st.show_grid) {
+        av::render_grid(st.grid_size, st.model.min_y * st.model_scale);
+    }
     float identity[16];
     av::mat4_identity(identity);
     float white[4] = {1, 1, 1, 1};
     float highlight[4] = {0.4f, 0.7f, 1.0f, 1.0f};
+
+    // Compute global model transformation matrix (rz * ry * rx * scale)
+    float rx[16], ry[16], rz[16], temp1[16], global_model_matrix[16];
+    av::mat4_rotate_x(rx, st.model_rotate_x);
+    av::mat4_rotate_y(ry, st.model_rotate_y);
+    av::mat4_rotate_z(rz, st.model_rotate_z);
+
+    av::mat4_multiply(temp1, ry, rx);
+    av::mat4_multiply(global_model_matrix, rz, temp1);
+
+    // Apply scale to global model matrix
+    global_model_matrix[0] *= st.model_scale;
+    global_model_matrix[1] *= st.model_scale;
+    global_model_matrix[2] *= st.model_scale;
+    global_model_matrix[4] *= st.model_scale;
+    global_model_matrix[5] *= st.model_scale;
+    global_model_matrix[6] *= st.model_scale;
+    global_model_matrix[8] *= st.model_scale;
+    global_model_matrix[9] *= st.model_scale;
+    global_model_matrix[10] *= st.model_scale;
 
     if (!st.model.nodes.empty()) {
         for (int i = 0; i < (int)st.model.nodes.size(); i++) {
@@ -896,12 +1125,15 @@ static void draw_model_viewport(ViewerState& st) {
             float node_matrix[16];
             av::get_node_matrix(st.model, i, st.current_frame, node_matrix);
 
+            float final_matrix[16];
+            av::mat4_multiply(final_matrix, global_model_matrix, node_matrix);
+
             float* col = (node.object_index == st.highlighted_mesh) ? highlight : white;
-            av::render_mesh(gm, node_matrix, col, false);
+            av::render_mesh(gm, final_matrix, col, false);
 
             if (st.show_wireframe) {
                 float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
-                av::render_mesh(gm, node_matrix, wire_col, true);
+                av::render_mesh(gm, final_matrix, wire_col, true);
             }
         }
     } else {
@@ -915,11 +1147,11 @@ static void draw_model_viewport(ViewerState& st) {
             }
 
             float* col = (i == st.highlighted_mesh) ? highlight : white;
-            av::render_mesh(gm, identity, col, false);
+            av::render_mesh(gm, global_model_matrix, col, false);
 
             if (st.show_wireframe) {
                 float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
-                av::render_mesh(gm, identity, wire_col, true);
+                av::render_mesh(gm, global_model_matrix, wire_col, true);
             }
         }
     }
@@ -957,26 +1189,43 @@ static void draw_model_viewport(ViewerState& st) {
         ImGuiIO& io = ImGui::GetIO();
 
         if (io.MouseWheel != 0.0f) {
-            st.camera.distance *= (1.0f - io.MouseWheel * 0.1f);
+            float zoom_speed = 0.1f * st.cam_zoom_speed;
+            st.camera.distance *= (1.0f - io.MouseWheel * zoom_speed);
             if (st.camera.distance < 0.1f) st.camera.distance = 0.1f;
             if (st.camera.distance > 500.0f) st.camera.distance = 500.0f;
         }
 
         if (ImGui::IsMouseDragging(0)) {
             ImVec2 delta = io.MouseDelta;
-            st.camera.yaw   += delta.x * 0.5f;
-            st.camera.pitch += delta.y * 0.5f;
+            float sign_x = st.cam_invert_x ? -1.0f : 1.0f;
+            float sign_y = st.cam_invert_y ? -1.0f : 1.0f;
+            st.camera.yaw   += delta.x * 0.5f * st.cam_orbit_speed * sign_x;
+            st.camera.pitch += delta.y * 0.5f * st.cam_orbit_speed * sign_y;
             if (st.camera.pitch >  89.0f) st.camera.pitch =  89.0f;
             if (st.camera.pitch < -89.0f) st.camera.pitch = -89.0f;
         }
 
         if (ImGui::IsMouseDragging(1)) {
             ImVec2 delta = io.MouseDelta;
-            float scale = st.camera.distance * 0.003f;
+            float scale = st.camera.distance * 0.003f * st.cam_pan_speed;
             float yaw_rad = st.camera.yaw * 3.14159f / 180.0f;
-            st.camera.target[0] -= (cosf(yaw_rad) * delta.x) * scale;
-            st.camera.target[2] -= (-sinf(yaw_rad) * delta.x) * scale;
-            st.camera.target[1] += delta.y * scale;
+            float pitch_rad = st.camera.pitch * 3.14159f / 180.0f;
+
+            // Compute local camera Right and Up vectors
+            float rx = cosf(yaw_rad);
+            float rz = -sinf(yaw_rad);
+
+            float ux = -sinf(yaw_rad) * sinf(pitch_rad);
+            float uy = cosf(pitch_rad);
+            float uz = -cosf(yaw_rad) * sinf(pitch_rad);
+
+            // Translate camera target locally
+            st.camera.target[0] -= rx * delta.x * scale;
+            st.camera.target[2] -= rz * delta.x * scale;
+
+            st.camera.target[0] += ux * delta.y * scale;
+            st.camera.target[1] += uy * delta.y * scale;
+            st.camera.target[2] += uz * delta.y * scale;
         }
     }
 }
@@ -985,53 +1234,122 @@ static void draw_model_viewport(ViewerState& st) {
 // UI: Center panel — Texture preview
 // ============================================================================
 
+static void compute_transformed_uvs(int rotation, bool flip_h, bool flip_v, ImVec2 uv[4]) {
+    // Default UVs
+    uv[0] = ImVec2(0, 0); // top-left
+    uv[1] = ImVec2(1, 0); // top-right
+    uv[2] = ImVec2(1, 1); // bottom-right
+    uv[3] = ImVec2(0, 1); // bottom-left
+
+    // Rotate (CW)
+    if (rotation == 90) {
+        uv[0] = ImVec2(0, 1); uv[1] = ImVec2(0, 0); uv[2] = ImVec2(1, 0); uv[3] = ImVec2(1, 1);
+    } else if (rotation == 180) {
+        uv[0] = ImVec2(1, 1); uv[1] = ImVec2(0, 1); uv[2] = ImVec2(0, 0); uv[3] = ImVec2(1, 0);
+    } else if (rotation == 270) {
+        uv[0] = ImVec2(1, 0); uv[1] = ImVec2(1, 1); uv[2] = ImVec2(0, 1); uv[3] = ImVec2(0, 0);
+    }
+
+    // Flip horizontal (swap X values on the UVs)
+    if (flip_h) {
+        for (int i = 0; i < 4; ++i) uv[i].x = 1.0f - uv[i].x;
+    }
+    // Flip vertical (swap Y values on the UVs)
+    if (flip_v) {
+        for (int i = 0; i < 4; ++i) uv[i].y = 1.0f - uv[i].y;
+    }
+}
+
 static void draw_texture_preview(ViewerState& st) {
     if (!st.preview_tex) {
         ImGui::TextDisabled("Failed to load texture.");
         return;
     }
 
+    ImGui::BeginChild("TextureViewportChild", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoMove);
+    
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    ImVec2 img_size((float)st.tex_w * st.tex_zoom, (float)st.tex_h * st.tex_zoom);
-
-    float off_x = (avail.x - img_size.x) * 0.5f + st.tex_pan_x;
-    float off_y = (avail.y - img_size.y) * 0.5f + st.tex_pan_y;
-
     ImVec2 cursor = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    ImVec2 img_min(cursor.x + off_x, cursor.y + off_y);
-    ImVec2 img_max(img_min.x + img_size.x, img_min.y + img_size.y);
-    
+    // Reset logic: center and fit initially
+    if (st.tex_reset_required) {
+        float scale_w = avail.x / (float)st.tex_w;
+        float scale_h = avail.y / (float)st.tex_h;
+        float fit_scale = std::min(scale_w, scale_h) * 0.9f;
+        st.tex_zoom = std::min(1.0f, fit_scale);
+        if (st.tex_zoom < 0.05f) st.tex_zoom = 0.05f;
+        st.tex_pan_x = avail.x * 0.5f;
+        st.tex_pan_y = avail.y * 0.5f;
+        st.tex_reset_required = false;
+    }
+
+    // Adjust render size based on 90/270 degree rotation
+    float w_render = (float)st.tex_w;
+    float h_render = (float)st.tex_h;
+    if (st.texture_rotation == 90 || st.texture_rotation == 270) {
+        w_render = (float)st.tex_h;
+        h_render = (float)st.tex_w;
+    }
+
+    ImVec2 img_size(w_render * st.tex_zoom, h_render * st.tex_zoom);
+
+    // Compute absolute corners of the quad centered at (pan_x, pan_y)
+    ImVec2 p1(cursor.x + st.tex_pan_x - img_size.x * 0.5f, cursor.y + st.tex_pan_y - img_size.y * 0.5f);
+    ImVec2 p2(p1.x + img_size.x, p1.y);
+    ImVec2 p3(p1.x + img_size.x, p1.y + img_size.y);
+    ImVec2 p4(p1.x, p1.y + img_size.y);
+
+    // Bind texture to dynamically adjust filtering quality
+    glBindTexture(GL_TEXTURE_2D, st.preview_tex);
+    if (st.tex_zoom > 1.0f && st.tex_pixel_art_mode) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    } else {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    }
+
+    // Draw Checkerboard Background
     if (st.checker_tex) {
         float uv_scale_x = img_size.x / 32.0f;
         float uv_scale_y = img_size.y / 32.0f;
-        dl->AddImage((ImTextureID)(intptr_t)st.checker_tex,
-                     img_min, img_max, ImVec2(0, 0), ImVec2(uv_scale_x, uv_scale_y));
+        dl->AddImageQuad((ImTextureID)(intptr_t)st.checker_tex,
+                         p1, p2, p3, p4,
+                         ImVec2(0, 0), ImVec2(uv_scale_x, 0), ImVec2(uv_scale_x, uv_scale_y), ImVec2(0, uv_scale_y));
     }
 
-    dl->AddImage((ImTextureID)(intptr_t)st.preview_tex, img_min, img_max);
+    // Compute transformed UVs and draw Image
+    ImVec2 uv[4];
+    compute_transformed_uvs(st.texture_rotation, st.texture_flip_h, st.texture_flip_v, uv);
+    ImU32 tint_col = ImGui::ColorConvertFloat4ToU32(ImVec4(st.texture_tint[0], st.texture_tint[1], st.texture_tint[2], st.texture_tint[3]));
+    dl->AddImageQuad((ImTextureID)(intptr_t)st.preview_tex, p1, p2, p3, p4, uv[0], uv[1], uv[2], uv[3], tint_col);
 
+    // Zoom/Pan interaction area
     ImGui::InvisibleButton("##tex_area", avail);
     if (ImGui::IsItemHovered()) {
         ImGuiIO& io = ImGui::GetIO();
         if (io.MouseWheel != 0.0f) {
             float old_zoom = st.tex_zoom;
-            st.tex_zoom *= (1.0f + io.MouseWheel * 0.1f);
-            if (st.tex_zoom < 0.1f) st.tex_zoom = 0.1f;
-            if (st.tex_zoom > 32.0f) st.tex_zoom = 32.0f;
+            st.tex_zoom *= (1.0f + io.MouseWheel * 0.15f);
+            if (st.tex_zoom < 0.05f) st.tex_zoom = 0.05f;
+            if (st.tex_zoom > 64.0f) st.tex_zoom = 64.0f;
 
-            float mx = io.MousePos.x - cursor.x - avail.x * 0.5f;
-            float my = io.MousePos.y - cursor.y - avail.y * 0.5f;
-            float factor = st.tex_zoom / old_zoom;
-            st.tex_pan_x = mx - factor * (mx - st.tex_pan_x);
-            st.tex_pan_y = my - factor * (my - st.tex_pan_y);
+            float mx = io.MousePos.x - cursor.x;
+            float my = io.MousePos.y - cursor.y;
+            float tx = mx - st.tex_pan_x;
+            float ty = my - st.tex_pan_y;
+            float ratio = st.tex_zoom / old_zoom;
+            st.tex_pan_x = mx - tx * ratio;
+            st.tex_pan_y = my - ty * ratio;
         }
-        if (ImGui::IsMouseDragging(0)) {
+        if (ImGui::IsMouseDragging(0) || ImGui::IsMouseDragging(2)) {
             st.tex_pan_x += io.MouseDelta.x;
             st.tex_pan_y += io.MouseDelta.y;
         }
     }
+
+    ImGui::EndChild();
 }
 
 // ============================================================================
@@ -1342,7 +1660,9 @@ static void draw_scene_visualizer(ViewerState& st) {
     }
 
     av::begin_3d(st.fbo, w, h, st.camera);
-    av::render_grid(100.0f, st.scene.bounds_min[1]);
+    if (st.show_grid) {
+        av::render_grid(st.grid_size * 5.0f, st.scene.bounds_min[1]);
+    }
 
     float white[4] = {1, 1, 1, 1};
     float highlight[4] = {0.4f, 0.7f, 1.0f, 1.0f};
@@ -1456,28 +1776,783 @@ static void draw_scene_visualizer(ViewerState& st) {
         ImGuiIO& io = ImGui::GetIO();
 
         if (io.MouseWheel != 0.0f) {
-            st.camera.distance *= (1.0f - io.MouseWheel * 0.1f);
+            float zoom_speed = 0.1f * st.cam_zoom_speed;
+            st.camera.distance *= (1.0f - io.MouseWheel * zoom_speed);
             if (st.camera.distance < 0.1f) st.camera.distance = 0.1f;
             if (st.camera.distance > 2000.0f) st.camera.distance = 2000.0f;
         }
 
         if (ImGui::IsMouseDragging(0)) {
             ImVec2 delta = io.MouseDelta;
-            st.camera.yaw   += delta.x * 0.5f;
-            st.camera.pitch += delta.y * 0.5f;
+            float sign_x = st.cam_invert_x ? -1.0f : 1.0f;
+            float sign_y = st.cam_invert_y ? -1.0f : 1.0f;
+            st.camera.yaw   += delta.x * 0.5f * st.cam_orbit_speed * sign_x;
+            st.camera.pitch += delta.y * 0.5f * st.cam_orbit_speed * sign_y;
             if (st.camera.pitch >  89.0f) st.camera.pitch =  89.0f;
             if (st.camera.pitch < -89.0f) st.camera.pitch = -89.0f;
         }
 
         if (ImGui::IsMouseDragging(1)) {
             ImVec2 delta = io.MouseDelta;
-            float scale = st.camera.distance * 0.003f;
+            float scale = st.camera.distance * 0.003f * st.cam_pan_speed;
             float yaw_rad = st.camera.yaw * 3.14159f / 180.0f;
-            st.camera.target[0] -= (cosf(yaw_rad) * delta.x) * scale;
-            st.camera.target[2] -= (-sinf(yaw_rad) * delta.x) * scale;
-            st.camera.target[1] += delta.y * scale;
+            float pitch_rad = st.camera.pitch * 3.14159f / 180.0f;
+
+            // Compute local camera Right and Up vectors
+            float rx = cosf(yaw_rad);
+            float rz = -sinf(yaw_rad);
+
+            float ux = -sinf(yaw_rad) * sinf(pitch_rad);
+            float uy = cosf(pitch_rad);
+            float uz = -cosf(yaw_rad) * sinf(pitch_rad);
+
+            // Translate camera target locally
+            st.camera.target[0] -= rx * delta.x * scale;
+            st.camera.target[2] -= rz * delta.x * scale;
+
+            st.camera.target[0] += ux * delta.y * scale;
+            st.camera.target[1] += uy * delta.y * scale;
+            st.camera.target[2] += uz * delta.y * scale;
         }
     }
+}
+
+// ============================================================================
+// UI: Center panel — Text / Hex general file previewer
+// ============================================================================
+
+struct Token {
+    std::string text;
+    ImVec4 color;
+};
+
+static std::vector<Token> tokenize_line(const std::string& line, bool is_dark_theme) {
+    std::vector<Token> tokens;
+    
+    // Define theme colors matching IntelliJ Darcula (dark) / Light themes
+    ImVec4 c_text     = ImGui::GetStyle().Colors[ImGuiCol_Text];
+    ImVec4 c_keyword  = is_dark_theme ? ImVec4(0.80f, 0.47f, 0.20f, 1.0f) : ImVec4(0.00f, 0.20f, 0.70f, 1.0f); // Orange / Blue
+    ImVec4 c_string   = is_dark_theme ? ImVec4(0.41f, 0.53f, 0.35f, 1.0f) : ImVec4(0.02f, 0.49f, 0.09f, 1.0f); // Green / Dark Green
+    ImVec4 c_number   = is_dark_theme ? ImVec4(0.41f, 0.59f, 0.73f, 1.0f) : ImVec4(0.09f, 0.31f, 0.92f, 1.0f); // Cyan / Blue
+    ImVec4 c_comment  = is_dark_theme ? ImVec4(0.50f, 0.50f, 0.50f, 1.0f) : ImVec4(0.55f, 0.55f, 0.55f, 1.0f); // Gray
+    ImVec4 c_bracket  = is_dark_theme ? ImVec4(0.66f, 0.72f, 0.78f, 1.0f) : ImVec4(0.40f, 0.40f, 0.40f, 1.0f);
+    ImVec4 c_property = is_dark_theme ? ImVec4(0.80f, 0.80f, 0.80f, 1.0f) : ImVec4(0.30f, 0.30f, 0.30f, 1.0f);
+
+    size_t i = 0;
+    size_t n = line.length();
+    
+    // 1. Single-line comment check (# or --)
+    size_t first_non_ws = line.find_first_not_of(" \t");
+    if (first_non_ws != std::string::npos) {
+        if (line[first_non_ws] == '#' || (first_non_ws + 1 < n && line[first_non_ws] == '-' && line[first_non_ws + 1] == '-')) {
+            tokens.push_back({line, c_comment});
+            return tokens;
+        }
+    }
+
+    std::string current;
+    auto emit_current = [&](ImVec4 col) {
+        if (!current.empty()) {
+            tokens.push_back({current, col});
+            current.clear();
+        }
+    };
+
+    while (i < n) {
+        char ch = line[i];
+
+        // String literals
+        if (ch == '\'' || ch == '"') {
+            emit_current(c_text);
+            char quote = ch;
+            current += ch;
+            i++;
+            while (i < n) {
+                current += line[i];
+                if (line[i] == quote && line[i - 1] != '\\') {
+                    i++;
+                    break;
+                }
+                i++;
+            }
+            emit_current(c_string);
+            continue;
+        }
+
+        // Brackets / Punctuation
+        if (ch == '{' || ch == '}' || ch == '(' || ch == ')' || ch == '[' || ch == ']') {
+            emit_current(c_text);
+            current += ch;
+            i++;
+            emit_current(c_bracket);
+            continue;
+        }
+
+        // Colon / Separator check
+        if (ch == ':') {
+            emit_current(c_property);
+            current += ch;
+            i++;
+            emit_current(c_bracket);
+            continue;
+        }
+
+        // Identifiers and numbers
+        if (isalnum(ch) || ch == '_' || ch == '.' || ch == '-') {
+            current += ch;
+            i++;
+            continue;
+        }
+
+        // Whitespace and symbols
+        emit_current(c_text);
+        while (i < n && !isalnum(line[i]) && line[i] != '_' && line[i] != '\'' && line[i] != '"' &&
+               line[i] != '{' && line[i] != '}' && line[i] != '(' && line[i] != ')' && line[i] != '[' && line[i] != ']' && line[i] != ':') {
+            current += line[i];
+            i++;
+        }
+        emit_current(c_text);
+    }
+    emit_current(c_text);
+
+    // Color keywords and numbers
+    for (auto& tok : tokens) {
+        if (tok.color.x == c_text.x && tok.color.y == c_text.y && tok.color.z == c_text.z) {
+            if (tok.text == "Template" || tok.text == "Object" || tok.text == "Component" ||
+                tok.text == "local" || tok.text == "self" || tok.text == "target" ||
+                tok.text == "if" || tok.text == "then" || tok.text == "end" ||
+                tok.text == "return" || tok.text == "function" || tok.text == "nil" ||
+                tok.text == "true" || tok.text == "false" || tok.text == "and" ||
+                tok.text == "or" || tok.text == "not") {
+                tok.color = c_keyword;
+            } else if (!tok.text.empty() && (isdigit(tok.text[0]) || (tok.text[0] == '-' && tok.text.size() > 1 && isdigit(tok.text[1])))) {
+                tok.color = c_number;
+            }
+        }
+    }
+
+    return tokens;
+}
+
+struct InputTextCallback_UserData {
+    std::string*            Str;
+    ImGuiInputTextCallback  ChainCallback;
+    void*                   ChainCallbackUserData;
+};
+
+static int InputTextCallback(ImGuiInputTextCallbackData* data) {
+    InputTextCallback_UserData* user_data = (InputTextCallback_UserData*)data->UserData;
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
+        std::string* str = user_data->Str;
+        IM_ASSERT(data->Buf == str->c_str());
+        str->resize(data->BufTextLen);
+        data->Buf = (char*)str->c_str();
+    }
+    if (user_data->ChainCallback) {
+        data->UserData = user_data->ChainCallbackUserData;
+        return user_data->ChainCallback(data);
+    }
+    return 0;
+}
+
+static bool InputTextMultilineStr(const char* label, std::string* str, const ImVec2& size = ImVec2(0, 0), ImGuiInputTextFlags flags = 0, ImGuiInputTextCallback callback = nullptr, void* user_data = nullptr) {
+    IM_ASSERT((flags & ImGuiInputTextFlags_CallbackResize) == 0);
+    flags |= ImGuiInputTextFlags_CallbackResize;
+    InputTextCallback_UserData cb_user_data;
+    cb_user_data.Str = str;
+    cb_user_data.ChainCallback = callback;
+    cb_user_data.ChainCallbackUserData = user_data;
+    return ImGui::InputTextMultiline(label, (char*)str->c_str(), str->capacity() + 1, size, flags, InputTextCallback, &cb_user_data);
+}
+
+static void replace_all(std::string& str, const std::string& from, const std::string& to) {
+    if(from.empty()) return;
+    size_t start_pos = 0;
+    while((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += to.length();
+    }
+}
+
+static void draw_text_preview(ViewerState& st) {
+    // 1. Detect extension and files type
+    auto dot = st.sel_path.rfind('.');
+    std::string ext = (dot != std::string::npos) ? st.sel_path.substr(dot) : "";
+    for (auto& c : ext) c = (char)tolower((unsigned char)c);
+    bool is_protobuf = (ext == ".scl" || ext == ".gdata" || ext == ".gstate" || 
+                        ext == ".gplayer" || ext == ".gopt" || ext == ".sounds" || 
+                        ext == ".scmap" || ext == ".atlas" || ext == ".fnt");
+
+    // Initialize edit buffer on file change
+    static std::string last_loaded_path;
+    if (st.sel_path != last_loaded_path) {
+        last_loaded_path = st.sel_path;
+        st.text_edit_buffer = st.text_preview_content;
+        st.text_edit_modified = false;
+    }
+
+    // Live validation for markup files
+    static std::string validation_error;
+    static std::string last_validated_content;
+    bool is_markup = (ext == ".scl" || ext == ".scene" || ext == ".gdata" || ext == ".gstate" || ext == ".gplayer" || ext == ".gopt" || ext == ".sounds");
+    if (is_markup && st.text_edit_buffer != last_validated_content) {
+        last_validated_content = st.text_edit_buffer;
+        try {
+            filerift::recode_markup(st.text_edit_buffer, ext.substr(1));
+            validation_error.clear();
+        } catch (const std::exception& e) {
+            validation_error = e.what();
+        }
+    }
+
+    // Theme check
+    ImVec4 textColor = ImGui::GetStyle().Colors[ImGuiCol_Text];
+    bool is_dark_theme = (textColor.x + textColor.y + textColor.z) / 3.0f > 0.5f;
+
+    // Header layout
+    ImGui::TextColored(ImVec4(0.00f, 0.62f, 1.00f, 1.0f), st.text_is_binary ? ICON_FA_EYE " Hex View" : (st.text_select_mode ? ICON_FA_PENCIL " Edit Mode (Split)" : ICON_FA_EYE " Code Viewer"));
+    ImGui::SameLine();
+    ImGui::TextDisabled("— %s", st.sel_name.c_str());
+
+    // Toolbar buttons alignment
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 420.0f);
+    
+    // Save button (disable if binary/hex view or if not modified)
+    bool can_save = !st.text_is_binary && (st.text_edit_modified || is_protobuf); 
+    if (!can_save) {
+        ImGui::BeginDisabled();
+    }
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.52f, 0.22f, 1.0f)); // Premium Green
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.64f, 0.28f, 1.0f));
+    if (ImGui::Button(ICON_FA_FLOPPY_DISK " Save")) {
+        std::ofstream out(st.sel_path, std::ios::binary);
+        if (out) {
+            if (is_protobuf) {
+                try {
+                    std::string binary_data = filerift::recode_markup(st.text_edit_buffer, ext.substr(1));
+                    out.write(binary_data.data(), binary_data.size());
+                    st.text_preview_content = st.text_edit_buffer;
+                    st.text_edit_modified = false;
+                    st.status_msg = "Successfully compiled and saved " + st.sel_name;
+                    log_file_event("FileEncode", "Compiled markup to binary and saved: " + st.sel_name + " (" + std::to_string(binary_data.size()) + " bytes)");
+                } catch (const std::exception& e) {
+                    st.status_msg = "Compilation Error: " + std::string(e.what());
+                    log_file_event("FileEncode", "ERROR: Compiler syntax error on " + st.sel_name + ": " + e.what());
+                }
+            } else {
+                out.write(st.text_edit_buffer.data(), st.text_edit_buffer.size());
+                st.text_preview_content = st.text_edit_buffer;
+                st.text_edit_modified = false;
+                st.status_msg = "Saved " + st.sel_name + " successfully!";
+                log_file_event("FileSave", "Saved file: " + st.sel_name + " (" + std::to_string(st.text_edit_buffer.size()) + " bytes)");
+            }
+        } else {
+            st.status_msg = "Failed to write to file: " + st.sel_path;
+            log_file_event("FileSave", "ERROR: Failed to write file: " + st.sel_path);
+        }
+    }
+    ImGui::PopStyleColor(2);
+    if (!can_save) {
+        ImGui::EndDisabled();
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button(ICON_FA_CLOCK " Reload")) {
+        last_loaded_path.clear(); // forces reload from disk on next frame
+        st.status_msg = "Reloaded " + st.sel_name;
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button(ICON_FA_COPY " Copy")) {
+        ImGui::SetClipboardText(st.text_edit_buffer.c_str());
+        st.status_msg = "Copied code to clipboard!";
+    }
+
+    ImGui::SameLine();
+    if (!st.text_is_binary) {
+        ImGui::Checkbox(ICON_FA_PENCIL " Edit Mode", &st.text_select_mode);
+    }
+
+    ImGui::Separator();
+
+    // Search and Replace Bar
+    static char find_pattern[128] = "";
+    static char replace_pattern[128] = "";
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text(ICON_FA_MAGNIFYING_GLASS " Find:"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputText("##find_pat", find_pattern, sizeof(find_pattern));
+    ImGui::SameLine();
+
+    ImGui::Text(ICON_FA_PENCIL " Replace:"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputText("##replace_pat", replace_pattern, sizeof(replace_pattern));
+    ImGui::SameLine();
+
+    if (ImGui::Button("Replace All")) {
+        if (find_pattern[0] != '\0') {
+            replace_all(st.text_edit_buffer, find_pattern, replace_pattern);
+            st.text_edit_modified = true;
+            st.status_msg = "Replaced all occurrences of '" + std::string(find_pattern) + "'";
+        }
+    }
+    
+    // Zoom control
+    ImGui::SameLine();
+    ImGui::Text(ICON_FA_GEAR " Zoom:"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(80.0f);
+    static float editor_font_scale = 1.0f;
+    ImGui::SliderFloat("##zoom", &editor_font_scale, 0.7f, 2.0f, "%.1fx");
+
+    // Show match count
+    int occurrences = 0;
+    if (find_pattern[0] != '\0') {
+        size_t pos = 0;
+        while ((pos = st.text_edit_buffer.find(find_pattern, pos)) != std::string::npos) {
+            occurrences++;
+            pos += strlen(find_pattern);
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(occurrences > 0 ? ImVec4(0.4f, 0.8f, 0.4f, 1.0f) : ImVec4(0.8f, 0.4f, 0.4f, 1.0f), "(%d matches)", occurrences);
+    }
+
+    ImGui::Separator();
+
+    // Editor Area Background
+    ImVec4 bg_col = is_dark_theme ? ImVec4(0.11f, 0.11f, 0.14f, 1.0f) : ImVec4(0.96f, 0.96f, 0.98f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, bg_col);
+
+    // Height calculation to leave room for the validation banner and status bar at the bottom
+    float footer_h = is_markup ? 60.0f : 30.0f;
+
+    if (st.text_is_binary) {
+        ImGui::BeginChild("TextScrollArea", ImVec2(0, -footer_h), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::SetWindowFontScale(editor_font_scale);
+        if (st.mono_font) ImGui::PushFont(st.mono_font);
+        ImGuiInputTextFlags flags = ImGuiInputTextFlags_ReadOnly;
+        ImVec2 size = ImGui::GetContentRegionAvail();
+        InputTextMultilineStr("##hex_view", &st.text_preview_content, size, flags);
+        if (st.mono_font) ImGui::PopFont();
+        ImGui::EndChild();
+    } else if (st.text_select_mode) {
+        // Edit Mode: Split screen (Editor on the Left, Live Highlighted Preview on the Right)
+        ImGui::Columns(2, "EditorSplit", true);
+        
+        // Column 1: Interactive Editor
+        ImGui::Text(ICON_FA_CODE " Interactive Editor");
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, is_dark_theme ? ImVec4(0.11f, 0.11f, 0.13f, 1.0f) : ImVec4(0.97f, 0.97f, 0.98f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, is_dark_theme ? ImVec4(0.15f, 0.31f, 0.47f, 0.80f) : ImVec4(0.68f, 0.80f, 1.00f, 0.80f));
+        
+        ImGui::BeginChild("EditorScrollArea", ImVec2(0, -footer_h - 25.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::SetWindowFontScale(editor_font_scale);
+        if (st.mono_font) ImGui::PushFont(st.mono_font);
+        ImGuiInputTextFlags flags = 0;
+        ImVec2 size = ImGui::GetContentRegionAvail();
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12, 12));
+        if (InputTextMultilineStr("##code_editor", &st.text_edit_buffer, size, flags)) {
+            st.text_edit_modified = (st.text_edit_buffer != st.text_preview_content);
+        }
+        ImGui::PopStyleVar();
+        if (st.mono_font) ImGui::PopFont();
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
+        
+        ImGui::NextColumn();
+        
+        // Column 2: Live Highlighted Preview
+        ImGui::Text(ICON_FA_EYE " Live Highlighted Preview");
+        ImGui::BeginChild("PreviewScrollArea", ImVec2(0, -footer_h - 25.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::SetWindowFontScale(editor_font_scale);
+        
+        std::string line;
+        std::istringstream stream(st.text_edit_buffer);
+        int line_num = 1;
+        
+        if (ImGui::BeginTable("CodeEditorTable", 2, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoHostExtendX)) {
+            ImGui::TableSetupColumn("Gutter", ImGuiTableColumnFlags_WidthFixed, 45.0f);
+            ImGui::TableSetupColumn("Code", ImGuiTableColumnFlags_WidthStretch);
+            
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 1));
+            while (std::getline(stream, line)) {
+                std::string line_processed;
+                for (char ch : line) {
+                    if (ch == '\t') line_processed += "    ";
+                    else line_processed += ch;
+                }
+
+                ImGui::TableNextRow();
+                
+                // Gutter
+                ImGui::TableNextColumn();
+                char num_str[32];
+                snprintf(num_str, sizeof(num_str), "%d", line_num++);
+                float posX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(num_str).x - 8.0f;
+                ImGui::SetCursorPosX(posX);
+                ImGui::TextDisabled("%s", num_str);
+                
+                // Code
+                ImGui::TableNextColumn();
+                if (st.mono_font) ImGui::PushFont(st.mono_font);
+                std::vector<Token> tokens = tokenize_line(line_processed, is_dark_theme);
+                for (size_t t_idx = 0; t_idx < tokens.size(); t_idx++) {
+                    if (t_idx > 0) {
+                        ImGui::SameLine(0.0f, 0.0f);
+                    }
+                    ImGui::TextColored(tokens[t_idx].color, "%s", tokens[t_idx].text.c_str());
+                }
+                if (st.mono_font) ImGui::PopFont();
+            }
+            ImGui::PopStyleVar();
+            ImGui::EndTable();
+        }
+        ImGui::EndChild();
+        ImGui::Columns(1);
+    } else {
+        // Viewer Mode: Fullscreen Highlighted View (Default)
+        ImGui::BeginChild("PreviewScrollAreaOnly", ImVec2(0, -footer_h), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::SetWindowFontScale(editor_font_scale);
+        
+        std::string line;
+        std::istringstream stream(st.text_edit_buffer);
+        int line_num = 1;
+        
+        if (ImGui::BeginTable("CodeEditorTableOnly", 2, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoHostExtendX)) {
+            ImGui::TableSetupColumn("GutterOnly", ImGuiTableColumnFlags_WidthFixed, 45.0f);
+            ImGui::TableSetupColumn("CodeOnly", ImGuiTableColumnFlags_WidthStretch);
+            
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 1));
+            while (std::getline(stream, line)) {
+                std::string line_processed;
+                for (char ch : line) {
+                    if (ch == '\t') line_processed += "    ";
+                    else line_processed += ch;
+                }
+
+                ImGui::TableNextRow();
+                
+                // Gutter
+                ImGui::TableNextColumn();
+                char num_str[32];
+                snprintf(num_str, sizeof(num_str), "%d", line_num++);
+                float posX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(num_str).x - 8.0f;
+                ImGui::SetCursorPosX(posX);
+                ImGui::TextDisabled("%s", num_str);
+                
+                // Code
+                ImGui::TableNextColumn();
+                if (st.mono_font) ImGui::PushFont(st.mono_font);
+                std::vector<Token> tokens = tokenize_line(line_processed, is_dark_theme);
+                for (size_t t_idx = 0; t_idx < tokens.size(); t_idx++) {
+                    if (t_idx > 0) {
+                        ImGui::SameLine(0.0f, 0.0f);
+                    }
+                    ImGui::TextColored(tokens[t_idx].color, "%s", tokens[t_idx].text.c_str());
+                }
+                if (st.mono_font) ImGui::PopFont();
+            }
+            ImGui::PopStyleVar();
+            ImGui::EndTable();
+        }
+        ImGui::EndChild();
+    }
+
+    ImGui::PopStyleColor();
+
+    // Footer section (Live validation banner & statistics)
+    if (is_markup) {
+        if (validation_error.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.28f, 0.12f, 1.0f)); 
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 1.00f, 0.85f, 1.0f));
+            ImGui::BeginChild("ValidationBanner", ImVec2(0, 24.0f), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("  " ICON_FA_CIRCLE_CHECK " Valid Swordigo Markup Schema — Code compiles perfectly.");
+            ImGui::EndChild();
+            ImGui::PopStyleColor(2);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.38f, 0.08f, 0.08f, 1.0f)); 
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.85f, 0.85f, 1.0f));
+            ImGui::BeginChild("ValidationBanner", ImVec2(0, 24.0f), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("  " ICON_FA_TRIANGLE_EXCLAMATION " Syntax Error: %s", validation_error.c_str());
+            ImGui::EndChild();
+            ImGui::PopStyleColor(2);
+        }
+    }
+
+    // Status Bar
+    ImGui::Separator();
+    int line_count = 1;
+    for (char c : st.text_edit_buffer) {
+        if (c == '\n') line_count++;
+    }
+    ImGui::TextDisabled(" Lines: %d | Size: %s | Mode: %s", 
+        line_count, 
+        format_size(st.text_edit_buffer.size()).c_str(), 
+        st.text_is_binary ? "Hex (Binary)" : "UTF-8 Text");
+    
+    if (st.text_edit_modified) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), " | [Modified]");
+    }
+}
+
+// ── Real PTY Terminal ─────────────────────────────────────────────────────
+#include <pty.h>
+#include <utmp.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+
+// Strip common ANSI escape sequences from raw PTY output so ImGui can render it.
+static std::string strip_ansi(const std::string& src) {
+    std::string out;
+    out.reserve(src.size());
+    bool in_esc = false;
+    bool in_csi = false;
+    for (size_t i = 0; i < src.size(); i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (in_csi) {
+            // CSI sequences end on a byte 0x40–0x7E
+            if (c >= 0x40 && c <= 0x7E) { in_csi = false; in_esc = false; }
+        } else if (in_esc) {
+            if (c == '[') { in_csi = true; }
+            else { in_esc = false; } // other escape — just discard
+        } else if (c == 0x1B) {
+            in_esc = true;
+        } else if (c == '\r') {
+            // carriage-return: move to start of current line in out
+            auto nl = out.rfind('\n');
+            if (nl != std::string::npos) out.resize(nl + 1);
+            else out.clear();
+        } else if (c == 0x07 || c == 0x08) {
+            // BEL / BS — skip
+            if (c == 0x08 && !out.empty()) out.pop_back();
+        } else {
+            out += (char)c;
+        }
+    }
+    return out;
+}
+
+static void pty_spawn(ViewerState& st) {
+    if (st.pty_master_fd >= 0) return; // already running
+
+    struct winsize ws = {};
+    ws.ws_col = 220; ws.ws_row = 50;
+
+    int master_fd;
+    pid_t pid = forkpty(&master_fd, nullptr, nullptr, &ws);
+    if (pid < 0) {
+        st.pty_output_buf += "[ruby] forkpty failed: " + std::string(strerror(errno)) + "\n";
+        return;
+    }
+    if (pid == 0) {
+        // child — exec bash with a clean environment
+        setenv("TERM", "xterm-256color", 1);
+        setenv("COLORTERM", "truecolor", 1);
+        const char* shell = getenv("SHELL");
+        if (!shell) shell = "/bin/bash";
+        execl(shell, shell, "--login", nullptr);
+        _exit(1);
+    }
+    // parent
+    st.pty_master_fd  = master_fd;
+    st.pty_child_pid  = pid;
+    // set non-blocking
+    int flags = fcntl(master_fd, F_GETFL, 0);
+    fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
+    st.terminal_scroll_to_bottom = true;
+}
+
+static void pty_poll(ViewerState& st) {
+    if (st.pty_master_fd < 0) return;
+    char buf[4096];
+    ssize_t n;
+    bool got_data = false;
+    while ((n = read(st.pty_master_fd, buf, sizeof(buf))) > 0) {
+        st.pty_output_buf += strip_ansi(std::string(buf, n));
+        got_data = true;
+    }
+    // Limit buffer size
+    static const size_t MAX_BUF = 256 * 1024;
+    if (st.pty_output_buf.size() > MAX_BUF) {
+        st.pty_output_buf.erase(0, st.pty_output_buf.size() - MAX_BUF);
+    }
+    if (got_data) st.terminal_scroll_to_bottom = true;
+    // Check if child died
+    if (n == 0 || (n < 0 && errno == EIO)) {
+        close(st.pty_master_fd);
+        st.pty_master_fd = -1;
+        st.pty_child_pid = -1;
+        st.pty_output_buf += "\n[ruby] shell exited.\n";
+        st.terminal_scroll_to_bottom = true;
+    }
+}
+
+static void pty_send(ViewerState& st, const char* text, size_t len) {
+    if (st.pty_master_fd < 0) return;
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = write(st.pty_master_fd, text + written, len - written);
+        if (n <= 0) break;
+        written += n;
+    }
+}
+
+static void pty_shutdown(ViewerState& st) {
+    if (st.pty_master_fd >= 0) {
+        close(st.pty_master_fd);
+        st.pty_master_fd = -1;
+    }
+    if (st.pty_child_pid > 0) {
+        kill(st.pty_child_pid, SIGTERM);
+        st.pty_child_pid = -1;
+    }
+}
+
+static void draw_bottom_panel(ViewerState& st) {
+    // Lazily spawn the PTY bash shell the first time the panel is opened
+    if (st.pty_master_fd < 0) pty_spawn(st);
+    // Drain any pending PTY output every frame
+    pty_poll(st);
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.10f, 0.11f, 1.0f));
+    ImGui::BeginChild("BottomPanelArea", ImVec2(0, 220.0f), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+
+    if (ImGui::BeginTabBar("BottomPanelTabBar")) {
+
+        // ── Terminal Tab ────────────────────────────────────────────────────
+        if (ImGui::BeginTabItem(ICON_FA_TERMINAL " Terminal")) {
+            const float input_h = ImGui::GetFrameHeightWithSpacing() + 6.0f;
+
+            // ── Output pane ────────────────────────────────────────────────
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.09f, 1.0f));
+            ImGui::BeginChild("PtyOutputScroll", ImVec2(0, -input_h), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+
+            if (st.mono_font) ImGui::PushFont(st.mono_font);
+            // Render line by line from the raw buffer
+            {
+                const std::string& buf = st.pty_output_buf;
+                size_t line_start = 0;
+                while (line_start <= buf.size()) {
+                    size_t nl = buf.find('\n', line_start);
+                    size_t line_end = (nl == std::string::npos) ? buf.size() : nl;
+                    if (line_end > line_start) {
+                        const char* p = buf.c_str() + line_start;
+                        ImGui::TextUnformatted(p, p + (line_end - line_start));
+                    } else if (nl == std::string::npos) {
+                        break;
+                    } else {
+                        ImGui::TextUnformatted(""); // blank line
+                    }
+                    line_start = line_end + 1;
+                }
+            }
+            if (st.terminal_scroll_to_bottom) {
+                ImGui::SetScrollHereY(1.0f);
+                st.terminal_scroll_to_bottom = false;
+            }
+            if (st.mono_font) ImGui::PopFont();
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+
+            // ── Input row ──────────────────────────────────────────────────
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.14f, 1.0f));
+            ImGui::BeginChild("PtyInputRow", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+
+            if (st.mono_font) ImGui::PushFont(st.mono_font);
+
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.85f, 0.4f, 1.0f));
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text(st.pty_master_fd >= 0 ? "$" : "[dead]");
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+
+            bool reclaim_focus = false;
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGuiInputTextFlags iflags = ImGuiInputTextFlags_EnterReturnsTrue
+                                       | ImGuiInputTextFlags_CallbackHistory;
+
+            // Command history for up/down arrow
+            static std::vector<std::string> cmd_history;
+            static int                      history_pos = -1;
+
+            struct HistoryCB {
+                static int callback(ImGuiInputTextCallbackData* data) {
+                    if (data->EventFlag != ImGuiInputTextFlags_CallbackHistory) return 0;
+                    int hp = *(int*)data->UserData;
+                    if (data->EventKey == ImGuiKey_UpArrow) {
+                        if (hp < (int)cmd_history.size() - 1) hp++;
+                    } else if (data->EventKey == ImGuiKey_DownArrow) {
+                        if (hp > -1) hp--;
+                    }
+                    *(int*)data->UserData = hp;
+                    const std::string& hist_line = (hp >= 0) ? cmd_history[cmd_history.size() - 1 - hp] : std::string{};
+                    data->DeleteChars(0, data->BufTextLen);
+                    data->InsertChars(0, hist_line.c_str());
+                    return 0;
+                }
+            };
+
+            bool entered = ImGui::InputText(
+                "##pty_input", st.terminal_input, sizeof(st.terminal_input),
+                iflags, HistoryCB::callback, &history_pos);
+
+            if (entered) {
+                std::string line(st.terminal_input);
+                if (!line.empty()) {
+                    // push to history
+                    cmd_history.push_back(line);
+                    if (cmd_history.size() > 200) cmd_history.erase(cmd_history.begin());
+                    history_pos = -1;
+                }
+                line += "\n";
+                pty_send(st, line.c_str(), line.size());
+                st.terminal_input[0] = '\0';
+                reclaim_focus = true;
+            }
+
+            if (st.mono_font) ImGui::PopFont();
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+
+            if (reclaim_focus) ImGui::SetKeyboardFocusHere(-1);
+
+            ImGui::EndTabItem();
+        }
+
+        // ── Output / Logger Tab ─────────────────────────────────────────────
+        if (ImGui::BeginTabItem(ICON_FA_TRIANGLE_EXCLAMATION " Output / Logger")) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.09f, 1.0f));
+            ImGui::BeginChild("LoggerLogScroll", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+
+            if (st.mono_font) ImGui::PushFont(st.mono_font);
+            for (const auto& entry : g_file_logs) {
+                if (entry.find("ERROR") != std::string::npos)
+                    ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s", entry.c_str());
+                else if (entry.find("FileSave") != std::string::npos || entry.find("FileEncode") != std::string::npos)
+                    ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1.0f), "%s", entry.c_str());
+                else if (entry.find("FileDecode") != std::string::npos)
+                    ImGui::TextColored(ImVec4(0.45f, 0.75f, 1.0f, 1.0f), "%s", entry.c_str());
+                else
+                    ImGui::TextUnformatted(entry.c_str());
+            }
+            // Auto-scroll when near bottom
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 20.0f)
+                ImGui::SetScrollHereY(1.0f);
+            if (st.mono_font) ImGui::PopFont();
+
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+            ImGui::EndTabItem();
+        }
+
+        ImGui::EndTabBar();
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
 }
 
 // ============================================================================
@@ -1488,6 +2563,7 @@ static void draw_center_panel(ViewerState& st) {
     switch (st.preview_type) {
         case PREVIEW_MODEL:   draw_model_viewport(st);  break;
         case PREVIEW_TEXTURE: draw_texture_preview(st);  break;
+        case PREVIEW_TEXT:    draw_text_preview(st);     break;
         case PREVIEW_SCENE:
             if (st.scene_visualize_mode) {
                 draw_scene_visualizer(st);
@@ -1532,6 +2608,36 @@ static void draw_properties_panel(ViewerState& st) {
         st.preview_type == PREVIEW_AUDIO   ? FTYPE_AUDIO   : FTYPE_OTHER));
     ImGui::TextWrapped("Path: %s", st.sel_path.c_str());
     ImGui::Separator();
+
+    // Context helper buttons (Open Folder in VSCode & Export to GIMP)
+    {
+        auto dot_b = st.sel_name.rfind('.');
+        std::string ext_b = (dot_b != std::string::npos) ? st.sel_name.substr(dot_b) : "";
+        for (auto& c : ext_b) c = (char)tolower((unsigned char)c);
+        
+        if (ext_b == ".scene" || ext_b == ".scl") {
+            ImGui::BeginDisabled(true);
+            if (ImGui::Button(ICON_FA_FOLDER_OPEN " Open Folder in VSCode", ImVec2(-1, 32))) {
+                // Disabled placeholder
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("Open this file's folder in Visual Studio Code (Future Feature).");
+            }
+            ImGui::Separator();
+        }
+        else if (ext_b == ".pvr" || ext_b == ".png" || ext_b == ".jpg" || ext_b == ".jpeg") {
+            ImGui::BeginDisabled(true);
+            if (ImGui::Button(ICON_FA_IMAGE " Export to GIMP", ImVec2(-1, 32))) {
+                // Disabled placeholder
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("Export texture and open it in GIMP (Future Feature).");
+            }
+            ImGui::Separator();
+        }
+    }
 
     switch (st.preview_type) {
     case PREVIEW_MODEL: {
@@ -1642,6 +2748,31 @@ static void draw_properties_panel(ViewerState& st) {
             }
             ImGui::TreePop();
         }
+
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Model Transforms");
+        ImGui::SliderFloat("Rotate X", &st.model_rotate_x, -180.0f, 180.0f, "%.1f°");
+        ImGui::SliderFloat("Rotate Y", &st.model_rotate_y, -180.0f, 180.0f, "%.1f°");
+        ImGui::SliderFloat("Rotate Z", &st.model_rotate_z, -180.0f, 180.0f, "%.1f°");
+        ImGui::SliderFloat("Scale", &st.model_scale, 0.1f, 10.0f, "%.2fx");
+        
+        if (ImGui::Button("Reset Transform")) {
+            st.model_rotate_x = 0.0f;
+            st.model_rotate_y = 0.0f;
+            st.model_rotate_z = 0.0f;
+            st.model_scale = 1.0f;
+        }
+
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Export Options");
+        ImGui::BeginDisabled(true); // Freeze / disable the button
+        if (ImGui::Button(ICON_FA_FLOPPY_DISK " Export to Blender", ImVec2(-1, 32))) {
+            // Future feature placeholder
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("Future Plan: Convert the POD file to Blender native 3D model and export it directly.");
+        }
     } break;
 
     case PREVIEW_TEXTURE: {
@@ -1650,14 +2781,42 @@ static void draw_properties_panel(ViewerState& st) {
         ImGui::Text("Format: %s", st.tex_format_str.c_str());
         ImGui::Text("Zoom:   %.0f%%", st.tex_zoom * 100.0f);
         ImGui::Separator();
-        if (ImGui::Button("Reset Zoom")) {
+        if (ImGui::Button("Reset View")) {
             st.tex_zoom = 1.0f;
             st.tex_pan_x = st.tex_pan_y = 0.0f;
+            st.tex_reset_required = true;
+        }
+        ImGui::Checkbox("Pixel Art Mode", &st.tex_pixel_art_mode);
+        
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Texture Operations");
+        
+        if (ImGui::Button("Rotate 90° CW")) {
+            st.texture_rotation = (st.texture_rotation + 90) % 360;
         }
         ImGui::SameLine();
-        if (ImGui::Button("Fit Screen")) {
-            st.tex_zoom = 1.0f;
-            st.tex_pan_x = st.tex_pan_y = 0.0f;
+        if (ImGui::Button("Rotate 90° CCW")) {
+            st.texture_rotation = (st.texture_rotation + 270) % 360;
+        }
+        
+        if (ImGui::Button("Rotate 180°")) {
+            st.texture_rotation = (st.texture_rotation + 180) % 360;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset Rotation")) {
+            st.texture_rotation = 0;
+        }
+        
+        ImGui::Checkbox("Flip Horizontally", &st.texture_flip_h);
+        ImGui::Checkbox("Flip Vertically", &st.texture_flip_v);
+        
+        ImGui::ColorEdit4("Color Tint", st.texture_tint);
+        
+        if (ImGui::Button("Reset Filters")) {
+            st.texture_flip_h = true;
+            st.texture_flip_v = true;
+            st.texture_rotation = 0;
+            st.texture_tint[0] = st.texture_tint[1] = st.texture_tint[2] = st.texture_tint[3] = 1.0f;
         }
     } break;
 
@@ -1715,19 +2874,45 @@ static void draw_properties_panel(ViewerState& st) {
 
 static void draw_status_bar(ViewerState& st) {
     ImGui::Separator();
-    ImGui::BeginChild("StatusBar", ImVec2(0, STATUS_BAR_H));
+    ImGui::BeginChild("StatusBar", ImVec2(0, STATUS_BAR_H), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
-    ImGui::TextDisabled("%s", st.current_dir.c_str());
+    if (ImGui::BeginTable("StatusBarTable", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoKeepColumnsVisible)) {
+        ImGui::TableSetupColumn("PathColumn", ImGuiTableColumnFlags_WidthStretch, 0.45f);
+        ImGui::TableSetupColumn("StatusColumn", ImGuiTableColumnFlags_WidthStretch, 0.35f);
+        ImGui::TableSetupColumn("ShortcutsColumn", ImGuiTableColumnFlags_WidthFixed, 220.0f);
 
-    if (!st.status_msg.empty()) {
-        float text_w = ImGui::CalcTextSize(st.status_msg.c_str()).x;
-        float avail = ImGui::GetContentRegionAvail().x;
-        ImGui::SameLine(avail * 0.3f);
-        ImGui::Text("%s", st.status_msg.c_str());
+        ImGui::TableNextRow();
+
+        // 1. Path Column
+        ImGui::TableNextColumn();
+        if (st.show_full_path_status && !st.sel_path.empty()) {
+            ImGui::TextDisabled("%s", st.sel_path.c_str());
+        } else {
+            ImGui::TextDisabled("%s", st.current_dir.c_str());
+        }
+
+        // 2. Status Message Column
+        ImGui::TableNextColumn();
+        if (!st.status_msg.empty()) {
+            float text_w = ImGui::CalcTextSize(st.status_msg.c_str()).x;
+            float cell_w = ImGui::GetContentRegionAvail().x;
+            if (cell_w > text_w) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (cell_w - text_w) * 0.5f);
+            }
+            ImGui::Text("%s", st.status_msg.c_str());
+        }
+
+        // 3. Shortcuts Column
+        ImGui::TableNextColumn();
+        float short_w = ImGui::CalcTextSize("[W]ire [T]ex [R]eset [Esc]Quit").x;
+        float cell_w = ImGui::GetContentRegionAvail().x;
+        if (cell_w > short_w) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (cell_w - short_w));
+        }
+        ImGui::TextDisabled("[W]ire [T]ex [R]eset [Esc]Quit");
+
+        ImGui::EndTable();
     }
-
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 200.0f + ImGui::GetCursorPosX());
-    ImGui::TextDisabled("[W]ire [T]ex [R]eset [Esc]Quit");
 
     ImGui::EndChild();
 }
@@ -1804,18 +2989,235 @@ static void apply_blender_theme(float dpi_scale) {
     c[ImGuiCol_TextDisabled]         = ImVec4(0.55f, 0.55f, 0.55f, 1.00f);
 }
 
+static void apply_ruby_cyber_theme() {
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    
+    style.WindowRounding    = 4.0f;
+    style.ChildRounding     = 4.0f;
+    style.FrameRounding     = 4.0f;
+    style.GrabRounding      = 3.0f;
+    style.PopupRounding     = 4.0f;
+    style.ScrollbarRounding = 4.0f;
+    style.TabRounding       = 4.0f;
+
+    style.FramePadding      = ImVec2(6, 4);
+    style.ItemSpacing       = ImVec2(8, 4);
+    style.ItemInnerSpacing  = ImVec2(6, 4);
+    style.ScrollbarSize     = 12.0f;
+
+    style.WindowBorderSize  = 1.0f;
+    style.ChildBorderSize   = 1.0f;
+    style.FrameBorderSize   = 1.0f;
+    style.PopupBorderSize   = 1.0f;
+    style.TabBorderSize     = 1.0f;
+
+    ImVec4* c = style.Colors;
+
+    c[ImGuiCol_WindowBg]             = ImVec4(0.08f, 0.08f, 0.12f, 1.00f); // Deep cyber dark blue
+    c[ImGuiCol_ChildBg]              = ImVec4(0.06f, 0.06f, 0.09f, 1.00f); // Darker blue for children
+    c[ImGuiCol_PopupBg]              = ImVec4(0.05f, 0.05f, 0.08f, 0.96f);
+    c[ImGuiCol_Border]               = ImVec4(0.16f, 0.24f, 0.35f, 0.80f); // Neon border
+    c[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+
+    c[ImGuiCol_FrameBg]              = ImVec4(0.12f, 0.16f, 0.26f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]       = ImVec4(0.16f, 0.22f, 0.36f, 1.00f);
+    c[ImGuiCol_FrameBgActive]        = ImVec4(0.20f, 0.28f, 0.44f, 1.00f);
+
+    c[ImGuiCol_TitleBg]              = ImVec4(0.10f, 0.10f, 0.15f, 1.00f);
+    c[ImGuiCol_TitleBgActive]        = ImVec4(0.14f, 0.14f, 0.22f, 1.00f);
+    c[ImGuiCol_TitleBgCollapsed]     = ImVec4(0.10f, 0.10f, 0.15f, 0.50f);
+
+    c[ImGuiCol_MenuBarBg]            = ImVec4(0.10f, 0.10f, 0.15f, 1.00f);
+
+    c[ImGuiCol_ScrollbarBg]          = ImVec4(0.08f, 0.08f, 0.12f, 0.30f);
+    c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.16f, 0.24f, 0.38f, 0.80f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.22f, 0.32f, 0.50f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.28f, 0.40f, 0.62f, 1.00f);
+
+    c[ImGuiCol_CheckMark]            = ImVec4(0.35f, 0.65f, 0.95f, 1.00f); // Bright cyber blue
+    c[ImGuiCol_SliderGrab]           = ImVec4(0.22f, 0.32f, 0.50f, 1.00f);
+    c[ImGuiCol_SliderGrabActive]     = ImVec4(0.35f, 0.65f, 0.95f, 1.00f);
+
+    c[ImGuiCol_Button]               = ImVec4(0.14f, 0.20f, 0.32f, 1.00f);
+    c[ImGuiCol_ButtonHovered]        = ImVec4(0.20f, 0.28f, 0.44f, 1.00f);
+    c[ImGuiCol_ButtonActive]         = ImVec4(0.35f, 0.65f, 0.95f, 1.00f);
+
+    c[ImGuiCol_Header]               = ImVec4(0.14f, 0.20f, 0.32f, 1.00f);
+    c[ImGuiCol_HeaderHovered]        = ImVec4(0.20f, 0.28f, 0.44f, 0.60f);
+    c[ImGuiCol_HeaderActive]         = ImVec4(0.35f, 0.65f, 0.95f, 0.80f);
+
+    c[ImGuiCol_Separator]            = ImVec4(0.16f, 0.24f, 0.35f, 0.80f);
+    c[ImGuiCol_SeparatorHovered]     = ImVec4(0.28f, 0.40f, 0.62f, 0.80f);
+    c[ImGuiCol_SeparatorActive]      = ImVec4(0.35f, 0.65f, 0.95f, 1.00f);
+
+    c[ImGuiCol_Text]                 = ImVec4(0.90f, 0.92f, 0.96f, 1.00f);
+    c[ImGuiCol_TextDisabled]         = ImVec4(0.55f, 0.60f, 0.70f, 1.00f);
+}
+
+static void apply_selected_theme(int theme_idx, float font_scale) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.FontGlobalScale = font_scale;
+    
+    if (theme_idx == 0) {
+        apply_blender_theme(1.0f);
+    } else if (theme_idx == 1) {
+        apply_ruby_cyber_theme();
+    } else if (theme_idx == 2) {
+        ImGui::StyleColorsLight();
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.WindowRounding    = 4.0f;
+        style.ChildRounding     = 4.0f;
+        style.FrameRounding     = 4.0f;
+        style.GrabRounding      = 3.0f;
+        style.PopupRounding     = 4.0f;
+        style.ScrollbarRounding = 4.0f;
+        style.TabRounding       = 4.0f;
+    } else {
+        ImGui::StyleColorsClassic();
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.WindowRounding    = 4.0f;
+        style.ChildRounding     = 4.0f;
+        style.FrameRounding     = 4.0f;
+        style.GrabRounding      = 3.0f;
+        style.PopupRounding     = 4.0f;
+        style.ScrollbarRounding = 4.0f;
+        style.TabRounding       = 4.0f;
+    }
+}
+
+static void draw_settings_dialog(ViewerState& st) {
+    if (!st.show_settings) return;
+
+    ImGui::OpenPopup("Settings / Preferences");
+    
+    ImGui::SetNextWindowSize(ImVec2(640, 420), ImGuiCond_FirstUseEver);
+    if (ImGui::BeginPopupModal("Settings / Preferences", &st.show_settings)) {
+        
+        static int active_tab = 0;
+        
+        ImGui::BeginChild("SettingsTabs", ImVec2(150, 0), ImGuiChildFlags_Borders);
+        if (ImGui::Selectable("General", active_tab == 0)) active_tab = 0;
+        if (ImGui::Selectable("Render Settings", active_tab == 1)) active_tab = 1;
+        if (ImGui::Selectable("Camera Settings", active_tab == 2)) active_tab = 2;
+        if (ImGui::Selectable("Asset Tweaks", active_tab == 3)) active_tab = 3;
+        if (ImGui::Selectable("Blender Export", active_tab == 4)) active_tab = 4;
+        ImGui::EndChild();
+        
+        ImGui::SameLine();
+        
+        ImGui::BeginChild("SettingsContent", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() - 5), ImGuiChildFlags_None);
+        
+        if (active_tab == 0) {
+            ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "General Options");
+            ImGui::Separator();
+            
+            const char* themes[] = { "Blender Dark", "Ruby Cyber", "ImGui Light", "ImGui Classic" };
+            if (ImGui::Combo("UI Theme", &st.ui_theme, themes, IM_ARRAYSIZE(themes))) {
+                apply_selected_theme(st.ui_theme, st.ui_font_scale);
+            }
+            
+            if (ImGui::SliderFloat("UI Scale", &st.ui_font_scale, 0.5f, 2.0f, "%.2f")) {
+                apply_selected_theme(st.ui_theme, st.ui_font_scale);
+            }
+            
+            ImGui::Checkbox("Show full path in status bar", &st.show_full_path_status);
+            ImGui::Checkbox("Auto refresh directories", &st.auto_refresh_dirs);
+            
+            ImGui::Spacing();
+            ImGui::TextDisabled("Changes are applied immediately.");
+        } 
+        else if (active_tab == 1) {
+            ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Rendering & Visuals");
+            ImGui::Separator();
+            
+            if (ImGui::ColorEdit3("Viewport Background", st.bg_color)) {
+                av::g_clear_color[0] = st.bg_color[0];
+                av::g_clear_color[1] = st.bg_color[1];
+                av::g_clear_color[2] = st.bg_color[2];
+            }
+            ImGui::Checkbox("Render Grid Lines", &st.show_grid);
+            ImGui::SliderFloat("Grid Plane Size", &st.grid_size, 5.0f, 200.0f, "%.0f");
+            
+            static int msaa_opt = 1; // MSAA 4x
+            const char* msaa_modes[] = { "Disabled", "MSAA 2x", "MSAA 4x", "MSAA 8x" };
+            ImGui::Combo("Anti-Aliasing", &msaa_opt, msaa_modes, IM_ARRAYSIZE(msaa_modes));
+            
+            ImGui::Checkbox("Enable V-Sync", &st.enable_vsync);
+        }
+        else if (active_tab == 2) {
+            ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "3D Orbit Camera");
+            ImGui::Separator();
+            
+            ImGui::SliderFloat("Orbit Sensitivity", &st.cam_orbit_speed, 0.1f, 2.0f, "%.1f");
+            ImGui::SliderFloat("Zoom Sensitivity", &st.cam_zoom_speed, 0.05f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Pan Sensitivity", &st.cam_pan_speed, 0.001f, 0.02f, "%.3f");
+            ImGui::Checkbox("Invert Orbit X (Yaw)", &st.cam_invert_x);
+            ImGui::Checkbox("Invert Orbit Y (Pitch)", &st.cam_invert_y);
+            
+            ImGui::SliderFloat("Camera Field of View", &st.camera.fov, 10.0f, 120.0f, "%.0f°");
+        }
+        else if (active_tab == 3) {
+            ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Asset Operations");
+            ImGui::Separator();
+            
+            ImGui::Checkbox("Pixel Art Filtering for Textures", &st.tex_pixel_art_mode);
+            ImGui::Checkbox("Auto-play Animations", &st.anim_autoplay);
+            
+            static float default_fps = 30.0f;
+            ImGui::SliderFloat("Default Animation FPS", &default_fps, 1.0f, 120.0f, "%.0f");
+        }
+        else if (active_tab == 4) {
+            ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Blender Export (Future Plan)");
+            ImGui::Separator();
+            
+            static char blender_path[256] = "/usr/bin/blender";
+            ImGui::InputText("Blender Executable Path", blender_path, sizeof(blender_path));
+            
+            static int export_fmt = 0; // glTF
+            const char* formats[] = { "glTF (.gltf / .glb)", "FBX (.fbx)", "Wavefront OBJ (.obj)" };
+            ImGui::Combo("Export Format", &export_fmt, formats, IM_ARRAYSIZE(formats));
+            
+            static float export_scale = 1.0f;
+            ImGui::InputFloat("Export Scale Factor", &export_scale);
+            
+            static bool embed_tex = true;
+            ImGui::Checkbox("Embed Textures in Export", &embed_tex);
+            
+            ImGui::Spacing();
+            ImGui::TextDisabled("This integration will launch Blender automatically and import assets.");
+        }
+        
+        ImGui::EndChild();
+        
+        ImGui::Separator();
+        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 130);
+        if (ImGui::Button("Close", ImVec2(120, 0))) {
+            st.show_settings = false;
+            ImGui::CloseCurrentPopup();
+        }
+        
+        ImGui::EndPopup();
+    }
+}
+
 // ============================================================================
 // Keyboard shortcut handling (called when ImGui doesn't want keyboard)
 // ============================================================================
 
 static bool handle_shortcuts(ViewerState& st) {
     ImGuiIO& io = ImGui::GetIO();
-    if (io.WantCaptureKeyboard) return false;
+    if (io.WantCaptureKeyboard && !ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) return false;
 
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) return true;
 
     if (ImGui::IsKeyPressed(ImGuiKey_W)) st.show_wireframe = !st.show_wireframe;
     if (ImGui::IsKeyPressed(ImGuiKey_T)) st.show_textured = !st.show_textured;
+    
+    // Toggle bottom panel via Ctrl+` (or just GraveAccent alone when not focused in input fields)
+    if ((io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) || ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) {
+        st.show_bottom_panel = !st.show_bottom_panel;
+    }
 
     if (ImGui::IsKeyPressed(ImGuiKey_R)) {
         st.camera = av::Camera{};
@@ -1845,6 +3247,11 @@ static bool handle_shortcuts(ViewerState& st) {
     if (ImGui::IsKeyPressed(ImGuiKey_F3)) { st.type_filter = 2; apply_filters(st); }
     if (ImGui::IsKeyPressed(ImGuiKey_F4)) { st.type_filter = 3; apply_filters(st); }
     if (ImGui::IsKeyPressed(ImGuiKey_F5)) { st.type_filter = 4; apply_filters(st); }
+    if (ImGui::IsKeyPressed(ImGuiKey_F6)) { st.type_filter = 5; apply_filters(st); }
+
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_P)) {
+        st.show_settings = true;
+    }
 
     if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
         if (st.selected_idx > 0) {
@@ -1926,7 +3333,10 @@ int main(int argc, char* argv[]) {
     if (dpi_scale < 1.0f) dpi_scale = 1.0f;
     if (dpi_scale > 3.0f) dpi_scale = 3.0f;
 
-    apply_blender_theme(dpi_scale);
+    apply_selected_theme(g_state.ui_theme, g_state.ui_font_scale);
+    av::g_clear_color[0] = g_state.bg_color[0];
+    av::g_clear_color[1] = g_state.bg_color[1];
+    av::g_clear_color[2] = g_state.bg_color[2];
 
     ImGui_ImplSDL3_InitForOpenGL(window, gl_ctx);
     ImGui_ImplOpenGL3_Init(GLSL_VERSION);
@@ -1988,6 +3398,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "[Ruby] FontAwesome icons merged successfully from: " << fa_path << std::endl;
             }
             io.FontGlobalScale = 1.0f / dpi_scale;
+            g_state.mono_font = font; // Use the verified main font for everything, ensuring zero icon breakages
         }
     }
 
@@ -2082,14 +3493,27 @@ int main(int argc, char* argv[]) {
                     refresh_directory(g_state);
                     apply_filters(g_state);
                 }
+                if (ImGui::BeginMenu("Export")) {
+                    ImGui::BeginDisabled(true);
+                    ImGui::MenuItem("Export to Blender...");
+                    ImGui::EndDisabled();
+                    ImGui::EndMenu();
+                }
                 if (ImGui::MenuItem("Exit", "Esc")) {
                     running = false;
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Edit")) {
+                if (ImGui::MenuItem("Preferences / Settings...", "Ctrl+P")) {
+                    g_state.show_settings = true;
                 }
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("View")) {
                 ImGui::MenuItem("Textured Mode", "T", &g_state.show_textured);
                 ImGui::MenuItem("Wireframe Mode", "W", &g_state.show_wireframe);
+                ImGui::MenuItem("Bottom Panel (Terminal/Logger)", "Ctrl+`", &g_state.show_bottom_panel);
                 if (ImGui::MenuItem("Reset Camera", "R")) {
                     g_state.camera = av::Camera{};
                     if (g_state.preview_type == PREVIEW_MODEL) {
@@ -2138,6 +3562,8 @@ int main(int argc, char* argv[]) {
             ImGui::EndPopup();
         }
 
+        draw_settings_dialog(g_state);
+
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
         ImGui::SetNextWindowSize(vp->WorkSize);
@@ -2161,7 +3587,20 @@ int main(int argc, char* argv[]) {
         float center_w = ImGui::GetContentRegionAvail().x - RIGHT_PANEL_W;
         if (center_w < 100.0f) center_w = 100.0f;
         ImGui::BeginChild("CenterPanel", ImVec2(center_w, 0));
+        
+        float center_panel_total_h = ImGui::GetContentRegionAvail().y;
+        float bottom_panel_h = g_state.show_bottom_panel ? 220.0f : 0.0f;
+        float top_part_h = center_panel_total_h - bottom_panel_h;
+        if (top_part_h < 100.0f) top_part_h = 100.0f;
+        
+        ImGui::BeginChild("TopPartPreview", ImVec2(0, top_part_h));
         draw_center_panel(g_state);
+        ImGui::EndChild();
+        
+        if (g_state.show_bottom_panel) {
+            draw_bottom_panel(g_state);
+        }
+        
         ImGui::EndChild();
 
         ImGui::SameLine();
@@ -2191,6 +3630,8 @@ int main(int argc, char* argv[]) {
 
     av::audio_shutdown();
     av::renderer_shutdown();
+
+    pty_shutdown(g_state);
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();

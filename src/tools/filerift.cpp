@@ -11,9 +11,9 @@
 #include <algorithm>
 
 /*
- * FileRift C++ Port
+ * FileRift C++ Port - Stage 1 - MrSinup
  * 
- * Missing Features (documented as requested):
+ * Missing Features (these are not needed for us now, i guess!? ):
  * - APK unpacking, modification, and rebuilding/signing (requires Java/jarsigner/zipalign integration).
  * - File manifests/checksum comparison to skip unmodified files (requires global database state).
  * - Detailed Lua compiler checks using host luac binary (uses direct extraction/in-memory compiler instead).
