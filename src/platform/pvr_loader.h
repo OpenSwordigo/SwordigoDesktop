@@ -18,6 +18,16 @@
  * Supports PVR v2 (44-byte header) and v3 (52-byte header).
  * Decodes ETC1 compressed pixel data to RGBA8.
  * Also returns width/height if out pointers are non-null. */
+#include <vector>
+
+/* Decode a PVR or gzipped .tex file buffer directly to RGBA8888.
+ * Handles automatic gzip decompression.
+ * Returns true on success. */
+bool pvr_decode_to_rgba(const uint8_t* file_data, size_t file_size, std::vector<uint8_t>& rgba_out, int& width, int& height);
+bool pvr_upload_compressed_to_tex(const uint8_t* file_data, size_t file_size, GLuint tex_name, int& out_w, int& out_h);
+
+extern bool g_pvr_software_decode;
+
 GLuint pvr_load_texture(const char* path, int* out_width = nullptr, int* out_height = nullptr);
 
 #endif /* PVR_LOADER_H */

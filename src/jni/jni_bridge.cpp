@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <deque>
 #include <unordered_set>
+#include <map>
+#include <algorithm>
 #include <mutex>
 #include <thread>
 #include <sys/stat.h>
@@ -29,15 +31,19 @@ namespace fs = std::filesystem;
 #define GL_GLEXT_PROTOTYPES
 #include "platform/gl_inc.h"
 #include <GL/glext.h>
+#include "platform/pvr_loader.h"
 #include <AL/al.h>
 #include <AL/alc.h>
 #include "platform/rgc.h"
+#include "platform/fbo_scaler.h"
 
 #ifdef VULKAN_BACKEND
 #include "platform/vulkan_backend.h"
 extern GraphicsAPI g_graphics_api;
 extern VulkanBackend g_vk_backend;
 #endif
+
+extern uint8_t* g_guest_memory;
 
 // When true, GL bridge functions call real OpenGL instead of no-ops
 bool g_display_active = false;
@@ -177,80 +183,88 @@ static std::deque<DeferredBlock> g_deferred_free_list;
 static uint64_t g_alloc_counter = 0;
 static std::mutex g_heap_mutex;
 
-static const uint32_t BUCKET_SIZES[] = {
-    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 
-    8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608
-};
-static const int NUM_BUCKETS = sizeof(BUCKET_SIZES) / sizeof(BUCKET_SIZES[0]);
+// Fastbins: O(1) allocator for small blocks (size <= 1024, in multiples of 8 bytes)
+// 128 buckets: index = (size - 1) / 8. Free blocks form a singly linked list in guest memory.
+static uint32_t g_fastbins[128] = {0};
 
-struct FreeBlock {
-    uint32_t addr;
-    uint32_t size;
-};
-static std::vector<FreeBlock> g_buckets[NUM_BUCKETS + 1];
-
-static int get_bucket_index(uint32_t size) {
-    for (int i = 0; i < NUM_BUCKETS; i++) {
-        if (size <= BUCKET_SIZES[i]) return i;
-    }
-    return -1;
-}
+// Dual-index free list: O(log n) best-fit with boundary coalescing (for size > 1024).
+// g_free_by_addr: addr -> size (for O(log n) coalescing via neighbour lookup)
+// g_free_by_size: size -> addr (multimap for O(log n) best-fit search)
+static std::map<uint32_t, uint32_t>      g_free_by_addr; // addr → size
+static std::multimap<uint32_t, uint32_t> g_free_by_size; // size → addr
 
 static void add_free_block_locked(uint32_t addr, uint32_t size) {
-    int idx = -1;
-    for (int i = NUM_BUCKETS - 1; i >= 0; i--) {
-        if (size >= BUCKET_SIZES[i]) {
-            idx = i;
-            break;
+    if (size == 0) return;
+
+    // Fast path: size <= 1024 goes to fastbins in O(1) without coalescing
+    if (size <= 1024) {
+        uint32_t idx = (size - 1) >> 3; // (size - 1) / 8
+        if (idx < 128) {
+            *(uint32_t*)(g_guest_memory + addr) = g_fastbins[idx];
+            g_fastbins[idx] = addr;
+            return;
         }
     }
-    if (idx == -1) idx = NUM_BUCKETS;
-    g_buckets[idx].push_back({addr, size});
+
+    uint32_t new_addr = addr;
+    uint32_t new_size = size;
+
+    // Coalesce with the immediately following block
+    auto next_it = g_free_by_addr.find(new_addr + new_size);
+    if (next_it != g_free_by_addr.end()) {
+        auto sr = g_free_by_size.equal_range(next_it->second);
+        for (auto it = sr.first; it != sr.second; ++it) {
+            if (it->second == next_it->first) { g_free_by_size.erase(it); break; }
+        }
+        new_size += next_it->second;
+        g_free_by_addr.erase(next_it);
+    }
+
+    // Coalesce with the immediately preceding block
+    auto after_it = g_free_by_addr.upper_bound(new_addr);
+    if (after_it != g_free_by_addr.begin()) {
+        auto prev_it = std::prev(after_it);
+        if (prev_it->first + prev_it->second == new_addr) {
+            auto sr = g_free_by_size.equal_range(prev_it->second);
+            for (auto it = sr.first; it != sr.second; ++it) {
+                if (it->second == prev_it->first) { g_free_by_size.erase(it); break; }
+            }
+            prev_it->second += new_size;
+            g_free_by_size.emplace(prev_it->second, prev_it->first);
+            return;
+        }
+    }
+
+    g_free_by_addr[new_addr] = new_size;
+    g_free_by_size.emplace(new_size, new_addr);
 }
 
 static uint32_t find_free_block_locked(uint32_t size, uint32_t& found_size) {
-    int start_idx = get_bucket_index(size);
-    if (start_idx == -1) start_idx = NUM_BUCKETS;
-    
-    if (start_idx > 0 && start_idx - 1 < NUM_BUCKETS) {
-        int below_idx = start_idx - 1;
-        for (size_t i = 0; i < g_buckets[below_idx].size(); i++) {
-            if (g_buckets[below_idx][i].size >= size) {
-                FreeBlock fb = g_buckets[below_idx][i];
-                g_buckets[below_idx].erase(g_buckets[below_idx].begin() + i);
-                found_size = fb.size;
-                return fb.addr;
-            }
+    // Fast path: try to pop from fastbin in O(1)
+    if (size <= 1024) {
+        uint32_t idx = (size - 1) >> 3; // (size - 1) / 8
+        if (idx < 128 && g_fastbins[idx] != 0) {
+            uint32_t addr = g_fastbins[idx];
+            g_fastbins[idx] = *(uint32_t*)(g_guest_memory + addr);
+            found_size = (idx + 1) << 3; // Aligned size
+            return addr;
         }
     }
-    
-    for (int idx = start_idx; idx <= NUM_BUCKETS; idx++) {
-        if (g_buckets[idx].empty()) continue;
-        
-        if (idx < NUM_BUCKETS) {
-            FreeBlock fb = g_buckets[idx].back();
-            g_buckets[idx].pop_back();
-            found_size = fb.size;
-            return fb.addr;
-        } else {
-            int best_fit_idx = -1;
-            uint32_t best_fit_size = 0xFFFFFFFF;
-            for (size_t i = 0; i < g_buckets[idx].size(); i++) {
-                if (g_buckets[idx][i].size >= size && g_buckets[idx][i].size < best_fit_size) {
-                    best_fit_size = g_buckets[idx][i].size;
-                    best_fit_idx = (int)i;
-                }
-            }
-            if (best_fit_idx != -1) {
-                FreeBlock fb = g_buckets[idx][best_fit_idx];
-                g_buckets[idx].erase(g_buckets[idx].begin() + best_fit_idx);
-                found_size = fb.size;
-                return fb.addr;
-            }
-        }
-    }
-    return 0;
+
+    auto it = g_free_by_size.lower_bound(size);
+    if (it == g_free_by_size.end()) return 0;
+
+    uint32_t addr     = it->second;
+    uint32_t blk_size = it->first;
+
+    g_free_by_size.erase(it);
+    g_free_by_addr.erase(addr);
+
+    found_size = blk_size;
+    return addr;
 }
+
+
 
 static uint32_t host_malloc_locked(uint32_t size) {
     size = (size + 7) & ~7;
@@ -258,7 +272,7 @@ static uint32_t host_malloc_locked(uint32_t size) {
     
     while (!g_deferred_free_list.empty()) {
         const auto& db = g_deferred_free_list.front();
-        if (g_alloc_counter - db.alloc_index > 2000) {
+        if (g_alloc_counter - db.alloc_index > 500) {
             add_free_block_locked(db.addr, db.size);
             g_deferred_free_list.pop_front();
         } else {
@@ -298,6 +312,11 @@ static void host_free_locked(uint32_t ptr) {
         g_deferred_free_list.push_back(db);
         g_guest_allocs.erase(ptr);
     }
+}
+
+extern "C" uint32_t get_guest_heap_size_32() {
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
+    return g_guest_heap_ptr - 0x20000000;
 }
 
 void bridge_malloc(void* emu_ptr) {
@@ -3417,6 +3436,7 @@ void bridge_gl_viewport(void* emu_ptr) {
 
 // Track current matrix mode so we can apply correct fallback for zero matrices
 static GLenum g_current_matrix_mode = GL_MODELVIEW;
+static bool g_current_projection_is_ortho = false;
 
 void bridge_gl_matrix_mode(void* emu_ptr) {
     Emulator* emu = (Emulator*)emu_ptr;
@@ -3445,6 +3465,9 @@ void bridge_gl_load_identity(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glLoadIdentity();
+    if (g_current_matrix_mode == GL_PROJECTION) {
+        g_current_projection_is_ortho = true;
+    }
 }
 
 void bridge_gl_load_matrixf(void* emu_ptr) {
@@ -3497,6 +3520,7 @@ void bridge_gl_load_matrixf(void* emu_ptr) {
             // For projection: use ortho matching game viewport; for modelview: identity
             if (g_current_matrix_mode == GL_PROJECTION) {
                 glOrtho(0, 800, 480, 0, -1, 1);  // Game's 2D UI space
+                g_current_projection_is_ortho = true;
             } else {
                 glLoadIdentity();
             }
@@ -3562,6 +3586,7 @@ void bridge_gl_load_matrixf(void* emu_ptr) {
         if (g_display_active) {
             if (g_current_matrix_mode == GL_PROJECTION) {
                 glOrtho(0, 800, 480, 0, -1, 1);
+                g_current_projection_is_ortho = true;
             } else {
                 // Identity matrix values: 1 at diagonal (0,5,10,15), 0 elsewhere
                 static const GLfloat identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -3585,6 +3610,9 @@ void bridge_gl_load_matrixf(void* emu_ptr) {
     GL_DIAG("glLoadMatrixf(@0x%x) [%.2f %.2f %.2f %.2f / %.2f %.2f %.2f %.2f / ...]", ptr, m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7]);
     if (g_display_active) {
         glLoadMatrixf(m);
+    }
+    if (g_current_matrix_mode == GL_PROJECTION) {
+        g_current_projection_is_ortho = (m[15] == 1.0f);
     }
 }
 
@@ -3620,8 +3648,19 @@ void bridge_gl_mult_matrixf(void* emu_ptr) {
                   << m[3] << " " << m[7] << " " << m[11] << " " << m[15] << "]" << std::endl;
     }
 
+    if (has_bad) {
+        return;
+    }
+
     if (g_display_active) {
         glMultMatrixf(m);
+        
+        // Shadow matrix updates
+        if (g_current_matrix_mode == GL_PROJECTION) {
+            GLfloat proj[16];
+            glGetFloatv(GL_PROJECTION_MATRIX, proj);
+            g_current_projection_is_ortho = (proj[15] == 1.0f);
+        }
     }
 }
 
@@ -3652,7 +3691,16 @@ void bridge_gl_pop_matrix(void* emu_ptr) {
         return;
     }
 #endif
-    if (g_display_active) glPopMatrix();
+    if (g_display_active) {
+        glPopMatrix();
+        
+        // Shadow matrix updates
+        if (g_current_matrix_mode == GL_PROJECTION) {
+            GLfloat proj[16];
+            glGetFloatv(GL_PROJECTION_MATRIX, proj);
+            g_current_projection_is_ortho = (proj[15] == 1.0f);
+        }
+    }
 }
 
 void bridge_gl_orthof(void* emu_ptr) {
@@ -3683,6 +3731,7 @@ void bridge_gl_orthof(void* emu_ptr) {
     if (g_display_active) {
         glOrtho(l, r_, b, t, n, f);
     }
+    g_current_projection_is_ortho = true;
 }
 
 
@@ -3761,6 +3810,7 @@ void bridge_gl_frustumf(void* emu_ptr) {
     if (g_display_active) {
         glFrustum(l, r_, b, t, n, f);
     }
+    g_current_projection_is_ortho = false;
 }
 
 // --- Phase 3: Geometry Submission ---
@@ -3882,7 +3932,27 @@ void bridge_gl_draw_arrays(void* emu_ptr) {
     }
 
     if (g_display_active) {
+        extern PostFXState g_postfx;
+        bool do_stencil = fbo_is_active() && g_postfx.enabled;
+
+        if (do_stencil) {
+            bool is_ui = g_current_projection_is_ortho;
+            glEnable(GL_STENCIL_TEST);
+            glStencilMask(0xFF);
+            if (is_ui) {
+                glStencilFunc(GL_ALWAYS, 1, 0xFF);
+                glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+            } else {
+                glStencilFunc(GL_ALWAYS, 0, 0xFF);
+                glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+            }
+        }
+
         glDrawArrays(mode, first, count);
+
+        if (do_stencil) {
+            glDisable(GL_STENCIL_TEST);
+        }
     }
 }
 
@@ -3912,8 +3982,28 @@ void bridge_gl_draw_elements(void* emu_ptr) {
     }
 
     if (g_display_active) {
+        extern PostFXState g_postfx;
+        bool do_stencil = fbo_is_active() && g_postfx.enabled;
+
+        if (do_stencil) {
+            bool is_ui = g_current_projection_is_ortho;
+            glEnable(GL_STENCIL_TEST);
+            glStencilMask(0xFF);
+            if (is_ui) {
+                glStencilFunc(GL_ALWAYS, 1, 0xFF);
+                glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+            } else {
+                glStencilFunc(GL_ALWAYS, 0, 0xFF);
+                glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+            }
+        }
+
         uint8_t* memory = emu->get_memory_base();
         glDrawElements(mode, count, type, (const void*)(memory + indices_ptr));
+
+        if (do_stencil) {
+            glDisable(GL_STENCIL_TEST);
+        }
     }
 }
 
@@ -4379,53 +4469,6 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
         cache_hit = RedstellGC::instance().ppd_get_texture(path, ppd_tex);
     }
     
-    int width = 0, height = 0;
-    const uint8_t* pixel_data = nullptr;
-    int format_type = -1;
-    uint32_t gl_format = GL_RGBA;
-    uint32_t gl_type = GL_UNSIGNED_BYTE;
-    int bpp = 4;
-    char c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-    uint8_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-    const uint8_t* upload_pixels = nullptr;
-    std::vector<uint8_t> rgba;
-
-    if (cache_hit) {
-        width = ppd_tex.width;
-        height = ppd_tex.height;
-        upload_pixels = ppd_tex.rgba.data();
-    } else {
-        const uint8_t* file_data = memory + file_data_ptr;
-        const HostPVRv3Header* v3 = (const HostPVRv3Header*)file_data;
-        if (v3->version == 0x03525650) {
-            width = v3->width;
-            height = v3->height;
-            pixel_data = file_data + sizeof(HostPVRv3Header) + v3->metadata_size;
-            format_type = pvr::ParsePVRv3Format(v3->pixel_format, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
-        } else {
-            const HostPVRv2Header* v2 = (const HostPVRv2Header*)file_data;
-            if (v2->magic == 0x21525650 || v2->header_size == 44) {
-                width = v2->width;
-                height = v2->height;
-                pixel_data = file_data + v2->header_size;
-                format_type = pvr::ParsePVRv2Format(v2->flags, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
-            } else {
-                std::cerr << "[SRE-PVR32] Unknown PVR header magic 0x" << std::hex << v2->magic << std::dec << std::endl;
-                return;
-            }
-        }
-        
-        if (format_type < 0) {
-            std::cerr << "[SRE-PVR32] Unsupported format decoding " << width << "x" << height << std::endl;
-            return;
-        }
-        
-        if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
-            std::cerr << "[SRE-PVR32] Invalid PVR dimensions " << width << "x" << height << std::endl;
-            return;
-        }
-    }
-    
     // Generate texture ID if not already generated
     uint32_t tex_name = 0;
     if (out_tex_name_ptr) {
@@ -4439,35 +4482,46 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
             *(uint32_t*)(memory + out_tex_name_ptr) = tex_name;
         }
     }
+
+    int width = 0, height = 0;
+
+    if (!cache_hit && !g_pvr_software_decode) {
+        const uint8_t* file_data = memory + file_data_ptr;
+        if (pvr_upload_compressed_to_tex(file_data, file_size, tex_name, width, height)) {
+            if (out_width_ptr) {
+                *(uint32_t*)(memory + out_width_ptr) = width;
+            }
+            if (out_height_ptr) {
+                *(uint32_t*)(memory + out_height_ptr) = height;
+            }
+            if (!emu->quiet_mode) {
+                std::cout << "[SRE-PVR32] Successfully loaded and uploaded " << width << "x" << height 
+                          << " PVR to GL texture (compressed) " << tex_name << " (Size: " << file_size << " bytes)" << std::endl;
+            }
+            return;
+        }
+    }
+
+    const uint8_t* upload_pixels = nullptr;
+    std::vector<uint8_t> rgba;
+
+    if (cache_hit) {
+        width = ppd_tex.width;
+        height = ppd_tex.height;
+        upload_pixels = ppd_tex.rgba.data();
+    } else {
+        const uint8_t* file_data = memory + file_data_ptr;
+        if (!pvr_decode_to_rgba(file_data, file_size, rgba, width, height)) {
+            std::cerr << "[SRE-PVR32] Decoding failed" << std::endl;
+            return;
+        }
+    }
     
     glBindTexture(GL_TEXTURE_2D, tex_name);
     
     if (cache_hit) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, upload_pixels);
     } else {
-        rgba.assign(width * height * 4, 255);
-        bool decode_success = false;
-        
-        if (format_type == 1) { // ETC1
-            pvr::PVRTDecompressETC(pixel_data, width, height, rgba.data(), 6);
-            decode_success = true;
-        } else if (format_type == 2 || format_type == 3) { // PVRTC
-            uint32_t do2bitMode = (format_type == 2) ? 1 : 0;
-            pvr::PVRTDecompressPVRTC(pixel_data, do2bitMode, width, height, rgba.data());
-            decode_success = true;
-        } else if (format_type >= 4 && format_type <= 6) { // DXT
-            uint32_t dxt_fmt = (format_type == 4) ? 1 : ((format_type == 5) ? 3 : 5);
-            pvr::PVRTDecompressDXT(pixel_data, width, height, rgba.data(), dxt_fmt);
-            decode_success = true;
-        } else if (format_type == 10) { // Uncompressed
-            decode_success = pvr::PVRTDecodeUncompressed(pixel_data, width, height, c0, c1, c2, c3, d0, d1, d2, d3, rgba.data());
-        }
-        
-        if (!decode_success) {
-            std::cerr << "[SRE-PVR32] Decoding failed for format_type: " << format_type << std::endl;
-            return;
-        }
-        
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -4484,7 +4538,7 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
     
     if (!emu->quiet_mode) {
         std::cout << "[SRE-PVR32] Successfully loaded and uploaded " << width << "x" << height 
-                  << " PVR to GL texture " << tex_name << " (Format Type: " << format_type << ", Size: " << file_size << " bytes)" << std::endl;
+                  << " PVR to GL texture " << tex_name << " (Size: " << file_size << " bytes)" << std::endl;
     }
 }
 

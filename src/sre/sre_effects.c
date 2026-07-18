@@ -278,6 +278,13 @@ void sre_cxa_throw(void* thrown_exception, void* tinfo, void(*dest)(void*)) {
             *ejp = entry->saved_errorJmp;
         }
         
+        /* Invoke exception object destructor before discarding — the ABI requires
+         * this; skipping it leaks the small block from __cxa_allocate_exception.
+         * Do this BEFORE longjmp since dest may call back into the Lua/C stack. */
+        if (dest && thrown_exception) {
+            dest(thrown_exception);
+        }
+
         /* Don't decrement depth here — the setjmp handler does it */
         sre_longjmp(entry->buf, 1);
         /* never reaches here */

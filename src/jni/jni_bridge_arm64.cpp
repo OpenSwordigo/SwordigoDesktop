@@ -5,6 +5,11 @@
 //   - No __aeabi_* helpers (ARM64 has native div instructions)
 //   - Backend-agnostic: works with Unicorn or Dynarmic
 
+// Must be defined before any GL headers are pulled in (even transitively)
+#ifndef GL_GLEXT_PROTOTYPES
+#define GL_GLEXT_PROTOTYPES 1
+#endif
+
 #include "jni_bridge.h"
 #include "jni_bridge_arm64.h"
 #include "jni/gl_render_state.h"  // GL state handshake — bridge writes, FBO reads
@@ -15,6 +20,9 @@
 #include "android/asset_manager.h"
 #include "platform/video_background.h"
 #include "platform/pvrtc_decoder.h"
+#include "platform/pvr_loader.h"
+#include "platform/gl_inc.h"
+#include <GL/glext.h>
 #include <iostream>
 #include <fstream>
 #include <cstring>
@@ -24,6 +32,7 @@
 #include <unordered_map>
 #include <deque>
 #include <unordered_set>
+#include <map>
 #include <sstream>
 #include <mutex>
 #include <sys/stat.h>
@@ -42,9 +51,12 @@ namespace fs = std::filesystem;
 #include <unistd.h>
 #include <thread>
 #include "platform/rgc.h"
+#include "platform/fbo_scaler.h"
 #include "loader/elf_loader_arm64.h"
 
 extern so_module_arm64 g_sre_mod;
+extern so_module_arm64 g_main_mod_64;
+extern uint8_t* g_guest_memory;
 #include <cerrno>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -219,85 +231,99 @@ struct DeferredBlock {
 };
 static uint32_t g_guest_heap_ptr = 0x20000000; // Start heap at 512MB
 static std::unordered_map<uint32_t, uint32_t> g_guest_allocs;
+static std::unordered_set<uint32_t> g_tracked_allocs;
 static std::vector<DeferredBlock> g_deferred_free_list_vector; // Original TVPG container
 static std::deque<DeferredBlock> g_deferred_free_list;
 static uint64_t g_alloc_counter = 0;
 static std::mutex g_heap_mutex;
 
-static const uint32_t BUCKET_SIZES[] = {
-    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 
-    8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608
-};
-static const int NUM_BUCKETS = sizeof(BUCKET_SIZES) / sizeof(BUCKET_SIZES[0]);
+// Fastbins: O(1) allocator for small blocks (size <= 1024, in multiples of 8 bytes)
+// 128 buckets: index = (size - 1) / 8. Free blocks form a singly linked list in guest memory.
+static uint32_t g_fastbins[128] = {0};
 
-struct FreeBlock {
-    uint32_t addr;
-    uint32_t size;
-};
-static std::vector<FreeBlock> g_buckets[NUM_BUCKETS + 1];
-
-static int get_bucket_index(uint32_t size) {
-    for (int i = 0; i < NUM_BUCKETS; i++) {
-        if (size <= BUCKET_SIZES[i]) return i;
-    }
-    return -1;
-}
+// Dual-index free list: O(log n) best-fit with boundary coalescing (for size > 1024).
+// g_free_by_addr: addr -> size (for O(log n) coalescing via neighbour lookup)
+// g_free_by_size: size -> addr (multimap for O(log n) best-fit search)
+static std::map<uint32_t, uint32_t>       g_free_by_addr; // addr → size
+static std::multimap<uint32_t, uint32_t>  g_free_by_size; // size → addr
 
 static void add_free_block_locked(uint32_t addr, uint32_t size) {
-    int idx = -1;
-    for (int i = NUM_BUCKETS - 1; i >= 0; i--) {
-        if (size >= BUCKET_SIZES[i]) {
-            idx = i;
-            break;
+    if (size == 0) return;
+
+    // Fast path: size <= 1024 goes to fastbins in O(1) without coalescing
+    if (size <= 1024) {
+        uint32_t idx = (size - 1) >> 3; // (size - 1) / 8
+        if (idx < 128) {
+            *(uint32_t*)(g_guest_memory + addr) = g_fastbins[idx];
+            g_fastbins[idx] = addr;
+            return;
         }
     }
-    if (idx == -1) idx = NUM_BUCKETS;
-    g_buckets[idx].push_back({addr, size});
+
+    uint32_t new_addr = addr;
+    uint32_t new_size = size;
+
+    // Coalesce with the immediately following block (addr + size == next.addr)
+    auto next_it = g_free_by_addr.find(new_addr + new_size);
+    if (next_it != g_free_by_addr.end()) {
+        // Remove from size index
+        auto sr = g_free_by_size.equal_range(next_it->second);
+        for (auto it = sr.first; it != sr.second; ++it) {
+            if (it->second == next_it->first) { g_free_by_size.erase(it); break; }
+        }
+        new_size += next_it->second;
+        g_free_by_addr.erase(next_it);
+    }
+
+    // Coalesce with the immediately preceding block (prev.addr + prev.size == addr)
+    auto after_it = g_free_by_addr.upper_bound(new_addr);
+    if (after_it != g_free_by_addr.begin()) {
+        auto prev_it = std::prev(after_it);
+        if (prev_it->first + prev_it->second == new_addr) {
+            // Remove from size index
+            auto sr = g_free_by_size.equal_range(prev_it->second);
+            for (auto it = sr.first; it != sr.second; ++it) {
+                if (it->second == prev_it->first) { g_free_by_size.erase(it); break; }
+            }
+            prev_it->second += new_size; // Expand in addr map
+            g_free_by_size.emplace(prev_it->second, prev_it->first); // Re-insert size index
+            return;
+        }
+    }
+
+    // No coalescing — insert fresh entry in both indexes
+    g_free_by_addr[new_addr] = new_size;
+    g_free_by_size.emplace(new_size, new_addr);
 }
 
 static uint32_t find_free_block_locked(uint32_t size, uint32_t& found_size) {
-    int start_idx = get_bucket_index(size);
-    if (start_idx == -1) start_idx = NUM_BUCKETS;
-    
-    if (start_idx > 0 && start_idx - 1 < NUM_BUCKETS) {
-        int below_idx = start_idx - 1;
-        for (size_t i = 0; i < g_buckets[below_idx].size(); i++) {
-            if (g_buckets[below_idx][i].size >= size) {
-                FreeBlock fb = g_buckets[below_idx][i];
-                g_buckets[below_idx].erase(g_buckets[below_idx].begin() + i);
-                found_size = fb.size;
-                return fb.addr;
-            }
+    // Fast path: try to pop from fastbin in O(1)
+    if (size <= 1024) {
+        uint32_t idx = (size - 1) >> 3; // (size - 1) / 8
+        if (idx < 128 && g_fastbins[idx] != 0) {
+            uint32_t addr = g_fastbins[idx];
+            g_fastbins[idx] = *(uint32_t*)(g_guest_memory + addr);
+            found_size = (idx + 1) << 3; // Aligned size
+            return addr;
         }
     }
-    
-    for (int idx = start_idx; idx <= NUM_BUCKETS; idx++) {
-        if (g_buckets[idx].empty()) continue;
-        
-        if (idx < NUM_BUCKETS) {
-            FreeBlock fb = g_buckets[idx].back();
-            g_buckets[idx].pop_back();
-            found_size = fb.size;
-            return fb.addr;
-        } else {
-            int best_fit_idx = -1;
-            uint32_t best_fit_size = 0xFFFFFFFF;
-            for (size_t i = 0; i < g_buckets[idx].size(); i++) {
-                if (g_buckets[idx][i].size >= size && g_buckets[idx][i].size < best_fit_size) {
-                    best_fit_size = g_buckets[idx][i].size;
-                    best_fit_idx = (int)i;
-                }
-            }
-            if (best_fit_idx != -1) {
-                FreeBlock fb = g_buckets[idx][best_fit_idx];
-                g_buckets[idx].erase(g_buckets[idx].begin() + best_fit_idx);
-                found_size = fb.size;
-                return fb.addr;
-            }
-        }
-    }
-    return 0;
+
+    // lower_bound gives us the smallest block >= requested size in O(log n)
+    auto it = g_free_by_size.lower_bound(size);
+    if (it == g_free_by_size.end()) return 0;
+
+    uint32_t addr      = it->second;
+    uint32_t blk_size  = it->first;
+
+    // Remove from both indexes
+    g_free_by_size.erase(it);
+    g_free_by_addr.erase(addr);
+
+    found_size = blk_size;
+    return addr;
 }
+
+
 
 extern bool g_advanced_redstell_opts;
 extern uint64_t g_sre_profile_addr;
@@ -309,35 +335,38 @@ static uint32_t host_malloc_locked(uint32_t size) {
     
     // === TVPG Original Config Allocator ===
     if (!g_advanced_redstell_opts) {
-        // Only recycle if heap size exceeds 2048MB (fast path O(1) bump allocator under 2GB)
-        if (g_guest_heap_ptr - 0x20000000 > 2048ULL * 1024 * 1024) {
-            size_t search_limit = std::min(g_deferred_free_list_vector.size(), (size_t)50);
-            for (size_t i = 0; i < search_limit; i++) {
-                const auto& db = g_deferred_free_list_vector[i];
-                // Chronological list: if the oldest elements aren't ready yet, none are!
-                if (g_alloc_counter - db.alloc_index <= 15000) {
-                    break; // Stop searching completely
-                }
-                if (db.size >= size && db.size <= size + 128) {
-                    uint32_t addr = db.addr;
-                    g_guest_allocs[addr] = size;
-                    g_deferred_free_list_vector.erase(g_deferred_free_list_vector.begin() + i);
-                    g_alloc_counter++;
-                    return addr;
-                }
+        // Drain deferred list (oldest-first, stop at first not-yet-safe block)
+        while (!g_deferred_free_list_vector.empty()) {
+            const auto& db = g_deferred_free_list_vector.front();
+            if (g_alloc_counter - db.alloc_index > 5000) {
+                add_free_block_locked(db.addr, db.size);
+                g_deferred_free_list_vector.erase(g_deferred_free_list_vector.begin());
+            } else {
+                break;
             }
         }
-        uint32_t addr = g_guest_heap_ptr;
+        uint32_t found_size = 0;
+        uint32_t addr = find_free_block_locked(size, found_size);
+        if (addr != 0) {
+            if (found_size >= size + 16) {
+                add_free_block_locked(addr + size, found_size - size);
+                found_size = size;
+            }
+            g_guest_allocs[addr] = found_size;
+            g_alloc_counter++;
+            return addr;
+        }
+        addr = g_guest_heap_ptr;
         g_guest_heap_ptr += size;
         g_guest_allocs[addr] = size;
         g_alloc_counter++;
         return addr;
     }
 
-    // === SRE Config Allocator ===
+    // === SRE Config Allocator — drain at 500-alloc safety margin ===
     while (!g_deferred_free_list.empty()) {
         const auto& db = g_deferred_free_list.front();
-        if (g_alloc_counter - db.alloc_index > 2000) {
+        if (g_alloc_counter - db.alloc_index > 500) {
             add_free_block_locked(db.addr, db.size);
             g_deferred_free_list.pop_front();
         } else {
@@ -366,6 +395,7 @@ static uint32_t host_malloc_locked(uint32_t size) {
     return addr;
 }
 
+
 static void host_free_locked(uint32_t ptr) {
     if (ptr == 0) return;
     if (g_guest_allocs.count(ptr)) {
@@ -393,17 +423,28 @@ extern "C" void rgc_reclaim_guest_memory(uint64_t addr) {
     host_free_locked((uint32_t)addr);
 }
 
+extern "C" uint32_t get_guest_heap_size_64() {
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
+    return g_guest_heap_ptr - 0x20000000;
+}
+
 static void bridge_malloc(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t size = emu->get_reg(0);
     std::lock_guard<std::mutex> lock(g_heap_mutex);
     uint32_t addr = host_malloc_locked(size);
 
-    if (g_advanced_redstell_opts) {
-        uint64_t lr = emu->get_reg(30);
-        if (g_sre_mod.base_addr != 0 && lr >= g_sre_mod.base_addr && lr < g_sre_mod.base_addr + g_sre_mod.mem_size) {
-            RedstellGC::instance().track_alloc(addr, size, lr, "malloc");
-        }
+    uint64_t lr = emu->get_reg(30);
+    bool should_track = false;
+    if (g_sre_mod.base_addr != 0 && lr >= g_sre_mod.base_addr && lr < g_sre_mod.base_addr + g_sre_mod.mem_size) {
+        should_track = true;
+    } else if (g_main_mod_64.base_addr != 0 && lr >= g_main_mod_64.base_addr && lr < g_main_mod_64.base_addr + g_main_mod_64.mem_size) {
+        should_track = true;
+    }
+
+    if (should_track) {
+        RedstellGC::instance().track_alloc(addr, size, lr, "malloc");
+        g_tracked_allocs.insert(addr);
     }
 
     emu->set_reg(0, addr);
@@ -418,11 +459,17 @@ static void bridge_calloc(void* emu_ptr) {
     uint32_t addr = host_malloc_locked(total);
     std::memset(emu->get_memory_base() + addr, 0, total);
 
-    if (g_advanced_redstell_opts) {
-        uint64_t lr = emu->get_reg(30);
-        if (g_sre_mod.base_addr != 0 && lr >= g_sre_mod.base_addr && lr < g_sre_mod.base_addr + g_sre_mod.mem_size) {
-            RedstellGC::instance().track_alloc(addr, total, lr, "calloc");
-        }
+    uint64_t lr = emu->get_reg(30);
+    bool should_track = false;
+    if (g_sre_mod.base_addr != 0 && lr >= g_sre_mod.base_addr && lr < g_sre_mod.base_addr + g_sre_mod.mem_size) {
+        should_track = true;
+    } else if (g_main_mod_64.base_addr != 0 && lr >= g_main_mod_64.base_addr && lr < g_main_mod_64.base_addr + g_main_mod_64.mem_size) {
+        should_track = true;
+    }
+
+    if (should_track) {
+        RedstellGC::instance().track_alloc(addr, total, lr, "calloc");
+        g_tracked_allocs.insert(addr);
     }
 
     emu->set_reg(0, addr);
@@ -436,12 +483,29 @@ static void bridge_realloc(void* emu_ptr) {
 
     // --- TVPG Vanilla Realloc ---
     if (!g_advanced_redstell_opts) {
+        uint64_t lr = emu->get_reg(30);
+        bool should_track = false;
+        if (g_sre_mod.base_addr != 0 && lr >= g_sre_mod.base_addr && lr < g_sre_mod.base_addr + g_sre_mod.mem_size) {
+            should_track = true;
+        } else if (g_main_mod_64.base_addr != 0 && lr >= g_main_mod_64.base_addr && lr < g_main_mod_64.base_addr + g_main_mod_64.mem_size) {
+            should_track = true;
+        }
+        bool was_tracked = (ptr != 0 && g_tracked_allocs.count(ptr) > 0);
+
         if (ptr == 0) {
             uint32_t addr = host_malloc_locked(size);
+            if (should_track) {
+                RedstellGC::instance().track_alloc(addr, size, lr, "realloc(new)");
+                g_tracked_allocs.insert(addr);
+            }
             emu->set_reg(0, addr);
             return;
         }
         if (size == 0) {
+            if (was_tracked) {
+                RedstellGC::instance().track_free(ptr, lr);
+                g_tracked_allocs.erase(ptr);
+            }
             host_free_locked(ptr);
             emu->set_reg(0, 0);
             return;
@@ -454,12 +518,24 @@ static void bridge_realloc(void* emu_ptr) {
             if (copy_size > 0) {
                 std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, copy_size);
             }
+            if (was_tracked) {
+                RedstellGC::instance().track_free(ptr, lr);
+                g_tracked_allocs.erase(ptr);
+            }
             host_free_locked(ptr);
+            if (should_track) {
+                RedstellGC::instance().track_alloc(addr, size, lr, "realloc(move)");
+                g_tracked_allocs.insert(addr);
+            }
             emu->set_reg(0, addr);
         } else {
             uint32_t addr = host_malloc_locked(size);
             if (size > 0) {
                 std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, size);
+            }
+            if (should_track) {
+                RedstellGC::instance().track_alloc(addr, size, lr, "realloc(fallback)");
+                g_tracked_allocs.insert(addr);
             }
             emu->set_reg(0, addr);
         }
@@ -468,13 +544,19 @@ static void bridge_realloc(void* emu_ptr) {
 
     // --- SRE Tracked Realloc ---
     uint64_t lr = emu->get_reg(30);
-    bool is_sre_alloc = (g_sre_mod.base_addr != 0 && lr >= g_sre_mod.base_addr && lr < g_sre_mod.base_addr + g_sre_mod.mem_size);
-    bool was_tracked = (ptr != 0 && RedstellGC::instance().is_tracked(ptr));
+    bool should_track = false;
+    if (g_sre_mod.base_addr != 0 && lr >= g_sre_mod.base_addr && lr < g_sre_mod.base_addr + g_sre_mod.mem_size) {
+        should_track = true;
+    } else if (g_main_mod_64.base_addr != 0 && lr >= g_main_mod_64.base_addr && lr < g_main_mod_64.base_addr + g_main_mod_64.mem_size) {
+        should_track = true;
+    }
+    bool was_tracked = (ptr != 0 && g_tracked_allocs.count(ptr) > 0);
 
     if (ptr == 0) {
         uint32_t addr = host_malloc_locked(size);
-        if (is_sre_alloc) {
+        if (should_track) {
             RedstellGC::instance().track_alloc(addr, size, lr, "realloc(new)");
+            g_tracked_allocs.insert(addr);
         }
         emu->set_reg(0, addr);
         return;
@@ -482,6 +564,7 @@ static void bridge_realloc(void* emu_ptr) {
     if (size == 0) {
         if (was_tracked) {
             RedstellGC::instance().track_free(ptr, lr);
+            g_tracked_allocs.erase(ptr);
         }
         host_free_locked(ptr);
         emu->set_reg(0, 0);
@@ -497,9 +580,11 @@ static void bridge_realloc(void* emu_ptr) {
             g_guest_allocs[ptr] = size;
             if (was_tracked) {
                 RedstellGC::instance().track_free(ptr, lr);
+                g_tracked_allocs.erase(ptr);
             }
-            if (is_sre_alloc) {
+            if (should_track) {
                 RedstellGC::instance().track_alloc(ptr, size, lr, "realloc(inplace)");
+                g_tracked_allocs.insert(ptr);
             }
             emu->set_reg(0, ptr);
             return;
@@ -510,9 +595,11 @@ static void bridge_realloc(void* emu_ptr) {
             g_guest_allocs[ptr] = size;
             if (was_tracked) {
                 RedstellGC::instance().track_free(ptr, lr);
+                g_tracked_allocs.erase(ptr);
             }
-            if (is_sre_alloc) {
+            if (should_track) {
                 RedstellGC::instance().track_alloc(ptr, size, lr, "realloc(extend)");
+                g_tracked_allocs.insert(ptr);
             }
             emu->set_reg(0, ptr);
             return;
@@ -525,10 +612,12 @@ static void bridge_realloc(void* emu_ptr) {
         }
         if (was_tracked) {
             RedstellGC::instance().track_free(ptr, lr);
+            g_tracked_allocs.erase(ptr);
         }
         host_free_locked(ptr);
-        if (is_sre_alloc) {
+        if (should_track) {
             RedstellGC::instance().track_alloc(addr, size, lr, "realloc(move)");
+            g_tracked_allocs.insert(addr);
         }
         emu->set_reg(0, addr);
     } else {
@@ -536,8 +625,9 @@ static void bridge_realloc(void* emu_ptr) {
         if (size > 0) {
             std::memcpy(emu->get_memory_base() + addr, emu->get_memory_base() + ptr, size);
         }
-        if (is_sre_alloc) {
+        if (should_track) {
             RedstellGC::instance().track_alloc(addr, size, lr, "realloc(fallback)");
+            g_tracked_allocs.insert(addr);
         }
         emu->set_reg(0, addr);
     }
@@ -549,11 +639,9 @@ static void bridge_free(void* emu_ptr) {
     if (ptr) {
         std::lock_guard<std::mutex> lock(g_heap_mutex);
         
-        if (g_advanced_redstell_opts) {
-            uint64_t lr = emu->get_reg(30);
-            if (RedstellGC::instance().is_tracked(ptr)) {
-                RedstellGC::instance().track_free(ptr, lr);
-            }
+        uint64_t lr = emu->get_reg(30);
+        if (g_tracked_allocs.erase(ptr)) {
+            RedstellGC::instance().track_free(ptr, lr);
         }
 
         host_free_locked(ptr);
@@ -5072,6 +5160,7 @@ static BatchState g_current_batch_state = {};
 
 // Track current matrix mode so we can apply correct fallback for zero matrices
 static GLenum g_current_matrix_mode = GL_MODELVIEW;
+static bool g_current_projection_is_ortho = false;
 
 static void bridge_gl_matrix_mode(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
@@ -5105,8 +5194,10 @@ static void bridge_gl_load_identity(void* emu_ptr) {
     static const float kIdentity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     if (g_current_matrix_mode == GL_MODELVIEW)
         memcpy(g_current_modelview,  kIdentity, 64);
-    else if (g_current_matrix_mode == GL_PROJECTION)
+    else if (g_current_matrix_mode == GL_PROJECTION) {
         memcpy(g_current_projection, kIdentity, 64);
+        g_current_projection_is_ortho = true;
+    }
 }
 
 static void bridge_gl_load_matrixf(void* emu_ptr) {
@@ -5159,6 +5250,7 @@ static void bridge_gl_load_matrixf(void* emu_ptr) {
             // For projection: use ortho matching game viewport; for modelview: identity
             if (g_current_matrix_mode == GL_PROJECTION) {
                 glOrtho(0, g_draw_w, g_draw_h, 0, -1, 1);  // Match actual game resolution
+                g_current_projection_is_ortho = true;
             } else {
                 glLoadIdentity();
             }
@@ -5179,6 +5271,7 @@ static void bridge_gl_load_matrixf(void* emu_ptr) {
         if (g_display_active) {
             if (g_current_matrix_mode == GL_PROJECTION) {
                 glOrtho(0, g_draw_w, g_draw_h, 0, -1, 1);
+                g_current_projection_is_ortho = true;
             } else {
                 glLoadIdentity();
             }
@@ -5209,8 +5302,10 @@ static void bridge_gl_load_matrixf(void* emu_ptr) {
     // not reflected in the shadow (those code paths returned early above).
     if (g_current_matrix_mode == GL_MODELVIEW)
         memcpy(g_current_modelview,  m, 64);
-    else if (g_current_matrix_mode == GL_PROJECTION)
+    else if (g_current_matrix_mode == GL_PROJECTION) {
         memcpy(g_current_projection, m, 64);
+        g_current_projection_is_ortho = (m[15] == 1.0f);
+    }
 }
 
 static void bridge_gl_mult_matrixf(void* emu_ptr) {
@@ -5245,8 +5340,20 @@ static void bridge_gl_mult_matrixf(void* emu_ptr) {
                   << m[3] << " " << m[7] << " " << m[11] << " " << m[15] << "]" << std::endl;
     }
 
+    if (has_bad) {
+        return;
+    }
+
     if (g_display_active) {
         glMultMatrixf(m);
+        
+        // Shadow matrix updates
+        if (g_current_matrix_mode == GL_MODELVIEW) {
+            glGetFloatv(GL_MODELVIEW_MATRIX, g_current_modelview);
+        } else if (g_current_matrix_mode == GL_PROJECTION) {
+            glGetFloatv(GL_PROJECTION_MATRIX, g_current_projection);
+            g_current_projection_is_ortho = (g_current_projection[15] == 1.0f);
+        }
     }
 }
 
@@ -5277,7 +5384,17 @@ static void bridge_gl_pop_matrix(void* emu_ptr) {
         return;
     }
 #endif
-    if (g_display_active) glPopMatrix();
+    if (g_display_active) {
+        glPopMatrix();
+        
+        // Shadow matrix updates
+        if (g_current_matrix_mode == GL_MODELVIEW) {
+            glGetFloatv(GL_MODELVIEW_MATRIX, g_current_modelview);
+        } else if (g_current_matrix_mode == GL_PROJECTION) {
+            glGetFloatv(GL_PROJECTION_MATRIX, g_current_projection);
+            g_current_projection_is_ortho = (g_current_projection[15] == 1.0f);
+        }
+    }
 }
 
 static void bridge_gl_orthof(void* emu_ptr) {
@@ -5312,6 +5429,7 @@ static void bridge_gl_orthof(void* emu_ptr) {
     if (g_display_active) {
         glOrtho(l, r_, b, t, n, f);
     }
+    g_current_projection_is_ortho = true;
 }
 
 
@@ -5392,6 +5510,7 @@ static void bridge_gl_frustumf(void* emu_ptr) {
     if (g_display_active) {
         glFrustum(l, r_, b, t, n, f);
     }
+    g_current_projection_is_ortho = false;
 }
 
 // --- Phase 3: Geometry Submission ---
@@ -5567,7 +5686,27 @@ static void bridge_gl_draw_arrays(void* emu_ptr) {
     }
 
     // Direct draw (fallback).
+    extern PostFXState g_postfx;
+    bool do_stencil = fbo_is_active() && g_postfx.enabled;
+
+    if (do_stencil) {
+        bool is_ui = g_current_projection_is_ortho;
+        glEnable(GL_STENCIL_TEST);
+        glStencilMask(0xFF);
+        if (is_ui) {
+            glStencilFunc(GL_ALWAYS, 1, 0xFF);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+        } else {
+            glStencilFunc(GL_ALWAYS, 0, 0xFF);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+        }
+    }
+
     glDrawArrays(mode, first, count);
+
+    if (do_stencil) {
+        glDisable(GL_STENCIL_TEST);
+    }
 }
 
 static void bridge_gl_draw_elements(void* emu_ptr) {
@@ -5718,8 +5857,28 @@ static void bridge_gl_draw_elements(void* emu_ptr) {
     }
 
     if (g_display_active) {
+        extern PostFXState g_postfx;
+        bool do_stencil = fbo_is_active() && g_postfx.enabled;
+
+        if (do_stencil) {
+            bool is_ui = g_current_projection_is_ortho;
+            glEnable(GL_STENCIL_TEST);
+            glStencilMask(0xFF);
+            if (is_ui) {
+                glStencilFunc(GL_ALWAYS, 1, 0xFF);
+                glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+            } else {
+                glStencilFunc(GL_ALWAYS, 0, 0xFF);
+                glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+            }
+        }
+
         uint8_t* memory = emu->get_memory_base();
         glDrawElements(mode, count, type, (const void*)(memory + indices_ptr));
+
+        if (do_stencil) {
+            glDisable(GL_STENCIL_TEST);
+        }
     }
 }
 
@@ -6304,6 +6463,30 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
         tex_name = gl_tex;
         if (out_tex_name_ptr) {
             *(uint32_t*)(memory + out_tex_name_ptr) = tex_name;
+        }
+    }
+
+    if (!cache_hit && !g_pvr_software_decode) {
+        const uint8_t* file_data = memory + file_data_ptr;
+        if (pvr_upload_compressed_to_tex(file_data, file_size, tex_name, width, height)) {
+            caver_format = 1;
+            if (out_height_ptr) {
+                *(uint32_t*)(memory + out_height_ptr) = (uint32_t)width;
+            }
+            if (out_width_ptr) {
+                *(uint32_t*)(memory + out_width_ptr) = (uint32_t)height;
+            }
+            if (image_ptr) {
+                *(int32_t*)(memory + image_ptr + 4) = (int32_t)height;
+                *(int32_t*)(memory + image_ptr + 8) = (int32_t)width;
+                *(int32_t*)(memory + image_ptr + 12) = (int32_t)caver_format;
+            }
+            if (!emu->quiet_mode) {
+                std::cerr << "[SRE-PVR] Uploaded compressed " << width << "x" << height
+                          << " format=" << caver_format << " -> GL tex " << tex_name << std::endl;
+            }
+            emu->set_reg(0, 0);
+            return;
         }
     }
     

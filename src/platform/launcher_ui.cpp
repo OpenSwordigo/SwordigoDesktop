@@ -8,6 +8,7 @@
 #include "platform/data_path.h"
 #include "platform/save_editor.h"
 #include "platform/IconsFontAwesome6.h"
+#include "platform/pvr_loader.h"
 
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_sdl3.h"
@@ -1312,6 +1313,10 @@ static void DrawOptionsModal(bool& show_options) {
             ImGui::Spacing();
             static bool postfx_enabled = true;
             ImGui::Checkbox("Enable PostFX (bloom, color grading)", &postfx_enabled);
+
+            ImGui::Spacing();
+            ImGui::Checkbox("Use PVR Software Decompression", &g_pvr_software_decode);
+            ImGui::TextDisabled("When disabled, raw compressed PVR textures are uploaded directly to the GPU (Hardware Decode).");
 
             ImGui::Spacing();
             ImGui::Separator();

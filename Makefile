@@ -3,8 +3,8 @@
 
 CXX     := g++
 CC      := gcc
-CXXFLAGS := -std=c++17 -g -O3 -Isrc -Isrc/imgui -Iinclude -MMD -MP
-CFLAGS   := -g -O3 -Isrc -Iinclude -MMD -MP
+CXXFLAGS := -std=c++17 -g -O3 -Isrc -Isrc/imgui -Isrc/sre/lua/src -Iinclude -Isrc/stb -MMD -MP
+CFLAGS   := -g -O3 -Isrc -Isrc/sre/lua/src -Iinclude -MMD -MP
 
 # pkg-config queries
 SDL3_CFLAGS  := $(shell pkg-config --cflags sdl3 2>/dev/null)
@@ -88,7 +88,22 @@ C_SRCS := \
 # Object files (in build/ dir)
 CXX_OBJS := $(patsubst src/%.cpp, build/%.o, $(CXX_SRCS))
 C_OBJS   := $(patsubst src/%.c, build/%.o, $(C_SRCS))
-ALL_OBJS := $(CXX_OBJS) $(C_OBJS)
+# Host-side Lua objects — needed by filerift.cpp (compile_lua_to_bytecode)
+# LUA_SRCS is defined later in the file (for ruby/AV); forward-declare the obj list here.
+# We reuse the same build/host_lua/ objects so they're built once and shared.
+HOST_LUA_C_SRCS := \
+    src/sre/lua/src/lapi.c src/sre/lua/src/lcode.c src/sre/lua/src/ldebug.c \
+    src/sre/lua/src/ldo.c src/sre/lua/src/ldump.c src/sre/lua/src/lfunc.c \
+    src/sre/lua/src/lgc.c src/sre/lua/src/llex.c src/sre/lua/src/lmem.c \
+    src/sre/lua/src/lobject.c src/sre/lua/src/lopcodes.c src/sre/lua/src/lparser.c \
+    src/sre/lua/src/lstate.c src/sre/lua/src/lstring.c src/sre/lua/src/ltable.c \
+    src/sre/lua/src/ltm.c src/sre/lua/src/lundump.c src/sre/lua/src/lvm.c \
+    src/sre/lua/src/lzio.c src/sre/lua/src/lauxlib.c src/sre/lua/src/lbaselib.c \
+    src/sre/lua/src/ldblib.c src/sre/lua/src/liolib.c src/sre/lua/src/lmathlib.c \
+    src/sre/lua/src/loslib.c src/sre/lua/src/lstrlib.c src/sre/lua/src/ltablib.c \
+    src/sre/lua/src/loadlib.c src/sre/lua/src/linit.c
+HOST_LUA_OBJS := $(patsubst src/sre/lua/src/%.c, build/host_lua/%.o, $(HOST_LUA_C_SRCS))
+ALL_OBJS := $(CXX_OBJS) $(C_OBJS) $(HOST_LUA_OBJS)
 
 # Auto-generated dependency files
 DEPS := $(ALL_OBJS:.o=.d)
@@ -173,7 +188,7 @@ SRE_CORE_SRCS := \
 SRE_LUA_OBJS := $(patsubst src/sre/%.c, build/sre/%.o, $(SRE_LUA_SRCS))
 SRE_CORE_OBJS := $(patsubst src/sre/%.c, build/sre/%.o, $(patsubst src/sre/%.S, build/sre/%.o, $(SRE_CORE_SRCS)))
 
-SRE_LUA_CFLAGS := -shared -fPIC -O2 -nostdlib -fno-builtin \
+SRE_LUA_CFLAGS := -shared -fPIC -O2 -nostdlib -fno-builtin -fno-stack-protector \
     -Isrc/sre/include \
     -Isrc/sre/lua/src
 
@@ -215,14 +230,47 @@ install-sre: libsre.so
 AV_SRCS := src/tools/asset_viewer.cpp \
     src/tools/filerift.cpp src/tools/scene_schemas.cpp src/tools/boulder.cpp \
     src/tools/pod_loader.cpp src/tools/av_renderer.cpp \
-    src/tools/av_audio.cpp src/tools/scene_loader.cpp \
+    src/tools/av_audio.cpp src/tools/scene_loader.cpp src/tools/intellij.cpp \
+    src/tools/batch_converter.cpp \
     src/platform/pvr_loader.cpp \
     src/platform/data_path.cpp \
     src/platform/pvrtc_decoder.cpp \
     src/imgui/imgui.cpp src/imgui/imgui_draw.cpp \
     src/imgui/imgui_tables.cpp src/imgui/imgui_widgets.cpp \
     src/imgui/backends/imgui_impl_sdl3.cpp src/imgui/backends/imgui_impl_opengl3.cpp
-AV_OBJS := $(patsubst src/%.cpp, build/%.o, $(AV_SRCS))
+
+LUA_SRCS := \
+    src/sre/lua/src/lapi.c \
+    src/sre/lua/src/lcode.c \
+    src/sre/lua/src/ldebug.c \
+    src/sre/lua/src/ldo.c \
+    src/sre/lua/src/ldump.c \
+    src/sre/lua/src/lfunc.c \
+    src/sre/lua/src/lgc.c \
+    src/sre/lua/src/llex.c \
+    src/sre/lua/src/lmem.c \
+    src/sre/lua/src/lobject.c \
+    src/sre/lua/src/lopcodes.c \
+    src/sre/lua/src/lparser.c \
+    src/sre/lua/src/lstate.c \
+    src/sre/lua/src/lstring.c \
+    src/sre/lua/src/ltable.c \
+    src/sre/lua/src/ltm.c \
+    src/sre/lua/src/lundump.c \
+    src/sre/lua/src/lvm.c \
+    src/sre/lua/src/lzio.c \
+    src/sre/lua/src/lauxlib.c \
+    src/sre/lua/src/lbaselib.c \
+    src/sre/lua/src/ldblib.c \
+    src/sre/lua/src/liolib.c \
+    src/sre/lua/src/lmathlib.c \
+    src/sre/lua/src/loslib.c \
+    src/sre/lua/src/lstrlib.c \
+    src/sre/lua/src/ltablib.c \
+    src/sre/lua/src/loadlib.c \
+    src/sre/lua/src/linit.c
+
+AV_OBJS := $(patsubst src/%.cpp, build/%.o, $(AV_SRCS)) $(patsubst src/sre/lua/src/%.c, build/host_lua/%.o, $(LUA_SRCS))
 AV_LIBS := $(SDL3_LIBS) $(SDL3I_LIBS) -lGL $(ZLIB_LIBS) -lutil
 
 ruby: $(AV_OBJS)
@@ -235,6 +283,12 @@ build/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
 	@echo "[CXX]  $<"
 	@$(CXX) $(ALL_CXXFLAGS) -c $< -o $@
+
+# Host Lua compile rule
+build/host_lua/%.o: src/sre/lua/src/%.c
+	@mkdir -p $(dir $@)
+	@echo "[CC/HOST-LUA] $<"
+	@$(CC) $(ALL_CFLAGS) -c $< -o $@
 
 # C compile rule
 build/%.o: src/%.c

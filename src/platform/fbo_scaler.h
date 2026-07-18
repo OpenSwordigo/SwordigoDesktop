@@ -71,13 +71,19 @@ struct PostFXState {
     float outline_intensity = 0.7f;      // outline opacity (0-1)
     float outline_depth_threshold = 0.002f; // depth difference to detect an edge
     
+    // --- Remaster (Tier 3) effects ---
+    bool pbr_enabled = false;            // Enable Cook-Torrance BRDF PBR + LabPBR materials
+    bool reflections_enabled = false;    // Enable dynamic wave reflections for water
+    float reflection_intensity = 0.35f;  // Reflection blend strength (0-1)
+
     // Preset name (for display)
     const char* preset_name = "Low";
 };
 
 enum class PostFXPreset : int {
     OFF = 0,
-    SW_PLUS,        // Swordigo Plus — enhanced atmospheric with god rays
+    SW_PLUS_MEDIUM, // Swordigo Plus - Medium settings
+    SW_PLUS_HIGH,   // Swordigo Plus - High settings (full PBR + reflections)
     ATMOSPHERIC,    // SSAO + volumetric + vignette
     ETHEREAL,       // God rays + warm glow
     CINEMATIC,

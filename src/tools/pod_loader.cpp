@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <filesystem>
 
 namespace av {
 
@@ -65,7 +66,14 @@ static constexpr uint32_t eMeshVertexIndexList          = 6003;
 static constexpr uint32_t eMeshVertexList               = 6006;
 static constexpr uint32_t eMeshNormalList               = 6007;
 static constexpr uint32_t eMeshUVWList                  = 6010;
+static constexpr uint32_t eMeshBoneIndexList            = 6012;
+static constexpr uint32_t eMeshBoneWeightList            = 6013;
 static constexpr uint32_t eMeshInteravedDataList        = 6014;
+static constexpr uint32_t eMeshBoneBatchIndexList       = 6015;
+static constexpr uint32_t eMeshNumBoneIndicesPerBatch   = 6016;
+static constexpr uint32_t eMeshBoneOffsetPerBatch       = 6017;
+static constexpr uint32_t eMeshMaxNumBonesPerBatch      = 6018;
+static constexpr uint32_t eMeshNumBoneBatches           = 6019;
 
 // Vertex Block fields
 static constexpr uint32_t eBlockDataType                = 9000;
@@ -289,6 +297,14 @@ static PODMesh readMeshBlock(const uint8_t* data, size_t size, size_t& off) {
     DataElement pos_element;
     DataElement nrm_element;
     DataElement uv_element; // first UV channel
+    DataElement bone_idx_element;
+    DataElement bone_wgt_element;
+
+    std::vector<uint32_t> bone_batch_indices;
+    std::vector<uint32_t> bone_batch_counts;
+    std::vector<uint32_t> bone_batch_offsets;
+    uint32_t max_bones_per_batch = 0;
+    uint32_t num_bone_batches = 0;
 
     while (off < size) {
         uint32_t tag = read_u32(data, size, off);
@@ -322,10 +338,31 @@ static PODMesh readMeshBlock(const uint8_t* data, size_t size, size_t& off) {
                 DataElement current_uv;
                 parse_vertex_block(data, size, off, tag, current_uv);
                 if (uv_element.payload == nullptr) {
-                    uv_element = current_uv; // Store the first UV channel
+                     uv_element = current_uv; // Store the first UV channel
                 }
                 break;
             }
+            case eMeshBoneIndexList:
+                parse_vertex_block(data, size, off, tag, bone_idx_element);
+                break;
+            case eMeshBoneWeightList:
+                parse_vertex_block(data, size, off, tag, bone_wgt_element);
+                break;
+            case eMeshBoneBatchIndexList:
+                bone_batch_indices = read_u32_array(data, len, off);
+                break;
+            case eMeshNumBoneIndicesPerBatch:
+                bone_batch_counts = read_u32_array(data, len, off);
+                break;
+            case eMeshBoneOffsetPerBatch:
+                bone_batch_offsets = read_u32_array(data, len, off);
+                break;
+            case eMeshMaxNumBonesPerBatch:
+                max_bones_per_batch = read_u32(data, size, off);
+                break;
+            case eMeshNumBoneBatches:
+                num_bone_batches = read_u32(data, size, off);
+                break;
             default:
                 off += len;
                 break;
@@ -338,6 +375,21 @@ static PODMesh readMeshBlock(const uint8_t* data, size_t size, size_t& off) {
     mesh.positions = unpack_vertex_data(interleaved_payload, interleaved_size, pos_element, mesh.num_vertices, 3);
     mesh.normals   = unpack_vertex_data(interleaved_payload, interleaved_size, nrm_element, mesh.num_vertices, 3);
     mesh.uvs       = unpack_vertex_data(interleaved_payload, interleaved_size, uv_element,  mesh.num_vertices, 2);
+
+    mesh.bones_per_vertex = bone_idx_element.num_components;
+    if (mesh.bones_per_vertex > 0) {
+        mesh.bone_indices = unpack_vertex_data(interleaved_payload, interleaved_size, bone_idx_element, mesh.num_vertices, mesh.bones_per_vertex);
+        mesh.bone_weights = unpack_vertex_data(interleaved_payload, interleaved_size, bone_wgt_element, mesh.num_vertices, mesh.bones_per_vertex);
+    }
+
+    if (num_bone_batches > 0) {
+        mesh.has_bone_batches = true;
+        mesh.bone_batches.indices = std::move(bone_batch_indices);
+        mesh.bone_batches.counts = std::move(bone_batch_counts);
+        mesh.bone_batches.offsets = std::move(bone_batch_offsets);
+        mesh.bone_batches.max_bones = max_bones_per_batch;
+        mesh.bone_batches.count = num_bone_batches;
+    }
 
     compute_mesh_aabb(mesh);
 
@@ -639,7 +691,91 @@ PODModel pod_load(const std::string& path) {
 
     if (!f) return {};
 
-    return pod_parse(buf.data(), buf.size());
+    PODModel model = pod_parse(buf.data(), buf.size());
+
+    // Check if this is an animation-only POD (no meshes)
+    if (model.meshes.empty()) {
+        namespace fs = std::filesystem;
+        fs::path anim_path(path);
+        fs::path parent_dir = anim_path.parent_path();
+        std::string stem = anim_path.stem().string();
+
+        // Strip "_2x" if it exists at the end of the stem
+        bool is_2x = false;
+        if (stem.size() > 3 && stem.substr(stem.size() - 3) == "_2x") {
+            stem = stem.substr(0, stem.size() - 3);
+            is_2x = true;
+        }
+
+        // Find the first underscore to extract the prefix
+        size_t underscore_pos = stem.find('_');
+        if (underscore_pos != std::string::npos) {
+            std::string prefix = stem.substr(0, underscore_pos);
+            
+            std::vector<fs::path> candidates;
+            if (is_2x) {
+                candidates.push_back(parent_dir / (prefix + "_2x.pod"));
+                candidates.push_back(parent_dir / (prefix + "_2x.POD"));
+            }
+            candidates.push_back(parent_dir / (prefix + ".pod"));
+            candidates.push_back(parent_dir / (prefix + ".POD"));
+
+            fs::path base_path;
+            for (const auto& cand : candidates) {
+                if (fs::exists(cand)) {
+                    base_path = cand;
+                    break;
+                }
+            }
+
+            if (base_path.empty() && fs::exists(parent_dir)) {
+                for (const auto& entry : fs::directory_iterator(parent_dir)) {
+                    if (!entry.is_regular_file()) continue;
+                    std::string entry_stem = entry.path().stem().string();
+                    std::string entry_ext = entry.path().extension().string();
+                    
+                    for (auto& c : entry_ext) c = (char)tolower((unsigned char)c);
+                    if (entry_ext != ".pod") continue;
+
+                    if (entry_stem.size() > 3 && entry_stem.substr(entry_stem.size() - 3) == "_2x") {
+                        entry_stem = entry_stem.substr(0, entry_stem.size() - 3);
+                    }
+
+                    if (entry_stem == prefix && entry.path() != anim_path) {
+                        base_path = entry.path();
+                        break;
+                    }
+                }
+            }
+
+            if (!base_path.empty()) {
+                std::cout << "[POD] Detected animation-only POD. Merging with base model: " << base_path.string() << std::endl;
+                PODModel base_model = pod_load(base_path.string());
+                if (!base_model.meshes.empty()) {
+                    base_model.num_frames = model.num_frames;
+                    for (auto& base_node : base_model.nodes) {
+                        for (const auto& anim_node : model.nodes) {
+                            if (base_node.name == anim_node.name) {
+                                base_node.anim_translation = anim_node.anim_translation;
+                                base_node.anim_rotation = anim_node.anim_rotation;
+                                base_node.anim_scale = anim_node.anim_scale;
+                                base_node.anim_matrix = anim_node.anim_matrix;
+                                base_node.anim_translation_idx = anim_node.anim_translation_idx;
+                                base_node.anim_rotation_idx = anim_node.anim_rotation_idx;
+                                base_node.anim_scale_idx = anim_node.anim_scale_idx;
+                                base_node.anim_matrix_idx = anim_node.anim_matrix_idx;
+                                base_node.anim_flags = anim_node.anim_flags;
+                                break;
+                            }
+                        }
+                    }
+                    return base_model;
+                }
+            }
+        }
+    }
+
+    return model;
 }
 
 // ─── Local Matrix Multiplication and Transformations ──────────────────

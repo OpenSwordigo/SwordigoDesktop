@@ -21,6 +21,20 @@ struct PODMesh {
     std::vector<float>    uvs;         // flat uv,  2 floats per vertex
     std::vector<uint16_t> indices;     // triangle indices
 
+    std::vector<float>    bone_indices; // flat float (or int), bones_per_vertex floats per vertex
+    std::vector<float>    bone_weights; // flat float, bones_per_vertex floats per vertex
+    int                   bones_per_vertex = 0;
+
+    struct BoneBatch {
+        std::vector<uint32_t> indices;
+        std::vector<uint32_t> counts;
+        std::vector<uint32_t> offsets;
+        int                   max_bones = 0;
+        int                   count = 0;
+    };
+    BoneBatch bone_batches;
+    bool has_bone_batches = false;
+
     int num_vertices = 0;
     int num_faces    = 0;
 

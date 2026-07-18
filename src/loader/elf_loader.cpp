@@ -86,6 +86,7 @@ int ElfLoader::load(so_module* mod, const std::string& filename, uint32_t load_a
     char* shstr = (char*)(buffer.data() + mod->shdr[mod->ehdr->e_shstrndx].sh_offset);
 
     mod->base_addr = load_addr;
+    uint32_t max_addr = load_addr;
 
     for (int i = 0; i < mod->ehdr->e_phnum; i++) {
         if (mod->phdr[i].p_type == PT_LOAD) {
@@ -93,6 +94,10 @@ int ElfLoader::load(so_module* mod, const std::string& filename, uint32_t load_a
             uint32_t memsz = mod->phdr[i].p_memsz;
             uint32_t filesz = mod->phdr[i].p_filesz;
             uint32_t offset = mod->phdr[i].p_offset;
+
+            if (vaddr + memsz > max_addr) {
+                max_addr = vaddr + memsz;
+            }
 
             if (vaddr + memsz > guest_limit) {
                 std::cerr << "Segment out of guest memory bounds!" << std::endl;
@@ -111,6 +116,7 @@ int ElfLoader::load(so_module* mod, const std::string& filename, uint32_t load_a
             }
         }
     }
+    mod->mem_size = max_addr - load_addr;
 
     for (int i = 0; i < mod->ehdr->e_shnum; i++) {
         std::string name = shstr + mod->shdr[i].sh_name;

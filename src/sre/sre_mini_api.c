@@ -5039,6 +5039,23 @@ static void sre_eval_lua(lua_State* L, const char* code) {
 static lua_State* g_injected_states[MAX_INJECTED_STATES] = {0};
 static int g_injected_count = 0;
 
+/* Evict a closed lua_State from the injection cache.
+ * Called by sre_ProgramState_destructor when the root state is destroyed.
+ * Without this, if the allocator recycles the same pointer for a brand-new
+ * state, sre_mini_ensure_injected would skip full initialization on it. */
+void sre_mini_remove_injected(lua_State* L) {
+    for (int i = 0; i < g_injected_count; i++) {
+        if (g_injected_states[i] == L) {
+            /* Shift remaining entries down to keep the array compact */
+            for (int j = i; j < g_injected_count - 1; j++) {
+                g_injected_states[j] = g_injected_states[j + 1];
+            }
+            g_injected_states[--g_injected_count] = 0;
+            return;
+        }
+    }
+}
+
 
 
 /* Declared in sre_lua_libs.c — extracts Lua source from binary protobuf SCL */
@@ -5318,69 +5335,112 @@ void sre_mini_ensure_injected(lua_State* L) {
      * can call sre_hook_obj() explicitly via Mini.HookObj() if needed.
      * The __sre_so_hooked guard ensures this runs only once per Lua state. */
     sre_eval_lua(L,
+        /* ------------------------------------------------------------------ *
+         * sre_hook_obj — GC-safe side-table with weak-wrapper registry       *
+         *                                                                      *
+         * ROOT CAUSE OF OLD LEAK:                                             *
+         *   The previous version stored per-entity environments keyed by      *
+         *   tostring(obj) — a plain Lua STRING. In Lua 5.1 weak-keyed tables  *
+         *   only collect OBJECT keys (userdata/table/function). String keys   *
+         *   are NEVER collected, so mt.__sre_sidetable grew by one entry per  *
+         *   unique entity ever wrapped, forever, across all scene reloads.    *
+         *                                                                      *
+         * FIX — two-table pattern:                                            *
+         *   active_wrappers  weak({__mode="k"}) userdata→addr string          *
+         *     Lua GC auto-removes dead wrappers from this table.              *
+         *   shared_envs      strong addr string→custom-field-table            *
+         *     Holds actual mod-assigned fields.                                *
+         *   sweep_shared_envs()  periodic mark-and-sweep (every 200 calls)   *
+         *     Scans active_wrappers to find live addrs, deletes any           *
+         *     shared_envs entry whose addr has zero live wrappers.            *
+         * ------------------------------------------------------------------ */
         "if not _G.__sre_so_hooked then\n"
         "  _G.__sre_so_hooked = true\n"
         "  local get_mt = (debug and debug.getmetatable) or getmetatable\n"
+        "\n"
+        "  -- Weak-keyed table: userdata wrapper object -> C++ address string\n"
+        "  -- Entries vanish automatically when Lua GC collects the wrapper\n"
+        "  local active_wrappers = setmetatable({}, { __mode = 'k' })\n"
+        "\n"
+        "  -- Strong table: C++ address string -> custom field env table\n"
+        "  local shared_envs = {}\n"
+        "\n"
+        "  -- Periodic mark-and-sweep: prune envs for fully-GC'd objects\n"
+        "  local _sweep_ctr = 0\n"
+        "  local function sweep_shared_envs()\n"
+        "    _sweep_ctr = _sweep_ctr + 1\n"
+        "    if _sweep_ctr < 200 then return end\n"
+        "    _sweep_ctr = 0\n"
+        "    local live = {}\n"
+        "    for _, addr in pairs(active_wrappers) do live[addr] = true end\n"
+        "    for addr in pairs(shared_envs) do\n"
+        "      if not live[addr] then shared_envs[addr] = nil end\n"
+        "    end\n"
+        "  end\n"
+        "\n"
+        "  -- Compute stable C++ address for an object via identifier() or tostring\n"
+        "  local function get_addr(obj, og_idx)\n"
+        "    local id_fn\n"
+        "    if type(og_idx) == 'function' then\n"
+        "      id_fn = og_idx(obj, 'identifier')\n"
+        "    elseif type(og_idx) == 'table' then\n"
+        "      id_fn = og_idx['identifier']\n"
+        "    end\n"
+        "    if type(id_fn) == 'function' then\n"
+        "      local ok, res = pcall(id_fn, obj)\n"
+        "      if ok and type(res) == 'string' and res ~= '' then return res end\n"
+        "    end\n"
+        "    return tostring(obj)\n"
+        "  end\n"
+        "\n"
         "  _G.sre_hook_obj = function(obj)\n"
         "    if not obj then return obj end\n"
         "    local mt = get_mt and get_mt(obj)\n"
-        "    if mt and type(mt) == 'table' and not mt.__sre_hooked then\n"
-        "      mt.__sre_hooked = true\n"
-        "      mt.__sre_sidetable = mt.__sre_sidetable or {}\n"
-        "      local envs = mt.__sre_sidetable\n"
-        "      local og_index = mt.__index\n"
-        "      local og_newindex = mt.__newindex\n"
-        "      mt.__index = function(self_obj, key)\n"
-        "        local addr\n"
-        "        local id_fn\n"
-        "        if type(og_index) == 'function' then\n"
-        "          id_fn = og_index(self_obj, 'identifier')\n"
-        "        elseif type(og_index) == 'table' then\n"
-        "          id_fn = og_index['identifier']\n"
-        "        end\n"
-        "        if type(id_fn) == 'function' then\n"
-        "          local ok, res = pcall(id_fn, self_obj)\n"
-        "          if ok and type(res) == 'string' and res ~= '' then addr = res end\n"
-        "        end\n"
-        "        if not addr then addr = tostring(self_obj) end\n"
-        "        local env = envs[addr]\n"
-        "        if env and env[key] ~= nil then return env[key] end\n"
-        "        if key == 'setAlwaysActive' then\n"
-        "          return function(self_act, active)\n"
-        "            if SceneObject and SceneObject.SetAlwaysActive then\n"
-        "              SceneObject.SetAlwaysActive(self_act, active)\n"
+        "    if mt and type(mt) == 'table' then\n"
+        "      -- For already-hooked metatables, retrieve the stashed originals\n"
+        "      local og_index    = mt.__sre_og_index    or mt.__index\n"
+        "      local og_newindex = mt.__sre_og_newindex or mt.__newindex\n"
+        "      if not mt.__sre_hooked then\n"
+        "        mt.__sre_hooked      = true\n"
+        "        mt.__sre_og_index    = og_index    -- stash so later registrations work\n"
+        "        mt.__sre_og_newindex = og_newindex\n"
+        "        mt.__index = function(self_obj, key)\n"
+        "          sweep_shared_envs()\n"
+        "          local addr = get_addr(self_obj, og_index)\n"
+        "          active_wrappers[self_obj] = addr\n"
+        "          local env = shared_envs[addr]\n"
+        "          if env and env[key] ~= nil then return env[key] end\n"
+        "          if key == 'setAlwaysActive' then\n"
+        "            return function(self_act, active)\n"
+        "              if SceneObject and SceneObject.SetAlwaysActive then\n"
+        "                SceneObject.SetAlwaysActive(self_act, active)\n"
+        "              end\n"
         "            end\n"
         "          end\n"
+        "          if type(og_index) == 'function' then\n"
+        "            return og_index(self_obj, key)\n"
+        "          elseif type(og_index) == 'table' then\n"
+        "            return og_index[key]\n"
+        "          end\n"
         "        end\n"
-        "        if type(og_index) == 'function' then\n"
-        "          return og_index(self_obj, key)\n"
-        "        elseif type(og_index) == 'table' then\n"
-        "          return og_index[key]\n"
+        "        mt.__newindex = function(self_obj, key, val)\n"
+        "          sweep_shared_envs()\n"
+        "          if og_newindex then\n"
+        "            pcall(function()\n"
+        "              if type(og_newindex) == 'function' then og_newindex(self_obj, key, val)\n"
+        "              elseif type(og_newindex) == 'table' then og_newindex[key] = val end\n"
+        "            end)\n"
+        "          end\n"
+        "          local addr = get_addr(self_obj, og_index)\n"
+        "          active_wrappers[self_obj] = addr\n"
+        "          if not shared_envs[addr] then shared_envs[addr] = {} end\n"
+        "          shared_envs[addr][key] = val\n"
         "        end\n"
         "      end\n"
-        "      mt.__newindex = function(self_obj, key, val)\n"
-        "        if og_newindex then\n"
-        "          pcall(function()\n"
-        "            if type(og_newindex) == 'function' then og_newindex(self_obj, key, val)\n"
-        "            elseif type(og_newindex) == 'table' then og_newindex[key] = val end\n"
-        "          end)\n"
-        "        end\n"
-        "        local addr\n"
-        "        local id_fn\n"
-        "        if type(og_index) == 'function' then\n"
-        "          id_fn = og_index(self_obj, 'identifier')\n"
-        "        elseif type(og_index) == 'table' then\n"
-        "          id_fn = og_index['identifier']\n"
-        "        end\n"
-        "        if type(id_fn) == 'function' then\n"
-        "          local ok, res = pcall(id_fn, self_obj)\n"
-        "          if ok and type(res) == 'string' and res ~= '' then addr = res end\n"
-        "        end\n"
-        "        if not addr then addr = tostring(self_obj) end\n"
-        "        local env = envs[addr]\n"
-        "        if not env then env = {}; envs[addr] = env end\n"
-        "        env[key] = val\n"
-        "      end\n"
+        "      -- Register this wrapper in the weak table so GC can track it\n"
+        "      local addr = get_addr(obj, og_index)\n"
+        "      active_wrappers[obj] = addr\n"
+        "      if not shared_envs[addr] then shared_envs[addr] = {} end\n"
         "    end\n"
         "    return obj\n"
         "  end\n"

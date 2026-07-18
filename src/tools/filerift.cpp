@@ -10,6 +10,12 @@
 #include <cstring>
 #include <algorithm>
 
+extern "C" {
+#include <lua.h>
+#include <lualib.h>
+#include <lauxlib.h>
+}
+
 /*
  * FileRift C++ Port - Stage 1 - MrSinup
  * 
@@ -20,6 +26,12 @@
  * - CLI configuration profiles config.py support.
  */
 
+extern "C" const char* sre_vfs_resolve_path(const char* filename, char* buf) {
+    if (!filename || !buf) return filename;
+    std::strcpy(buf, filename);
+    return buf;
+}
+
 namespace filerift {
 
 struct FieldSchema {
@@ -28,6 +40,41 @@ struct FieldSchema {
     std::string name;
     std::string classname;
 };
+
+static int lua_writer_cb(lua_State* L, const void* p, size_t sz, void* ud) {
+    std::string* out = static_cast<std::string*>(ud);
+    out->append(static_cast<const char*>(p), sz);
+    return 0;
+}
+
+std::string compile_lua_to_bytecode(const std::string& source, const std::string& name = "script") {
+    lua_State* L = luaL_newstate();
+    if (!L) {
+        std::cerr << "Failed to create Lua state for compilation" << std::endl;
+        return "";
+    }
+    
+    luaL_openlibs(L);
+    
+    int status = luaL_loadbuffer(L, source.c_str(), source.size(), name.c_str());
+    if (status != 0) {
+        std::string err = lua_tostring(L, -1);
+        std::cerr << "Lua compile error: " << err << std::endl;
+        lua_close(L);
+        return "";
+    }
+    
+    std::string bytecode;
+    status = lua_dump(L, lua_writer_cb, &bytecode);
+    lua_close(L);
+    
+    if (status != 0) {
+        std::cerr << "Lua dump failed" << std::endl;
+        return "";
+    }
+    
+    return bytecode;
+}
 
 static std::map<std::string, std::vector<FieldSchema>> schemas;
 static bool schemas_initialized = false;
@@ -1283,7 +1330,12 @@ static std::string recode_message(const std::vector<std::string>& tokens, size_t
             if (idx < tokens.size() && tokens[idx] == "$end") {
                 idx++; // skip '$end'
             }
-            writer.write_bytes_field(1, lua_source);
+            std::string bytecode = compile_lua_to_bytecode(lua_source);
+            if (!bytecode.empty()) {
+                writer.write_bytes_field(1, bytecode);
+            } else {
+                writer.write_bytes_field(1, lua_source);
+            }
             writer.write_bytes_field(2, "");
         } else {
             if (w_type == proto::WIRE_VARINT) {

@@ -140,6 +140,7 @@ int ElfLoaderArm64::load(so_module_arm64* mod, const std::string& filename, uint
     char* shstr = (char*)(buffer.data() + mod->shdr[mod->ehdr->e_shstrndx].sh_offset);
 
     mod->base_addr = load_addr;
+    uint64_t max_addr = load_addr;
 
     // Load PT_LOAD segments into guest memory
     for (int i = 0; i < mod->ehdr->e_phnum; i++) {
@@ -148,6 +149,10 @@ int ElfLoaderArm64::load(so_module_arm64* mod, const std::string& filename, uint
             uint64_t memsz = mod->phdr[i].p_memsz;
             uint64_t filesz = mod->phdr[i].p_filesz;
             uint64_t offset = mod->phdr[i].p_offset;
+
+            if (vaddr + memsz > max_addr) {
+                max_addr = vaddr + memsz;
+            }
 
             if (vaddr + memsz > guest_limit) {
                 std::cerr << "[ElfLoader/ARM64] Segment out of guest memory bounds!" << std::endl;
@@ -170,6 +175,7 @@ int ElfLoaderArm64::load(so_module_arm64* mod, const std::string& filename, uint
                       << ((mod->phdr[i].p_flags & PF_X) ? " [TEXT]" : " [DATA]") << std::endl;
         }
     }
+    mod->mem_size = max_addr - load_addr;
 
     // Parse sections — note: .rela.dyn/.rela.plt instead of .rel.dyn/.rel.plt
     for (int i = 0; i < mod->ehdr->e_shnum; i++) {

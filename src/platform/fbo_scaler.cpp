@@ -136,6 +136,11 @@ static GLint loc_comp_ambient_r = -1;
 static GLint loc_comp_ambient_g = -1;
 static GLint loc_comp_ambient_b = -1;
 static GLint loc_comp_tex_size = -1;
+static GLint loc_comp_pbr_enabled = -1;
+static GLint loc_comp_reflections_enabled = -1;
+static GLint loc_comp_reflection_intensity = -1;
+static GLint loc_comp_time = -1;
+static GLint loc_comp_ui_pass = -1;
 
 // g_prog_postfx uniforms
 static GLint loc_postfx_tex = -1;
@@ -603,7 +608,8 @@ void main() {
     vec3 pos_c = get_view_pos(v_uv);
     vec3 pos_r = get_view_pos(v_uv + vec2(px.x, 0.0));
     vec3 pos_u = get_view_pos(v_uv + vec2(0.0, px.y));
-    vec3 normal = normalize(cross(pos_r - pos_c, pos_u - pos_c));
+    // Flip normal direction to face the camera (Z increases with distance, so camera points to smaller Z)
+    vec3 normal = normalize(cross(pos_u - pos_c, pos_r - pos_c));
     
     float occlusion = 0.0;
     int samples = 16;
@@ -712,32 +718,35 @@ uniform float u_gr_tint_r, u_gr_tint_g, u_gr_tint_b;  // god ray color tint
 uniform float u_shadow_enabled;  // 0 or 1
 uniform float u_shadow_intensity;
 uniform float u_shadow_softness;
-uniform vec2  u_shadow_light_dir;  // 2D light direction in UV space (from sun toward scene)
-uniform float u_shadow_sun_z;      // virtual sun depth (>0 = player/camera side, <0 = background side)
+uniform vec2  u_shadow_light_dir;  // 2D light direction in UV space
+uniform float u_shadow_sun_z;      // virtual sun depth
 uniform float u_shadow_near;
 uniform float u_shadow_far;
 uniform vec2  u_tex_size;          // resolution size
 
 // === Background-driven atmosphere (from SRE) ===
 uniform float u_bg_depth;       // distance to background plane
-uniform float u_bg_scale;       // background scale (larger = closer sky)
-uniform float u_shadow_lift;    // how much to brighten shadows (0.0-0.5)
+uniform float u_bg_scale;       // background scale
+uniform float u_shadow_lift;    // how much to brighten shadows
 uniform float u_ambient_r, u_ambient_g, u_ambient_b;  // sky ambient color
 
 // === Game-Engine Light Handshake ===
-// These uniforms are fed directly from the live GL state captured by the
-// JNI bridge hooks (glLightfv, glMaterialfv, glLoadMatrixf, glColor4f).
-// They allow effects to be driven by the game's actual lighting rather
-// than static per-preset values.
-uniform vec4  u_light0_pos;      // GL_LIGHT0 position (w=0 directional, w=1 point)
+uniform vec4  u_light0_pos;      // GL_LIGHT0 position
 uniform vec4  u_light0_diffuse;  // GL_LIGHT0 diffuse color
 uniform vec4  u_light0_ambient;  // GL_LIGHT0 ambient color
 uniform vec4  u_light_model_amb; // glLightModel global ambient
-uniform vec4  u_mat_diffuse;     // current material diffuse (boss/char color)
+uniform vec4  u_mat_diffuse;     // current material diffuse
 uniform vec4  u_cur_color;       // current glColor4 vertex color
-uniform vec3  u_player_world;    // hero world-space position (from SRE)
+uniform vec3  u_player_world;    // hero world-space position
 uniform mat4  u_modelview;       // current modelview matrix
 uniform mat4  u_projection;      // current projection matrix
+
+// === Remaster (Tier 3) Uniforms ===
+uniform float u_pbr_enabled;          // 0 or 1
+uniform float u_reflections_enabled;  // 0 or 1
+uniform float u_reflection_intensity; // 0-1
+uniform float u_time;                 // animated ripples
+uniform float u_ui_pass;              // 0 or 1 (bypasses postfx for UI)
 
 in vec2 v_uv;
 out vec4 FragColor;
@@ -752,48 +761,190 @@ float linearize_depth(float d) {
     return (2.0 * n) / (f + n - d * (f - n));
 }
 
-// Derive a screen-space shadow direction from the live GL_LIGHT0 position.
-// When the game has a real directional light (w=0), we use its XY components
-// directly.  For point lights (w=1) we project the light relative to the
-// player world position so shadows always radiate away from the light.
+// Derive screen-space shadow direction
 vec2 compute_light_dir_ss() {
     if (u_light0_pos.w < 0.5) {
-        // Directional light — use XY as direction
         return normalize(u_light0_pos.xy + vec2(0.0001));
     } else {
-        // Point light — project light vs player into screen space using matrices
         vec4 light_clip  = u_projection * u_modelview * vec4(u_light0_pos.xyz, 1.0);
         vec4 player_clip = u_projection * u_modelview * vec4(u_player_world, 1.0);
+        
+        // Robustness: check for division by zero
+        if (abs(light_clip.w) < 0.0001 || abs(player_clip.w) < 0.0001) {
+            return u_shadow_light_dir;
+        }
+        
         vec2 light_ss  = (light_clip.xy  / light_clip.w)  * 0.5 + 0.5;
         vec2 player_ss = (player_clip.xy / player_clip.w) * 0.5 + 0.5;
+        
+        // Robustness: check for NaN / Inf
+        if (any(isnan(light_ss)) || any(isinf(light_ss)) || any(isnan(player_ss)) || any(isinf(player_ss))) {
+            return u_shadow_light_dir;
+        }
+        
         vec2 d = light_ss - player_ss;
         float len = length(d);
-        return len > 0.001 ? d / len : u_shadow_light_dir;
+        
+        // Robustness: check for NaN/Inf length
+        if (isnan(len) || isinf(len) || len <= 0.001) {
+            return u_shadow_light_dir;
+        }
+        return d / len;
     }
 }
 
-// Derive tint from material diffuse and vertex color.
-// This lets the composite shader know when a boss/character has a custom
-// color applied (e.g. Fire Boss turning green, damage red flash).
+// Material/vertex color tint helper
 vec3 get_material_tint() {
-    // Both material diffuse and vertex color are 1,1,1 by default.
-    // Only blend when one of them is non-neutral.
     vec3 md = u_mat_diffuse.rgb;
     vec3 vc = u_cur_color.rgb;
-    // Cheap divergence check: if both are near-white, return neutral.
     float md_diff = dot(abs(md - vec3(0.8)), vec3(1.0));
     float vc_diff = dot(abs(vc - vec3(1.0)), vec3(1.0));
     if (md_diff < 0.12 && vc_diff < 0.12) return vec3(1.0);
-    // Weight material diffuse heavier (it's set per-model, not per-vertex)
     return clamp(md * 0.7 + vc * 0.3, vec3(0.0), vec3(1.0));
 }
 
+// --- Procedural LabPBR Material System ---
+struct Material {
+    int id; // 0=default, 1=water, 2=lava/emissive, 3=gold/metallic, 4=foliage
+    float roughness;
+    float metalness;
+    float emissive;
+    vec3 F0;
+};
+
+Material get_material(vec3 color, float depth) {
+    Material mat;
+    mat.id = 0;
+    mat.roughness = 0.8;
+    mat.metalness = 0.0;
+    mat.emissive = 0.0;
+    mat.F0 = vec3(0.04);
+    
+    if (depth > 0.95) {
+        return mat; // Sky/Background
+    }
+    
+    // 1. Water (Cyan-blue signature)
+    if (color.b > 0.45 && color.g > 0.25 && color.r < 0.35) {
+        mat.id = 1;
+        mat.roughness = 0.08;
+        mat.metalness = 0.1;
+        mat.F0 = vec3(0.02);
+        return mat;
+    }
+    
+    // 2. Lava / Fire (Highly emissive red-orange)
+    if (color.r > 0.80 && color.g > 0.22 && color.b < 0.20) {
+        mat.id = 2;
+        mat.emissive = 1.0;
+        mat.roughness = 1.0;
+        return mat;
+    }
+    
+    // 3. Gold / Coins / Key objects (Yellowish reflection)
+    if (color.r > 0.70 && color.g > 0.50 && color.b < 0.30) {
+        mat.id = 3;
+        mat.roughness = 0.18;
+        mat.metalness = 0.95;
+        mat.F0 = color; // reflect base color
+        return mat;
+    }
+    
+    // 4. Foliage / Grass (Green tone classification)
+    if (color.g > color.r * 1.15 && color.g > color.b * 1.15 && color.g > 0.20) {
+        mat.id = 4;
+        mat.roughness = 0.85;
+        return mat;
+    }
+    
+    return mat;
+}
+
+// --- Physically Based Shading (GGX Cook-Torrance BRDF) ---
+float D_GGX(float NoH, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NoH2 = NoH * NoH;
+    float num = a2;
+    float denom = (NoH2 * (a2 - 1.0) + 1.0);
+    denom = 3.14159265 * denom * denom;
+    return num / max(denom, 0.0001);
+}
+
+float G_SchlickGGX(float NoV, float roughness) {
+    float r = (roughness + 1.0);
+    float k = (r * r) / 8.0;
+    float num = NoV;
+    float denom = NoV * (1.0 - k) + k;
+    return num / max(denom, 0.0001);
+}
+
+float G_Smith(float NoV, float NoL, float roughness) {
+    float ggx2 = G_SchlickGGX(NoV, roughness);
+    float ggx1 = G_SchlickGGX(NoL, roughness);
+    return ggx1 * ggx2;
+}
+
+vec3 F_Schlick(float cosTheta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+vec3 compute_pbr_shading(vec3 albedo, vec3 normal, Material mat) {
+    vec3 N = normal;
+    vec3 V = vec3(0.0, 0.0, 1.0); // Orthographic view direction
+    
+    // Light direction (live JNI light or default)
+    vec2 live_dir = (u_light0_diffuse.r + u_light0_diffuse.g + u_light0_diffuse.b > 0.05)
+                     ? compute_light_dir_ss() : u_shadow_light_dir;
+    vec3 L = normalize(vec3(live_dir, 0.5));
+    vec3 H = normalize(V + L);
+    
+    float NoV = clamp(dot(N, V), 0.0, 1.0);
+    float NoL = clamp(dot(N, L), 0.0, 1.0);
+    float NoH = clamp(dot(N, H), 0.0, 1.0);
+    float VoH = clamp(dot(V, H), 0.0, 1.0);
+    
+    // Cook-Torrance Specular BRDF terms
+    float D = D_GGX(NoH, mat.roughness);
+    float G = G_Smith(NoV, NoL, mat.roughness);
+    vec3 F = F_Schlick(VoH, mat.F0);
+    
+    vec3 kS = F;
+    vec3 kD = vec3(1.0) - kS;
+    kD *= 1.0 - mat.metalness;
+    
+    // If the game light is too dark or zero, use a balanced fallback to avoid pitch blackness
+    vec3 light_color = u_light0_diffuse.rgb;
+    float luma_light = dot(light_color, vec3(0.299, 0.587, 0.114));
+    if (luma_light < 0.35) {
+        light_color = mix(light_color, vec3(0.7), 0.7 * (1.0 - luma_light / 0.35));
+    }
+    
+    vec3 diffuse = kD * albedo;
+    vec3 specular = (D * G * F) / max(4.0 * NoV * NoL, 0.001);
+    specular = clamp(specular, vec3(0.0), vec3(1.5));
+    
+    vec3 result = (diffuse + specular * 3.14159265) * light_color * (0.28 + 0.72 * NoL);
+    
+    // Base ambient preserves the engine's original pre-lit details
+    vec3 ambient = albedo * (u_light_model_amb.rgb * 0.5 + 0.5);
+    
+    // Smoothly blend PBR shading with original bright albedo for dynamic response + visibility
+    vec3 final_color = mix(albedo * 0.95 + specular * 0.25, result + ambient * 0.20, 0.52);
+    
+    if (mat.emissive > 0.5) {
+        final_color = max(final_color, albedo * 1.35);
+    }
+    
+    return final_color;
+}
+
+// Ray-cast screen-space shadows
 float compute_shadow_at(vec2 uv) {
     float my_depth = linearize_depth(texture(u_depth, uv).r);
     if (my_depth > 0.95) return 1.0;
     
     float shadow = 1.0;
-    // Use live-derived light direction if possible, else fall back to preset
     vec2 live_dir = (u_light0_diffuse.r + u_light0_diffuse.g + u_light0_diffuse.b > 0.05)
                      ? compute_light_dir_ss() : u_shadow_light_dir;
     vec3 ray_dir_3d = normalize(vec3(live_dir, u_shadow_sun_z));
@@ -801,8 +952,9 @@ float compute_shadow_at(vec2 uv) {
     float step_z   = ray_dir_3d.z  * u_shadow_softness;
     
     float dither = rand(uv);
+    int steps = u_pbr_enabled > 0.5 ? 18 : 12; // More ray steps in High preset
     
-    for (int i = 1; i <= 12; i++) {
+    for (int i = 1; i <= steps; i++) {
         float t = float(i) - dither * 0.9;
         vec2 sample_uv = uv + step_uv * t;
         float ray_depth = my_depth + step_z * t;
@@ -814,92 +966,154 @@ float compute_shadow_at(vec2 uv) {
         float depth_diff = ray_depth - sample_depth;
         
         if (depth_diff > 0.001 && depth_diff < 0.18) {
-            float falloff = 1.0 - t / 12.0;
+            float falloff = 1.0 - t / float(steps);
             shadow = min(shadow, 1.0 - u_shadow_intensity * falloff);
         }
     }
     return shadow;
 }
 
-float compute_shadow_soft() {
-    float eps_x = 1.2 / u_tex_size.x;
-    float eps_y = 1.2 / u_tex_size.y;
-    
-    float s_c = compute_shadow_at(v_uv);
-    float s_r = compute_shadow_at(v_uv + vec2(eps_x, 0.0));
-    float s_l = compute_shadow_at(v_uv - vec2(eps_x, 0.0));
-    float s_u = compute_shadow_at(v_uv + vec2(0.0, eps_y));
-    float s_d = compute_shadow_at(v_uv - vec2(0.0, eps_y));
-    
-    return (s_c * 4.0 + s_r + s_l + s_u + s_d) / 8.0;
+// PCF (Percentage Closer Filtering)
+float compute_shadow_pcf() {
+    if (u_pbr_enabled < 0.5) {
+        // Standard fast 5-tap PCF
+        float eps_x = 1.2 / u_tex_size.x;
+        float eps_y = 1.2 / u_tex_size.y;
+        float s_c = compute_shadow_at(v_uv);
+        float s_r = compute_shadow_at(v_uv + vec2(eps_x, 0.0));
+        float s_l = compute_shadow_at(v_uv - vec2(eps_x, 0.0));
+        float s_u = compute_shadow_at(v_uv + vec2(0.0, eps_y));
+        float s_d = compute_shadow_at(v_uv - vec2(0.0, eps_y));
+        return (s_c * 4.0 + s_r + s_l + s_u + s_d) / 8.0;
+    } else {
+        // High quality dithered rotative PCF (reduces banding)
+        float s_c = compute_shadow_at(v_uv);
+        float eps_x = 2.0 * u_shadow_softness / u_tex_size.x;
+        float eps_y = 2.0 * u_shadow_softness / u_tex_size.y;
+        
+        float angle = rand(v_uv) * 6.28318;
+        vec2 dir = vec2(cos(angle), sin(angle)) * 0.7;
+        
+        float s_r = compute_shadow_at(v_uv + vec2(dir.x * eps_x, dir.y * eps_y));
+        float s_l = compute_shadow_at(v_uv - vec2(dir.x * eps_x, dir.y * eps_y));
+        float s_u = compute_shadow_at(v_uv + vec2(-dir.y * eps_x, dir.x * eps_y));
+        float s_d = compute_shadow_at(v_uv - vec2(-dir.y * eps_x, dir.x * eps_y));
+        
+        return (s_c * 2.0 + s_r + s_l + s_u + s_d) / 6.0;
+    }
 }
 
-vec3 get_bumped_scene(vec2 uv) {
-    float eps_x = 1.0 / u_tex_size.x;
-    float eps_y = 1.0 / u_tex_size.y;
+// Planar water reflection
+vec3 compute_water_reflection(vec3 current_scene, float depth, vec3 color) {
+    float water_level = v_uv.y;
+    // Find bank boundary/shoreline
+    for (float offset = 0.002; offset < 0.12; offset += 0.004) {
+        vec2 sample_uv = v_uv + vec2(0.0, offset);
+        vec3 c = texture(u_scene, sample_uv).rgb;
+        bool is_still_water = (c.b > 0.45 && c.g > 0.25 && c.r < 0.35);
+        if (!is_still_water) {
+            water_level = sample_uv.y;
+            break;
+        }
+    }
     
-    // Sample luminance around the current pixel to get height map
-    float h_c  = dot(texture(u_scene, uv).rgb, vec3(0.2126, 0.7152, 0.0722));
-    float h_r  = dot(texture(u_scene, uv + vec2(eps_x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722));
-    float h_l  = dot(texture(u_scene, uv - vec2(eps_x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722));
-    float h_u  = dot(texture(u_scene, uv + vec2(0.0, eps_y)).rgb, vec3(0.2126, 0.7152, 0.0722));
-    float h_d  = dot(texture(u_scene, uv - vec2(0.0, eps_y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    // Mirror coords vertically
+    vec2 reflect_uv = vec2(v_uv.x, water_level + (water_level - v_uv.y) * 0.85);
     
-    // Compute bump gradient
-    vec2 bump = vec2(h_r - h_l, h_u - h_d);
+    // Wave ripple distortion
+    reflect_uv.x += sin(v_uv.y * 65.0 + u_time * 3.5) * 0.0025;
+    reflect_uv.y += cos(v_uv.x * 65.0 + u_time * 3.5) * 0.0018;
+    reflect_uv = clamp(reflect_uv, vec2(0.0), vec2(1.0));
     
-    vec2 displaced_uv = uv - bump * 0.0018;
-    displaced_uv = clamp(displaced_uv, vec2(0.0), vec2(1.0));
+    vec3 reflected_color = texture(u_scene, reflect_uv).rgb;
     
-    vec3 col = texture(u_scene, displaced_uv).rgb;
+    // Fade reflections near shorelines
+    float shoreline_dist = clamp((water_level - v_uv.y) * 12.0, 0.0, 1.0);
+    float reflection_blend = u_reflection_intensity * shoreline_dist;
     
-    vec3 normal = normalize(vec3(-bump.x * 2.0, -bump.y * 2.0, 1.0));
-    
-    // Use live light direction for bump shading too
-    vec2 live_dir = (u_light0_diffuse.r + u_light0_diffuse.g + u_light0_diffuse.b > 0.05)
-                     ? compute_light_dir_ss() : u_shadow_light_dir;
-    vec3 light_dir_3d = normalize(vec3(live_dir, -u_shadow_sun_z));
-    float diff = clamp(dot(normal, light_dir_3d), 0.0, 1.0);
-    col *= (0.88 + 0.24 * diff);
-    
-    return col;
+    return mix(current_scene, reflected_color, reflection_blend);
 }
 
 void main() {
-    vec3 scene = get_bumped_scene(v_uv);
+    if (u_ui_pass > 0.5) {
+        FragColor = texture(u_scene, v_uv);
+        return;
+    }
+    float eps_x = 1.0 / u_tex_size.x;
+    float eps_y = 1.0 / u_tex_size.y;
     
-    // Apply SSAO with shadow lift
-    if (u_ao_enabled > 0.5) {
+    // Displaced UV based on color height-bump
+    float h_c  = dot(texture(u_scene, v_uv).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float h_r  = dot(texture(u_scene, v_uv + vec2(eps_x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float h_l  = dot(texture(u_scene, v_uv - vec2(eps_x, 0.0)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float h_u  = dot(texture(u_scene, v_uv + vec2(0.0, eps_y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    float h_d  = dot(texture(u_scene, v_uv - vec2(0.0, eps_y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+    
+    vec2 bump = vec2(h_r - h_l, h_u - h_d);
+    vec2 displaced_uv = v_uv - bump * 0.0018;
+    displaced_uv = clamp(displaced_uv, vec2(0.0), vec2(1.0));
+    
+    vec3 albedo = texture(u_scene, displaced_uv).rgb;
+    vec3 normal = normalize(vec3(-bump.x * 5.2, -bump.y * 5.2, 1.0));
+    
+    float d_c = linearize_depth(texture(u_depth, displaced_uv).r);
+    Material mat = get_material(albedo, d_c);
+    
+    vec3 scene;
+    if (u_pbr_enabled > 0.5) {
+        scene = compute_pbr_shading(albedo, normal, mat);
+    } else {
+        vec2 live_dir = (u_light0_diffuse.r + u_light0_diffuse.g + u_light0_diffuse.b > 0.05)
+                         ? compute_light_dir_ss() : u_shadow_light_dir;
+        vec3 light_dir_3d = normalize(vec3(live_dir, -u_shadow_sun_z));
+        float diff = clamp(dot(normal, light_dir_3d), 0.0, 1.0);
+        scene = albedo * (0.88 + 0.24 * diff);
+    }
+    
+    // Apply SSAO (skip for lava/emissive)
+    if (u_ao_enabled > 0.5 && mat.emissive < 0.5) {
         float ao = texture(u_ao, v_uv).r;
         ao = mix(ao, 1.0, u_shadow_lift);
         scene *= ao;
     }
     
-    // Apply screen-space shadows
-    if (u_shadow_enabled > 0.5) {
-        float shadow = compute_shadow_soft();
+    // Apply screen-space shadows (skip for lava/emissive)
+    if (u_shadow_enabled > 0.5 && mat.emissive < 0.5) {
+        float shadow = compute_shadow_pcf();
         scene *= shadow;
     }
     
-    // Ambient sky color influence — combine preset sky + live GL light model ambient
+    // Dynamic reflections for water
+    if (u_reflections_enabled > 0.5 && mat.id == 1) {
+        scene = compute_water_reflection(scene, d_c, albedo);
+    }
+    
+    // Foliage subsurface scattering simulation
+    if (u_pbr_enabled > 0.5 && mat.id == 4) {
+        vec2 live_dir = (u_light0_diffuse.r + u_light0_diffuse.g + u_light0_diffuse.b > 0.05)
+                         ? compute_light_dir_ss() : u_shadow_light_dir;
+        vec3 L = normalize(vec3(live_dir, 0.5));
+        float sss = clamp(dot(normal, -L), 0.0, 1.0) * 0.12;
+        scene += vec3(0.08, 0.16, 0.06) * sss * u_light0_diffuse.rgb;
+    }
+    
+    // Ambient sky color influence
     float luma = dot(scene, vec3(0.2126, 0.7152, 0.0722));
     float shadow_mask = smoothstep(0.4, 0.1, luma);
     vec3 sky_ambient  = vec3(u_ambient_r, u_ambient_g, u_ambient_b);
     vec3 guest_ambient = u_light_model_amb.rgb;
-    vec3 ambient = mix(sky_ambient, sky_ambient * guest_ambient * 3.0, 0.35);
-    scene += ambient * shadow_mask * 0.10;
+    vec3 tot_ambient = mix(sky_ambient, sky_ambient * guest_ambient * 3.0, 0.35);
+    scene += tot_ambient * shadow_mask * 0.10;
     
-    // Material/vertex color tint — subtly push shadows toward the model's own color.
-    // This preserves boss color overrides (green Fire Boss etc.) in dark areas.
+    // Material/vertex color tint
     vec3 mat_tint = get_material_tint();
-    float dark_mask = smoothstep(0.5, 0.1, luma);  // only in dark regions
+    float dark_mask = smoothstep(0.5, 0.1, luma);
     scene = mix(scene, scene * mat_tint, dark_mask * 0.25);
     
     // Apply God Rays (additive with tint)
     if (u_gr_enabled > 0.5) {
         vec3 rays = texture(u_godrays, v_uv).rgb;
         vec3 tint = vec3(u_gr_tint_r, u_gr_tint_g, u_gr_tint_b);
-        // Bias god-ray tint toward the actual diffuse light color
         tint = mix(tint, u_light0_diffuse.rgb, 0.25);
         scene += rays * tint;
     }
@@ -907,19 +1121,19 @@ void main() {
     // Apply Bloom (additive glow)
     if (u_bloom_enabled > 0.5) {
         vec3 bloom = texture(u_bloom, v_uv).rgb;
-        scene += bloom * u_bloom_intensity;
+        float boost = mat.emissive > 0.5 ? 2.5 : 1.0; // Emissive boost for Lava
+        scene += bloom * u_bloom_intensity * boost;
     }
     
-    // --- Tone mapping (Extended Reinhard) ---
-    float Lwhite = 2.5;
-    scene = scene * (1.0 + scene / (Lwhite * Lwhite)) / (1.0 + scene);
+    // --- Highlight compression (SDR friendly) ---
+    // Preserves white point at 1.0, boosts midtones, and rolls off values > 1.0 safely
+    scene = scene * 1.12 / (1.0 + scene * 0.12);
     
     // --- Saturation boost ---
     float luma2 = dot(scene, vec3(0.2126, 0.7152, 0.0722));
-    scene = mix(vec3(luma2), scene, 1.18);
+    scene = mix(vec3(luma2), scene, 1.12);
     
-    // --- Contrast micro-curve ---
-    scene = smoothstep(0.02, 1.0, scene);
+    // No more harsh smoothstep crushing blacks
     
     FragColor = vec4(clamp(scene, 0.0, 1.0), 1.0);
 }
@@ -1073,6 +1287,7 @@ static GLuint get_program(FBOScale mode) {
 }
 
 // Fullscreen quad data (uploaded to VBO during fbo_init)
+// Fullscreen quad data - 4 vertices for GL_TRIANGLE_FAN (compatibility profile)
 static const float FSQ[] = {
     -1.0f, -1.0f,  0.0f, 0.0f,
      1.0f, -1.0f,  1.0f, 0.0f,
@@ -1131,8 +1346,9 @@ bool fbo_init(int game_w, int game_h) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    // Important: allow reading depth component when sampling
-    glTexParameteri(GL_TEXTURE_2D, GL_DEPTH_TEXTURE_MODE, GL_LUMINANCE);
+    // GL_DEPTH_TEXTURE_MODE is deprecated/removed in GL3 core — omit it.
+    // Use GL_TEXTURE_COMPARE_MODE = GL_NONE so depth reads as a plain float.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
     glBindTexture(GL_TEXTURE_2D, 0);
 
     glGenFramebuffers(1, &g_fbo);
@@ -1153,9 +1369,16 @@ bool fbo_init(int game_w, int game_h) {
     if (!create_fbo(g_postfx_fbo, g_postfx_tex, game_w, game_h)) {
         std::cerr << "[FBO] PostFX FBO A incomplete" << std::endl;
     }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_postfx_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, g_fbo_depth_tex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
     if (!create_fbo(g_postfx_fbo_b, g_postfx_tex_b, game_w, game_h)) {
         std::cerr << "[FBO] PostFX FBO B incomplete" << std::endl;
     }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_postfx_fbo_b);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, g_fbo_depth_tex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (!create_fbo(g_half_fbo_a, g_half_tex_a, g_half_w, g_half_h)) {
         std::cerr << "[FBO] Half-res FBO A incomplete" << std::endl;
     }
@@ -1240,6 +1463,11 @@ bool fbo_init(int game_w, int game_h) {
         loc_comp_ambient_g        = glGetUniformLocation(g_prog_composite, "u_ambient_g");
         loc_comp_ambient_b        = glGetUniformLocation(g_prog_composite, "u_ambient_b");
         loc_comp_tex_size         = glGetUniformLocation(g_prog_composite, "u_tex_size");
+        loc_comp_pbr_enabled      = glGetUniformLocation(g_prog_composite, "u_pbr_enabled");
+        loc_comp_reflections_enabled = glGetUniformLocation(g_prog_composite, "u_reflections_enabled");
+        loc_comp_reflection_intensity = glGetUniformLocation(g_prog_composite, "u_reflection_intensity");
+        loc_comp_time             = glGetUniformLocation(g_prog_composite, "u_time");
+        loc_comp_ui_pass          = glGetUniformLocation(g_prog_composite, "u_ui_pass");
     }
     if (g_prog_postfx) {
         loc_postfx_tex                  = glGetUniformLocation(g_prog_postfx, "u_tex");
@@ -1329,9 +1557,15 @@ void fbo_destroy() {
 }
 
 void fbo_begin_game() {
-    if (!g_fbo_ok) return;
+    extern PostFXState g_postfx;
+    if (!g_fbo_ok || !g_postfx.enabled) return;
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
     glViewport(0, 0, g_game_w, g_game_h);
+
+    // Clear stencil buffer to 0 at the start of each frame
+    glStencilMask(0xFF);
+    glClearStencil(0);
+    glClear(GL_STENCIL_BUFFER_BIT);
     
     static int begin_diag_count = 0;
     if (begin_diag_count < 5) {
@@ -1342,7 +1576,7 @@ void fbo_begin_game() {
 }
 
 void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXState* postfx) {
-    if (!g_fbo_ok) return;
+    if (!g_fbo_ok || !postfx || !postfx->enabled) return;
 
     static int end_diag_count = 0;
     if (end_diag_count < 5) {
@@ -1357,7 +1591,7 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Save GL state manually (Optimization 3 — replaces glPushAttrib/glPopAttrib)
+    // Save GL state (same pattern as v7 which worked — compat profile supports these)
     GLint old_prog = 0;
     glGetIntegerv(GL_CURRENT_PROGRAM, &old_prog);
     GLboolean saved_depth_test = glIsEnabled(GL_DEPTH_TEST);
@@ -1425,17 +1659,17 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         glBindTexture(GL_TEXTURE_2D, g_fbo_depth_tex);
         draw_fsq();
 
-        // Blur SSAO horizontally: half_a -> half_b
+        // Blur SSAO horizontally: half_a -> half_b (increased to 2.2f for soft feathered shadows)
         glBindFramebuffer(GL_FRAMEBUFFER, g_half_fbo_b);
         glUseProgram(g_prog_blur);
         glUniform1i(loc_blur_tex, 0);
-        glUniform2f(loc_blur_direction, 1.0f / g_half_w, 0.0f);
+        glUniform2f(loc_blur_direction, 2.2f / g_half_w, 0.0f);
         glBindTexture(GL_TEXTURE_2D, g_half_tex_a);
         draw_fsq();
 
         // Blur SSAO vertically: half_b -> half_a
         glBindFramebuffer(GL_FRAMEBUFFER, g_half_fbo_a);
-        glUniform2f(loc_blur_direction, 0.0f, 1.0f / g_half_h);
+        glUniform2f(loc_blur_direction, 0.0f, 2.2f / g_half_h);
         glBindTexture(GL_TEXTURE_2D, g_half_tex_b);
         draw_fsq();
 
@@ -1640,6 +1874,18 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         if (loc_comp_tex_size != -1) {
             glUniform2f(loc_comp_tex_size, (float)g_game_w, (float)g_game_h);
         }
+        if (loc_comp_pbr_enabled != -1) {
+            glUniform1f(loc_comp_pbr_enabled, (postfx && postfx->pbr_enabled) ? 1.0f : 0.0f);
+        }
+        if (loc_comp_reflections_enabled != -1) {
+            glUniform1f(loc_comp_reflections_enabled, (postfx && postfx->reflections_enabled) ? 1.0f : 0.0f);
+        }
+        if (loc_comp_reflection_intensity != -1) {
+            glUniform1f(loc_comp_reflection_intensity, postfx ? postfx->reflection_intensity : 0.35f);
+        }
+        if (loc_comp_time != -1) {
+            glUniform1f(loc_comp_time, g_postfx_time);
+        }
 
         // ── Game-engine handshake — upload live GL state to composite shader ────
         // Find the first enabled light (or fall back to light0 data as-is).
@@ -1650,26 +1896,86 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
             for (int li = 0; li < 8; li++) {
                 if (g_frame_lights[li].enabled) { best = li; break; }
             }
+
+            float safe_modelview[16];
+            float safe_projection[16];
+            memcpy(safe_modelview, g_current_modelview, 64);
+            memcpy(safe_projection, g_current_projection, 64);
+            
+            bool mv_invalid = false;
+            for (int i = 0; i < 16; i++) {
+                if (std::isnan(safe_modelview[i]) || std::isinf(safe_modelview[i])) {
+                    mv_invalid = true;
+                    break;
+                }
+            }
+            if (mv_invalid) {
+                float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                memcpy(safe_modelview, identity, 64);
+            }
+            
+            bool proj_invalid = false;
+            for (int i = 0; i < 16; i++) {
+                if (std::isnan(safe_projection[i]) || std::isinf(safe_projection[i])) {
+                    proj_invalid = true;
+                    break;
+                }
+            }
+            if (proj_invalid) {
+                float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                memcpy(safe_projection, identity, 64);
+            }
+
+            float safe_light_pos[4];
+            float safe_light_diff[4];
+            float safe_light_amb[4];
+            float safe_light_model_amb[4];
+            float safe_mat_diff[4];
+            float safe_cur_color[4];
+            float safe_player_world[3];
+            
+            memcpy(safe_light_pos, g_frame_lights[best].position, 16);
+            memcpy(safe_light_diff, g_frame_lights[best].diffuse, 16);
+            memcpy(safe_light_amb, g_frame_lights[best].ambient, 16);
+            memcpy(safe_light_model_amb, g_frame_light_model_ambient, 16);
+            memcpy(safe_mat_diff, g_frame_material.diffuse, 16);
+            memcpy(safe_cur_color, g_current_color, 16);
+            memcpy(safe_player_world, g_host_hero_pos, 12);
+            
+            for (int i = 0; i < 4; i++) {
+                if (std::isnan(safe_light_pos[i]) || std::isinf(safe_light_pos[i])) safe_light_pos[i] = 0.0f;
+                if (std::isnan(safe_light_diff[i]) || std::isinf(safe_light_diff[i])) safe_light_diff[i] = 1.0f;
+                if (std::isnan(safe_light_amb[i]) || std::isinf(safe_light_amb[i])) safe_light_amb[i] = 0.0f;
+                if (std::isnan(safe_light_model_amb[i]) || std::isinf(safe_light_model_amb[i])) safe_light_model_amb[i] = 0.2f;
+                if (std::isnan(safe_mat_diff[i]) || std::isinf(safe_mat_diff[i])) safe_mat_diff[i] = 0.8f;
+                if (std::isnan(safe_cur_color[i]) || std::isinf(safe_cur_color[i])) safe_cur_color[i] = 1.0f;
+            }
+            for (int i = 0; i < 3; i++) {
+                if (std::isnan(safe_player_world[i]) || std::isinf(safe_player_world[i])) safe_player_world[i] = 0.0f;
+            }
+
             if (loc_comp_light0_pos     != -1)
-                glUniform4fv(loc_comp_light0_pos,     1, g_frame_lights[best].position);
+                glUniform4fv(loc_comp_light0_pos,     1, safe_light_pos);
             if (loc_comp_light0_diffuse != -1)
-                glUniform4fv(loc_comp_light0_diffuse, 1, g_frame_lights[best].diffuse);
+                glUniform4fv(loc_comp_light0_diffuse, 1, safe_light_diff);
             if (loc_comp_light0_ambient != -1)
-                glUniform4fv(loc_comp_light0_ambient, 1, g_frame_lights[best].ambient);
+                glUniform4fv(loc_comp_light0_ambient, 1, safe_light_amb);
             if (loc_comp_light_model_amb != -1)
-                glUniform4fv(loc_comp_light_model_amb, 1, g_frame_light_model_ambient);
+                glUniform4fv(loc_comp_light_model_amb, 1, safe_light_model_amb);
             if (loc_comp_mat_diffuse    != -1)
-                glUniform4fv(loc_comp_mat_diffuse,    1, g_frame_material.diffuse);
+                glUniform4fv(loc_comp_mat_diffuse,    1, safe_mat_diff);
             if (loc_comp_cur_color      != -1)
-                glUniform4fv(loc_comp_cur_color,      1, g_current_color);
+                glUniform4fv(loc_comp_cur_color,      1, safe_cur_color);
             // Hero world position from host handshake
             if (loc_comp_player_world   != -1)
-                glUniform3fv(loc_comp_player_world, 1, g_host_hero_pos);
+                glUniform3fv(loc_comp_player_world, 1, safe_player_world);
             if (loc_comp_modelview      != -1)
-                glUniformMatrix4fv(loc_comp_modelview,  1, GL_FALSE, g_current_modelview);
+                glUniformMatrix4fv(loc_comp_modelview,  1, GL_FALSE, safe_modelview);
             if (loc_comp_projection     != -1)
-                glUniformMatrix4fv(loc_comp_projection, 1, GL_FALSE, g_current_projection);
+                glUniformMatrix4fv(loc_comp_projection, 1, GL_FALSE, safe_projection);
         }
+        
+        // Single composite draw — no stencil tricks (g_postfx_fbo has no stencil attachment)
         draw_fsq();
 
         final_tex = g_postfx_tex;
@@ -1736,7 +2042,7 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         glBlitFramebuffer(0, 0, g_game_w, g_game_h, 0, 0, win_w, win_h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glUseProgram(old_prog);
-        // Restore GL state (Optimization 3)
+        // Restore GL state
         if (saved_depth_test) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
         if (saved_blend)      glEnable(GL_BLEND);      else glDisable(GL_BLEND);
         if (saved_cull_face)  glEnable(GL_CULL_FACE);  else glDisable(GL_CULL_FACE);
@@ -1757,7 +2063,7 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
     if (!prog) {
         // Fallback blit
         glUseProgram(old_prog);
-        // Restore GL state (Optimization 3)
+        // Restore GL state
         if (saved_depth_test) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
         if (saved_blend)      glEnable(GL_BLEND);      else glDisable(GL_BLEND);
         if (saved_cull_face)  glEnable(GL_CULL_FACE);  else glDisable(GL_CULL_FACE);
@@ -1812,7 +2118,7 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
     draw_fsq();
 
     glUseProgram(old_prog);
-    // Restore GL state (Optimization 3)
+    // Restore GL state
     if (saved_depth_test) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     if (saved_blend)      glEnable(GL_BLEND);      else glDisable(GL_BLEND);
     if (saved_cull_face)  glEnable(GL_CULL_FACE);  else glDisable(GL_CULL_FACE);
@@ -1837,90 +2143,154 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
     switch (p) {
         case PostFXPreset::OFF:
             s.enabled = true;
-            s.ssao = true; s.ssao_radius = 0.042f; s.ssao_intensity = 2.1f;
-            s.shadow_intensity = 0.425f;
+            s.ssao = false; // Disabled for performance/clarity on Low
+            s.shadow_intensity = 0.20f;
             s.shadow_softness = 0.004f;
             s.shadow_light_x = 0.3f;
             s.shadow_light_y = -0.8f;
             s.color_adjust = true;
-            s.warmth = 0.18f;
-            s.contrast = 1.13f;
-            s.saturation = 1.15f;
-            s.brightness = 0.14f;
+            s.warmth = 0.05f;
+            s.contrast = 1.0f;
+            s.saturation = 1.05f;
+            s.brightness = 0.06f;
             s.vignette = true;
-            s.vignette_intensity = 0.35f;
+            s.vignette_intensity = 0.12f;
             s.preset_name = "Low";
             break;
-        case PostFXPreset::SW_PLUS:
-    s.enabled = true;
+        case PostFXPreset::SW_PLUS_MEDIUM:
+            s.enabled = true;
 
-    // SSAO — gentle contact depth, preserve Swordigo's soft geometry
-    s.ssao = true;
-    s.ssao_radius = 0.036f;
-    s.ssao_intensity = 1.35f;
+            // SSAO — gentle contact depth, preserve Swordigo's soft geometry (made lighter)
+            s.ssao = true;
+            s.ssao_radius = 0.036f;
+            s.ssao_intensity = 0.85f;
 
-    // God rays — atmospheric, not dominant
-    s.god_rays = true;
-    s.god_rays_intensity = 0.42f;
-    s.god_rays_decay = 0.965f;
+            // God rays — atmospheric, not dominant
+            s.god_rays = true;
+            s.god_rays_intensity = 0.35f;
+            s.god_rays_decay = 0.965f;
 
-    // Sun above screen
-    s.sun_x = 0.58f;
-    s.sun_y = 1.12f;
+            // Sun above screen
+            s.sun_x = 0.58f;
+            s.sun_y = 1.12f;
 
-    // Volumetric atmosphere
-    s.volumetric_light = true;
-    s.volumetric_intensity = 0.24f;
+            // Volumetric atmosphere
+            s.volumetric_light = true;
+            s.volumetric_intensity = 0.22f;
 
-    // Color grading — preserve Swordigo palette, enrich rather than replace
-    s.color_adjust = true;
-    s.warmth = 0.08f;
-    s.contrast = 1.07f;
-    s.saturation = 1.08f;
-    s.brightness = 0.045f;
+            // Color grading — vibrant, warm, bright, rich
+            s.color_adjust = true;
+            s.warmth = 0.08f;
+            s.contrast = 1.02f;
+            s.saturation = 1.10f;
+            s.brightness = 0.01f;
 
-    // Very soft cinematic framing
-    s.vignette = true;
-    s.vignette_intensity = 0.20f;
+            // Soft vignette
+            s.vignette = true;
+            s.vignette_intensity = 0.12f;
 
-    // Crisp texture detail without ringing
-    s.sharpen = true;
-    s.sharpen_strength = 0.21f;
+            // Crisp texture detail without ringing
+            s.sharpen = true;
+            s.sharpen_strength = 0.21f;
 
-    // Extremely subtle lens separation
-    s.chromatic_aberration = false;
-    s.ca_offset = 0.00035f;
+            // Controlled bloom
+            s.bloom = true;
+            s.bloom_threshold = 0.82f;
+            s.bloom_intensity = 0.55f;
 
-    // Controlled bloom — only actual luminous/highlight regions
-    s.bloom = true;
-    s.bloom_threshold = 0.86f;
-    s.bloom_intensity = 0.38f;
+            // Soft directional shadows
+            s.shadows = true;
+            s.shadow_intensity = 0.25f;
+            s.shadow_softness = 0.0080f;
+            s.shadow_light_x = -0.10f;
+            s.shadow_light_y = 0.85f;
+            s.shadow_sun_z = 0.16f;
 
-    // Soft directional shadows
-    s.shadows = true;
-    s.shadow_intensity = 0.34f;
-    s.shadow_softness = 0.0080f;
-    s.shadow_light_x = -0.10f;
-    s.shadow_light_y = 0.85f;
-    s.shadow_sun_z = 0.16f;
+            s.pbr_enabled = false;
+            s.reflections_enabled = false;
+            s.preset_name = "Sw+ Med";
+            break;
 
-    // Tiny depth definition, not cartoon ink
-    s.outlines = true;
-    s.outline_thickness = 1.0f;
-    s.outline_intensity = 0.24f;
-    s.outline_depth_threshold = 0.0035f;
+        case PostFXPreset::SW_PLUS_HIGH:
+            s.enabled = true;
 
-    s.preset_name = "Sw+";
-    break;
+            // SSAO — gentle contact depth, preserve Swordigo's soft geometry (made lighter)
+            s.ssao = true;
+            s.ssao_radius = 0.036f;
+            s.ssao_intensity = 1.05f;
+
+            // God rays — atmospheric, not dominant
+            s.god_rays = true;
+            s.god_rays_intensity = 0.42f;
+            s.god_rays_decay = 0.965f;
+
+            // Sun above screen
+            s.sun_x = 0.58f;
+            s.sun_y = 1.12f;
+
+            // Volumetric atmosphere
+            s.volumetric_light = true;
+            s.volumetric_intensity = 0.28f;
+
+            // Color grading — vibrant, warm, bright, rich
+            s.color_adjust = true;
+            s.warmth = 0.08f;
+            s.contrast = 1.03f;
+            s.saturation = 1.12f;
+            s.brightness = 0.02f;
+
+            // Soft vignette
+            s.vignette = true;
+            s.vignette_intensity = 0.10f;
+
+            // Crisp texture detail without ringing
+            s.sharpen = true;
+            s.sharpen_strength = 0.21f;
+
+            // Remastered: Subtle cinematic chromatic aberration
+            s.chromatic_aberration = true;
+            s.ca_offset = 0.0006f;
+
+            // Remastered: Subtle organic film grain
+            s.film_grain = true;
+            s.grain_intensity = 0.015f;
+
+            // Controlled bloom — only actual luminous/highlight regions (boosted)
+            s.bloom = true;
+            s.bloom_threshold = 0.80f;
+            s.bloom_intensity = 0.70f;
+
+            // Soft directional shadows
+            s.shadows = true;
+            s.shadow_intensity = 0.28f;
+            s.shadow_softness = 0.0080f;
+            s.shadow_light_x = -0.10f;
+            s.shadow_light_y = 0.85f;
+            s.shadow_sun_z = 0.16f;
+
+            // Soft contours
+            s.outlines = true;
+            s.outline_thickness = 1.2f;
+            s.outline_intensity = 0.18f;
+            s.outline_depth_threshold = 0.0035f;
+
+            s.pbr_enabled = true;
+            s.reflections_enabled = true;
+            s.reflection_intensity = 0.35f;
+            s.preset_name = "Sw+ High";
+            break;
         case PostFXPreset::ATMOSPHERIC:
             s.enabled = true;
-            s.ssao = true; s.ssao_radius = 0.025f; s.ssao_intensity = 1.4f;
-            s.volumetric_light = true; s.volumetric_intensity = 0.25f;
+            s.ssao = true; s.ssao_radius = 0.025f; s.ssao_intensity = 0.8f;
+            s.volumetric_light = true; s.volumetric_intensity = 0.32f;
             s.sun_x = 0.7f; s.sun_y = 0.85f;
-            s.vignette = true; s.vignette_intensity = 0.3f;
-            s.color_adjust = true; s.contrast = 1.05f;
+            s.vignette = true; s.vignette_intensity = 0.15f;
+            s.color_adjust = true; 
+            s.contrast = 1.02f;
+            s.saturation = 1.08f;
+            s.brightness = 0.06f;
             s.bloom = true; s.bloom_threshold = 0.7f; s.bloom_intensity = 0.3f;
-            s.shadows = true; s.shadow_intensity = 0.5f; s.shadow_softness = 0.004f;
+            s.shadows = true; s.shadow_intensity = 0.28f; s.shadow_softness = 0.004f;
             s.shadow_light_x = 0.4f; s.shadow_light_y = -0.7f;
             s.preset_name = "Atmospheric";
             break;
@@ -2132,7 +2502,8 @@ void postfx_save_default_json() {
 const char* postfx_preset_name(PostFXPreset p) {
     switch (p) {
         case PostFXPreset::OFF: return "Low";
-        case PostFXPreset::SW_PLUS: return "Sw+";
+        case PostFXPreset::SW_PLUS_MEDIUM: return "Sw+ Med";
+        case PostFXPreset::SW_PLUS_HIGH: return "Sw+ High";
         case PostFXPreset::ATMOSPHERIC: return "Atmospheric";
         case PostFXPreset::ETHEREAL: return "Ethereal";
         case PostFXPreset::CINEMATIC: return "Cinematic";

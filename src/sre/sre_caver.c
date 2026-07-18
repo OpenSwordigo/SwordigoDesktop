@@ -343,11 +343,37 @@ void sre_CameraController_Update(void* self, float dt) {
     }
 
     static int s_was_active = 0;
+    static float s_vanilla_fov = 0.34906584f;
+    static float s_vanilla_aspect = 1.0f;
+    static float s_vanilla_near = 50.0f;
+    static float s_vanilla_far = 20000.0f;
+    static float s_vanilla_offset_x = 0.0f;
+    static float s_vanilla_offset_y = 0.0f;
+    static float s_vanilla_offset_z = 1000.0f;
+    static float s_vanilla_qx = 0.0f;
+    static float s_vanilla_qy = 0.0f;
+    static float s_vanilla_qz = 0.0f;
+    static float s_vanilla_qw = 1.0f;
 
     if (g_sre_cam_active) {
-        s_was_active = 1;
         void* camera = *(void**)((char*)self + 0x58);
         if (camera) {
+            // Save vanilla camera parameters on transition to active
+            if (!s_was_active) {
+                s_vanilla_fov = *(float*)((char*)camera + 0xf4);
+                s_vanilla_aspect = *(float*)((char*)camera + 0xf0);
+                s_vanilla_near = *(float*)((char*)camera + 0xf8);
+                s_vanilla_far = *(float*)((char*)camera + 0xfc);
+                s_vanilla_offset_x = *(float*)((char*)self + 0x04);
+                s_vanilla_offset_y = *(float*)((char*)self + 0x08);
+                s_vanilla_offset_z = *(float*)((char*)self + 0x0c);
+                s_vanilla_qx = *(float*)((char*)camera + 0x1c);
+                s_vanilla_qy = *(float*)((char*)camera + 0x20);
+                s_vanilla_qz = *(float*)((char*)camera + 0x24);
+                s_vanilla_qw = *(float*)((char*)camera + 0x28);
+            }
+            s_was_active = 1;
+
             if (g_sre_cam_pov_mode) {
                 extern volatile float g_sre_hero_pos_x;
                 extern volatile float g_sre_hero_pos_y;
@@ -403,17 +429,24 @@ void sre_CameraController_Update(void* self, float dt) {
         s_was_active = 0;
         void* camera = *(void**)((char*)self + 0x58);
         if (camera) {
-            *(float*)((char*)self + 0x04) = 0.0f;
-            *(float*)((char*)self + 0x08) = 0.0f;
-            *(float*)((char*)self + 0x0c) = 1000.0f;
+            // Restore vanilla level camera offsets
+            *(float*)((char*)self + 0x04) = s_vanilla_offset_x;
+            *(float*)((char*)self + 0x08) = s_vanilla_offset_y;
+            *(float*)((char*)self + 0x0c) = s_vanilla_offset_z;
 
             *(float*)((char*)self + 0x48) = 0.0f;
             *(float*)((char*)self + 0x4c) = 1.0f;
             *(float*)((char*)self + 0x50) = 0.0f;
 
+            // Restore vanilla camera orientation
+            *(float*)((char*)camera + 0x1c) = s_vanilla_qx;
+            *(float*)((char*)camera + 0x20) = s_vanilla_qy;
+            *(float*)((char*)camera + 0x24) = s_vanilla_qz;
+            *(float*)((char*)camera + 0x28) = s_vanilla_qw;
+
+            // Restore the exact vanilla projection parameters saved before the override
             if (g_Camera_SetPerspectiveProjection) {
-                // Vanilla values: 20 deg FOV (0.34906584f rad), aspect = 1.0f
-                g_Camera_SetPerspectiveProjection(camera, 0.34906584f, 1.0f, 50.0f, 20000.0f);
+                g_Camera_SetPerspectiveProjection(camera, s_vanilla_fov, s_vanilla_aspect, s_vanilla_near, s_vanilla_far);
             }
         }
     }

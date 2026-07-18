@@ -15,6 +15,7 @@
  * Usage:  ./ruby [optional_path_to_dir_or_file]
  */
 
+#define IMGUI_DEFINE_MATH_OPERATORS
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
 
@@ -22,6 +23,8 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 
+#include <unistd.h>
+#include <set>
 #include "imgui.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_opengl3.h"
@@ -29,11 +32,15 @@
 #include "platform/pvr_loader.h"
 #include "platform/data_path.h"
 #include "platform/IconsFontAwesome6.h"
+#include "platform/protobuf_reader.h"
 #include "tools/pod_loader.h"
 #include "tools/av_renderer.h"
 #include "tools/av_audio.h"
 #include "tools/scene_loader.h"
+#include "tools/intellij.h"
+#include "tools/boulder.h"
 #include "tools/filerift.h"
+#include "tools/batch_converter.h"
 #include <zlib.h>
 
 #include <cstdio>
@@ -83,7 +90,7 @@ std::string g_assets_dir = "assets";
 
 static const int   WIN_W             = 1400;
 static const int   WIN_H             = 900;
-static const char* WIN_TITLE         = "Ruby - Swordigo Desktop Asset Viewer & Editor";
+static const char* WIN_TITLE         = "Ruby : Swordigo SDK";
 static const float LEFT_PANEL_W      = 320.0f;
 static const float RIGHT_PANEL_W     = 320.0f;
 static const float STATUS_BAR_H      = 24.0f;
@@ -124,7 +131,8 @@ static int classify_file(const std::string& name) {
         ext == ".cfg" || ext == ".ini" || ext == ".md" || ext == ".log" || ext == ".sh" ||
         ext == ".cpp" || ext == ".h" || ext == ".c" ||
         ext == ".scl" || ext == ".gdata" || ext == ".gstate" || ext == ".gplayer" ||
-        ext == ".gopt" || ext == ".sounds" || ext == ".scmap" || ext == ".atlas" || ext == ".fnt") {
+        ext == ".gopt" || ext == ".sounds" || ext == ".scmap" || ext == ".atlas" || ext == ".fnt" ||
+        ext == ".gmesh") {
         return FTYPE_TEXT;
     }
     return FTYPE_OTHER;
@@ -168,8 +176,8 @@ struct ViewerState {
 
     // Scene preview
     av::SceneData scene;
+    int           scene_preview_tab = 0; // 0 = Swordfare Editor, 1 = 3D Visualizer, 2 = Tree Inspector
     int           selected_object = -1;
-    bool          scene_visualize_mode = false;
     std::map<std::string, av::PODModel> scene_model_cache;
     std::map<std::string, std::vector<av::GPUMesh>> scene_gpu_mesh_cache;
     std::map<std::string, std::vector<GLuint>> scene_texture_cache;
@@ -237,7 +245,33 @@ struct ViewerState {
     std::string              pty_output_buf; // raw bytes from PTY, stripped of control seqs
     char                     terminal_input[512] = {};
     bool                     terminal_scroll_to_bottom = false;
+
+    // --- Scene Editor state ---
+    bool        scene_dirty = false;       // true when unsaved changes exist
+    std::string scene_save_msg;            // status message after last save
+    float       scene_save_msg_timer = 0.0f; // countdown to clear msg
+    // Per-object OnLoad script editor
+    char        scene_onload_buf[16384]   = {}; // decoded Lua source from selected obj onload
+    bool        scene_onload_modified = false; // true if user edited the script
+    char        scene_obj_name_buf[256]    = {}; // editable name field
+    char        scene_obj_template_buf[256]= {}; // editable template field
+    
+    // --- IntelliJ Text Editor state ---
+    intel::IntelliJ intellij_editor;
+    std::vector<std::pair<std::string, std::string>> intellij_styles; // {name, path}
+    int             intellij_style_idx = 0;
+    ImVec4          editor_custom_bg = ImVec4(0.0f, 0.0f, 0.0f, 0.0f); // alpha > 0 triggers custom BG
+    
+    // Compile diagnostics feedback
+    bool            has_compile_result = false;
+    bool            compile_success = false;
+    std::string     compile_error_msg;
+    double          compile_time_ms = 0.0;
+
+    // Batch Converter
+    batch::BatchState batch_converter;
 };
+
 
 static ViewerState g_state;
 
@@ -246,6 +280,21 @@ static bool load_scene_model_to_cache(ViewerState& st, const std::string& mesh_n
 // ============================================================================
 // Helpers
 // ============================================================================
+
+static std::string resolve_style_path(const std::string& filename) {
+    std::string paths[] = {
+        "/run/media/quantumcreeper/TVPG/Prenxy Packages/SwordigoTools/ss/" + filename,
+        "../SwordigoTools/ss/" + filename,
+        "SwordigoTools/ss/" + filename,
+        "ss/" + filename,
+        "./" + filename
+    };
+    for (const auto& p : paths) {
+        std::error_code ec;
+        if (std::filesystem::exists(p, ec)) return p;
+    }
+    return "";
+}
 
 static std::string expand_home(const std::string& p) {
     if (!p.empty() && p[0] == '~') {
@@ -461,7 +510,7 @@ static void free_preview_resources(ViewerState& st) {
     }
     st.scene_texture_cache.clear();
     st.scene_model_cache.clear();
-    st.scene_visualize_mode = false;
+    st.scene_preview_tab = 0;
 
     // Reset transformations
     st.texture_rotation = 0;
@@ -728,6 +777,16 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
     case FTYPE_SCENE: {
         st.preview_type = PREVIEW_SCENE;
         st.scene = av::scene_load(fe.full_path);
+        // Reset scene editor state
+        st.selected_object     = -1;
+        st.scene_dirty         = false;
+        st.scene_save_msg.clear();
+        st.scene_save_msg_timer = 0.0f;
+        st.scene_onload_buf[0] = '\0';
+        st.scene_onload_modified = false;
+        st.scene_obj_name_buf[0]     = '\0';
+        st.scene_obj_template_buf[0] = '\0';
+
         if (st.scene.objects.empty()) {
             st.status_msg = "Failed to parse " + fe.name;
             log_file_event("SceneRead", "ERROR: Failed to parse scene file: " + fe.name);
@@ -735,16 +794,25 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
             st.scene_model_cache.clear();
             st.scene_gpu_mesh_cache.clear();
             st.scene_texture_cache.clear();
-            st.scene_visualize_mode = false;
+            st.scene_preview_tab = 0; // Default to Swordfare Editor
+
+            // Read scene binary bytes and decode to text markup
+            {
+                std::ifstream f_in(fe.full_path, std::ios::binary);
+                if (f_in) {
+                    std::string bytes((std::istreambuf_iterator<char>(f_in)), std::istreambuf_iterator<char>());
+                    st.text_preview_content = filerift::decode_protobuf(bytes, "scene");
+                    st.text_edit_buffer = st.text_preview_content;
+                    st.text_edit_modified = false;
+                }
+            }
 
             fs::path scene_dir = fs::path(fe.full_path).parent_path();
             for (const auto& obj : st.scene.objects) {
-                if (!obj.mesh_name.empty()) {
+                if (!obj.mesh_name.empty())
                     load_scene_model_to_cache(st, obj.mesh_name, scene_dir.string());
-                }
-                if (!obj.background_name.empty()) {
+                if (!obj.background_name.empty())
                     load_scene_model_to_cache(st, obj.background_name, scene_dir.string());
-                }
             }
 
             st.camera = av::Camera{};
@@ -768,6 +836,7 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
             log_file_event("SceneRead", "Loaded scene: " + fe.name + " (" + std::to_string(st.scene.objects.size()) + " objects, " + format_size(fe.size) + ")");
         }
     } break;
+
 
     case FTYPE_AUDIO: {
         st.preview_type = PREVIEW_AUDIO;
@@ -1374,7 +1443,20 @@ static void draw_scene_inspector(ViewerState& st) {
         if (obj.components.empty()) flags |= ImGuiTreeNodeFlags_Leaf;
 
         bool open = ImGui::TreeNodeEx((void*)(intptr_t)i, flags, "%s", obj.name.c_str());
-        if (ImGui::IsItemClicked()) st.selected_object = i;
+        if (ImGui::IsItemClicked()) {
+            if (st.selected_object != i) {
+                st.selected_object = i;
+                // Populate editor input buffers
+                snprintf(st.scene_obj_name_buf, sizeof(st.scene_obj_name_buf),
+                         "%s", obj.name.c_str());
+                snprintf(st.scene_obj_template_buf, sizeof(st.scene_obj_template_buf),
+                         "%s", obj.template_name.c_str());
+                // Reset script editor so it re-reads from the new object
+                st.scene_onload_buf[0] = '\0';
+                st.scene_onload_modified = false;
+            }
+        }
+
 
         if (open) {
             ImGui::TextDisabled("Position: (%.2f, %.2f, %.2f)", obj.pos_x, obj.pos_y, obj.pos_z);
@@ -1975,13 +2057,14 @@ static void replace_all(std::string& str, const std::string& from, const std::st
 }
 
 static void draw_text_preview(ViewerState& st) {
-    // 1. Detect extension and files type
     auto dot = st.sel_path.rfind('.');
     std::string ext = (dot != std::string::npos) ? st.sel_path.substr(dot) : "";
     for (auto& c : ext) c = (char)tolower((unsigned char)c);
+    
     bool is_protobuf = (ext == ".scl" || ext == ".gdata" || ext == ".gstate" || 
                         ext == ".gplayer" || ext == ".gopt" || ext == ".sounds" || 
                         ext == ".scmap" || ext == ".atlas" || ext == ".fnt");
+    bool is_gmesh = (ext == ".gmesh");
 
     // Initialize edit buffer on file change
     static std::string last_loaded_path;
@@ -1989,312 +2072,307 @@ static void draw_text_preview(ViewerState& st) {
         last_loaded_path = st.sel_path;
         st.text_edit_buffer = st.text_preview_content;
         st.text_edit_modified = false;
+        st.has_compile_result = false;
     }
 
-    // Live validation for markup files
-    static std::string validation_error;
-    static std::string last_validated_content;
-    bool is_markup = (ext == ".scl" || ext == ".scene" || ext == ".gdata" || ext == ".gstate" || ext == ".gplayer" || ext == ".gopt" || ext == ".sounds");
-    if (is_markup && st.text_edit_buffer != last_validated_content) {
-        last_validated_content = st.text_edit_buffer;
-        try {
-            filerift::recode_markup(st.text_edit_buffer, ext.substr(1));
-            validation_error.clear();
-        } catch (const std::exception& e) {
-            validation_error = e.what();
-        }
-    }
-
-    // Theme check
-    ImVec4 textColor = ImGui::GetStyle().Colors[ImGuiCol_Text];
-    bool is_dark_theme = (textColor.x + textColor.y + textColor.z) / 3.0f > 0.5f;
-
-    // Header layout
-    ImGui::TextColored(ImVec4(0.00f, 0.62f, 1.00f, 1.0f), st.text_is_binary ? ICON_FA_EYE " Hex View" : (st.text_select_mode ? ICON_FA_PENCIL " Edit Mode (Split)" : ICON_FA_EYE " Code Viewer"));
+    // Toolbar Header
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(ImVec4(0.00f, 0.62f, 1.00f, 1.0f), ICON_FA_FILE " %s", st.sel_name.c_str());
     ImGui::SameLine();
-    ImGui::TextDisabled("— %s", st.sel_name.c_str());
-
-    // Toolbar buttons alignment
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 420.0f);
     
-    // Save button (disable if binary/hex view or if not modified)
-    bool can_save = !st.text_is_binary && (st.text_edit_modified || is_protobuf); 
-    if (!can_save) {
-        ImGui::BeginDisabled();
-    }
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.52f, 0.22f, 1.0f)); // Premium Green
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.64f, 0.28f, 1.0f));
-    if (ImGui::Button(ICON_FA_FLOPPY_DISK " Save")) {
+    // Save button (professional visual feedback)
+    bool can_save = !st.text_is_binary && (st.text_edit_modified || is_protobuf);
+    
+    if (!can_save) ImGui::BeginDisabled();
+    ImGui::PushStyleColor(ImGuiCol_Button, st.text_edit_modified ? ImVec4(0.85f, 0.35f, 0.15f, 1.0f) : ImVec4(0.12f, 0.52f, 0.22f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, st.text_edit_modified ? ImVec4(0.95f, 0.45f, 0.25f, 1.0f) : ImVec4(0.16f, 0.64f, 0.28f, 1.0f));
+    if (ImGui::Button(ICON_FA_FLOPPY_DISK)) {
         std::ofstream out(st.sel_path, std::ios::binary);
         if (out) {
             if (is_protobuf) {
+                auto start = std::chrono::high_resolution_clock::now();
                 try {
                     std::string binary_data = filerift::recode_markup(st.text_edit_buffer, ext.substr(1));
                     out.write(binary_data.data(), binary_data.size());
                     st.text_preview_content = st.text_edit_buffer;
                     st.text_edit_modified = false;
-                    st.status_msg = "Successfully compiled and saved " + st.sel_name;
-                    log_file_event("FileEncode", "Compiled markup to binary and saved: " + st.sel_name + " (" + std::to_string(binary_data.size()) + " bytes)");
+                    st.status_msg = "Compiled markup and saved " + st.sel_name;
+                    log_file_event("FileEncode", "Compiled markup to binary and saved: " + st.sel_name);
+                    
+                    auto end = std::chrono::high_resolution_clock::now();
+                    st.compile_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    st.compile_success = true;
+                    st.has_compile_result = true;
                 } catch (const std::exception& e) {
                     st.status_msg = "Compilation Error: " + std::string(e.what());
-                    log_file_event("FileEncode", "ERROR: Compiler syntax error on " + st.sel_name + ": " + e.what());
+                    
+                    auto end = std::chrono::high_resolution_clock::now();
+                    st.compile_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    st.compile_success = false;
+                    st.compile_error_msg = e.what();
+                    st.has_compile_result = true;
                 }
             } else {
                 out.write(st.text_edit_buffer.data(), st.text_edit_buffer.size());
                 st.text_preview_content = st.text_edit_buffer;
                 st.text_edit_modified = false;
                 st.status_msg = "Saved " + st.sel_name + " successfully!";
-                log_file_event("FileSave", "Saved file: " + st.sel_name + " (" + std::to_string(st.text_edit_buffer.size()) + " bytes)");
+                log_file_event("FileSave", "Saved file: " + st.sel_name);
+                
+                st.has_compile_result = false;
             }
         } else {
-            st.status_msg = "Failed to write to file: " + st.sel_path;
-            log_file_event("FileSave", "ERROR: Failed to write file: " + st.sel_path);
+            st.status_msg = "Failed to write file: " + st.sel_path;
         }
     }
     ImGui::PopStyleColor(2);
-    if (!can_save) {
-        ImGui::EndDisabled();
-    }
+    if (!can_save) ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Save File");
 
     ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_CLOCK " Reload")) {
-        last_loaded_path.clear(); // forces reload from disk on next frame
+    if (ImGui::Button(ICON_FA_CLOCK)) {
+        last_loaded_path.clear();
         st.status_msg = "Reloaded " + st.sel_name;
+        st.has_compile_result = false;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reload file from disk");
+
+    // Format-specific helpers
+    if (is_gmesh) {
+        ImGui::SameLine();
+        if (ImGui::Button(ICON_FA_PUZZLE_PIECE " Compile GroundMesh to SCL")) {
+            std::string markup = boulder::generate_ground_mesh(st.text_edit_buffer);
+            if (!markup.empty()) {
+                try {
+                    std::string binary_data = filerift::recode_markup(markup, "scl");
+                    // Save to the same filename but with .scl extension
+                    std::string scl_path = st.sel_path.substr(0, st.sel_path.rfind('.')) + ".scl";
+                    std::ofstream out(scl_path, std::ios::binary);
+                    if (out) {
+                        out.write(binary_data.data(), binary_data.size());
+                        st.status_msg = "Successfully compiled GroundMesh and saved to " + fs::path(scl_path).filename().string();
+                        log_file_event("GMeshCompile", "Compiled GroundMesh to SCL: " + scl_path);
+                    }
+                } catch (const std::exception& e) {
+                    st.status_msg = "GroundMesh Compilation Error: " + std::string(e.what());
+                }
+            } else {
+                st.status_msg = "GroundMesh compilation yielded empty markup.";
+            }
+        }
     }
 
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_COPY " Copy")) {
-        ImGui::SetClipboardText(st.text_edit_buffer.c_str());
-        st.status_msg = "Copied code to clipboard!";
+    // Style Selection combo box and Import button
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 280.0f);
+    ImGui::SetNextItemWidth(140.0f);
+    
+    std::string combo_items;
+    for (const auto& pair : st.intellij_styles) {
+        combo_items += pair.first;
+        combo_items += '\0';
     }
-
-    ImGui::SameLine();
-    if (!st.text_is_binary) {
-        ImGui::Checkbox(ICON_FA_PENCIL " Edit Mode", &st.text_select_mode);
-    }
-
-    ImGui::Separator();
-
-    // Search and Replace Bar
-    static char find_pattern[128] = "";
-    static char replace_pattern[128] = "";
-
-    ImGui::AlignTextToFramePadding();
-    ImGui::Text(ICON_FA_MAGNIFYING_GLASS " Find:"); ImGui::SameLine();
-    ImGui::SetNextItemWidth(120.0f);
-    ImGui::InputText("##find_pat", find_pattern, sizeof(find_pattern));
-    ImGui::SameLine();
-
-    ImGui::Text(ICON_FA_PENCIL " Replace:"); ImGui::SameLine();
-    ImGui::SetNextItemWidth(120.0f);
-    ImGui::InputText("##replace_pat", replace_pattern, sizeof(replace_pattern));
-    ImGui::SameLine();
-
-    if (ImGui::Button("Replace All")) {
-        if (find_pattern[0] != '\0') {
-            replace_all(st.text_edit_buffer, find_pattern, replace_pattern);
-            st.text_edit_modified = true;
-            st.status_msg = "Replaced all occurrences of '" + std::string(find_pattern) + "'";
+    combo_items += '\0';
+    
+    int prev_idx = st.intellij_style_idx;
+    if (ImGui::Combo("Style", &st.intellij_style_idx, combo_items.c_str())) {
+        if (st.intellij_style_idx != prev_idx) {
+            const std::string& path = st.intellij_styles[st.intellij_style_idx].second;
+            if (path == "embedded://grove") {
+                st.intellij_editor.load_style_from_memory(intel::FILERIFT_GROOVE_STYX_CONTENT);
+            } else if (path == "embedded://batsyntax") {
+                st.intellij_editor.load_style_from_memory(intel::BAT_SYNTAX_STYX_CONTENT);
+            } else if (path == "embedded://fallback") {
+                st.intellij_editor.load_default_style();
+            } else {
+                st.intellij_editor.load_style(path);
+            }
         }
     }
     
-    // Zoom control
     ImGui::SameLine();
-    ImGui::Text(ICON_FA_GEAR " Zoom:"); ImGui::SameLine();
-    ImGui::SetNextItemWidth(80.0f);
-    static float editor_font_scale = 1.0f;
-    ImGui::SliderFloat("##zoom", &editor_font_scale, 0.7f, 2.0f, "%.1fx");
-
-    // Show match count
-    int occurrences = 0;
-    if (find_pattern[0] != '\0') {
-        size_t pos = 0;
-        while ((pos = st.text_edit_buffer.find(find_pattern, pos)) != std::string::npos) {
-            occurrences++;
-            pos += strlen(find_pattern);
-        }
-        ImGui::SameLine();
-        ImGui::TextColored(occurrences > 0 ? ImVec4(0.4f, 0.8f, 0.4f, 1.0f) : ImVec4(0.8f, 0.4f, 0.4f, 1.0f), "(%d matches)", occurrences);
+    if (ImGui::Button(ICON_FA_PLUS)) {
+        ImGui::OpenPopup("Import Style Sheet");
     }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Import .styx style sheet");
 
-    ImGui::Separator();
-
-    // Editor Area Background
-    ImVec4 bg_col = is_dark_theme ? ImVec4(0.11f, 0.11f, 0.14f, 1.0f) : ImVec4(0.96f, 0.96f, 0.98f, 1.0f);
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, bg_col);
-
-    // Height calculation to leave room for the validation banner and status bar at the bottom
-    float footer_h = is_markup ? 60.0f : 30.0f;
-
-    if (st.text_is_binary) {
-        ImGui::BeginChild("TextScrollArea", ImVec2(0, -footer_h), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
-        ImGui::SetWindowFontScale(editor_font_scale);
-        if (st.mono_font) ImGui::PushFont(st.mono_font);
-        ImGuiInputTextFlags flags = ImGuiInputTextFlags_ReadOnly;
-        ImVec2 size = ImGui::GetContentRegionAvail();
-        InputTextMultilineStr("##hex_view", &st.text_preview_content, size, flags);
-        if (st.mono_font) ImGui::PopFont();
-        ImGui::EndChild();
-    } else if (st.text_select_mode) {
-        // Edit Mode: Split screen (Editor on the Left, Live Highlighted Preview on the Right)
-        ImGui::Columns(2, "EditorSplit", true);
+    // Modal popup for importing style
+    if (ImGui::BeginPopupModal("Import Style Sheet", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        static bool scanned = false;
+        static std::vector<std::pair<std::string, std::string>> found_files;
+        static int selected_item = -1;
+        static char import_path[512] = "";
+        static std::string validation_status = "Select a file to validate";
+        static bool validation_ok = false;
+        static std::vector<std::string> validation_details;
         
-        // Column 1: Interactive Editor
-        ImGui::Text(ICON_FA_CODE " Interactive Editor");
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, is_dark_theme ? ImVec4(0.11f, 0.11f, 0.13f, 1.0f) : ImVec4(0.97f, 0.97f, 0.98f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, is_dark_theme ? ImVec4(0.15f, 0.31f, 0.47f, 0.80f) : ImVec4(0.68f, 0.80f, 1.00f, 0.80f));
-        
-        ImGui::BeginChild("EditorScrollArea", ImVec2(0, -footer_h - 25.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
-        ImGui::SetWindowFontScale(editor_font_scale);
-        if (st.mono_font) ImGui::PushFont(st.mono_font);
-        ImGuiInputTextFlags flags = 0;
-        ImVec2 size = ImGui::GetContentRegionAvail();
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12, 12));
-        if (InputTextMultilineStr("##code_editor", &st.text_edit_buffer, size, flags)) {
-            st.text_edit_modified = (st.text_edit_buffer != st.text_preview_content);
+        static bool popup_was_open = false;
+        bool is_popup_open = ImGui::IsPopupOpen("Import Style Sheet");
+        if (is_popup_open && !popup_was_open) {
+            scanned = false;
+            import_path[0] = '\0';
         }
-        ImGui::PopStyleVar();
-        if (st.mono_font) ImGui::PopFont();
+        popup_was_open = is_popup_open;
+        
+        // Lambda for validation
+        auto validate_style = [&](const std::string& path) {
+            validation_details.clear();
+            validation_ok = false;
+            if (path.empty()) {
+                validation_status = "Path is empty";
+                return;
+            }
+            if (!fs::exists(path) || fs::is_directory(path)) {
+                validation_status = "File does not exist";
+                return;
+            }
+            intel::IntelliJ temp_val;
+            if (temp_val.load_style(path)) {
+                validation_ok = true;
+                const auto& sh = temp_val.get_style();
+                validation_status = "Valid Styx Style Sheet";
+                validation_details.push_back("Name: " + sh.name);
+                validation_details.push_back("Rules: " + std::to_string(sh.styles.size()));
+                validation_details.push_back("Keywords: " + std::to_string(sh.keywords.size()));
+                if (!sh.line_comment.empty()) {
+                    validation_details.push_back("Line comment: " + sh.line_comment);
+                }
+            } else {
+                validation_status = "Failed to parse JSON/Styx structure";
+            }
+        };
+        
+        // Scan directories once
+        if (!scanned) {
+            found_files.clear();
+            std::vector<std::string> dirs_to_scan = {
+                "/run/media/quantumcreeper/TVPG/Prenxy Packages/SwordigoTools/ss",
+                "/run/media/quantumcreeper/TVPG/Prenxy Packages/SwordigoTools",
+                "/home/quantumcreeper/SwordigoDesktop",
+                st.current_dir
+            };
+            std::set<std::string> unique_paths;
+            for (const auto& d : dirs_to_scan) {
+                if (d.empty()) continue;
+                try {
+                    if (fs::exists(d) && fs::is_directory(d)) {
+                        for (const auto& entry : fs::directory_iterator(d)) {
+                            if (entry.is_regular_file() && entry.path().extension() == ".styx") {
+                                std::string full_p = entry.path().string();
+                                if (unique_paths.find(full_p) == unique_paths.end()) {
+                                    unique_paths.insert(full_p);
+                                    found_files.push_back({entry.path().filename().string(), full_p});
+                                }
+                            }
+                        }
+                    }
+                } catch (...) {}
+            }
+            scanned = true;
+            selected_item = -1;
+            validation_status = "Select a file to validate";
+            validation_ok = false;
+            validation_details.clear();
+        }
+        
+        ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), ICON_FA_PAINT_BRUSH " Styx Stylesheet Hub");
+        ImGui::TextDisabled("Auto-scanned project and media directories for stylesheets.");
+        ImGui::Separator();
+        ImGui::Spacing();
+        
+        // Layout: Two columns
+        ImGui::Columns(2, "import_layout", true);
+        ImGui::SetColumnWidth(0, 260.0f);
+        
+        // Left Column: Discovered files
+        ImGui::Text(ICON_FA_FOLDER_OPEN " Discovered files:");
+        ImGui::BeginChild("DiscoveredList", ImVec2(0, 180.0f), ImGuiChildFlags_Borders);
+        if (found_files.empty()) {
+            ImGui::TextDisabled("No .styx files found");
+        } else {
+            for (int i = 0; i < (int)found_files.size(); i++) {
+                const auto& item = found_files[i];
+                bool is_selected = (selected_item == i);
+                if (ImGui::Selectable(item.first.c_str(), is_selected)) {
+                    selected_item = i;
+                    strncpy(import_path, item.second.c_str(), sizeof(import_path) - 1);
+                    import_path[sizeof(import_path) - 1] = '\0';
+                    validate_style(import_path);
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s", item.second.c_str());
+                }
+            }
+        }
         ImGui::EndChild();
-        ImGui::PopStyleColor(2);
+        if (ImGui::Button(ICON_FA_MAGNIFYING_GLASS " Rescan")) {
+            scanned = false;
+        }
         
         ImGui::NextColumn();
         
-        // Column 2: Live Highlighted Preview
-        ImGui::Text(ICON_FA_EYE " Live Highlighted Preview");
-        ImGui::BeginChild("PreviewScrollArea", ImVec2(0, -footer_h - 25.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
-        ImGui::SetWindowFontScale(editor_font_scale);
-        
-        std::string line;
-        std::istringstream stream(st.text_edit_buffer);
-        int line_num = 1;
-        
-        if (ImGui::BeginTable("CodeEditorTable", 2, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoHostExtendX)) {
-            ImGui::TableSetupColumn("Gutter", ImGuiTableColumnFlags_WidthFixed, 45.0f);
-            ImGui::TableSetupColumn("Code", ImGuiTableColumnFlags_WidthStretch);
-            
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 1));
-            while (std::getline(stream, line)) {
-                std::string line_processed;
-                for (char ch : line) {
-                    if (ch == '\t') line_processed += "    ";
-                    else line_processed += ch;
-                }
-
-                ImGui::TableNextRow();
-                
-                // Gutter
-                ImGui::TableNextColumn();
-                char num_str[32];
-                snprintf(num_str, sizeof(num_str), "%d", line_num++);
-                float posX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(num_str).x - 8.0f;
-                ImGui::SetCursorPosX(posX);
-                ImGui::TextDisabled("%s", num_str);
-                
-                // Code
-                ImGui::TableNextColumn();
-                if (st.mono_font) ImGui::PushFont(st.mono_font);
-                std::vector<Token> tokens = tokenize_line(line_processed, is_dark_theme);
-                for (size_t t_idx = 0; t_idx < tokens.size(); t_idx++) {
-                    if (t_idx > 0) {
-                        ImGui::SameLine(0.0f, 0.0f);
-                    }
-                    ImGui::TextColored(tokens[t_idx].color, "%s", tokens[t_idx].text.c_str());
-                }
-                if (st.mono_font) ImGui::PopFont();
-            }
-            ImGui::PopStyleVar();
-            ImGui::EndTable();
+        // Right Column: Path details and Validation
+        ImGui::Text(ICON_FA_FILE " Stylesheet Path:");
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::InputText("##style_import_path", import_path, sizeof(import_path))) {
+            selected_item = -1; // path manual edit deselects list item
+            validate_style(import_path);
         }
-        ImGui::EndChild();
-        ImGui::Columns(1);
-    } else {
-        // Viewer Mode: Fullscreen Highlighted View (Default)
-        ImGui::BeginChild("PreviewScrollAreaOnly", ImVec2(0, -footer_h), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
-        ImGui::SetWindowFontScale(editor_font_scale);
         
-        std::string line;
-        std::istringstream stream(st.text_edit_buffer);
-        int line_num = 1;
-        
-        if (ImGui::BeginTable("CodeEditorTableOnly", 2, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoHostExtendX)) {
-            ImGui::TableSetupColumn("GutterOnly", ImGuiTableColumnFlags_WidthFixed, 45.0f);
-            ImGui::TableSetupColumn("CodeOnly", ImGuiTableColumnFlags_WidthStretch);
-            
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 1));
-            while (std::getline(stream, line)) {
-                std::string line_processed;
-                for (char ch : line) {
-                    if (ch == '\t') line_processed += "    ";
-                    else line_processed += ch;
-                }
-
-                ImGui::TableNextRow();
-                
-                // Gutter
-                ImGui::TableNextColumn();
-                char num_str[32];
-                snprintf(num_str, sizeof(num_str), "%d", line_num++);
-                float posX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(num_str).x - 8.0f;
-                ImGui::SetCursorPosX(posX);
-                ImGui::TextDisabled("%s", num_str);
-                
-                // Code
-                ImGui::TableNextColumn();
-                if (st.mono_font) ImGui::PushFont(st.mono_font);
-                std::vector<Token> tokens = tokenize_line(line_processed, is_dark_theme);
-                for (size_t t_idx = 0; t_idx < tokens.size(); t_idx++) {
-                    if (t_idx > 0) {
-                        ImGui::SameLine(0.0f, 0.0f);
-                    }
-                    ImGui::TextColored(tokens[t_idx].color, "%s", tokens[t_idx].text.c_str());
-                }
-                if (st.mono_font) ImGui::PopFont();
+        ImGui::Spacing();
+        ImGui::Text("Validation:");
+        ImGui::BeginChild("ValidationResults", ImVec2(0, 110.0f), ImGuiChildFlags_Borders);
+        if (validation_ok) {
+            ImGui::TextColored(ImVec4(0.20f, 0.80f, 0.40f, 1.0f), ICON_FA_CIRCLE_CHECK " %s", validation_status.c_str());
+            for (const auto& detail : validation_details) {
+                ImGui::BulletText("%s", detail.c_str());
             }
-            ImGui::PopStyleVar();
-            ImGui::EndTable();
-        }
-        ImGui::EndChild();
-    }
-
-    ImGui::PopStyleColor();
-
-    // Footer section (Live validation banner & statistics)
-    if (is_markup) {
-        if (validation_error.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.28f, 0.12f, 1.0f)); 
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 1.00f, 0.85f, 1.0f));
-            ImGui::BeginChild("ValidationBanner", ImVec2(0, 24.0f), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
-            ImGui::AlignTextToFramePadding();
-            ImGui::Text("  " ICON_FA_CIRCLE_CHECK " Valid Swordigo Markup Schema — Code compiles perfectly.");
-            ImGui::EndChild();
-            ImGui::PopStyleColor(2);
         } else {
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.38f, 0.08f, 0.08f, 1.0f)); 
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.85f, 0.85f, 1.0f));
-            ImGui::BeginChild("ValidationBanner", ImVec2(0, 24.0f), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
-            ImGui::AlignTextToFramePadding();
-            ImGui::Text("  " ICON_FA_TRIANGLE_EXCLAMATION " Syntax Error: %s", validation_error.c_str());
-            ImGui::EndChild();
-            ImGui::PopStyleColor(2);
+            ImGui::TextColored(ImVec4(0.90f, 0.30f, 0.30f, 1.0f), ICON_FA_TRIANGLE_EXCLAMATION " %s", validation_status.c_str());
         }
-    }
-
-    // Status Bar
-    ImGui::Separator();
-    int line_count = 1;
-    for (char c : st.text_edit_buffer) {
-        if (c == '\n') line_count++;
-    }
-    ImGui::TextDisabled(" Lines: %d | Size: %s | Mode: %s", 
-        line_count, 
-        format_size(st.text_edit_buffer.size()).c_str(), 
-        st.text_is_binary ? "Hex (Binary)" : "UTF-8 Text");
-    
-    if (st.text_edit_modified) {
+        ImGui::EndChild();
+        
+        ImGui::Columns(1);
+        ImGui::Separator();
+        ImGui::Spacing();
+        
+        // Action Buttons
+        if (!validation_ok) ImGui::BeginDisabled();
+        if (ImGui::Button("Import & Apply", ImVec2(140.0f, 32.0f))) {
+            if (st.intellij_editor.load_style(import_path)) {
+                std::string stem = fs::path(import_path).stem().string();
+                bool exists = false;
+                for (int i = 0; i < (int)st.intellij_styles.size(); i++) {
+                    if (st.intellij_styles[i].second == import_path) {
+                        st.intellij_style_idx = i;
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    st.intellij_styles.push_back({stem, import_path});
+                    st.intellij_style_idx = (int)st.intellij_styles.size() - 1;
+                }
+                st.status_msg = "Successfully imported & applied: " + stem;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        if (!validation_ok) ImGui::EndDisabled();
+        
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), " | [Modified]");
+        if (ImGui::Button("Cancel", ImVec2(100.0f, 32.0f))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
+    
+    ImGui::SameLine();
+    ImGui::ColorEdit4("BG", &st.editor_custom_bg.x, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Custom Editor Background (alpha > 0 to enable, 0 to use style default)");
+
+    ImGui::Separator();
+    
+    // Call unified IntelliJ editor pane
+    st.intellij_editor.draw_editor("text_preview", &st.text_edit_buffer, st.text_edit_modified, st.sel_path, st.mono_font, st.editor_custom_bg);
 }
 
 // ── Real PTY Terminal ─────────────────────────────────────────────────────
@@ -2428,11 +2506,12 @@ static void draw_bottom_panel(ViewerState& st) {
             const float input_h = ImGui::GetFrameHeightWithSpacing() + 6.0f;
 
             // ── Output pane ────────────────────────────────────────────────
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.09f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.05f, 0.05f, 0.06f, 1.0f)); // solid terminal black
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
             ImGui::BeginChild("PtyOutputScroll", ImVec2(0, -input_h), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
 
             if (st.mono_font) ImGui::PushFont(st.mono_font);
-            // Render line by line from the raw buffer
+            // Render line by line from the raw buffer with terminal syntax coloring
             {
                 const std::string& buf = st.pty_output_buf;
                 size_t line_start = 0;
@@ -2440,8 +2519,68 @@ static void draw_bottom_panel(ViewerState& st) {
                     size_t nl = buf.find('\n', line_start);
                     size_t line_end = (nl == std::string::npos) ? buf.size() : nl;
                     if (line_end > line_start) {
-                        const char* p = buf.c_str() + line_start;
-                        ImGui::TextUnformatted(p, p + (line_end - line_start));
+                        std::string line = buf.substr(line_start, line_end - line_start);
+                        
+                        // Parse bash prompt line
+                        size_t at_pos = line.find('@');
+                        size_t colon_pos = (at_pos != std::string::npos) ? line.find(':', at_pos) : std::string::npos;
+                        size_t dollar_pos = (colon_pos != std::string::npos) ? line.find('$', colon_pos) : std::string::npos;
+                        
+                        if (at_pos != std::string::npos && colon_pos != std::string::npos && dollar_pos != std::string::npos && dollar_pos < line.size() - 1) {
+                            // User
+                            std::string user = line.substr(0, at_pos);
+                            ImGui::TextColored(ImVec4(0.18f, 0.80f, 0.44f, 1.0f), "%s", user.c_str());
+                            ImGui::SameLine(0, 0);
+                            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "@");
+                            ImGui::SameLine(0, 0);
+                            
+                            // Host
+                            std::string host = line.substr(at_pos + 1, colon_pos - at_pos - 1);
+                            ImGui::TextColored(ImVec4(0.18f, 0.80f, 0.44f, 1.0f), "%s", host.c_str());
+                            ImGui::SameLine(0, 0);
+                            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), ":");
+                            ImGui::SameLine(0, 0);
+                            
+                            // Path
+                            std::string path = line.substr(colon_pos + 1, dollar_pos - colon_pos - 1);
+                            ImGui::TextColored(ImVec4(0.20f, 0.60f, 0.86f, 1.0f), "%s", path.c_str());
+                            ImGui::SameLine(0, 0);
+                            
+                            // Dollar
+                            std::string p_char = line.substr(dollar_pos, 2);
+                            ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.9f, 1.0f), "%s", p_char.c_str());
+                            ImGui::SameLine(0, 0);
+                            
+                            // Command
+                            std::string cmd = line.substr(dollar_pos + 2);
+                            ImGui::TextUnformatted(cmd.c_str());
+                        }
+                        // Parse compiler tags (e.g. [CXX], [LINK])
+                        else if (line[0] == '[' && line.find(']') != std::string::npos) {
+                            size_t r_bracket = line.find(']');
+                            std::string tag = line.substr(0, r_bracket + 1);
+                            std::string rest = line.substr(r_bracket + 1);
+                            
+                            ImVec4 tag_col = ImVec4(0.6f, 0.6f, 0.6f, 1.0f);
+                            if (tag == "[CXX]") tag_col = ImVec4(0.20f, 0.60f, 0.86f, 1.0f);
+                            else if (tag == "[LINK]") tag_col = ImVec4(0.90f, 0.45f, 0.15f, 1.0f);
+                            else if (tag == "[AV]" || tag == "[PVR]") tag_col = ImVec4(0.68f, 0.38f, 0.78f, 1.0f);
+                            
+                            ImGui::TextColored(tag_col, "%s", tag.c_str());
+                            ImGui::SameLine(0, 0);
+                            ImGui::TextUnformatted(rest.c_str());
+                        }
+                        // Highlight errors
+                        else if (line.find("error:") != std::string::npos || line.find("Error:") != std::string::npos) {
+                            ImGui::TextColored(ImVec4(0.90f, 0.25f, 0.25f, 1.0f), "%s", line.c_str());
+                        }
+                        // Highlight warnings
+                        else if (line.find("warning:") != std::string::npos || line.find("Warning:") != std::string::npos) {
+                            ImGui::TextColored(ImVec4(0.90f, 0.65f, 0.15f, 1.0f), "%s", line.c_str());
+                        }
+                        else {
+                            ImGui::TextUnformatted(line.c_str());
+                        }
                     } else if (nl == std::string::npos) {
                         break;
                     } else {
@@ -2456,18 +2595,34 @@ static void draw_bottom_panel(ViewerState& st) {
             }
             if (st.mono_font) ImGui::PopFont();
             ImGui::EndChild();
+            ImGui::PopStyleVar();
             ImGui::PopStyleColor();
 
             // ── Input row ──────────────────────────────────────────────────
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.14f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.09f, 1.0f));
             ImGui::BeginChild("PtyInputRow", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
 
             if (st.mono_font) ImGui::PushFont(st.mono_font);
 
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.85f, 0.4f, 1.0f));
-            ImGui::AlignTextToFramePadding();
-            ImGui::Text(st.pty_master_fd >= 0 ? "$" : "[dead]");
-            ImGui::PopStyleColor();
+            // Replicate local bash prompt
+            char host[128] = "yoga-7-pro-fedora";
+            gethostname(host, sizeof(host));
+            const char* user = getenv("USER");
+            if (!user) user = "quantumcreeper";
+            
+            if (st.pty_master_fd >= 0) {
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextColored(ImVec4(0.18f, 0.80f, 0.44f, 1.0f), "%s@%s", user, host);
+                ImGui::SameLine(0, 0);
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), ":");
+                ImGui::SameLine(0, 0);
+                ImGui::TextColored(ImVec4(0.20f, 0.60f, 0.86f, 1.0f), "~/SwordigoDesktop");
+                ImGui::SameLine(0, 0);
+                ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.9f, 1.0f), "$ ");
+            } else {
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextColored(ImVec4(0.85f, 0.25f, 0.25f, 1.0f), "[dead] ");
+            }
             ImGui::SameLine();
 
             bool reclaim_focus = false;
@@ -2499,6 +2654,15 @@ static void draw_bottom_panel(ViewerState& st) {
             bool entered = ImGui::InputText(
                 "##pty_input", st.terminal_input, sizeof(st.terminal_input),
                 iflags, HistoryCB::callback, &history_pos);
+
+            // Blinking block cursor overlay
+            if (ImGui::IsItemActive() && st.terminal_input[0] == '\0') {
+                if ((int)(ImGui::GetTime() * 2.0f) % 2 == 0) {
+                    ImVec2 min_pos = ImGui::GetItemRectMin() + ImVec2(4.0f, 3.0f);
+                    ImVec2 max_pos = min_pos + ImVec2(8.0f, ImGui::GetItemRectSize().y - 6.0f);
+                    ImGui::GetWindowDrawList()->AddRectFilled(min_pos, max_pos, IM_COL32(0, 215, 100, 255)); // terminal green color
+                }
+            }
 
             if (entered) {
                 std::string line(st.terminal_input);
@@ -2565,7 +2729,14 @@ static void draw_center_panel(ViewerState& st) {
         case PREVIEW_TEXTURE: draw_texture_preview(st);  break;
         case PREVIEW_TEXT:    draw_text_preview(st);     break;
         case PREVIEW_SCENE:
-            if (st.scene_visualize_mode) {
+            if (st.scene_preview_tab == 0) {
+                bool scene_text_modified = st.scene_dirty;
+                st.intellij_editor.draw_editor("scene_text", &st.text_edit_buffer, scene_text_modified, st.sel_path, st.mono_font, st.editor_custom_bg,
+                                               st.has_compile_result, st.compile_success, st.compile_error_msg, st.compile_time_ms);
+                if (scene_text_modified != st.scene_dirty) {
+                    st.scene_dirty = scene_text_modified;
+                }
+            } else if (st.scene_preview_tab == 1) {
                 draw_scene_visualizer(st);
             } else {
                 draw_scene_inspector(st);
@@ -2821,35 +2992,261 @@ static void draw_properties_panel(ViewerState& st) {
     } break;
 
     case PREVIEW_SCENE: {
-        ImGui::Text("Objects: %d", (int)st.scene.objects.size());
-        ImGui::Separator();
-        
-        if (st.scene_visualize_mode) {
-            if (ImGui::Button("Switch to Tree Inspector")) {
-                st.scene_visualize_mode = false;
-            }
-        } else {
-            if (ImGui::Button("Switch to 3D Visualizer")) {
-                st.scene_visualize_mode = true;
-            }
-        }
+        // ── Scene header / summary ──────────────────────────────────
+        ImGui::TextColored(ImVec4(0.55f,0.80f,0.55f,1.0f), ICON_FA_CUBE " %s", st.scene.filename.c_str());
+        ImGui::Text("Objects: %d  |  Libraries: %d  |  Groups: %d",
+            (int)st.scene.objects.size(),
+            (int)st.scene.object_libraries.size(),
+            (int)st.scene.groups.size());
         ImGui::Separator();
 
+        // ── Save scene controls ─────────────────────────────────────
+        bool can_save = !st.scene.filepath.empty();
+        {
+            ImVec4 btn_col = st.scene_dirty
+                ? ImVec4(0.85f, 0.35f, 0.15f, 1.0f)
+                : ImVec4(0.22f, 0.55f, 0.22f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button, btn_col);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                ImVec4(btn_col.x+0.10f, btn_col.y+0.10f, btn_col.z+0.10f, 1.0f));
+            if (ImGui::Button(ICON_FA_FLOPPY_DISK " Save Scene  [Ctrl+S]",
+                              ImVec2(-1.0f, 0.0f)) && can_save) {
+                if (st.scene_preview_tab == 0) {
+                    // Save by compiling the text editor markup back to binary
+                    st.has_compile_result = false;
+                    auto start = std::chrono::high_resolution_clock::now();
+                    try {
+                        std::string binary_data = filerift::recode_markup(st.text_edit_buffer, "scene");
+                        std::ofstream out(st.scene.filepath, std::ios::binary);
+                        if (out) {
+                            out.write(binary_data.data(), binary_data.size());
+                            st.scene = av::scene_load(st.scene.filepath);
+                            st.scene_dirty = false;
+                            st.scene_save_msg = "Compiled and Saved scene!";
+                            st.scene_save_msg_timer = 4.0f;
+                            log_file_event("SceneSave", "Compiled and saved scene: " + st.scene.filename);
+                            
+                            // Reload cached assets
+                            st.scene_model_cache.clear();
+                            st.scene_gpu_mesh_cache.clear();
+                            st.scene_texture_cache.clear();
+                            fs::path scene_dir = fs::path(st.scene.filepath).parent_path();
+                            for (const auto& obj : st.scene.objects) {
+                                if (!obj.mesh_name.empty())
+                                    load_scene_model_to_cache(st, obj.mesh_name, scene_dir.string());
+                                if (!obj.background_name.empty())
+                                    load_scene_model_to_cache(st, obj.background_name, scene_dir.string());
+                            }
+                            
+                            auto end = std::chrono::high_resolution_clock::now();
+                            st.compile_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                            st.compile_success = true;
+                            st.has_compile_result = true;
+                        }
+                    } catch (const std::exception& e) {
+                        st.status_msg = "Compile Error: " + std::string(e.what());
+                        st.scene_save_msg = "Compile Error!";
+                        st.scene_save_msg_timer = 4.0f;
+                        
+                        auto end = std::chrono::high_resolution_clock::now();
+                        st.compile_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                        st.compile_success = false;
+                        st.compile_error_msg = e.what();
+                        st.has_compile_result = true;
+                    }
+                } else {
+                    // Flush any pending OnLoad script edit back to object
+                    if (st.scene_onload_modified &&
+                        st.selected_object >= 0 &&
+                        st.selected_object < (int)st.scene.objects.size()) {
+                        auto& obj = st.scene.objects[st.selected_object];
+                        proto::Writer prog;
+                        prog.write_string_field(1, std::string(st.scene_onload_buf));
+                        obj.onload = prog.to_string();
+                        st.scene_onload_modified = false;
+                    }
+                    av::scene_save(st.scene.filepath, st.scene);
+                    st.scene_dirty = false;
+                    st.scene_save_msg = "Saved " + st.scene.filename;
+                    st.scene_save_msg_timer = 4.0f;
+                    log_file_event("SceneSave", "Saved scene: " + st.scene.filename);
+                }
+            }
+            ImGui::PopStyleColor(2);
+        }
+        if (!st.scene_save_msg.empty()) {
+            ImGui::TextColored(ImVec4(0.40f, 0.90f, 0.40f, 1.0f),
+                               ICON_FA_CHECK " %s", st.scene_save_msg.c_str());
+        }
+        if (st.scene_dirty)
+            ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.20f, 1.0f),
+                               ICON_FA_TRIANGLE_EXCLAMATION " Unsaved changes");
+
+        // ── View mode selection (Tab Bar) ───────────────────────────
+        ImGui::Spacing();
+        if (ImGui::BeginTabBar("##SceneTabBar", ImGuiTabBarFlags_NoTooltip)) {
+            bool tab_editor = (st.scene_preview_tab == 0);
+            bool tab_visual = (st.scene_preview_tab == 1);
+            bool tab_tree = (st.scene_preview_tab == 2);
+            
+            ImGuiTabItemFlags f_editor = tab_editor ? ImGuiTabItemFlags_SetSelected : 0;
+            ImGuiTabItemFlags f_visual = tab_visual ? ImGuiTabItemFlags_SetSelected : 0;
+            ImGuiTabItemFlags f_tree = tab_tree ? ImGuiTabItemFlags_SetSelected : 0;
+            
+            if (ImGui::BeginTabItem(ICON_FA_CODE " Editor", nullptr, f_editor)) {
+                st.scene_preview_tab = 0;
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem(ICON_FA_CUBE " 3D View", nullptr, f_visual)) {
+                st.scene_preview_tab = 1;
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem(ICON_FA_LAYER_GROUP " Inspector", nullptr, f_tree)) {
+                st.scene_preview_tab = 2;
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+        ImGui::Spacing();
+        ImGui::Separator();
+
+        // ── Selected object editor ───────────────────────────────────
         if (st.selected_object >= 0 && st.selected_object < (int)st.scene.objects.size()) {
             auto& obj = st.scene.objects[st.selected_object];
-            ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Selected Object");
-            ImGui::Text("Name: %s", obj.name.c_str());
-            ImGui::Text("Components: %d", (int)obj.components.size());
+
+            ImGui::TextColored(ImVec4(0.40f, 0.70f, 1.00f, 1.0f),
+                               ICON_FA_CUBE " Object #%d", st.selected_object);
             ImGui::Separator();
-            ImGui::Text("Position: (%.2f, %.2f, %.2f)", obj.pos_x, obj.pos_y, obj.pos_z);
-            ImGui::Text("Rotation: (%.2f, %.2f, %.2f)", obj.rot_x, obj.rot_y, obj.rot_z);
-            ImGui::Text("Scale:    (%.2f, %.2f, %.2f)", obj.scale_x, obj.scale_y, obj.scale_z);
+
+            // ── Identity fields ──────────────────────────────────────
+            ImGui::PushItemWidth(-1.0f);
+
+            ImGui::Text("Identifier");
+            if (ImGui::InputText("##obj_name", st.scene_obj_name_buf,
+                                 sizeof(st.scene_obj_name_buf))) {
+                obj.name = st.scene_obj_name_buf;
+                st.scene_dirty = true;
+            }
+            ImGui::Text("Template");
+            if (ImGui::InputText("##obj_tmpl", st.scene_obj_template_buf,
+                                 sizeof(st.scene_obj_template_buf))) {
+                obj.template_name = st.scene_obj_template_buf;
+                st.scene_dirty = true;
+            }
+
+            ImGui::PopItemWidth();
+
+            // ── Transform ────────────────────────────────────────────
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.70f, 0.70f, 0.85f, 1.0f), "Transform");
+            ImGui::PushItemWidth(-1.0f);
+
+            if (ImGui::DragFloat2("##pos_xy", &obj.pos_x, 0.5f, -99999.f, 99999.f, "XY: %.1f")) {
+                st.scene_dirty = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Position X / Y");
+
+            if (ImGui::DragFloat("##depth", &obj.pos_z, 0.1f, -999.f, 999.f, "Depth: %.3f")) {
+                st.scene_dirty = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Depth (world Z / parallax layer)");
+
+            if (ImGui::DragFloat("##rot", &obj.rot_y, 0.01f, -6.2832f, 6.2832f, "Rot: %.4f rad")) {
+                obj.rot_x = obj.rot_z = 0.0f;
+                st.scene_dirty = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Y-axis rotation (radians)");
+
+            if (ImGui::DragFloat("##scale", &obj.scale_x, 0.01f, 0.001f, 100.f, "Scale: %.3f")) {
+                obj.scale_y = obj.scale_z = obj.scale_x;
+                st.scene_dirty = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Uniform scale");
+
+            ImGui::PopItemWidth();
+
+            // ── Flags ─────────────────────────────────────────────────
+            ImGui::Spacing();
+            bool hidden_tmp = obj.hidden;
+            if (ImGui::Checkbox("Hidden", &hidden_tmp)) {
+                obj.hidden = hidden_tmp;
+                st.scene_dirty = true;
+            }
+
+            // ── Asset refs ────────────────────────────────────────────
+            ImGui::Spacing();
             if (!obj.mesh_name.empty())
-                ImGui::Text("Mesh: %s", obj.mesh_name.c_str());
+                ImGui::TextDisabled("Mesh: %s", obj.mesh_name.c_str());
             if (!obj.texture_name.empty())
-                ImGui::Text("Texture: %s", obj.texture_name.c_str());
+                ImGui::TextDisabled("Tex:  %s", obj.texture_name.c_str());
+            if (!obj.background_name.empty())
+                ImGui::TextDisabled("BG:   %s", obj.background_name.c_str());
+
+            // ── Components list ───────────────────────────────────────
+            ImGui::Spacing();
+            if (ImGui::CollapsingHeader(
+                    (std::string(ICON_FA_PUZZLE_PIECE " Components (") +
+                     std::to_string(obj.components.size()) + ")").c_str())) {
+                for (int ci = 0; ci < (int)obj.components.size(); ++ci) {
+                    const auto& c = obj.components[ci];
+                    ImGui::BulletText("%s  (id=%d, %zu bytes)",
+                                      c.type_name.empty() ? "(unnamed)" : c.type_name.c_str(),
+                                      c.type_id, c.raw_data.size());
+                }
+            }
+
+            // ── OnLoad script editor ──────────────────────────────────
+            if (!obj.onload.empty()) {
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.90f, 0.75f, 0.30f, 1.0f),
+                                   ICON_FA_CODE " OnLoad Script");
+
+                // Decode Program source on first show / object switch
+                if (st.scene_onload_buf[0] == '\0' && !obj.onload.empty()) {
+                    try {
+                        proto::Reader pr(obj.onload);
+                        proto::Field  pf;
+                        while (pr.read_field(pf)) {
+                            if (pf.field_number == 1 && pf.wire_type == proto::WIRE_LEN) {
+                                size_t copy_len = std::min(pf.bytes_val.size(),
+                                                           sizeof(st.scene_onload_buf) - 1);
+                                memcpy(st.scene_onload_buf, pf.bytes_val.data(), copy_len);
+                                st.scene_onload_buf[copy_len] = '\0';
+                                break;
+                            }
+                        }
+                    } catch (...) {}
+                    st.scene_onload_modified = false;
+                }
+
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.10f,0.10f,0.14f,1.0f));
+                float avail_h = std::max(100.0f, ImGui::GetContentRegionAvail().y - 28.0f);
+                if (ImGui::InputTextMultiline(
+                        "##onload_src",
+                        st.scene_onload_buf,
+                        sizeof(st.scene_onload_buf),
+                        ImVec2(-1.0f, avail_h),
+                        ImGuiInputTextFlags_AllowTabInput)) {
+                    st.scene_onload_modified = true;
+                    st.scene_dirty = true;
+                }
+                ImGui::PopStyleColor();
+
+                if (st.scene_onload_modified) {
+                    ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.20f, 1.0f),
+                                       ICON_FA_PENCIL " Script edited—save to apply");
+                }
+            }
+
+        } else {
+            // No object selected — show hint
+            ImGui::Spacing();
+            ImGui::TextDisabled(ICON_FA_HAND_POINTER " Click an object in the scene list");
+            ImGui::TextDisabled("or in the 3D viewport to select it.");
         }
     } break;
+
 
     case PREVIEW_AUDIO: {
         auto& as = av::audio_get_state();
@@ -3163,6 +3560,7 @@ static void draw_settings_dialog(ViewerState& st) {
             
             ImGui::Checkbox("Pixel Art Filtering for Textures", &st.tex_pixel_art_mode);
             ImGui::Checkbox("Auto-play Animations", &st.anim_autoplay);
+            ImGui::Checkbox("Use PVR Software Decompression", &g_pvr_software_decode);
             
             static float default_fps = 30.0f;
             ImGui::SliderFloat("Default Animation FPS", &default_fps, 1.0f, 120.0f, "%.0f");
@@ -3251,6 +3649,31 @@ static bool handle_shortcuts(ViewerState& st) {
 
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_P)) {
         st.show_settings = true;
+    }
+
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_B)) {
+        st.batch_converter.open_window = true;
+    }
+
+    // Ctrl+S — save current scene (if scene is loaded and has a path)
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
+        if (st.preview_type == PREVIEW_SCENE && !st.scene.filepath.empty()) {
+            // Flush pending OnLoad edits before saving
+            if (st.scene_onload_modified &&
+                st.selected_object >= 0 &&
+                st.selected_object < (int)st.scene.objects.size()) {
+                auto& obj = st.scene.objects[st.selected_object];
+                proto::Writer prog;
+                prog.write_string_field(1, std::string(st.scene_onload_buf));
+                obj.onload = prog.to_string();
+                st.scene_onload_modified = false;
+            }
+            av::scene_save(st.scene.filepath, st.scene);
+            st.scene_dirty = false;
+            st.scene_save_msg = "Saved " + st.scene.filename;
+            st.scene_save_msg_timer = 4.0f;
+            log_file_event("SceneSave", "Saved scene (Ctrl+S): " + st.scene.filename);
+        }
     }
 
     if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
@@ -3411,6 +3834,13 @@ int main(int argc, char* argv[]) {
 
     g_state.checker_tex = create_checkerboard();
 
+    // Initialize default styles list with embedded configurations
+    g_state.intellij_styles.push_back({"Redstell", "embedded://batsyntax"});
+    g_state.intellij_styles.push_back({"FileRift (Grove)", "embedded://grove"});
+    g_state.intellij_styles.push_back({"Ruby", "embedded://fallback"});
+    g_state.intellij_style_idx = 0; // Redstell
+    g_state.intellij_editor.load_style_from_memory(intel::BAT_SYNTAX_STYX_CONTENT);
+
     // ── Parse startup folder/file parameter ─────────────────────────────
     std::string start_path;
     if (argc > 1) {
@@ -3473,6 +3903,15 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Tick scene save message timer
+        if (g_state.scene_save_msg_timer > 0.0f) {
+            g_state.scene_save_msg_timer -= dt;
+            if (g_state.scene_save_msg_timer <= 0.0f) {
+                g_state.scene_save_msg_timer = 0.0f;
+                g_state.scene_save_msg.clear();
+            }
+        }
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
@@ -3499,6 +3938,11 @@ int main(int argc, char* argv[]) {
                     ImGui::EndDisabled();
                     ImGui::EndMenu();
                 }
+                ImGui::Separator();
+                if (ImGui::MenuItem(ICON_FA_IMAGE "  Batch Converter...", "Ctrl+B")) {
+                    g_state.batch_converter.open_window = true;
+                }
+                ImGui::Separator();
                 if (ImGui::MenuItem("Exit", "Esc")) {
                     running = false;
                 }
@@ -3556,13 +4000,15 @@ int main(int argc, char* argv[]) {
             ImGui::Text("Ruby - Swordigo Desktop Asset Viewer & Editor");
             ImGui::Separator();
             ImGui::Text("Remastered 3D POD model hierarchy, texture, scene and audio player.");
-            ImGui::Text("Credits: PowerVR Native SDK decompressors (MIT).");
+            ImGui::Text("Credits: PowerVR Native SDK decompressors (MIT), syntax styling formats (.mtsx) by Redstell and COropatasy.");
             ImGui::Spacing();
             if (ImGui::Button("OK", ImVec2(120, 0))) { ImGui::CloseCurrentPopup(); }
             ImGui::EndPopup();
         }
 
         draw_settings_dialog(g_state);
+
+
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
@@ -3613,6 +4059,16 @@ int main(int argc, char* argv[]) {
 
         ImGui::End();
 
+        // ── Batch Converter modal window ───────────────────────────────────────
+        {
+            double now_sec = (double)SDL_GetTicks() / 1000.0;
+            if (g_state.batch_converter.open_window) {
+                ImGui::OpenPopup("  ⚙  Batch Converter — Ruby");
+                g_state.batch_converter.open_window = false;
+            }
+            batch::draw_batch_converter(g_state.batch_converter, now_sec);
+        }
+
         ImGui::Render();
         int fb_w, fb_h;
         SDL_GetWindowSizeInPixels(window, &fb_w, &fb_h);
@@ -3623,6 +4079,7 @@ int main(int argc, char* argv[]) {
         SDL_GL_SwapWindow(window);
     }
 
+    batch::shutdown_batch(g_state.batch_converter);
     free_preview_resources(g_state);
 
     if (g_state.fbo) av::delete_fbo(g_state.fbo, g_state.fbo_tex);

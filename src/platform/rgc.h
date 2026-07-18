@@ -132,6 +132,7 @@ public:
     void process_main_thread_deletions();
     void flush_thread_local_queues();
     void process_event_queue();
+    void generate_allocation_report();
 
     // Diagnostics & Overlay Logging
     void log(const char* fmt, ...);
@@ -286,6 +287,10 @@ private:
 
     // Time baseline
     std::chrono::steady_clock::time_point m_boot_time;
+
+    // Rendering path performance optimization & thread check
+    std::atomic<bool> m_has_redirects;
+    std::thread::id m_main_thread_id;
 };
 
 #ifdef __cplusplus

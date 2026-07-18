@@ -67,6 +67,7 @@ RedstellGC::RedstellGC()
     , m_openal_count(0)
     , m_optimizations_performed(0)
     , m_last_cleanup_duration(0.0)
+    , m_has_redirects(false)
 {
     m_boot_time = std::chrono::steady_clock::now();
     memset((void*)m_alloc_buckets, 0, sizeof(m_alloc_buckets));
@@ -79,6 +80,7 @@ RedstellGC::~RedstellGC() {
 void RedstellGC::init() {
     if (m_running) return;
     m_running = true;
+    m_main_thread_id = std::this_thread::get_id();
 
     log("[Redstell GC] Initializing...");
 
@@ -241,17 +243,23 @@ thread_local std::vector<RedstellGC::RgcEvent> tl_write_queue;
 extern bool g_advanced_redstell_opts;
 
 void RedstellGC::track_alloc(uint64_t addr, size_t size, uint64_t lr, const char* reason, RgcResourceType type) {
-    if (!g_advanced_redstell_opts || g_sre_mod.base_addr == 0 || addr == 0) return;
+    if (g_sre_mod.base_addr == 0 || addr == 0) return;
     tl_write_queue.push_back({RgcEvent::ALLOC, addr, size, lr, type, reason});
+    if (std::this_thread::get_id() != m_main_thread_id) {
+        flush_thread_local_queues();
+    }
 }
 
 void RedstellGC::track_free(uint64_t addr, uint64_t lr) {
-    if (!g_advanced_redstell_opts || g_sre_mod.base_addr == 0 || addr == 0) return;
+    if (g_sre_mod.base_addr == 0 || addr == 0) return;
     tl_write_queue.push_back({RgcEvent::FREE, addr, 0, lr, RgcResourceType::MEMORY, nullptr});
+    if (std::this_thread::get_id() != m_main_thread_id) {
+        flush_thread_local_queues();
+    }
 }
 
 bool RedstellGC::is_tracked(uint64_t addr) {
-    if (!g_advanced_redstell_opts || g_sre_mod.base_addr == 0) return false;
+    if (g_sre_mod.base_addr == 0) return false;
     std::shared_lock<std::shared_mutex> lock(m_allocs_mutex);
     return m_allocs.count(addr) > 0;
 }
@@ -438,6 +446,9 @@ void RedstellGC::track_gl_delete_texture(uint32_t tex_id) {
     if (it != m_textures.end()) {
         m_textures.erase(it);
         m_texture_redirects.erase(tex_id);
+        if (m_texture_redirects.empty()) {
+            m_has_redirects.store(false, std::memory_order_relaxed);
+        }
     }
     
     release_resource_ref((uint64_t)tex_id);
@@ -478,6 +489,7 @@ void RedstellGC::track_gl_tex_image(uint32_t tex_id, int width, int height, int 
 
 uint32_t RedstellGC::get_redirected_texture(uint32_t tex_id) {
     if (g_sre_mod.base_addr == 0) return tex_id;
+    if (!m_has_redirects.load(std::memory_order_relaxed)) return tex_id;
     std::shared_lock<std::shared_mutex> lock(m_textures_mutex);
     auto it = m_texture_redirects.find(tex_id);
     if (it != m_texture_redirects.end()) {
@@ -648,7 +660,7 @@ void RedstellGC::opt_thread_func() {
         // of VRAM is not worth the risk of visual bugs.
         
         // 2. Scan for, report, and actively reclaim dangling / leaked file handles and memory blocks
-        {
+        if (g_advanced_redstell_opts) {
             std::vector<uint64_t> leaked_buffers;
             {
                 std::shared_lock<std::shared_mutex> alock(m_allocs_mutex);
@@ -902,6 +914,77 @@ bool RedstellGC::ppd_get_texture(const std::string& path, PPDTexture& out_tex) {
         return true;
     }
     return false;
+}
+
+#include <fstream>
+#include <algorithm>
+
+void RedstellGC::generate_allocation_report() {
+    log("[Redstell GC] Generating active allocations report...");
+
+    struct GroupInfo {
+        size_t count = 0;
+        size_t total_size = 0;
+        std::string symbol;
+    };
+
+    std::unordered_map<std::string, GroupInfo> groups;
+    size_t total_tracked_size = 0;
+    size_t total_tracked_count = 0;
+
+    {
+        std::shared_lock<std::shared_mutex> lock(m_allocs_mutex);
+        for (const auto& pair : m_allocs) {
+            const auto& info = pair.second;
+            std::string symbol = resolve_symbol(info.callsite);
+            
+            auto& g = groups[symbol];
+            g.symbol = symbol;
+            g.count++;
+            g.total_size += info.size;
+
+            total_tracked_size += info.size;
+            total_tracked_count++;
+        }
+    }
+
+    // Sort groups by total size descending
+    std::vector<GroupInfo> sorted_groups;
+    for (const auto& pair : groups) {
+        sorted_groups.push_back(pair.second);
+    }
+    std::sort(sorted_groups.begin(), sorted_groups.end(), [](const GroupInfo& a, const GroupInfo& b) {
+        return a.total_size > b.total_size;
+    });
+
+    // Write to a Markdown file in the game directory
+    std::ofstream out("rgc_allocation_report.md");
+    if (!out) {
+        log("[Redstell GC] Error: Failed to open rgc_allocation_report.md for writing.");
+        return;
+    }
+
+    out << "# Redstell GC — Active Allocations Report\n\n";
+    out << "This report lists all currently active guest allocations tracked by RGC, grouped by their allocation callsites.\n\n";
+    out << "## Summary\n\n";
+    out << "- **Total Active Allocations**: " << total_tracked_count << "\n";
+    out << "- **Total Tracked Memory**: " << (double)total_tracked_size / (1024.0 * 1024.0) << " MB (" << total_tracked_size << " bytes)\n\n";
+    
+    out << "## Breakdown by Callsite\n\n";
+    out << "| Rank | Count | Total Size (MB) | Total Size (Bytes) | Callsite / Allocation Origin |\n";
+    out << "| :--- | :--- | :-------------- | :----------------- | :-------------------------- |\n";
+
+    int rank = 1;
+    for (const auto& g : sorted_groups) {
+        out << "| " << rank++ 
+            << " | " << g.count 
+            << " | " << (double)g.total_size / (1024.0 * 1024.0) 
+            << " | " << g.total_size 
+            << " | `" << g.symbol << "` |\n";
+    }
+
+    out.close();
+    log("[Redstell GC] Saved allocation report to rgc_allocation_report.md (%zu callsites).", sorted_groups.size());
 }
 
 extern "C" {

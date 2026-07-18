@@ -35,6 +35,9 @@
 #include <cstring>
 #include <iostream>
 #include <vector>
+#include <zlib.h>
+
+bool g_pvr_software_decode = true;
 
 /* ===================== ETC1 Decoder =====================
  * Decodes a single 4x4 ETC1 block (8 bytes → 64 RGBA bytes).
@@ -191,6 +194,311 @@ struct PVRv2Header {
 
 /* ===================== Main Loader ===================== */
 
+static bool decompress_gzip_buffer(const std::vector<uint8_t>& in_buf, std::vector<uint8_t>& out_buf) {
+    z_stream strm;
+    std::memset(&strm, 0, sizeof(strm));
+    if (inflateInit2(&strm, 16 + MAX_WBITS) != Z_OK) return false;
+    
+    strm.next_in = const_cast<uint8_t*>(in_buf.data());
+    strm.avail_in = in_buf.size();
+    
+    uint8_t temp[16384];
+    int ret;
+    do {
+        strm.next_out = temp;
+        strm.avail_out = sizeof(temp);
+        ret = inflate(&strm, Z_NO_FLUSH);
+        if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
+            inflateEnd(&strm);
+            return false;
+        }
+        size_t decoded = sizeof(temp) - strm.avail_out;
+        if (decoded > 0) {
+            out_buf.insert(out_buf.end(), temp, temp + decoded);
+        }
+    } while (ret != Z_STREAM_END && strm.avail_in > 0);
+    
+    inflateEnd(&strm);
+    return (ret == Z_STREAM_END);
+}
+
+bool pvr_decode_to_rgba(const uint8_t* file_data, size_t file_size, std::vector<uint8_t>& rgba_out, int& width, int& height) {
+    if (file_size == 0 || !file_data) return false;
+
+    std::vector<uint8_t> decompressed;
+    const uint8_t* active_data = file_data;
+    size_t active_size = file_size;
+
+    if (file_size >= 2 && file_data[0] == 0x1f && file_data[1] == 0x8b) {
+        std::vector<uint8_t> input_wrap(file_data, file_data + file_size);
+        if (!decompress_gzip_buffer(input_wrap, decompressed)) {
+            std::cerr << "[PVR-Decoder] Gzip decompression failed" << std::endl;
+            return false;
+        }
+        active_data = decompressed.data();
+        active_size = decompressed.size();
+    }
+
+    if (active_size < 12) {
+        std::cerr << "[PVR-Decoder] Active buffer too small: " << active_size << " bytes" << std::endl;
+        return false;
+    }
+
+    bool is_pvr = false;
+    if (active_size >= 52) {
+        uint32_t magic_v3 = *(const uint32_t*)active_data;
+        uint32_t magic_v2 = *(const uint32_t*)(active_data + 44);
+        if (magic_v3 == PVR3_VERSION || magic_v2 == PVR2_MAGIC) {
+            is_pvr = true;
+        }
+    }
+
+    if (is_pvr) {
+        int w = 0, h = 0;
+        const uint8_t* pixel_data = nullptr;
+        int format_type = -1;
+        uint32_t gl_format = 0x1908;
+        uint32_t gl_type = 0x1401;
+        int bpp = 4;
+        char c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+        uint8_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+
+        const PVRv3Header* v3 = (const PVRv3Header*)active_data;
+        if (v3->version == PVR3_VERSION) {
+            w = v3->width;
+            h = v3->height;
+            pixel_data = active_data + sizeof(PVRv3Header) + v3->metadata_size;
+            format_type = pvr::ParsePVRv3Format(v3->pixel_format, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
+        } else {
+            const PVRv2Header* v2 = (const PVRv2Header*)active_data;
+            w = v2->width;
+            h = v2->height;
+            pixel_data = active_data + v2->header_size;
+            format_type = pvr::ParsePVRv2Format(v2->flags, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
+        }
+
+        if (format_type < 0 || w <= 0 || h <= 0) {
+            std::cerr << "[PVR-Decoder] Unsupported PVR format_type or invalid dimensions" << std::endl;
+            return false;
+        }
+
+        width = w;
+        height = h;
+        rgba_out.resize(width * height * 4, 255);
+        bool decode_success = false;
+
+        if (format_type == 1) { // ETC1
+            pvr::PVRTDecompressETC(pixel_data, width, height, rgba_out.data(), 6);
+            decode_success = true;
+        } else if (format_type == 2 || format_type == 3) { // PVRTC
+            uint32_t do2bitMode = (format_type == 2) ? 1 : 0;
+            pvr::PVRTDecompressPVRTC(pixel_data, do2bitMode, width, height, rgba_out.data());
+            decode_success = true;
+        } else if (format_type >= 4 && format_type <= 6) { // DXT
+            uint32_t dxt_fmt = (format_type == 4) ? 1 : ((format_type == 5) ? 3 : 5);
+            pvr::PVRTDecompressDXT(pixel_data, width, height, rgba_out.data(), dxt_fmt);
+            decode_success = true;
+        } else if (format_type == 10) { // Uncompressed
+            decode_success = pvr::PVRTDecodeUncompressed(pixel_data, width, height, c0, c1, c2, c3, d0, d1, d2, d3, rgba_out.data());
+        }
+
+        return decode_success;
+    } else {
+        uint32_t img_type = *(const uint32_t*)(active_data + 0);
+        uint32_t w = *(const uint32_t*)(active_data + 4);
+        uint32_t h = *(const uint32_t*)(active_data + 8);
+
+        if (w == 0 || h == 0 || w > 8192 || h > 8192 || img_type < 1 || img_type > 8) {
+            std::cerr << "[PVR-Decoder] Invalid .tex dimensions or format: " << w << "x" << h << ", type=" << img_type << std::endl;
+            return false;
+        }
+
+        width = (int)w;
+        height = (int)h;
+        size_t num_pixels = (size_t)width * (size_t)height;
+        rgba_out.resize(num_pixels * 4, 255);
+
+        const uint8_t* payload = active_data + 12;
+        size_t payload_size = active_size - 12;
+
+        if (img_type == 1) { // RGBA_8888
+            if (payload_size < num_pixels * 4) return false;
+            std::memcpy(rgba_out.data(), payload, num_pixels * 4);
+        }
+        else if (img_type == 2) { // RGBA_4444 (2 bytes/pixel)
+            if (payload_size < num_pixels * 2) return false;
+            for (size_t u = 0; u < num_pixels; ++u) {
+                uint16_t d = payload[u * 2] | (payload[u * 2 + 1] << 8);
+                rgba_out[u * 4 + 0] = ((d >> 12) & 15) * 17;
+                rgba_out[u * 4 + 1] = ((d >> 8)  & 15) * 17;
+                rgba_out[u * 4 + 2] = ((d >> 4)  & 15) * 17;
+                rgba_out[u * 4 + 3] = (d & 15) * 17;
+            }
+        }
+        else if (img_type == 3) { // RGBA_5551 (2 bytes/pixel)
+            if (payload_size < num_pixels * 2) return false;
+            for (size_t u = 0; u < num_pixels; ++u) {
+                uint16_t d = payload[u * 2] | (payload[u * 2 + 1] << 8);
+                rgba_out[u * 4 + 0] = ((d >> 11) & 31) * 255 / 31;
+                rgba_out[u * 4 + 1] = ((d >> 6)  & 31) * 255 / 31;
+                rgba_out[u * 4 + 2] = ((d >> 1)  & 31) * 255 / 31;
+                rgba_out[u * 4 + 3] = (d & 1) * 255;
+            }
+        }
+        else if (img_type == 4) { // RGB_888 (3 bytes/pixel)
+            if (payload_size < num_pixels * 3) return false;
+            for (size_t u = 0; u < num_pixels; ++u) {
+                rgba_out[u * 4 + 0] = payload[u * 3 + 0];
+                rgba_out[u * 4 + 1] = payload[u * 3 + 1];
+                rgba_out[u * 4 + 2] = payload[u * 3 + 2];
+                rgba_out[u * 4 + 3] = 255;
+            }
+        }
+        else if (img_type == 5) { // RGB_565 (2 bytes/pixel)
+            if (payload_size < num_pixels * 2) return false;
+            for (size_t u = 0; u < num_pixels; ++u) {
+                uint16_t d = payload[u * 2] | (payload[u * 2 + 1] << 8);
+                rgba_out[u * 4 + 0] = ((d >> 11) & 31) * 255 / 31;
+                rgba_out[u * 4 + 1] = ((d >> 5)  & 63) * 255 / 63;
+                rgba_out[u * 4 + 2] = (d & 31) * 255 / 31;
+                rgba_out[u * 4 + 3] = 255;
+            }
+        }
+        else if (img_type == 6) { // LUMINANCE_8 (1 byte/pixel)
+            if (payload_size < num_pixels) return false;
+            for (size_t u = 0; u < num_pixels; ++u) {
+                uint8_t val = payload[u];
+                rgba_out[u * 4 + 0] = val;
+                rgba_out[u * 4 + 1] = val;
+                rgba_out[u * 4 + 2] = val;
+                rgba_out[u * 4 + 3] = 255;
+            }
+        }
+        else if (img_type == 7) { // ALPHA_8 (1 byte/pixel)
+            if (payload_size < num_pixels) return false;
+            for (size_t u = 0; u < num_pixels; ++u) {
+                rgba_out[u * 4 + 0] = 255;
+                rgba_out[u * 4 + 1] = 255;
+                rgba_out[u * 4 + 2] = 255;
+                rgba_out[u * 4 + 3] = payload[u];
+            }
+        }
+        else if (img_type == 8) { // LUMINANCE_ALPHA_88 (2 bytes/pixel)
+            if (payload_size < num_pixels * 2) return false;
+            for (size_t u = 0; u < num_pixels; ++u) {
+                uint8_t lum = payload[u * 2 + 0];
+                uint8_t alpha = payload[u * 2 + 1];
+                rgba_out[u * 4 + 0] = lum;
+                rgba_out[u * 4 + 1] = lum;
+                rgba_out[u * 4 + 2] = lum;
+                rgba_out[u * 4 + 3] = alpha;
+            }
+        }
+
+        return true;
+    }
+}
+
+bool pvr_upload_compressed_to_tex(const uint8_t* file_data, size_t file_size, GLuint tex_name, int& out_w, int& out_h) {
+    if (file_size == 0 || !file_data) return false;
+
+    std::vector<uint8_t> decompressed;
+    const uint8_t* active_data = file_data;
+    size_t active_size = file_size;
+
+    if (file_size >= 2 && file_data[0] == 0x1f && file_data[1] == 0x8b) {
+        if (!decompress_gzip_buffer(std::vector<uint8_t>(file_data, file_data + file_size), decompressed)) {
+            return false;
+        }
+        active_data = decompressed.data();
+        active_size = decompressed.size();
+    }
+
+    if (active_size < 12) return false;
+
+    bool is_pvr = false;
+    if (active_size >= 52) {
+        uint32_t magic_v3 = *(const uint32_t*)active_data;
+        uint32_t magic_v2 = *(const uint32_t*)(active_data + 44);
+        if (magic_v3 == PVR3_VERSION || magic_v2 == PVR2_MAGIC) {
+            is_pvr = true;
+        }
+    }
+
+    int w = 0, h = 0;
+    const uint8_t* pixel_data = nullptr;
+    size_t data_size = 0;
+    int format_type = -1;
+    uint32_t gl_format = 0x1908;
+    uint32_t gl_type = 0x1401;
+    int bpp = 4;
+    char c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    uint8_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+
+    if (is_pvr) {
+        const PVRv3Header* v3 = (const PVRv3Header*)active_data;
+        if (v3->version == PVR3_VERSION) {
+            w = v3->width;
+            h = v3->height;
+            pixel_data = active_data + sizeof(PVRv3Header) + v3->metadata_size;
+            data_size = active_size - (sizeof(PVRv3Header) + v3->metadata_size);
+            format_type = pvr::ParsePVRv3Format(v3->pixel_format, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
+        } else {
+            const PVRv2Header* v2 = (const PVRv2Header*)active_data;
+            w = v2->width;
+            h = v2->height;
+            pixel_data = active_data + v2->header_size;
+            data_size = active_size - v2->header_size;
+            format_type = pvr::ParsePVRv2Format(v2->flags, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
+        }
+    } else {
+        return false;
+    }
+
+    if (format_type < 0 || w <= 0 || h <= 0) return false;
+
+    GLenum internal_format = 0;
+    if (format_type == 1) { // ETC1
+        internal_format = 0x8D64; // GL_ETC1_RGB8_OES
+    } else if (format_type == 2) { // PVRTC 2bpp
+        internal_format = 0x8C01; // GL_COMPRESSED_RGB_PVRTC_2BPPV1_IMG
+    } else if (format_type == 3) { // PVRTC 4bpp
+        internal_format = 0x8C00; // GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG
+    } else if (format_type == 4) { // DXT1
+        internal_format = 0x83F0; // GL_COMPRESSED_RGB_S3TC_DXT1_EXT
+    } else if (format_type == 5) { // DXT3
+        internal_format = 0x83F2; // GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
+    } else if (format_type == 6) { // DXT5
+        internal_format = 0x83F3; // GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
+    }
+
+    if (internal_format == 0) {
+        return false;
+    }
+
+    glBindTexture(GL_TEXTURE_2D, tex_name);
+    glCompressedTexImage2D(GL_TEXTURE_2D, 0, internal_format, w, h, 0, (GLsizei)data_size, pixel_data);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+    out_w = w;
+    out_h = h;
+    return true;
+}
+
+static bool pvr_upload_compressed(const uint8_t* file_data, size_t file_size, GLuint& out_tex, int& out_w, int& out_h) {
+    glGenTextures(1, &out_tex);
+    if (pvr_upload_compressed_to_tex(file_data, file_size, out_tex, out_w, out_h)) {
+        return true;
+    }
+    glDeleteTextures(1, &out_tex);
+    out_tex = 0;
+    return false;
+}
+
+
 GLuint pvr_load_texture(const char* path, int* out_width, int* out_height) {
     FILE* f = fopen(path, "rb");
     if (!f) {
@@ -198,18 +506,15 @@ GLuint pvr_load_texture(const char* path, int* out_width, int* out_height) {
         return 0;
     }
     
-    /* Get file size */
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
     
-    if (file_size < 44) {
-        std::cerr << "[PVR] File too small: " << file_size << " bytes" << std::endl;
+    if (file_size <= 0) {
         fclose(f);
         return 0;
     }
     
-    /* Read entire file into memory */
     std::vector<uint8_t> file_data(file_size);
     if (fread(file_data.data(), 1, file_size, f) != (size_t)file_size) {
         std::cerr << "[PVR] Read error" << std::endl;
@@ -217,85 +522,26 @@ GLuint pvr_load_texture(const char* path, int* out_width, int* out_height) {
         return 0;
     }
     fclose(f);
-    
+
     int width = 0, height = 0;
-    const uint8_t* pixel_data = nullptr;
-    int format_type = -1;
-    
-    uint32_t gl_format = 0x1908; // GL_RGBA
-    uint32_t gl_type = 0x1401; // GL_UNSIGNED_BYTE
-    int bpp = 4;
-    char c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-    uint8_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-    
-    /* Try PVR v3 first */
-    const PVRv3Header* v3 = (const PVRv3Header*)file_data.data();
-    if (v3->version == PVR3_VERSION) {
-        width = v3->width;
-        height = v3->height;
-        pixel_data = file_data.data() + sizeof(PVRv3Header) + v3->metadata_size;
-        format_type = pvr::ParsePVRv3Format(v3->pixel_format, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
-        
-        std::cout << "[PVR] v3 format: " << width << "x" << height 
-                  << " pixel_format=" << v3->pixel_format
-                  << " format_type=" << format_type
-                  << " mips=" << v3->mip_count << std::endl;
-    }
-    /* Try PVR v2 */
-    else {
-        const PVRv2Header* v2 = (const PVRv2Header*)file_data.data();
-        if (v2->magic == PVR2_MAGIC || v2->header_size == 44) {
-            width = v2->width;
-            height = v2->height;
-            pixel_data = file_data.data() + v2->header_size;
-            format_type = pvr::ParsePVRv2Format(v2->flags, gl_format, gl_type, bpp, c0, c1, c2, c3, d0, d1, d2, d3);
-            
-            std::cout << "[PVR] v2 format: " << width << "x" << height 
-                      << " flags=0x" << std::hex << v2->flags << std::dec 
-                      << " format_type=" << format_type << std::endl;
-        } else {
-            std::cerr << "[PVR] Unknown PVR version: 0x" 
-                      << std::hex << v3->version << std::dec << std::endl;
-            return 0;
+    GLuint tex = 0;
+
+    if (!g_pvr_software_decode) {
+        if (pvr_upload_compressed(file_data.data(), file_data.size(), tex, width, height)) {
+            if (out_width)  *out_width = width;
+            if (out_height) *out_height = height;
+            std::cout << "[PVR] Uploaded compressed " << width << "x" << height 
+                      << " → GL texture " << tex << " (hardware direct)" << std::endl;
+            return tex;
         }
     }
-    
-    if (format_type < 0) {
-        std::cerr << "[PVR] Unsupported format type: " << format_type << std::endl;
+
+    std::vector<uint8_t> rgba;
+    if (!pvr_decode_to_rgba(file_data.data(), file_data.size(), rgba, width, height)) {
+        std::cerr << "[PVR] Decoding failed for: " << path << std::endl;
         return 0;
     }
-    
-    if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
-        std::cerr << "[PVR] Invalid dimensions: " << width << "x" << height << std::endl;
-        return 0;
-    }
-    
-    /* Decode to RGBA8888 */
-    std::vector<uint8_t> rgba(width * height * 4, 255);
-    bool decode_success = false;
-    
-    if (format_type == 1) { // ETC1
-        pvr::PVRTDecompressETC(pixel_data, width, height, rgba.data(), 6);
-        decode_success = true;
-    } else if (format_type == 2 || format_type == 3) { // PVRTC
-        uint32_t do2bitMode = (format_type == 2) ? 1 : 0;
-        pvr::PVRTDecompressPVRTC(pixel_data, do2bitMode, width, height, rgba.data());
-        decode_success = true;
-    } else if (format_type >= 4 && format_type <= 6) { // DXT
-        uint32_t dxt_fmt = (format_type == 4) ? 1 : ((format_type == 5) ? 3 : 5);
-        pvr::PVRTDecompressDXT(pixel_data, width, height, rgba.data(), dxt_fmt);
-        decode_success = true;
-    } else if (format_type == 10) { // Uncompressed
-        decode_success = pvr::PVRTDecodeUncompressed(pixel_data, width, height, c0, c1, c2, c3, d0, d1, d2, d3, rgba.data());
-    }
-    
-    if (!decode_success) {
-        std::cerr << "[PVR] Decoding failed for format_type: " << format_type << std::endl;
-        return 0;
-    }
-    
-    /* Upload to GL texture */
-    GLuint tex = 0;
+
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, 
@@ -308,8 +554,8 @@ GLuint pvr_load_texture(const char* path, int* out_width, int* out_height) {
     if (out_width)  *out_width = width;
     if (out_height) *out_height = height;
     
-    std::cout << "[PVR] Uploaded " << width << "x" << height 
-              << " → GL texture " << tex << " (format_type=" << format_type << ")" << std::endl;
+    std::cout << "[PVR] Uploaded decoded " << width << "x" << height 
+              << " → GL texture " << tex << " (software decoded)" << std::endl;
     
     return tex;
 }

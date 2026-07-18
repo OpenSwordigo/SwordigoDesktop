@@ -34,6 +34,10 @@
 
 bool g_sre_overlay_blocking = false;
 
+// Guest heap size reporters (defined in jni_bridge_arm64.cpp / jni_bridge.cpp)
+extern "C" uint32_t get_guest_heap_size_64();
+extern "C" uint32_t get_guest_heap_size_32();
+
 // ---------------------------------------------------------------------------
 // Helpers — no stdlib in SRE land, but this is host-side C++ so fine
 // ---------------------------------------------------------------------------
@@ -427,7 +431,14 @@ void SwordfareGUI::update_console_backend() {
             m_tcp_cmd_in_flight = false;
             int client_fd = m_tcp_client_fd.load();
             if (client_fd >= 0) {
-                std::string output = res_str + "\n> ";
+                std::string output;
+                if (status == 2) {
+                    // Output error in red
+                    output = "\033[1;31mError: " + res_str + "\033[0m\n\033[1;36mraijin-sdk\033[0m> ";
+                } else {
+                    // Normal execution output
+                    output = res_str.empty() ? "\033[1;36mraijin-sdk\033[0m> " : (res_str + "\n\033[1;36mraijin-sdk\033[0m> ");
+                }
                 write(client_fd, output.c_str(), output.size());
             }
         }
@@ -650,6 +661,11 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
 
                 auto& rgc = RedstellGC::instance();
 
+                // Guest heap: pages actually accessed in the mmap'd guest address space
+                uint32_t ghs64 = get_guest_heap_size_64();
+                uint32_t ghs32 = get_guest_heap_size_32();
+                uint32_t guest_heap_total = ghs64 + ghs32;
+                row("Guest Heap Used", "%.2f MB", (float)guest_heap_total / (1024.0f * 1024.0f));
                 row("Current RAM", "%.2f MB", (float)rgc.get_current_ram() / (1024.0f * 1024.0f));
                 row("Peak RAM", "%.2f MB", (float)rgc.get_peak_ram() / (1024.0f * 1024.0f));
                 row("Largest Alloc", "%.2f MB", (float)rgc.get_largest_allocation() / (1024.0f * 1024.0f));
@@ -661,6 +677,11 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
                 row("Last GC Duration", "%.2f ms", rgc.get_last_cleanup_duration());
 
                 ImGui::EndTable();
+            }
+
+            ImGui::Spacing();
+            if (ImGui::Button("Generate Allocation Report", ImVec2(-1, 0))) {
+                RedstellGC::instance().generate_allocation_report();
             }
 
             // Resource Breakdown Sub-Header
@@ -2959,6 +2980,122 @@ void SwordfareGUI::stop_tcp_server() {
     }
 }
 
+static bool is_lua_chunk_complete(const std::string& code) {
+    int braces = 0;
+    int parens = 0;
+    int brackets = 0; // [ ]
+    int blocks = 0;
+    
+    size_t i = 0;
+    size_t n = code.length();
+    while (i < n) {
+        char ch = code[i];
+        
+        // 1. Skip comments
+        if (ch == '-' && i + 1 < n && code[i + 1] == '-') {
+            i += 2;
+            // Check for multi-line comment: --[[ ... ]] or --[=[ ... ]=]
+            if (i < n && code[i] == '[') {
+                size_t start = i;
+                size_t equals_count = 0;
+                i++;
+                while (i < n && code[i] == '=') {
+                    equals_count++;
+                    i++;
+                }
+                if (i < n && code[i] == '[') {
+                    // It is a multi-line comment. Find matching closer: ]=...]
+                    i++;
+                    std::string closer = "]" + std::string(equals_count, '=') + "]";
+                    size_t closer_pos = code.find(closer, i);
+                    if (closer_pos != std::string::npos) {
+                        i = closer_pos + closer.length();
+                    } else {
+                        i = n; // Incomplete multi-line comment
+                    }
+                    continue;
+                }
+                // Not a multi-line comment, fall back to single-line comment
+                i = start;
+            }
+            // Single-line comment: skip to newline
+            while (i < n && code[i] != '\n') {
+                i++;
+            }
+            continue;
+        }
+        
+        // 2. Skip string literals
+        if (ch == '\'' || ch == '"') {
+            char quote = ch;
+            i++;
+            while (i < n) {
+                if (code[i] == '\\' && i + 1 < n) {
+                    i += 2; // skip escaped char
+                    continue;
+                }
+                if (code[i] == quote) {
+                    i++;
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        
+        // 3. Skip Lua long brackets (strings): [[ ... ]] or [=[ ... ]=]
+        if (ch == '[') {
+            size_t start = i;
+            size_t equals_count = 0;
+            i++;
+            while (i < n && code[i] == '=') {
+                equals_count++;
+                i++;
+            }
+            if (i < n && code[i] == '[') {
+                i++;
+                std::string closer = "]" + std::string(equals_count, '=') + "]";
+                size_t closer_pos = code.find(closer, i);
+                if (closer_pos != std::string::npos) {
+                    i = closer_pos + closer.length();
+                } else {
+                    i = n; // Incomplete long string
+                }
+                continue;
+            }
+            i = start; // Just a regular bracket [
+        }
+        
+        // 4. Track braces, parens, brackets
+        if (ch == '{') braces++;
+        else if (ch == '}') braces--;
+        else if (ch == '(') parens++;
+        else if (ch == ')') parens--;
+        else if (ch == '[') brackets++;
+        else if (ch == ']') brackets--;
+        
+        // 5. Track Lua block keywords
+        if (isalpha(ch) || ch == '_') {
+            std::string word;
+            while (i < n && (isalnum(code[i]) || code[i] == '_')) {
+                word += code[i];
+                i++;
+            }
+            if (word == "do" || word == "then" || word == "repeat" || word == "function") {
+                blocks++;
+            } else if (word == "end" || word == "until") {
+                blocks--;
+            } else if (word == "elseif") {
+                blocks--;
+            }
+            continue;
+        }
+        
+        i++;
+    }
+    return (braces <= 0 && parens <= 0 && brackets <= 0 && blocks <= 0);
+}
+
 void SwordfareGUI::tcp_server_loop() {
     while (m_tcp_running) {
         sockaddr_in client_addr{};
@@ -2980,18 +3117,21 @@ void SwordfareGUI::tcp_server_loop() {
 
         // Welcome greeting
         const char* greeting = 
-            "==========================================\n"
-            "   Swordigo TCP console session started   \n"
-            "==========================================\n"
-            "Type Lua commands here to run them in game.\n"
-            "Use 'Ctrl+L' (or send 'clear') to clear screen.\n"
-            "Type 'exit' or 'quit' to disconnect.\n\n"
-            "> ";
+            "\033[1;36m=====================================================\033[0m\n"
+            "\033[1;32m      RAIJIN Lua SDK Console (Swordfare TCP Server)  \033[0m\n"
+            "\033[1;36m=====================================================\033[0m\n"
+            " \033[33m*\033[0m Enter Lua commands or blocks to evaluate dynamically.\n"
+            " \033[33m*\033[0m Supports full multiline input (braces, quotes, functions).\n"
+            " \033[33m*\033[0m Type \033[1;31m.\033[0m on a new line to clear current input buffer.\n"
+            " \033[33m*\033[0m Type \033[1;32mclear\033[0m to clear screen.\n"
+            " \033[33m*\033[0m Type \033[1;31mexit\033[0m or \033[1;31mquit\033[0m to close connection.\n\n"
+            "\033[1;36mraijin-sdk\033[0m> ";
         write(client_fd, greeting, strlen(greeting));
 
         // Read loop for client commands
         char read_buf[4096];
         std::string line_accumulator;
+        std::string multiline_cmd;
         while (m_tcp_running && m_tcp_client_fd.load() == client_fd) {
             ssize_t bytes_read = read(client_fd, read_buf, sizeof(read_buf) - 1);
             if (bytes_read <= 0) {
@@ -3004,25 +3144,33 @@ void SwordfareGUI::tcp_server_loop() {
             // Process any complete lines
             size_t newline_pos;
             while ((newline_pos = line_accumulator.find('\n')) != std::string::npos) {
-                std::string cmd = line_accumulator.substr(0, newline_pos);
+                std::string line = line_accumulator.substr(0, newline_pos);
                 line_accumulator.erase(0, newline_pos + 1);
 
                 // Strip carriage return if present
-                if (!cmd.empty() && cmd.back() == '\r') {
-                    cmd.pop_back();
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
                 }
 
                 // Strip leading/trailing whitespaces
-                size_t first = cmd.find_first_not_of(" \t");
+                size_t first = line.find_first_not_of(" \t");
                 if (first != std::string::npos) {
-                    cmd = cmd.substr(first);
-                    size_t last = cmd.find_last_not_of(" \t");
-                    cmd = cmd.substr(0, last + 1);
+                    line = line.substr(first);
+                    size_t last = line.find_last_not_of(" \t");
+                    line = line.substr(0, last + 1);
                 } else {
-                    cmd.clear();
+                    line.clear();
                 }
 
-                if (cmd == "exit" || cmd == "quit") {
+                // Check for input buffer reset command
+                if (line == ".") {
+                    multiline_cmd.clear();
+                    const char* reset_msg = "Input buffer cleared.\n\033[1;36mraijin-sdk\033[0m> ";
+                    write(client_fd, reset_msg, strlen(reset_msg));
+                    continue;
+                }
+
+                if (line == "exit" || line == "quit") {
                     const char* bye = "Goodbye!\n";
                     write(client_fd, bye, strlen(bye));
                     close(client_fd);
@@ -3030,32 +3178,58 @@ void SwordfareGUI::tcp_server_loop() {
                     break;
                 }
 
-                if (cmd == "clear") {
+                if (line == "clear") {
                     // Send ANSI clear screen command
-                    const char* clear_ansi = "\033[2J\033[H> ";
+                    const char* clear_ansi = "\033[2J\033[H\033[1;36mraijin-sdk\033[0m> ";
                     write(client_fd, clear_ansi, strlen(clear_ansi));
+                    multiline_cmd.clear();
                     continue;
                 }
 
-                if (!cmd.empty()) {
-                    // Block until the previous command has been processed
-                    while (m_tcp_running && m_tcp_client_fd.load() == client_fd) {
-                        m_tcp_mutex.lock();
-                        bool empty = m_tcp_pending_cmd.empty();
-                        m_tcp_mutex.unlock();
-                        if (empty) break;
-                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                    }
-
-                    if (!m_tcp_running || m_tcp_client_fd.load() != client_fd) break;
-
-                    m_tcp_mutex.lock();
-                    m_tcp_pending_cmd = cmd;
-                    m_tcp_mutex.unlock();
+                // Accumulate block line
+                if (multiline_cmd.empty()) {
+                    multiline_cmd = line;
                 } else {
-                    // Just print a new prompt if empty line is submitted
-                    const char* prompt = "> ";
-                    write(client_fd, prompt, strlen(prompt));
+                    multiline_cmd += "\n" + line;
+                }
+
+                // Execute block if it is complete
+                bool execute = false;
+                if (multiline_cmd.empty()) {
+                    execute = true;
+                } else {
+                    if (is_lua_chunk_complete(multiline_cmd)) {
+                        execute = true;
+                    }
+                }
+
+                if (execute) {
+                    if (!multiline_cmd.empty()) {
+                        // Block until the previous command has been processed
+                        while (m_tcp_running && m_tcp_client_fd.load() == client_fd) {
+                            m_tcp_mutex.lock();
+                            bool empty = m_tcp_pending_cmd.empty();
+                            m_tcp_mutex.unlock();
+                            if (empty) break;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        }
+
+                        if (!m_tcp_running || m_tcp_client_fd.load() != client_fd) break;
+
+                        m_tcp_mutex.lock();
+                        m_tcp_pending_cmd = multiline_cmd;
+                        m_tcp_mutex.unlock();
+
+                        multiline_cmd.clear();
+                    } else {
+                        // Just print a new prompt if empty line is submitted in clean state
+                        const char* prompt = "\033[1;36mraijin-sdk\033[0m> ";
+                        write(client_fd, prompt, strlen(prompt));
+                    }
+                } else {
+                    // Send block continuation prompt
+                    const char* cont_prompt = "\033[1;33m          \033[0m>> ";
+                    write(client_fd, cont_prompt, strlen(cont_prompt));
                 }
             }
         }

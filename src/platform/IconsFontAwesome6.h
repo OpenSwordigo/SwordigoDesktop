@@ -41,6 +41,7 @@
 #define ICON_FA_ROCKET           "\xef\x84\xb5"  // U+F135
 #define ICON_FA_PUZZLE_PIECE     "\xef\x84\xae"  // U+F12E
 #define ICON_FA_CUBE             "\xef\x86\xb2"  // U+F1B2
+#define ICON_FA_HAND_POINTER     "\xef\x89\x9a"  // U+F25A
 #define ICON_FA_DOWNLOAD         "\xef\x80\x99"  // U+F019
 
 // --- Status / Info ---

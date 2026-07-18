@@ -1037,25 +1037,24 @@ void sre_handleTouchEvent(void* env, void* obj, int action, int id, double time,
 }
 
 void sre_ProgramState_destructor(void* self) {
-    /* commented out to revert to old behavior
+    /* Evict the closed lua_State from the injection cache so that if the
+     * guest allocator recycles this pointer for a new state, the new state
+     * gets fully initialized by sre_mini_ensure_injected instead of being
+     * silently skipped as "already injected". */
     void* parent = *(void**)((char*)self + 8);
-
     if (parent == NULL) {
+        /* Root ProgramState — it owns the lua_State */
         lua_State* L = *(lua_State**)self;
-        if (L != NULL && L == g_sre_last_lua_state) {
-            g_sre_last_lua_state = NULL;
-        }
-    } else {
-        lua_State* parent_L = *(lua_State**)parent;
-        if (parent_L != NULL && g_lua_pushlightuserdata && g_lua_pushnil && g_lua_settable) {
-            g_lua_pushlightuserdata(parent_L, self);
-            g_lua_pushnil(parent_L);
-            g_lua_settable(parent_L, LUA_REGISTRYINDEX);
+        if (L != NULL) {
+            extern void sre_mini_remove_injected(lua_State* L);
+            sre_mini_remove_injected(L);
+            if (L == g_sre_last_lua_state) {
+                g_sre_last_lua_state = NULL;
+            }
         }
     }
 
     if (g_orig_ProgramState_destructor) {
         g_orig_ProgramState_destructor(self);
     }
-    */
 }
