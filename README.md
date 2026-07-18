@@ -1,16 +1,15 @@
 <div align="center">
 <img width="225" height="225" alt="image" src="https://github.com/user-attachments/assets/24f6bc9f-fb38-4618-b3e1-e7de5d3c67f8" />
 
-# ⚔️ Swordigo Desktop
+# Swordigo Desktop
 
-### The Swordigo Runtime (SRT)
+### SDK, Developer Toolchain, and Compatibility Layer
 
-*The classic 2012 action-adventure — running natively on Linux through a custom ARM compatibility runtime.*
+*A native desktop compatibility layer, software development kit, and modding utility for Swordigo, running original guest binaries natively on Linux through a custom ARM64 compatibility runtime.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/TheCorrectSynovian/SwordigoDesktop/blob/master/LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20x86__64-purple.svg)](#)
 [![Version](https://img.shields.io/badge/Version-v8.0%20Beta%201-00e5ff.svg)](https://github.com/TheCorrectSynovian/SwordigoDesktop/releases)
-[![Engine](https://img.shields.io/badge/Engine-SRT%20v8.0-8b3dff.svg)](#-srt-architecture)
 
 [Website](https://thecorrectsynovian.github.io/SwordigoDesktop/web/) · [Download](https://github.com/TheCorrectSynovian/SwordigoDesktop/releases) · [Research](https://thecorrectsynovian.github.io/SwordigoDesktop/web/research.html) · [Changelog](https://thecorrectsynovian.github.io/SwordigoDesktop/web/changelog.html)
 
@@ -18,319 +17,183 @@
 
 ---
 
-**Swordigo Desktop** is a native Linux port of the beloved mobile action-adventure platformer by Touch Foo. Rather than running through Android emulation layers, this project uses the **Swordigo Runtime (SRT)** — a layered runtime architecture that treats `libswordigo.so` as a gameplay kernel while progressively replacing subsystems with clean, native reimplementations.
+**Swordigo Desktop** is a comprehensive native Linux compatibility layer, SDK, and modding kit for Ville Mäkynen's classic mobile action-adventure platformer by Touch Foo. Rather than relying on heavy emulation layers or virtualization, this project uses a hybrid architecture that loads the original `libswordigo.so` binary as a gameplay kernel while intercepting and routing all system calls, rendering commands, and filesystem access to native host-side implementations.
 
-v8.0 Beta 1 brings a monumental overhaul to the modding ecosystem: a **Host-side Virtual File System (VFS)** with 5-layer prioritized fallback, **Native Uncompressed PVR & PVRTC decoding**, a fully unrestricted **Lua console (`caver.call`)**, **TOML Mod Manifests**, and **SwKiwi Native UI Vector Overlays** — completely decoupling asset emulation from legacy guest limits while maintaining perfect backwards compatibility through an isolated ARM32 backend.
-
----
-
-## 🎯 What's New in v8.0 Beta 1
-
-### 📂 Universal Mod Virtual File System (VFS)
-- Complete host-side `AAssetManager` interception with a 5-layer path priority (`mods/<active_mod>/resources/<profile>/` → `assets/resources/`).
-- Seamless overrides: Mod assets instantly replace vanilla assets without destructive file changes.
-- Smart fallbacks: Transparent `.tex.png` ↔ `.pvr` and `_2x` ↔ `_1x` format swapping under the hood.
-
-### 🗜️ Native PVR & PVRTC Decoding
-- **PVR v3 + RGBA/BGRA:** Fonts and UI atlases render flawlessly using a native host-side extractor.
-- **PVRTC Decompression:** Raw iOS PVRTC textures are unpacked directly on the host using the PowerVR SDK decoder, bypassing broken guest fallback software pipelines.
-
-### ⌨️ SwKiwi: Native UI Overlays (ImGui)
-- The Android-based `ButtonController` ported natively into ImGui vector elements.
-- Spawn interactive window overlays, draggable panels (`movable`), and pinch-to-zoom elements (`pinchable`).
-- Input gating: hovering SwKiwi elements automatically swallows gameplay touches.
-
-### 📜 True Lua Console
-- Real standard `print()` is fixed and no longer crashes the game.
-- Execute any native ARM64 engine method via `caver.call(addr, ...)` directly from the console.
-- Native memory inspection via `caver.read32(addr)` and `caver.write8(addr, val)`.
-
-### ⚙️ TOML Mod Manifests
-- Uses TOMLC to instantly parse `mini.toml` files on boot to configure engine state, versions, and limits natively before VFS activation.
-
-### 🛡️ Isolated ARM32 Asset Emulation
-- Complete decoupling of ARM32 asset management into an isolated implementation, ensuring classic `armeabi-v7a` mods run exactly as intended without SRE path mutations.
-
-> See [v8.0 Beta 1 Release Notes](documentation/Release%20Notes/RELEASE_NOTES_v8.0_Beta_1.md) for full details.
+The project features a **Host-side Virtual File System (VFS)** with prioritized fallback, **Native Uncompressed PVR & PVRTC decoding**, a fully unrestricted **Lua console**, **TOML Mod Manifests**, and **SwKiwi Native UI Vector Overlays** — completely decoupling asset emulation from legacy guest limits while maintaining perfect backwards compatibility.
 
 ---
 
-## ⚡ SRT Architecture
+## Codebase Architecture and Components
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│  🖥️  Platform Layer (Host)                                   │
-│      SDL3 · OpenGL · OpenAL · Linux x86_64                    │
-├───────────────────────────────────────────────────────────────┤
-│  🎮  Controls Manager         │  🎨  Presentation Layer      │
-│      Keyboard/Gamepad/Touch   │      PolyMC Launcher          │
-│      Configurable bindings    │      F-key overlays           │
-│      Macro support            │      PostFX pipeline          │
-├───────────────────────────────┼───────────────────────────────┤
-│  🔧  JNI Bridge               │  📦  ELF Loader              │
-│      200+ bridged functions   │      ARM32 + ARM64            │
-│      libc/GL/AL/IO/pthread    │      Full ELF relocation      │
-├───────────────────────────────┴───────────────────────────────┤
-│  ⚙️  Dynarmic JIT (Default) / Unicorn Interpreter (Fallback) │
-│      ARM64 JIT → x86_64 native · 60fps · Near-native speed   │
-├───────────────────────────────────────────────────────────────┤
-│  🏗️  libsre.so — Swordigo Runtime Engine (Guest ARM64)       │
-│      30+ active hooks · GUI · Music · HUD · Death · Saves    │
-│      Replaces subsystems, not patches them                    │
-├───────────────────────────────────────────────────────────────┤
-│  📜  libswordigo.so — Gameplay Kernel (Original ARM Binary)   │
-│      Physics · AI · Lua · Combat · Entities · Saves           │
-└───────────────────────────────────────────────────────────────┘
-```
+The repository is organized into distinct host-side and guest-side subsystems, mapping specialized responsibilities across separate compilation layers.
 
-### Runtime Layers
+### 1. Platform Layer (Host Frontend)
+- **src/main.cpp**: The core entry point. Configures the host process, initializes the SDL3 window, sets up the graphics backends (Vulkan / OpenGL), mounts the virtual CPU cores (Dynarmic / Unicorn), loads the binaries, resolves dynamic relocations, and coordinates the execution loop.
+- **src/platform/display.cpp / display.h**: Manages the native SDL3 display window, window resize events, scaling aspect ratios, and context creation.
+- **src/platform/data_path.cpp / data_path.h**: Handles file paths and implements the prioritized Virtual File System (VFS) redirection rules, Retina overrides, and texture file format swaps.
+- **src/platform/fbo_scaler.cpp**: Implements high-resolution Framebuffer Object (FBO) scaling, bilinear/nearest filtering, and the Post-Processing pipeline (SSAO, God Rays, Cinematic presets).
+- **src/platform/video_background.cpp**: Operates the background companion video player using FFmpeg frames extracted to temporary files and loaded asynchronously.
+- **src/platform/launcher.cpp / launcher_ui.cpp**: Defines the graphical startup manager built with ImGui, supporting graphics configuration, save game modifications, and mod profile selection.
 
-| Layer | Component | What It Does |
-|-------|-----------|-------------|
-| **Platform** | SDL3, OpenGL, OpenAL | Windowing, rendering, audio on host |
-| **Controls** | Input Config + Macro Engine | Fully remappable keyboard/gamepad/touch |
-| **Bridge** | JNI Bridge (200+ functions) | Translates ARM JNI calls to host APIs |
-| **Loader** | ELF Loader (ARM32 + ARM64) | Parses, relocates, loads ARM shared objects |
-| **Emulator** | Dynarmic JIT (default) / Unicorn | JIT compiles ARM64 → x86_64 at near-native speed |
-| **SRE** | libsre.so (30+ hooks) | **Replaces** game subsystems with clean C |
-| **Kernel** | libswordigo.so | Original game: physics, AI, Lua, combat |
+### 2. Binary Loader and CPU Emulators (Host Engine)
+- **src/loader/elf_loader.cpp / elf_loader_arm64.cpp**: Custom ELF binary parsing engine. Relocates and maps segment headers for `libswordigo.so` and `libsre.so` into the allocated guest memory block, resolving symbol bindings (JUMP_SLOT, GLOB_DAT, RELATIVE).
+- **src/platform/emulator.cpp / emulator_arm64.cpp / emulator_dynarmic64.cpp**: Interfaces with CPU emulation cores. Dynarmic translates guest ARM64 instructions directly to host x86_64 machine code via Just-In-Time (JIT) compilation at near-native speeds, while Unicorn provides a standard interpretative fallback.
 
-### 🏗️ SRE — What It Owns
+### 3. Translation Subsystem (JNI Bridge)
+- **src/jni/jni_bridge.cpp / jni_bridge_arm64.cpp**: Emulates the Android JNI environment. Maps over 200 Android OS calls generated by the guest kernel into native Linux equivalents (bridging directory files, mapping OpenGL ES calls to desktop GL Core profiles, and translating JNI sound calls to OpenAL Soft routines).
 
-| Subsystem | Status | How |
-|-----------|--------|-----|
-| 🎵 Music | **Fully replaced** | 6 hooks replace MusicPlayer, command interface to host OpenAL |
-| 💀 Death/Respawn | **Fully replaced** | 1 hook skips ads, calls native respawn from checkpoint |
-| 🎮 HUD (HP/Mana/Coins) | **Fully replaced** | Full GameSceneView::Update reimplementation |
-| 💰 Smart Coin Bar | **Owned** | Shop-aware auto-hide, 3s fade, world-change detection |
-| 🌄 Backgrounds | **Fully replaced** | 3 hooks for custom sky/depth rendering |
-| 🔴 Damage Flash | **Owned** | Red screen flash on HP decrease |
-| 📊 Player Stats | **Exported** | HP, Mana, Coins, XP, Level, ATK — readable from host |
-| 🧵 String System | **Replaced** | 4 hooks eliminate atomic STXR spin loops |
-| 🖼️ GUI Rendering | **Fully replaced** | 8 DrawRect hooks — buttons, labels, frames, sliders natively in C |
-| 💾 Save Editor | **Integrated** | Built into launcher — edit coins, HP, mana, XP, weapons, keys |
-| 🔍 Asset Viewer | **New tool** | Browse PVR/PNG textures, audio, scenes (`make asset_viewer`) |
-| 🛡️ Crash Safety | **Active** | luaD_throw + ProgramPanic + __cxa_throw interception |
+### 4. SRE (Swordigo Runtime Engine - Guest Side)
+The SRE is compiled as a shared library (`libsre.so`) and executed within the virtual ARM64 address space alongside the game engine.
+- **src/sre/sre_init.c**: Manages SRE startup, applies function-level hook trampolines, intercepts core game logic, and registers custom APIs.
+- **src/sre/sre_vfs.c**: Resolves virtual asset requests inside the guest environment, converting MiniPaths (`/Assets/`, `/Files/`, `/Cache/`) to clean paths before invoking filesystem calls.
+- **src/sre/sre_gui.c / sre_mini_api.c**: Implements native GUI structures, custom button controls, and modded vector button inputs.
+- **src/sre/sre_lua.c / sre_lua_compat.h**: Wraps internal Lua Virtual Machine operations to safeguard execution paths, capture program exceptions (`luaD_throw`), and resolve Lua-to-native API calls.
 
 ---
 
-## ✨ Features
+## Technical Features
 
-### Desktop-Native Experience
-- **1920×1080 internal rendering** with FBO-based scaling (Sharp Bilinear, Nearest, CRT Scanline)
-- **Keyboard controls** — fully remappable via the in-game Controls Editor (F2)
-- **Gamepad support** — Xbox/PlayStation controllers with analog stick + D-pad
-- **Multi-touch support** — 10 independent touch inputs for touchscreen laptops
+### Host-side Virtual File System (VFS)
+- Complete host-side `AAssetManager` interception with a 5-layer path priority (`mods/<active_mod>/resources/<profile>/` → `assets/resources/`), preventing modifications to the base game files.
+- Transparent format mapping for texture overrides (such as automatic `.tex.png` to `.pvr` swapping) and resolution selection (Retina `_2x` to `_1x` fallbacks).
 
-### PostFX Pipeline
-- **6 Presets** (F6) — Cinematic, Retro, Fantasy, Noir, Ethereal, Atmospheric
-- **SSAO** — Screen Space Ambient Occlusion with 16-sample hemisphere
-- **God Rays** — 64-sample radial blur from configurable sun position
-- **Color Effects** — Vignette, Film Grain, Chromatic Aberration, Sharpen
+### Native Texture Decoding & Audio Subsystems
+- Direct host-side decompression of PowerVR PVRTC iOS-format textures and PVR v3 RGBA/BGRA atlases.
+- Complete OpenAL Soft music and audio engine rewriting, bypassing Android JNI and JNI-level garbage collection overhead.
 
-### Engine Features
-| Key | Feature |
-|-----|---------|
-| **F1** | Toggle GUI menu bar (File/Emulation/Config/Misc/Help) |
-| **F2** | Controls Editor (drag to reposition buttons) |
-| **F3** | Debug overlay (FPS, draw calls, player stats, binary info) |
-| **F4** | Cycle scaling modes |
-| **F5** | Camera override toggle |
-| **F6** | Cycle PostFX presets |
-| **F7** | Toggle video background playback (ON/OFF) |
-| **\\** | Toggle keyboard typing mode |
-| **F10** | Toggle native on-screen controls |
-| **F12** | Fullscreen toggle |
+### SwKiwi: Vector User Interface Overlay
+- ImGui-powered host-side overlays rendering the virtual gamepad, console panels, and debug dashboards as crisp vector elements.
+- Input capture gating that intercepts touch events before passing them to the guest engine.
+
+### Post-Processing Pipeline
+- Framebuffer scaling modes (Sharp Bilinear, Nearest, CRT Scanline) at native 1080p+ resolutions.
+- 16-sample hemisphere Screen Space Ambient Occlusion (SSAO) and 64-sample radial light god rays.
 
 ---
 
-## 🎮 Modding Ecosystem
+## SDK and Developer Tools
 
-### Two Modding Frameworks
+### The Raijin Console
+The Raijin Console provides an interactive Lua interpreter and debugging interface directly inside the game instance:
+- **Guest Engine Interaction**: Call native ARM64 assembly routines from the console via `caver.call(address, ...)`.
+- **Memory Inspection**: Inspect guest memory using `caver.read32(address)` or modify register variables and state flags using `caver.write8(address, value)`.
+- **Standard Library Hook**: Intercepts `print()` calls from original Lua scripts and routes them to the host terminal or console window.
 
-Swordigo Desktop supports **two parallel modding approaches:**
+### Ruby (Asset Browser & Converter)
+`ruby` is a standalone, lightweight tool included in the repository (`make ruby`) for static analysis and asset extraction:
+- **Visual Asset Viewer**: Browse and render game textures, UI icons, and character atlases directly from PVR / PVRTC / PNG formats.
+- **Scene Inspector**: Load and display `.scene` configurations, node hierarchies, and map layouts.
+- **Audio Host**: Playback WAV / OGG companion files, music loops, and sound effects.
 
-#### 1️⃣ **KiwiAPI / Mini API Capaitablity (Primary — Active Development)**
-- **Status:** Actively developed, primary focus 
-- **Framework:** SwKiwi/SwMini modloader hooks into SRE
-- **Capabilities:** Full game hooks, custom contents, audio, GUI, lua table expansions.
-- **Examples:** RLSwordigo, Phonkdigo, Combatch , Mason mod etc (SwordiForge mods support)
-- **Recommendation:** This acts as a *potential* future PC implementation of libmini.
-
-#### 2️⃣ **SDMOD (Lightweight Custom Mods)**
-- **Status:** Lightweight, not actively expanded
-- **Framework:** Direct Asset replacement at runtime + simple Lua tweaks(in future)
-- **Capabilities:** Cosmetics, lightweight visual changes, simple tweaks
-- **Limitations:** Fragile, not advanced and no community.
-- **Note:** Useful for quick tweaks, but superseded by KiwiAPI for complex work
+### Analysis & Relocation Scripts
+- **check_relocations**: Inspects guest ELF binaries to isolate unrelocated symbols or dynamic library mapping discrepancies.
+- **analyze_syms**: Automates symbol sorting and classification across different game versions.
 
 ---
 
-## 📦 Install (v7.2)
+## SwKiwi Compatibility & Modding API
 
-### Pre-built Packages
-| Format | Platform | Command |
-|--------|----------|---------|
-| `.rpm` | Fedora x86_64 | `sudo dnf install swordigo-desktop-7.2.0-1.x86_64.rpm` |
-| `.deb` | Debian/Ubuntu x86_64 | `sudo dpkg -i swordigo-desktop_7.2.0-1_amd64.deb` |
+The SRE layer implements broad compatibility with the **SwKiwi (KiwiAPI)** modding framework, mimicking the low-level functions available to Android mod scripts:
 
-### Build from Source
+- **Lua-Native Interface (LNI)**: A high-speed, bidirectional communication bridge that maps Lua variables directly to native C++ engine pointers, avoiding string serialization overhead.
+- **API Bindings**: Exposes major game hooks such as:
+  - `Mini.Character`: Fetch, modify, or hook properties (HP, Mana, coordinates, stats) of the active player character.
+  - `Mini.Input`: Intercept keys, configure custom mapping profiles, or synthesize artificial input events.
+  - `Mini.Ui / Mini.Buttons`: Instantiate custom on-screen touch interfaces, button binds, and custom overlay dashboards.
+  - `Mini.Config`: Dynamically load options from local mod-specific configurations.
 
-See [BUILD.md](BUILD.md) for the full developer build guide.
+---
 
-**Quick Start:**
+## Future Roadmap: SwMega Framework
+
+The project is laying structural groundwork for the next-generation modding framework, **SwMega**, which aims to lift remaining engine limitations:
+
+- **Dynamic Entity Injection**: Adding entirely new enemies, items, and NPCs with custom behavior trees defined dynamically, bypassing the hardcoded entity index limits in `libswordigo.so`.
+- **Custom Shaders and Materials**: Enabling mods to define custom GLSL scripts, dynamic lighting maps, and particle effects per level.
+- **Unified Asset Packer**: A compilation utility to package scripts, textures, and models into single, compressed `.mega` files.
+- **Multiplayer State Sync**: A lightweight UDP synchronization client to track and render player coordinates, basic combat events, and shared lobby spaces in co-op sessions.
+
+---
+
+## How to Use
+
+### Installation and Launch
+
+The runtime requires a copy of the game assets and library binaries (`libswordigo.so`). Place them in your data directory: `~/.local/share/swordigo-desktop/`.
+
+#### Pre-built Packages
+- **Debian / Ubuntu**: `sudo dpkg -i swordigo-desktop-8.0.0-amd64.deb`
+- **Fedora**: `sudo dnf install swordigo-desktop-8.0.0-1.x86_64.rpm`
+
+#### Building and Running from Source
 ```bash
-# Install dependencies (Fedora)
-sudo dnf install libmpg123-devel unicorn-devel SDL3-devel SDL3_image-devel \
-    openal-soft-devel mesa-libGL-devel zlib-devel libvorbis-devel \
-    gcc-aarch64-linux-gnu cmake
-
-# Clone and build
+# Clone the repository
 git clone https://github.com/TheCorrectSynovian/SwordigoDesktop.git
 cd SwordigoDesktop
-./run_swordigo.sh   # Auto-builds, compiles, installs SRE, and launches
+
+# Execute build and launcher wrapper
+./run_swordigo.sh
 ```
 
-> **Note**: `aarch64-linux-gnu-gcc` is required to cross-compile libsre.so for ARM64. Dynarmic JIT is built from included source automatically on first run.
+### Controls and Commands
+
+#### Keyboard Default Controls
+- Move Left: **Left Arrow** / **A**
+- Move Right: **Right Arrow** / **D**
+- Jump: **Space** / **W**
+- Attack: **J** / **Z**
+- Magic Spell: **K** / **X**
+- Use Item: **I**
+- Menu / Settings: **Escape**
+- Pause: **P**
+
+#### Host Keybinds
+- **F1**: Toggle host UI menu bar (File / Emulation / Config / Help)
+- **F2**: Interactive Controls repositioning dashboard
+- **F3**: Show debug overlay (FPS, draw calls, memory registers, active mods)
+- **F4**: Cycle display scaling presets
+- **F5**: Toggle camera bounds override
+- **F6**: Cycle post-processing filters
+- **F7**: Toggle companion video background playback
+- **F10**: Toggle on-screen touch overlays
+- **F12**: Toggle fullscreen
 
 ---
 
-## ⚠️ Supported Instances & Bug Reporting
+## Modding and Compatibility Matrix
 
-### ✅ Officially Supported (Bug Reports Welcome)
-
-| Instance | Status | Details |
-|----------|--------|---------|
-| **Vanilla Swordigo 1.4.12 ARM64** | ✅ Fully stable | Beatable end-to-end, all bosses accessible, all progression paths verified |
-| **RLSwordigo 6.6** | 🟡 Near stable | Gameplay stable; some RogueSpells mod features incomplete |
-| **Combatch v3** | 🟡 Nearly stable | Mostly functional; Kiwi Buttons are currently buggy |
-| **Mason Mod** | 🟡 Near stable | Core mechanics work; cosmetic features untested |
-
-*Note:- During CUSTOM GUI , the game's on screen touch controls are not disabled, we are currently working on it*
-
-### ❌ Not Supported (No Bug Reports)
-
-| Instance | Status | Reason |
-|----------|--------|--------|
-| **ARM32 instances** | Deprecated | No SRE support, not actively maintained (ARM64 is the future) |
-| **Other custom mods** | As-is | Use KiwiAPI framework for new mod development |
-
-### How to Report Bugs
-
-Only report crashes/bugs for **supported instances listed above**:
-1. Clearly state the instance name and version
-2. Provide exact reproduction steps
-3. Include console output or log files
-4. Submit on [GitHub Issues](https://github.com/TheCorrectSynovian/SwordigoDesktop/issues)
-
-**Note:** ARM32 support is intentionally deprecated in favor of ARM64 performance. We focus 100% on ARM64.
+### Supported Game Editions
+- **Vanilla Swordigo 1.4.12 ARM64**: Fully verified, playable from start to finish.
+- **RLSwordigo 6.6**: Playable; specific spells and status hooks are being optimized.
+- **Combatch v3**: Stable; layout-bound Kiwi buttons are supported.
+- **Mason Mod**: Fully functional core mechanics.
 
 ---
 
-## 🎯 Controls
+## Contributors and Credits
 
-### Default Keyboard Layout
-| Key | Action | Alt Key |
-|-----|--------|---------|
-| ← / **A** | Move Left | |
-| → / **D** | Move Right | |
-| **Space** / **W** | Jump | |
-| **J** / **Z** | Attack | |
-| **K** / **X** | Magic | |
-| **I** | Use Item | |
-| **Escape** | Menu / Settings | |
-| **P** | Pause | |
+### Development Team
+- **Mano K (TheMegineBraine)** (https://github.com/branirayine)
+- **QuantumCreeper (TheCorrectSynovian)** (https://github.com/TheCorrectSynovian)
+- **MrSinup (BingsWumpus)** (https://github.com/MrSinup)
+- **X Dukinja (Duke)** (https://github.com/Dukinja)
+- **Raijin** (https://github.com/raijinswordigo/SwMega)
 
-### Gamepad
-| Button | Action |
-|--------|--------|
-| D-Pad / Left Stick | Movement |
-| A / Cross | Jump |
-| X / Square | Attack |
-| Y / Triangle | Magic |
-| B / Circle | Use Item |
-| Start | Menu |
-
-All controls are fully remappable — press **F2** to open the Controls Editor. Config is saved to `controls.ini`.
+### Community and Research
+- **ItsJustSomeDude (IJSD)**: Development of SwMini mod loader and engine reverse engineering.
+- **Kiziyon**: Development of SwKiwi modding framework (KiwiAPI).
+- **Rinnegatamante**: Initial ARM emulation research and Vita implementation.
+- **DanielSpaniel**: Creation of Swordigo FileRift, Boulder v1 parser, and SW3D mesh decoder.
+- **Swordiforge Community**: Continued contributions and mod preservation work.
 
 ---
 
-## ⚠️ Known Limitations
+## Dependencies and Licensing
 
-### ARM64 (arm64-v8a) — Primary Target
-| Issue | Severity | Details |
-|-------|----------|---------|
-| Text input crash | 🟡 Medium | Typing into certain UI fields can crash — avoid it |
+Swordigo Desktop is released under the MIT License. The project depends on the following libraries:
+- **Dynarmic**: BSD-3-Clause (ARM64 JIT CPU emulation)
+- **Unicorn Engine**: GPL-2.0 (ARM CPU fallback interpreter)
+- **SDL3 & SDL3_image**: Zlib (Platform abstraction, windowing, texture loading)
+- **OpenAL Soft**: LGPL-2.0+ (Audio rendering)
 
-### ARM32 (armeabi-v7a) — Deprecated
-| Issue | Severity | Details |
-|-------|----------|---------|
-| Timer-based spikes | 🔴 High | Repeating timer spikes don't activate |
-| Boss gates | 🔴 High | Post-boss gates don't trigger |
-| No SRE | 🔴 High | libsre.so is ARM64 only — ARM32 runs without engine hooks |
-| **Not actively maintained** | ⚠️ Design | Focus is 100% on ARM64 for best performance. ARM32 is effectively deprecated. |
-
-
-### 🔧 v7.3 NEW: KiwiAPI Buttons & Touchables (Beta)
-- Experimental interactive GUI elements
-- Full backward compatibility with existing mods
-
-> See [v7.3 Release Notes](RELEASE_NOTES_v7.3.md) for comprehensive details.
-
----
-
-## 👥 Credits
-
-### Core Team
-
-| Role | Name | GitHub |
-|------|------|--------|
-| **Lead Developer** | TheMegineBraine | [@Mano K](https://github.com/branirayine) |
-| **Developer** | TheCorrectSynovian | [@QuantumCreeper](https://github.com/TheCorrectSynovian) |
-| **Developer** | MrSinup | [@BingsWumpus](https://github.com/MrSinup) |
-| **Developer** | X Dukinja | [@Duke](https://github.com/Dukinja) |
-| **Developer** | Raijin | - | 
-
-### Research & Community
-
-| Contribution | Name | GitHub |
-|-------------|------|--------|
-| **SwMini** — Swordigo Mini mod loader & reverse engineering | ItsJustSomeDude (IJSD) | [@ItsJustSomeDude](https://github.com/ItsJustSomeDude) |
-| **SwKiwi** is Fork of SwMini — KiwiAPI modding framework for Swordigo | Kiziyon | [@Kiziyon](https://github.com/Kiziyon) |
-| **Swordigo Vita Port** — Original porting research | Rinnegatamante | [@Rinnegatamante](https://github.com/Rinnegatamante) |
-| **Swordigo FileRift** , **Boulder v1** and **SW3D** - Parsing, decoding and encoding of protobuff files, Camera overeide and work on Groundmeshes. | DanielSpaniel | [@DanielSpaniel](https://github.com/DanielSpaniel) |
-
-Thanking the **Swordiforge** community for keeping the swordigo modding active.
-
-### Original Game
-
-> **Swordigo** — Copyright © 2012-2025 Ville Mäkynen / Touch Foo
-> All Rights Reserved — [touchfoo.com/swordigo](http://www.touchfoo.com/swordigo)
-
-### Open Source Dependencies
-
-| Project | License | Purpose |
-|---------|---------|---------|
-| [Dynarmic](https://github.com/lioncash/dynarmic) | BSD-0-Clause | ARM64 JIT compiler (default engine) |
-| [Unicorn Engine](https://www.unicorn-engine.org/) | GPL-2.0 | ARM CPU interpreter (fallback engine) |
-| [SDL3](https://www.libsdl.org/) | Zlib | Window, input, gamepad |
-| [SDL3_image](https://github.com/libsdl-org/SDL_image) | Zlib | Texture loading |
-| [OpenAL Soft](https://openal-soft.org/) | LGPL-2.1 | Audio playback |
-
----
-
-## ⚖️ Legal Notice
-
-This project **does not include or distribute** any original game assets, binaries, music, or copyrighted content from Swordigo or Touch Foo. Users must provide their own `libswordigo.so` and `assets/` directory extracted from a legally obtained copy of the game.
-
-This is a personal research and preservation project. Swordigo is the property of Ville Mäkynen / Touch Foo.
-
----
-
-<div align="center">
-
-*Powered by the Swordigo Runtime (SRT)*
-
-Built with ❤️ for game preservation
-
-</div>
+This utility does not distribute Ville Mäkynen/Touch Foo copyrighted binaries, game data, or music. Users must supply their own game files to initialize the compatibility layer.
