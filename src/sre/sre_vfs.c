@@ -582,7 +582,7 @@ void* sre_NewByteBufferFromAndroidAsset(SreString* path_str, uint32_t* out_len) 
 /* Hook SetResourcesPath to force it to "resources" */
 void sre_SetResourcesPath(SreString* path_str) {
     if (g_swordigo_base != 0) {
-        SreString* global_res_path = (SreString*)(g_swordigo_base + 0x7e9d10);
+        SreString* global_res_path = (SreString*)(g_swordigo_base + 0x6e9d10);
         sre_CppString_assign(global_res_path, "resources", 9);
         printf("[SRE VFS] Hooked SetResourcesPath (original was '%s'): forced to 'resources'\n", path_str->data);
     }

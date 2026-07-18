@@ -63,6 +63,7 @@
 namespace fs = std::filesystem;
 
 std::string g_assets_dir = "assets";
+std::string g_instance_assets_dir = "assets";
 
 // --- Additional FontAwesome definitions ---
 #ifndef ICON_FA_PAUSE

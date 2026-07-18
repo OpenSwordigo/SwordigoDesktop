@@ -26,7 +26,7 @@
  * FORWARD DECLARATIONS
  * ===================================================================== */
 
-extern void sre_CppString_from_char_p(SreString* self, const char* src);
+extern SreString* sre_CppString_from_char_p(SreString* self, const char* src);
 extern void sre_CppString_release(SreString* self);
 
 /* From sre_gui.c — FontText functions for text rebuild */
@@ -1246,7 +1246,7 @@ void sre_GameOverVC_ShowAdMaybe(void* self) {
  * ===================================================================== */
 
 /* BSS offset of the engine's global ITextInputDelegate* pointer */
-#define TEXTINPUT_DELEGATE_OFFSET  0x7e9cb0
+#define TEXTINPUT_DELEGATE_OFFSET  0x6e9cb0
 
 /* GUITextFieldImpl field offsets */
 #define TEXTFIELD_BASE_ADJUST      0x140  /* delegate_ptr - this = base */

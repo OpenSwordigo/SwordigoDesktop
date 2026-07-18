@@ -72,6 +72,7 @@ static float TOUCH_SCALE_X = (float)GAME_W / 960.0f;
 // Which game binary to load (switchable via launcher or --lib flag)
 static std::string g_lib_name = "engine/v1.4.12/arm64-v8a/libswordigo.so";
 std::string g_assets_dir = "assets";  // "assets" for vanilla, "rl_assets" for RLSwordigo
+std::string g_instance_assets_dir = "assets";
 static float TOUCH_SCALE_Y = (float)GAME_H / 544.0f;   // ~1.985
 
 // Add a specific area for guest-side global variables (libc stuff)
@@ -2960,11 +2961,11 @@ void load_and_boot_arm64() {
                         uint64_t safe_vaddr = g_loader_64->get_symbol_vaddr(
                             &g_sre_mod, "sre_lua_call_safe");
                         if (lua_call_vaddr && safe_vaddr) {
-                            // Write 16-byte trampoline: LDR X16, [PC,#8]; BR X16; .quad addr
-                            uint32_t* code = (uint32_t*)(g_guest_memory + lua_call_vaddr);
-                            code[0] = 0x58000050;  // LDR X16, [PC, #8]
-                            code[1] = 0xD61F0200;  // BR X16
-                            *(uint64_t*)(code + 2) = safe_vaddr;
+                             // Write 4-byte direct branch trampoline B safe_vaddr
+                             uint32_t* code = (uint32_t*)(g_guest_memory + lua_call_vaddr);
+                             int64_t offset = (int64_t)safe_vaddr - (int64_t)lua_call_vaddr;
+                             int64_t imm = offset / 4;
+                             code[0] = 0x14000000 | (imm & 0x3FFFFFF);
                             std::cout << "[SRE] lua_call → sre_lua_call_safe @ 0x" 
                                       << std::hex << lua_call_vaddr << " → 0x" << safe_vaddr 
                                       << std::dec << " (LATE INSTALL — pcall ready)" << std::endl;
@@ -3002,7 +3003,7 @@ void load_and_boot_arm64() {
                                 lua_resume_vaddr,
                                 safe_resume_vaddr,
                                 g_lua_resume_addr,
-                                4);
+                                1);
                         } else {
                             std::cerr << "[SRE] WARNING: lua_resume trampoline skipped"
                                       << " (resume=0x" << std::hex << lua_resume_vaddr
@@ -3124,11 +3125,11 @@ void load_and_boot_arm64() {
                     {
                         copy_and_relocate(g_guest_memory + CXA_RELAY,
                                           g_guest_memory + cxa_throw_vaddr,
-                                          CXA_RELAY, cxa_throw_vaddr, 4);
-                        uint32_t* tail = (uint32_t*)(g_guest_memory + CXA_RELAY + 16);
-                        tail[0] = 0x58000050;
-                        tail[1] = 0xD61F0200;
-                        *(uint64_t*)(tail + 2) = cxa_throw_vaddr + 16;
+                                          CXA_RELAY, cxa_throw_vaddr, 1);
+                        uint32_t* tail = (uint32_t*)(g_guest_memory + CXA_RELAY + 4);
+                        int64_t ret_offset = (int64_t)(cxa_throw_vaddr + 4) - (int64_t)(CXA_RELAY + 4);
+                        int64_t ret_imm = ret_offset / 4;
+                        tail[0] = 0x14000000 | (ret_imm & 0x3FFFFFF);
                         std::cout << "[SRE] __cxa_throw relay pre-saved @ 0x"
                                   << std::hex << CXA_RELAY << std::dec << std::endl;
                     }
@@ -3141,11 +3142,11 @@ void load_and_boot_arm64() {
                         UPDATE_RELAY = TrampolineMgr::instance().reserve_cave("ProgramState_Update_relay");
                         copy_and_relocate(g_guest_memory + UPDATE_RELAY,
                                           g_guest_memory + update_vaddr,
-                                          UPDATE_RELAY, update_vaddr, 4);
-                        uint32_t* tail = (uint32_t*)(g_guest_memory + UPDATE_RELAY + 16);
-                        tail[0] = 0x58000050;
-                        tail[1] = 0xD61F0200;
-                        *(uint64_t*)(tail + 2) = update_vaddr + 16;
+                                          UPDATE_RELAY, update_vaddr, 1);
+                        uint32_t* tail = (uint32_t*)(g_guest_memory + UPDATE_RELAY + 4);
+                        int64_t ret_offset = (int64_t)(update_vaddr + 4) - (int64_t)(UPDATE_RELAY + 4);
+                        int64_t ret_imm = ret_offset / 4;
+                        tail[0] = 0x14000000 | (ret_imm & 0x3FFFFFF);
                     }
 
                     // ─── Destructor relay ────────────────────────────────────────
@@ -3158,7 +3159,7 @@ void load_and_boot_arm64() {
                             "ProgramState_destructor",
                             destructor_vaddr,
                             g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_ProgramState_destructor"),
-                            g_orig_destructor_addr, 4);
+                            g_orig_destructor_addr, 1);
                     }
 
                     // ─── CameraController::Update relay ──────────────────────────
@@ -3170,10 +3171,11 @@ void load_and_boot_arm64() {
                         uint64_t cam_cave = TrampolineMgr::instance().reserve_cave("CameraController_Update_relay");
                         copy_and_relocate(g_guest_memory + cam_cave,
                                           g_guest_memory + cam_update_vaddr,
-                                          cam_cave, cam_update_vaddr, 4);
-                        uint32_t* tail = (uint32_t*)(g_guest_memory + cam_cave + 16);
-                        tail[0] = 0x58000050; tail[1] = 0xD61F0200;
-                        *(uint64_t*)(tail + 2) = cam_update_vaddr + 16;
+                                          cam_cave, cam_update_vaddr, 1);
+                        uint32_t* tail = (uint32_t*)(g_guest_memory + cam_cave + 4);
+                        int64_t ret_offset = (int64_t)(cam_update_vaddr + 4) - (int64_t)(cam_cave + 4);
+                        int64_t ret_imm = ret_offset / 4;
+                        tail[0] = 0x14000000 | (ret_imm & 0x3FFFFFF);
                         if (g_orig_cam_update_addr)
                             *(uint64_t*)(g_guest_memory + g_orig_cam_update_addr) = cam_cave;
                         std::cout << "[SRE] g_orig_CameraController_Update → relay @ 0x"
@@ -3189,10 +3191,11 @@ void load_and_boot_arm64() {
                         uint64_t sg_cave = TrampolineMgr::instance().reserve_cave("SceneGrid_UpdateVis_relay");
                         copy_and_relocate(g_guest_memory + sg_cave,
                                           g_guest_memory + scenegrid_update_vaddr,
-                                          sg_cave, scenegrid_update_vaddr, 4);
-                        uint32_t* tail = (uint32_t*)(g_guest_memory + sg_cave + 16);
-                        tail[0] = 0x58000050; tail[1] = 0xD61F0200;
-                        *(uint64_t*)(tail + 2) = scenegrid_update_vaddr + 16;
+                                          sg_cave, scenegrid_update_vaddr, 1);
+                        uint32_t* tail = (uint32_t*)(g_guest_memory + sg_cave + 4);
+                        int64_t ret_offset = (int64_t)(scenegrid_update_vaddr + 4) - (int64_t)(sg_cave + 4);
+                        int64_t ret_imm = ret_offset / 4;
+                        tail[0] = 0x14000000 | (ret_imm & 0x3FFFFFF);
                         if (g_orig_sg_update_addr)
                             *(uint64_t*)(g_guest_memory + g_orig_sg_update_addr) = sg_cave;
                         std::cout << "[SRE] g_orig_SceneGrid_UpdateVisibleAreasWithCamera → relay @ 0x"
@@ -3227,10 +3230,11 @@ void load_and_boot_arm64() {
                         uint64_t gr_cave = TrampolineMgr::instance().reserve_cave(r.orig_sym);
                         copy_and_relocate(g_guest_memory + gr_cave,
                                           g_guest_memory + vaddr,
-                                          gr_cave, vaddr, 4);
-                        uint32_t* c32 = (uint32_t*)(g_guest_memory + gr_cave + 16);
-                        c32[0] = 0x58000050; c32[1] = 0xD61F0200;
-                        *(uint64_t*)(c32 + 2) = vaddr + 16;
+                                          gr_cave, vaddr, 1);
+                        uint32_t* c32 = (uint32_t*)(g_guest_memory + gr_cave + 4);
+                        int64_t ret_offset = (int64_t)(vaddr + 4) - (int64_t)(gr_cave + 4);
+                        int64_t ret_imm = ret_offset / 4;
+                        c32[0] = 0x14000000 | (ret_imm & 0x3FFFFFF);
                         if (orig_sym_addr)
                             *(uint64_t*)(g_guest_memory + orig_sym_addr) = gr_cave;
                         std::cout << "[SRE] Relay: " << r.orig_sym
@@ -3288,14 +3292,11 @@ void load_and_boot_arm64() {
                             continue;
                         }
 
-                        // Write a 16-byte trampoline at the target address:
-                        //   LDR X16, [PC, #8]    ; 0x58000050
-                        //   BR  X16              ; 0xD61F0200
-                        //   .quad replacement    ; 8-byte address
+                        // Write a 4-byte direct unconditional branch trampoline at the target address
+                        int64_t offset = (int64_t)replacement - (int64_t)target_addr;
+                        int64_t imm = offset / 4;
                         uint32_t* code = (uint32_t*)(g_guest_memory + target_addr);
-                        code[0] = 0x58000050;  // LDR X16, [PC, #8]
-                        code[1] = 0xD61F0200;  // BR X16
-                        *(uint64_t*)(code + 2) = replacement;
+                        code[0] = 0x14000000 | (imm & 0x3FFFFFF);
 
                         std::cout << "[SRE] Hook: 0x" << std::hex << target_offset 
                                   << " -> " << sym_name << " @ 0x" << replacement 
@@ -3440,6 +3441,68 @@ void load_and_boot_arm64() {
                         }
                     }
                     std::cout << "[SRE-Resolver] Dynamically resolved " << fn_resolved << " global engine functions." << std::endl;
+
+                    // Resolve helper functions dynamically
+                    struct HelperFn {
+                        const char* sre_var_name;
+                        const char* mangled_name;
+                    };
+                    const HelperFn helpers[] = {
+                        { "g_SceneObject_ComponentWithInterface", "_ZNK5Caver11SceneObject22ComponentWithInterfaceEl" },
+                        { "g_ProgramState_FromLuaState", "_ZN5Caver12ProgramState12FromLuaStateEP9lua_State" },
+                        { "g_SwingableWeapon_SetGlowIntensity", "_ZN5Caver24SwingableWeaponComponent16SetGlowIntensityEf" },
+                        { "g_SwingableWeapon_SetGlowColor", "_ZN5Caver24SwingableWeaponComponent12SetGlowColorENS_10FloatColorE" }
+                    };
+                    for (const auto& h : helpers) {
+                        uint64_t sre_var_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, h.sre_var_name);
+                        uint64_t engine_func_addr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, h.mangled_name);
+                        if (sre_var_addr && engine_func_addr) {
+                            *(uint64_t*)(g_guest_memory + sre_var_addr) = engine_func_addr;
+                        } else {
+                            std::cerr << "[SRE-Resolver] WARNING: Could not resolve helper " << h.sre_var_name << std::endl;
+                        }
+                    }
+
+                    // Resolve all component interfaces dynamically to prevent hard-coded offsets crash
+                    const char* interface_names[] = {
+                        "GlowComponent", "ManaComponent", "LightComponent", "ModelComponent", "ShapeComponent",
+                        "SkillComponent", "SpellComponent", "SwingComponent", "AttackComponent", "DamageComponent",
+                        "EntityComponent", "HealthComponent", "PortalComponent", "ShadowComponent", "SpriteComponent",
+                        "OverlayComponent", "ProgramComponent", "ShatterComponent", "ItemDropComponent", "ParticleComponent",
+                        "AnimationComponent", "MagicBoltComponent", "MagicBombComponent", "TouchableComponent", "TransformComponent",
+                        "WaterMeshComponent", "BackgroundComponent", "EntityInfoComponent", "FireBreathComponent", "GroundMeshComponent",
+                        "HeroEntityComponent", "PropertiesComponent", "SimpleGlowComponent", "SpawnPointComponent", "TextBubbleComponent",
+                        "WeaponGlowComponent", "FireEmitterComponent", "OverlayTextComponent", "SoundEffectComponent", "WeaponTrailComponent",
+                        "EntityActionComponent", "PortalEffectComponent", "ShadowVolumeComponent", "UtilityShapeComponent", "GroundPolygonComponent",
+                        "HookshotTrailComponent", "MonsterEntityComponent", "ParticleFieldComponent", "PhysicsObjectComponent", "BlendAnimationComponent",
+                        "BushControllerComponent", "CharControllerComponent", "CollisionShapeComponent", "DimensionSpellComponent", "DoorControllerComponent",
+                        "MagicExplosionComponent", "MagicSpellCastComponent", "ObjectModifierComponent", "ParticleObjectComponent", "TextureMappingComponent",
+                        "BreakableObjectComponent", "CollectableItemComponent", "DimensionObjectComponent", "OrbitControllerComponent", "ParticleEmitterComponent",
+                        "PhysicsPlatformComponent", "PressureTriggerComponent", "SwingableWeaponComponent", "EntityControllerComponent", "KeyframeAnimationComponent",
+                        "MonsterControllerComponent", "CharAnimControllerComponent", "ElevatorControllerComponent", "OverlayTargetArrowComponent", "RotatingBackgroundComponent",
+                        "AnimationControllerComponent", "GroundMeshGeneratorComponent", "TransformControllerComponent", "BatMonsterControllerComponent", "MagicParticleEmitterComponent",
+                        "ObjectLinkControllerComponent", "ProjectileControllerComponent", "MonsterDeathControllerComponent", "SkellyMonsterControllerComponent", "StaticMonsterControllerComponent",
+                        "GenericMonsterControllerComponent", "LeapingMonsterControllerComponent", "ModelTransformControllerComponent", "WalkingMonsterControllerComponent", "BouncingMonsterControllerComponent",
+                        "ChargingMonsterControllerComponent", "ShootingMonsterControllerComponent", "SnappingMonsterControllerComponent", "SwingableWeaponControllerComponent", "ProjectileMonsterControllerComponent",
+                        "BoneControlledCollisionShapeComponent", "MagicHookshotComponent"
+                    };
+                    int iface_resolved = 0;
+                    for (const char* name : interface_names) {
+                        std::string var_name = std::string(name) + "_Interface";
+                        uint64_t sre_var_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, var_name.c_str());
+                        if (!sre_var_addr) continue;
+                        
+                        std::string mangled = "_ZN5Caver" + std::to_string(strlen(name)) + name + "9InterfaceEv";
+                        uint64_t engine_func_addr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, mangled.c_str());
+                        if (engine_func_addr) {
+                            uint64_t iface_ptr = g_emulator_64->call(engine_func_addr, {});
+                            *(uint64_t*)(g_guest_memory + sre_var_addr) = iface_ptr;
+                            iface_resolved++;
+                        } else {
+                            std::cerr << "[SRE-Resolver] WARNING: Could not resolve engine interface for " << name << std::endl;
+                        }
+                    }
+                    std::cout << "[SRE-Resolver] Dynamically resolved " << iface_resolved << " component interfaces." << std::endl;
 
                     // updateApplication hook completely removed. The CBZ instruction inside the 7-instruction
                     // updateApplication wrapper has an offset limit of +-1MB. Relocating it to our cave region
@@ -4520,10 +4583,8 @@ void load_and_boot_arm64() {
             // Scene transitions spawn loading threads. Running them inline
             // (nested uc_emu_start) corrupts state. Run them here between frames.
             if (g_emulator_64->has_pending_threads()) {
-                if (completed_frames < 20) {
-                    std::cout << "[Diag64] Frame " << completed_frames 
-                              << " running deferred threads" << std::endl;
-                }
+                std::cout << "[Diag64] Frame " << completed_frames 
+                          << " running deferred threads" << std::endl;
                 g_emulator_64->run_pending_threads();
             }
             
@@ -4877,10 +4938,8 @@ void load_and_boot_arm64() {
 
                     // Sync overlay state with guest controls_hidden
                     if (sre_controls_hidden_addr && g_guest_memory) {
-                        if (g_swordfare_gui.is_mod_overlay_visible()) {
-                            int one = 1;
-                            memcpy(g_guest_memory + sre_controls_hidden_addr, &one, 4);
-                        }
+                        int state = g_swordfare_gui.is_mod_overlay_visible() ? 1 : 0;
+                        memcpy(g_guest_memory + sre_controls_hidden_addr, &state, 4);
                     }
                 }
             }
@@ -6020,8 +6079,9 @@ int main(int argc, char* argv[]) {
             std::cout << "[Main] Custom lib: " << g_lib_name << std::endl;
         }
         if (strcmp(argv[i], "--assets") == 0 && i + 1 < argc) {
-            g_assets_dir = argv[++i];
-            std::cout << "[Main] Custom assets: " << g_assets_dir << std::endl;
+            g_instance_assets_dir = argv[++i];
+            g_assets_dir = "assets";
+            std::cout << "[Main] Custom assets: " << g_instance_assets_dir << std::endl;
         }
         // Generate manifest.json from engine/ dir and exit
         // Usage: swordigo-desktop --generate-manifest [engine_dir] [output_path]
@@ -6131,25 +6191,26 @@ int main(int argc, char* argv[]) {
                 g_binary_selector.save_user_instances(user_instances_path);
                 return 0;
             }
-            g_graphics_api = lconf.graphics_api;
-            g_lib_name = lconf.selected_binary;
-            g_assets_dir = lconf.assets_dir;
-            g_use_dynarmic = lconf.use_dynarmic;
-            g_use_sre = lconf.use_sre;
-            g_advanced_redstell_opts = lconf.advanced_redstell_opts;
-            // Re-initialize the asset manager with the correct assets directory
-            // (asset_manager_init was called at startup with the default "assets" path)
-            asset_manager_init(get_data_path(g_assets_dir).c_str());
-            asset_manager_init_arm32(get_data_path(g_assets_dir).c_str());
-            g_binary_selector.set_loaded(g_lib_name);
-            
-            // Persist any user instances created during this session
-            g_binary_selector.save_user_instances(user_instances_path);
-            std::cout << "[Main] Launcher: " 
-                      << (g_graphics_api == GraphicsAPI::VULKAN ? "Vulkan" : "OpenGL")
-                      << " | Engine: " << (g_use_dynarmic ? "Dynarmic" : "Unicorn")
-                      << " | Binary: " << g_lib_name
-                      << " | Assets: " << g_assets_dir << std::endl;
+             g_graphics_api = lconf.graphics_api;
+             g_lib_name = lconf.selected_binary;
+             g_instance_assets_dir = lconf.assets_dir;
+             g_assets_dir = "assets";
+             g_use_dynarmic = lconf.use_dynarmic;
+             g_use_sre = lconf.use_sre;
+             g_advanced_redstell_opts = lconf.advanced_redstell_opts;
+             // Re-initialize the asset manager with the correct assets directory
+             // (asset_manager_init was called at startup with the default "assets" path)
+             asset_manager_init(get_data_path(g_instance_assets_dir).c_str());
+             asset_manager_init_arm32(get_data_path(g_instance_assets_dir).c_str());
+             g_binary_selector.set_loaded(g_lib_name);
+             
+             // Persist any user instances created during this session
+             g_binary_selector.save_user_instances(user_instances_path);
+             std::cout << "[Main] Launcher: " 
+                       << (g_graphics_api == GraphicsAPI::VULKAN ? "Vulkan" : "OpenGL")
+                       << " | Engine: " << (g_use_dynarmic ? "Dynarmic" : "Unicorn")
+                       << " | Binary: " << g_lib_name
+                       << " | Assets: " << g_assets_dir << " (Instance: " << g_instance_assets_dir << ")" << std::endl;
         }
     }
 

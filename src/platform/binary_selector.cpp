@@ -575,6 +575,9 @@ bool BinarySelector::add_custom_instance(const std::string& so_filepath, const s
         info.game_type = "Swordigo";
     }
     info.assets_dir = assets_dir;
+    if (info.assets_dir.empty()) {
+        info.assets_dir = "assets";
+    }
 
     // Look up hash in known hashes for status
     auto it = KNOWN_HASHES.find(info.sha256);
@@ -724,6 +727,9 @@ BinaryInfo BinarySelector::parse_instance_json(const std::string& json) {
     b.is_default = json_bool(json, "is_default");
     b.game_type = json_str(json, "game_type");
     b.assets_dir = json_str(json, "assets_dir");
+    if (b.assets_dir.empty()) {
+        b.assets_dir = "assets";
+    }
     b.icon_path = json_str(json, "icon_path");
     b.dependencies = json_str_array(json, "dependencies");
     b.dep_paths = json_str_array(json, "dep_paths");
@@ -923,6 +929,9 @@ void BinarySelector::load_manifest(const std::string& manifest_path) {
 
             b.game_type = kv["game_type"];
             b.assets_dir = kv["assets_dir"];
+            if (b.assets_dir.empty()) {
+                b.assets_dir = "assets";
+            }
             b.icon_path = kv["icon_path"];
 
             b.dependencies = split_comma_string(kv["dependencies"]);

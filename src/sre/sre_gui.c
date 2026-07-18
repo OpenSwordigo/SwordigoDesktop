@@ -29,7 +29,7 @@ extern pfn_SetColor    g_RenderingContext_SetColor;
 extern pfn_SpriteDraw  g_Sprite_Draw;
 
 /* CppString constructor from sre_string.c */
-extern void sre_CppString_from_char_p(SreString* self, const char* src);
+extern SreString* sre_CppString_from_char_p(SreString* self, const char* src);
 extern void sre_CppString_release(SreString* self);
 
 /* ========== RenderingContext API ========== */

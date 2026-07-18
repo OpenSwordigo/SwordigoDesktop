@@ -165,15 +165,16 @@ volatile float g_sre_hero_pos_z = 0.0f;
 uint64_t g_orig_RenderingContext_C1 = 0;
 
 /* Hook: Force GLES 2.0 API Mode */
-void sre_RenderingContext_C1(void* self, int api_mode) {
+void* sre_RenderingContext_C1(void* self, int api_mode) {
     // Call the original constructor through relay stub forcing GLES 2.0 (api_mode = 1)
-    typedef void (*fn_Ctor)(void*, int);
-    ((fn_Ctor)g_orig_RenderingContext_C1)(self, 1);
+    typedef void* (*fn_Ctor)(void*, int);
+    return ((fn_Ctor)g_orig_RenderingContext_C1)(self, 1);
 }
 
 /* Scene state flags */
 volatile int g_sre_gui_scene_active = 0;
 volatile uint64_t g_sre_gui_scene_view_ptr = 0;
+void* g_sre_gamesceneview_ptr = NULL;
 
 /* GameState pointer — exported so host can directly read/write game state.
  * This is a GUEST pointer (offset from guest memory base).
@@ -233,6 +234,7 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
     
     /* Store scene view pointer for host */
     g_sre_gui_scene_view_ptr = (uint64_t)self;
+    g_sre_gamesceneview_ptr = self;
     g_sre_gui_scene_active = 1;
     
     /* ---- Read core pointers ---- */
@@ -444,14 +446,12 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
     }
     
     /* ---- 4. CONTROLS VISIBILITY ---- */
-    /* Original: hide controls if enemy_count >= 1 OR wireframe combat flag set */
+    /* Respect g_sre_controls_hidden set by mods, and hide during cinematics/dialog (combat_flag) */
     {
-        uint64_t scene_data = *(uint64_t*)(ctrl_ptr + 0x20);
-        int enemy_count = (scene_data != 0) ? *(int*)(scene_data + 0x20) : 0;
+        extern int g_sre_controls_hidden;
         int combat_flag = (int)(uint8_t)this_[0x198];
-        
         void* overlay = (void*)*(uint64_t*)(this_ + 0x100);
-        int hide = (enemy_count >= 1 || combat_flag != 0) ? 1 : 0;
+        int hide = (g_sre_controls_hidden || combat_flag != 0) ? 1 : 0;
         if (g_sre_GameOverlayView_SetControlsHidden) g_sre_GameOverlayView_SetControlsHidden(overlay, hide);
     }
     

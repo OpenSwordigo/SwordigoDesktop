@@ -1819,7 +1819,15 @@ static int l_mini_get_profile_id(lua_State* L) {
 
 /* Mini.SetControlsHidden(bool) */
 static int l_mini_set_controls_hidden(lua_State* L) {
-    g_sre_controls_hidden = g_lua_toboolean(L, 1);
+    extern void* g_sre_gamesceneview_ptr;
+    int hidden = g_lua_toboolean(L, 1);
+    g_sre_controls_hidden = hidden;
+    if (g_sre_gamesceneview_ptr) {
+        void* overlay = *(void**)((char*)g_sre_gamesceneview_ptr + 0x100);
+        if (overlay && g_sre_GameOverlayView_SetControlsHidden) {
+            g_sre_GameOverlayView_SetControlsHidden(overlay, hidden);
+        }
+    }
     return 0;
 }
 
@@ -4731,7 +4739,7 @@ typedef void (*pfn_TextBubble_ShowText)(void* text_bubble_comp, SreString* text,
 typedef void (*pfn_TextBubble_SetHandleTouches)(void* text_bubble_comp, int enabled);
 typedef int (*pfn_TextBubble_IsTextFinishedShowing)(void* text_bubble_comp);
 
-extern void sre_CppString_from_char_p(SreString* self, const char* src);
+extern SreString* sre_CppString_from_char_p(SreString* self, const char* src);
 extern void sre_CppString_release(SreString* self);
 
 static void* get_scene_object(lua_State* L, int idx) {

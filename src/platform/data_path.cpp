@@ -11,6 +11,7 @@
 #endif
 
 extern std::string g_assets_dir;
+extern std::string g_instance_assets_dir;
 
 namespace fs = std::filesystem;
 
@@ -152,6 +153,11 @@ bool ensure_user_data() {
 // ============================================================
 
 std::string get_data_path(const std::string& relative_path) {
+    // If the path is already absolute, return it as-is
+    if (!relative_path.empty() && (relative_path[0] == '/' || (relative_path.length() > 1 && relative_path[1] == ':'))) {
+        return relative_path;
+    }
+
     // 1. Environment variable override
     const char* env_dir = getenv("SWORDIGO_DATA_DIR");
     if (env_dir) {
@@ -309,9 +315,24 @@ extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_p
 
     std::string path(original_path);
 
+    // If the path is absolute, check if it contains virtual resource folders
+    bool is_absolute = (path[0] == '/');
+    if (is_absolute) {
+        size_t res_pos = path.find("/resources/");
+        if (res_pos != std::string::npos) {
+            path = path.substr(res_pos + 11);
+            is_absolute = false; // Treat as relative from now on
+        } else {
+            size_t assets_pos = path.find("/assets/");
+            if (assets_pos != std::string::npos) {
+                path = "/Assets/" + path.substr(assets_pos + 8);
+            }
+        }
+    }
+
     // Strip virtual folder prefixes (if any)
     std::string prefix1 = "assets/resources/";
-    std::string prefix2 = g_assets_dir + "/resources/";
+    std::string prefix2 = g_instance_assets_dir + "/resources/";
     if (path.rfind(prefix1, 0) == 0) {
         path = path.substr(prefix1.length());
     } else if (path.rfind(prefix2, 0) == 0) {
@@ -322,7 +343,10 @@ extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_p
 
     // MiniPath translations: virtual paths defined by touchfoo/SWKiwi
     if (path.rfind("/Assets/", 0) == 0) {
-        std::string res = get_user_data_dir() + g_assets_dir + "/" + path.substr(8);
+        std::string res = get_user_data_dir() + g_instance_assets_dir + "/" + path.substr(8);
+        if (g_instance_assets_dir != "assets" && !fs::exists(res)) {
+            res = get_user_data_dir() + "assets/" + path.substr(8);
+        }
         strncpy(out_resolved_path, res.c_str(), max_len - 1);
         out_resolved_path[max_len - 1] = '\0';
         return true;
@@ -348,7 +372,7 @@ extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_p
     }
 
     // Absolute paths are passed through as-is
-    if (original_path[0] == '/') {
+    if (is_absolute && path[0] == '/') {
         strncpy(out_resolved_path, original_path, max_len - 1);
         out_resolved_path[max_len - 1] = '\0';
         return true;
@@ -380,7 +404,11 @@ extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_p
     // 4. resources/X
     candidates.push_back(data_dir + "/resources/" + path);
     // 5. custom_assets/resources/X (fallback to configured assets dir)
-    candidates.push_back(data_dir + "/" + g_assets_dir + "/resources/" + path);
+    candidates.push_back(data_dir + "/" + g_instance_assets_dir + "/resources/" + path);
+    // 6. vanilla assets fallback (always fallback to vanilla if custom assets directory is configured)
+    if (g_instance_assets_dir != "assets") {
+        candidates.push_back(data_dir + "/assets/resources/" + path);
+    }
 
     // Search through candidates in priority order
     for (const auto& candidate : candidates) {
@@ -393,7 +421,7 @@ extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_p
     }
 
     // Ultimate fallback: configured assets resources path (level 5)
-    std::string fallback = data_dir + "/" + g_assets_dir + "/resources/" + path;
+    std::string fallback = data_dir + "/" + g_instance_assets_dir + "/resources/" + path;
     strncpy(out_resolved_path, fallback.c_str(), max_len - 1);
     out_resolved_path[max_len - 1] = '\0';
     return true;

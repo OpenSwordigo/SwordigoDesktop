@@ -1029,6 +1029,19 @@ static const char* sre_minipath_translate(const char* path, char* out, int outle
     } else if (sre_str_starts_with(path, "/Assets/")) {
         rest = path + 8;
         base = g_sre_vfs_path_assets[0] ? g_sre_vfs_path_assets : 0;
+        extern char g_sre_vfs_data_dir[512];
+        if (base && g_sre_vfs_data_dir[0] && strstr(base, "/assets") == NULL) {
+            char test_path[512];
+            snprintf(test_path, sizeof(test_path), "%s/%s", base, rest);
+            FILE* f = fopen(test_path, "rb");
+            if (f) {
+                fclose(f);
+            } else {
+                static char fallback_base[512];
+                snprintf(fallback_base, sizeof(fallback_base), "%s/assets", g_sre_vfs_data_dir);
+                base = fallback_base;
+            }
+        }
     } else {
         return path; /* Not a recognized MiniPath */
     }
@@ -1219,6 +1232,14 @@ const char* sre_vfs_resolve_path(const char* path, char* out_buf) {
         if (g_sre_vfs_path_assets[0]) {
             snprintf(out_buf, 512, "%s/resources/%s", 
                      g_sre_vfs_path_assets, subpath);
+            f = fopen(out_buf, "rb");
+            if (f) { fclose(f); return out_buf; }
+        }
+
+        // 6. <data_dir>/assets/resources/<subpath> (vanilla fallback)
+        if (g_sre_vfs_data_dir[0]) {
+            snprintf(out_buf, 512, "%s/assets/resources/%s", 
+                     g_sre_vfs_data_dir, subpath);
             f = fopen(out_buf, "rb");
             if (f) { fclose(f); return out_buf; }
         }

@@ -200,6 +200,16 @@ public:
 
         if (exception == Exception::NoExecuteFault) {
             std::cerr << "[Dynarmic] NoExecuteFault at 0x" << std::hex << pc << std::dec << std::endl;
+            std::cerr << "=== REGISTERS ===" << std::endl;
+            for (int r = 0; r < 31; r++) {
+                uint64_t val = emu->get_reg(r);
+                const char* sym = sre_resolve_symbol(val);
+                std::cerr << "  X" << r << " = 0x" << std::hex << val;
+                if (sym) std::cerr << " [" << sym << "]";
+                std::cerr << std::dec << std::endl;
+            }
+            std::cerr << "  SP = 0x" << std::hex << emu->get_jit()->GetSP() << std::dec << std::endl;
+            std::cerr << "  PC = 0x" << std::hex << pc << std::dec << std::endl;
             emu->get_jit()->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
             return;
         }
@@ -567,6 +577,14 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
         if (Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined2)) {
             std::cerr << "[Dynarmic] Halt (UserDefined2) at 0x" << std::hex << curr_pc
                       << " — force returning" << std::dec << std::endl;
+            jit->SetPC(MAGIC_LR);
+            jit->SetSP(entry_sp);
+            break;
+        }
+
+        // Check for MemoryAbort (e.g. NoExecuteFault or unmapped memory)
+        if (Dynarmic::Has(hr, Dynarmic::HaltReason::MemoryAbort)) {
+            std::cerr << "[Dynarmic] MemoryAbort halt at PC=0x" << std::hex << curr_pc << std::dec << " — stopping execution" << std::endl;
             jit->SetPC(MAGIC_LR);
             jit->SetSP(entry_sp);
             break;

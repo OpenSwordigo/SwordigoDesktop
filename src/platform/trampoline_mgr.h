@@ -91,14 +91,9 @@ public:
                       uint64_t    target_vaddr,
                       uint64_t    replacement,
                       uint64_t    g_orig_guest_addr = 0,
-                      int         insns_to_save     = 4)
+                      int         insns_to_save     = 1)
     {
         if (!m_initialized) { die(name, "init() not called"); return false; }
-        if (insns_to_save < 4) {
-            fprintf(stderr, "[TrampolineMgr] ERROR %s: insns_to_save=%d < 4\n",
-                    name, insns_to_save);
-            return false;
-        }
         if (!target_vaddr || !replacement) {
             fprintf(stderr, "[TrampolineMgr] SKIP %s: null address\n", name);
             return false;
@@ -107,26 +102,27 @@ public:
         uint64_t cave = alloc_cave(name);
         if (!cave) return false;
 
-        // 1. Relocate original instructions to cave
+        // 1. Relocate original 1 instruction to cave (completely avoids relocating trailing CBZ/B.cond/etc.)
         copy_and_relocate(m_mem + cave, m_mem + target_vaddr,
-                          cave, target_vaddr, insns_to_save);
+                          cave, target_vaddr, 1);
 
-        // 2. Append return-jump: LDR X16,[PC,#8]; BR X16; .quad ret_target
-        uint64_t  ret = target_vaddr + (uint64_t)(insns_to_save * 4);
-        uint32_t* t   = (uint32_t*)(m_mem + cave + (uint64_t)(insns_to_save * 4));
-        t[0] = 0x58000050; t[1] = 0xD61F0200;
-        *(uint64_t*)(t + 2) = ret;
+        // 2. Append return-jump back to target_vaddr + 4 using a direct branch
+        uint32_t* t = (uint32_t*)(m_mem + cave + 4);
+        int64_t ret_offset = (int64_t)(target_vaddr + 4) - (int64_t)(cave + 4);
+        int64_t ret_imm = ret_offset / 4;
+        t[0] = 0x14000000 | (ret_imm & 0x3FFFFFF);
 
-        // 3. Write trampoline at original function (overwrites first 16 bytes)
+        // 3. Write direct branch trampoline at original function (overwrites only the first 4 bytes)
+        int64_t offset = (int64_t)replacement - (int64_t)target_vaddr;
+        int64_t imm = offset / 4;
         uint32_t* tr = (uint32_t*)(m_mem + target_vaddr);
-        tr[0] = 0x58000050; tr[1] = 0xD61F0200;
-        *(uint64_t*)(tr + 2) = replacement;
+        tr[0] = 0x14000000 | (imm & 0x3FFFFFF);
 
         // 4. Set g_orig_* pointer in libsre.so guest memory
         if (g_orig_guest_addr)
             *(uint64_t*)(m_mem + g_orig_guest_addr) = cave;
 
-        m_entries.push_back({ name, target_vaddr, replacement, cave, insns_to_save });
+        m_entries.push_back({ name, target_vaddr, replacement, cave, 1 });
         fprintf(stdout,
             "[TrampolineMgr] HOOK  %-44s  target=0x%lx  replacement=0x%lx  relay=0x%lx\n",
             name, target_vaddr, replacement, cave);

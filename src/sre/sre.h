@@ -92,9 +92,9 @@ typedef struct {
 void sre_init(uint64_t swordigo_base, uint64_t empty_sentinel_bss_offset);
 
 /* CppString replacements — hooked via trampoline */
-void sre_CppString_from_char_p(SreString* self, const char* src);
-void sre_CppString_assign(SreString* self, const char* src, uint64_t len);
-void sre_CppString_append(SreString* self, const char* src, uint64_t len);
+SreString* sre_CppString_from_char_p(SreString* self, const char* src);
+SreString* sre_CppString_assign(SreString* self, const char* src, uint64_t len);
+SreString* sre_CppString_append(SreString* self, const char* src, uint64_t len);
 void sre_CppString_release(SreString* self);
 
 /* =========================================================================

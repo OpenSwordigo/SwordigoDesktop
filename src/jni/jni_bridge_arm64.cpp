@@ -1089,14 +1089,12 @@ static void bridge_GetStringUTFChars(void* emu_ptr) {
 
 static void bridge_AAssetManager_fromJava(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    void* mgr = AAssetManager_fromJava(NULL, NULL);
-    emu->set_reg(0, register_pointer(mgr));
+    emu->set_reg(0, 0xAA000001ULL);
 }
 
 static void bridge_AAssetManager_open(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
-    AAssetManager* mgr = (AAssetManager*)get_pointer(emu->get_reg(0));
     uint32_t filename_ptr = emu->get_reg(1);
     const char* filename = (const char*)(memory + filename_ptr);
     g_frame_stats.asset_opens++;
@@ -1128,7 +1126,7 @@ static void bridge_AAssetManager_open(void* emu_ptr) {
         g_music_duck_trigger = 1;
     }
     
-    void* asset = AAssetManager_open(mgr, filename, emu->get_reg(2));
+    void* asset = AAssetManager_open(NULL, filename, emu->get_reg(2));
     if (!asset) {
         std::cerr << "[ASSET] Open FAILED: " << filename << std::endl;
     }
@@ -1844,6 +1842,15 @@ static void bridge_CallStaticVoidMethodV(void* emu_ptr) {
             if (array_len > 0 && array_len < 0x1000000) {
                 std::vector<uint8_t> data_to_save(array_data, array_data + array_len);
                 std::string snap_path = g_save_dir + "/snapshot.bin";
+                
+                // Write synchronously first as an extra safety measure so it's ready immediately
+                FILE* fp = fopen(snap_path.c_str(), "wb");
+                if (fp) {
+                    fwrite(array_data, 1, array_len, fp);
+                    fclose(fp);
+                    std::cout << "[SAVE] Synchronously saved " << array_len << " bytes to " << snap_path << std::endl;
+                }
+                
                 io_thread_post_save(snap_path, std::move(data_to_save));
                 std::cout << "[SAVE] Wrote " << array_len << " bytes asynchronously via IO thread" << std::endl;
             }
@@ -6325,7 +6332,7 @@ static void bridge_PVRTTextureLoadFromPVRBuffer(void* emu_ptr) {
     uint32_t file_data_ptr = (uint32_t)emu->get_reg(0);
     uint32_t file_size = (uint32_t)emu->get_reg(1);
     uint32_t out_tex_name_ptr = (uint32_t)emu->get_reg(2);
-    uint32_t image_ptr = (uint32_t)emu->get_reg(3);      // X3 = Image* temp
+    uint64_t image_ptr = emu->get_reg(3);      // X3 = Image* temp
     uint32_t out_height_ptr = (uint32_t)emu->get_reg(6); // X6 = height out (pTVar11) -> writes width to HEIGHT field
     uint32_t out_width_ptr = (uint32_t)emu->get_reg(7);  // X7 = width out  (pTVar10) -> writes height to WIDTH field
     

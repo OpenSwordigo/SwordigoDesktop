@@ -14,6 +14,8 @@
 VoidFillColor g_void_fill_color;
 bool g_video_background_enabled = false; // Vanilla by default
 
+extern std::string g_instance_assets_dir;
+
 namespace VideoBackground {
     struct PlayerState {
         uint32_t tex_id;
@@ -78,13 +80,13 @@ namespace VideoBackground {
         {
             std::vector<std::string> candidates;
             for (const auto& b : bares) {
-                candidates.push_back(get_data_path("assets/resources/" + b + ".mp4"));
-                candidates.push_back(get_data_path("assets/resources/background/" + b + ".mp4"));
-                candidates.push_back(get_data_path("assets/resources/backgrounds/" + b + ".mp4"));
+                candidates.push_back(get_data_path(g_instance_assets_dir + "/resources/" + b + ".mp4"));
+                candidates.push_back(get_data_path(g_instance_assets_dir + "/resources/background/" + b + ".mp4"));
+                candidates.push_back(get_data_path(g_instance_assets_dir + "/resources/backgrounds/" + b + ".mp4"));
             }
             for (const auto& f : filenames) {
-                candidates.push_back(get_data_path("assets/resources/background/" + f + ".mp4"));
-                candidates.push_back(get_data_path("assets/resources/backgrounds/" + f + ".mp4"));
+                candidates.push_back(get_data_path(g_instance_assets_dir + "/resources/background/" + f + ".mp4"));
+                candidates.push_back(get_data_path(g_instance_assets_dir + "/resources/backgrounds/" + f + ".mp4"));
             }
 
             for (const auto& cand : candidates) {
@@ -97,7 +99,7 @@ namespace VideoBackground {
             if (mp4_path.empty()) {
                 // No video companion found. Try to sample the vanilla texture if it's a background texture.
                 if (base.find("background") != std::string::npos || base.find("bg") != std::string::npos || base.find("menu") != std::string::npos || base.find("back") != std::string::npos) {
-                    std::string vanilla_path = get_data_path("assets/" + base);
+                    std::string vanilla_path = get_data_path(g_instance_assets_dir + "/" + base);
                     if (std::filesystem::exists(vanilla_path)) {
                         SDL_Surface* surf = IMG_Load(vanilla_path.c_str());
                         if (surf) {
@@ -216,7 +218,7 @@ namespace VideoBackground {
         state.tex_id = tex_id;
         state.mp4_path = mp4_path;
         state.temp_dir = temp_dir;
-        state.vanilla_path = get_data_path("assets/" + base);
+        state.vanilla_path = get_data_path(g_instance_assets_dir + "/" + base);
         state.width = width;
         state.height = height;
         state.frame_count = frame_count;

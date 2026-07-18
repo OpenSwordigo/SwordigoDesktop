@@ -279,11 +279,11 @@ static int sre_strcmp(const char* a, const char* b) {
  * ALL game strings pass through here. The replacement table above
  * lets you change any text without touching the binary.
  */
-void sre_CppString_from_char_p(SreString* self, const char* src) {
+SreString* sre_CppString_from_char_p(SreString* self, const char* src) {
     if (!src) {
         /* NULL source → empty string */
         self->data = g_empty_sentinel;
-        return;
+        return self;
     }
 
     /* Apply string replacement table (static) */
@@ -308,13 +308,13 @@ void sre_CppString_from_char_p(SreString* self, const char* src) {
     uint64_t len = strlen(src);
     if (len == 0 && g_empty_sentinel) {
         self->data = g_empty_sentinel;
-        return;
+        return self;
     }
 
     SreStringRep* rep = sre_string_alloc(len);
     if (!rep) {
         self->data = g_empty_sentinel;
-        return;
+        return self;
     }
 
     char* data = SRE_DATA(rep);
@@ -322,6 +322,7 @@ void sre_CppString_from_char_p(SreString* self, const char* src) {
     rep->length = len;
 
     self->data = data;
+    return self;
 }
 
 /*
@@ -330,12 +331,12 @@ void sre_CppString_from_char_p(SreString* self, const char* src) {
  * Original at offset 0x56918c (v1.4.12)
  * ARM64 ABI: X0 = this (SreString*), X1 = src (const char*), X2 = len
  */
-void sre_CppString_assign(SreString* self, const char* src, uint64_t len) {
+SreString* sre_CppString_assign(SreString* self, const char* src, uint64_t len) {
     if (!src || len == 0) {
         /* Release old data */
         sre_rep_release(self->data);
         self->data = g_empty_sentinel;
-        return;
+        return self;
     }
 
     /* Try to reuse existing buffer */
@@ -345,6 +346,7 @@ void sre_CppString_assign(SreString* self, const char* src, uint64_t len) {
     memcpy(data, src, len);
     data[len] = '\0';
     rep->length = len;
+    return self;
 }
 
 /*
@@ -353,8 +355,8 @@ void sre_CppString_assign(SreString* self, const char* src, uint64_t len) {
  * Original at offset 0x567254 (v1.4.12)
  * ARM64 ABI: X0 = this (SreString*), X1 = src (const char*), X2 = len
  */
-void sre_CppString_append(SreString* self, const char* src, uint64_t len) {
-    if (!src || len == 0) return;
+SreString* sre_CppString_append(SreString* self, const char* src, uint64_t len) {
+    if (!src || len == 0) return self;
 
     char* data = self->data;
     uint64_t old_len = 0;
@@ -373,6 +375,7 @@ void sre_CppString_append(SreString* self, const char* src, uint64_t len) {
     memcpy(data + old_len, src, len);
     data[new_len] = '\0';
     rep->length = new_len;
+    return self;
 }
 
 /*

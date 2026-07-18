@@ -1761,8 +1761,8 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
     if (g_portal_active > 0.5f && g_prog_portal) {
         // Load portal texture on first use
         if (!g_portal_tex_loaded) {
-            extern std::string g_assets_dir;
-            std::string path = get_data_path(g_assets_dir + "/resources/portal_effect_2x.pvr");
+            extern std::string g_instance_assets_dir;
+            std::string path = get_data_path(g_instance_assets_dir + "/resources/portal_effect_2x.pvr");
             FILE* f = fopen(path.c_str(), "rb");
             if (f) { fclose(f); 
                 g_portal_tex = pvr_load_texture(path.c_str());
@@ -2550,8 +2550,8 @@ void fbo_draw_portal_vanilla(int viewport_w, int viewport_h) {
     
     // Load portal texture on first use
     if (!g_portal_tex_loaded) {
-        extern std::string g_assets_dir;
-        std::string path = get_data_path(g_assets_dir + "/resources/portal_effect_2x.pvr");
+        extern std::string g_instance_assets_dir;
+        std::string path = get_data_path(g_instance_assets_dir + "/resources/portal_effect_2x.pvr");
         FILE* f = fopen(path.c_str(), "rb");
         if (f) { fclose(f);
             g_portal_tex = pvr_load_texture(path.c_str());
