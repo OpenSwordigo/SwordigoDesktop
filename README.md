@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/TheCorrectSynovian/SwordigoDesktop/blob/master/LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20x86__64-purple.svg)](#)
-[![Version](https://img.shields.io/badge/Version-v8.0%20Beta%201-00e5ff.svg)](https://github.com/TheCorrectSynovian/SwordigoDesktop/releases)
+[![Version](https://img.shields.io/badge/Version-v8%201-00e5ff.svg)](https://github.com/TheCorrectSynovian/SwordigoDesktop/releases)
 
 [Website](https://thecorrectsynovian.github.io/SwordigoDesktop/web/) · [Download](https://github.com/TheCorrectSynovian/SwordigoDesktop/releases) · [Research](https://thecorrectsynovian.github.io/SwordigoDesktop/web/research.html) · [Changelog](https://thecorrectsynovian.github.io/SwordigoDesktop/web/changelog.html)
 
