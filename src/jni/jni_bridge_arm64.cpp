@@ -177,9 +177,6 @@ void JniBridge64::register_handler(const std::string& name, BridgeHandler64 hand
 void JniBridge64::call_handler(uint64_t address, void* emu_ptr) {
     if (addr_to_func.count(address)) {
         BridgeFunction64& func = addr_to_func[address];
-        IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-        // Successful calls are intentionally not logged to reduce noise.
-        // Only errors (UNHANDLED, Unknown address) are printed.
         if (func.handler) {
             func.handler(emu_ptr);
         } else {
@@ -735,14 +732,14 @@ static void bridge_strlen(void* emu_ptr) {
 
 static void bridge_memcmp(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    uint32_t str1 = emu->get_reg(0);
-    uint32_t str2 = emu->get_reg(1);
-    uint32_t n = emu->get_reg(2);
+    uint64_t str1 = emu->get_reg(0);
+    uint64_t str2 = emu->get_reg(1);
+    uint64_t n = emu->get_reg(2);
     int res = 0;
-    if (n > 0) {
+    if (n > 0 && str1 && str2) {
         res = std::memcmp(emu->get_memory_base() + str1, emu->get_memory_base() + str2, n);
     }
-    emu->set_reg(0, res);
+    emu->set_reg(0, (uint64_t)(int64_t)res);
 }
 
 // --- Soft-Float Math Bridges ---
@@ -1145,7 +1142,7 @@ static void bridge_AAsset_read(void* emu_ptr) {
     if (read < 0) {
         std::cerr << "[Asset] READ FAILED: " << (asset ? asset->name : "NULL") << std::endl;
     }
-    emu->set_reg(0, read);
+    emu->set_reg(0, (uint64_t)(int64_t)read);
 }
 
 static void bridge_AAsset_close(void* emu_ptr) {
@@ -1158,7 +1155,7 @@ static void bridge_AAsset_close(void* emu_ptr) {
 static void bridge_AAsset_getLength(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     AAsset* asset = (AAsset*)get_pointer(emu->get_reg(0));
-    emu->set_reg(0, (uint32_t)AAsset_getLength(asset));
+    emu->set_reg(0, (uint64_t)(int64_t)AAsset_getLength(asset));
 }
 
 static void bridge_AAsset_openFileDescriptor(void* emu_ptr) {
@@ -1171,7 +1168,7 @@ static void bridge_AAsset_openFileDescriptor(void* emu_ptr) {
     if (!emu->quiet_mode) {
         std::cout << "[Asset] openFileDescriptor: " << (asset ? asset->name : "NULL") << " -> fd=" << fd << std::endl;
     }
-    emu->set_reg(0, fd);
+    emu->set_reg(0, (uint64_t)(int64_t)fd);
 }
 
 // --- RESTORED JNI ENVIRONMENT SHIMS ---
@@ -2096,20 +2093,28 @@ static void bridge_strncpy(void* emu_ptr) {
 static void bridge_strcmp(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
-    uint32_t s1 = emu->get_reg(0);
-    uint32_t s2 = emu->get_reg(1);
+    uint64_t s1 = emu->get_reg(0);
+    uint64_t s2 = emu->get_reg(1);
+    if (!s1 || !s2) {
+        emu->set_reg(0, 0);
+        return;
+    }
     int result = std::strcmp((const char*)(memory + s1), (const char*)(memory + s2));
-    emu->set_reg(0, (uint32_t)result);
+    emu->set_reg(0, (uint64_t)(int64_t)result);
 }
 
 static void bridge_strncmp(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
-    uint32_t s1 = emu->get_reg(0);
-    uint32_t s2 = emu->get_reg(1);
-    uint32_t n = emu->get_reg(2);
+    uint64_t s1 = emu->get_reg(0);
+    uint64_t s2 = emu->get_reg(1);
+    uint64_t n = emu->get_reg(2);
+    if (!s1 || !s2 || !n) {
+        emu->set_reg(0, 0);
+        return;
+    }
     int result = std::strncmp((const char*)(memory + s1), (const char*)(memory + s2), n);
-    emu->set_reg(0, (uint32_t)result);
+    emu->set_reg(0, (uint64_t)(int64_t)result);
 }
 
 static void bridge_strcat(void* emu_ptr) {
@@ -3474,9 +3479,13 @@ static void bridge_fscanf(void* emu_ptr) {
 static void bridge_mkdir(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
-    uint32_t path_ptr = emu->get_reg(0);
-    uint32_t mode = emu->get_reg(1);
+    uint64_t path_ptr = emu->get_reg(0);
+    uint64_t mode = emu->get_reg(1);
     const char* path = (const char*)(memory + path_ptr);
+    if (!path || !*path) {
+        emu->set_reg(0, 0);
+        return;
+    }
     
     std::string resolved_path = path;
     char resolved[512];
@@ -3484,16 +3493,21 @@ static void bridge_mkdir(void* emu_ptr) {
         resolved_path = resolved;
     }
 
-    std::cout << "[File] mkdir(\"" << path << "\" -> \"" << resolved_path << "\", " << std::oct << mode << std::dec << ")" << std::endl;
+    // Fast path: cached created directory set eliminates repeated syscalls & log spam
+    static std::unordered_set<std::string> s_created_dirs;
+    if (s_created_dirs.find(resolved_path) != s_created_dirs.end()) {
+        emu->set_reg(0, 0);
+        return;
+    }
+
     int result = mkdir(resolved_path.c_str(), (mode_t)mode);
-    if (result != 0 && errno == EEXIST) {
-        // Directory already exists — treat as success (game does recursive mkdir)
+    if (result == 0 || errno == EEXIST) {
+        s_created_dirs.insert(resolved_path);
         result = 0;
+    } else {
+        std::cout << "[File] mkdir FAILED: \"" << resolved_path << "\": " << strerror(errno) << std::endl;
     }
-    if (result != 0) {
-        std::cout << "[File]   mkdir FAILED: " << strerror(errno) << std::endl;
-    }
-    emu->set_reg(0, (uint32_t)result);
+    emu->set_reg(0, (uint64_t)(int64_t)result);
 }
 
 static void bridge_rename(void* emu_ptr) {
@@ -6141,7 +6155,7 @@ static void bridge_gl_tex_image_2d(void* emu_ptr) {
         // Video background: register texture if a .mp4 video version exists
         if (g_last_opened_asset[0] != '\0') {
             VideoBackground::register_texture_maybe(
-                g_frame_stats.last_bound_texture, g_last_opened_asset, width, height);
+                g_frame_stats.last_bound_texture, g_last_opened_asset, width, height, pixels, format, type);
         }
     }
 }
@@ -7876,10 +7890,17 @@ static void bridge_pthread_once(void* emu_ptr) {
 
 static void bridge_pthread_cond(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    // For pthread_cond_wait: the game likely just spawned a thread via
-    // pthread_create and is now waiting for it to signal completion.
-    // Run pending threads inline so the work gets done before we return.
+    // pthread_cond_wait is an explicit synchronization point: the calling thread
+    // is yielding control and waiting for another thread to signal it. In our
+    // single-threaded emulation model, this is exactly the point where we must
+    // run any pending threads (spawned via pthread_create) so that they can
+    // complete their work and set whatever flag/condition the caller is waiting on.
+    //
+    // We also handle pthread_cond_signal/broadcast/init/destroy here as no-ops
+    // since our threading model runs threads to completion inline.
     if (emu->has_pending_threads()) {
+        std::cerr << "[Thread64] pthread_cond_wait — running " 
+                  << "pending threads to resolve synchronization" << std::endl;
         emu->run_pending_threads();
     }
     emu->set_reg(0, 0); // success

@@ -387,3 +387,5 @@ sre_u64 g_orig_NewMenuView_DrawRect  = 0;
 sre_u64 g_orig_MainMenuView_ButtonPressed = 0;  /* Phase 2: main menu event interception */
 sre_u64 g_orig_CreditsVC_LoadView = 0;          /* Options menu: CreditsVC view customization */
 sre_u64 g_orig_CreditsVC_ButtonPressed = 0;     /* Options menu: back button detection */
+sre_u64 g_orig_GameOverlayView_SetControlsHidden = 0;
+

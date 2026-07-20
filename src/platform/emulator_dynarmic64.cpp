@@ -14,6 +14,19 @@ extern "C" const char* sre_resolve_symbol(uint64_t addr);
 #include "dynarmic/interface/optimization_flags.h"
 #include "dynarmic/interface/exclusive_monitor.h"
 
+struct SavedCpuState {
+    uint64_t regs[31];
+    uint64_t sp;
+    uint64_t pc;
+    uint32_t pstate;
+    Dynarmic::A64::Vector vectors[32];
+    
+    // Member variables for reentrancy
+    bool bridge_halt_requested;
+    uint64_t bridge_halt_address;
+    bool function_returned;
+};
+
 // ============================================================================
 // Dynarmic ARM64 Backend — Implementation
 //
@@ -534,29 +547,57 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
                 last_bridge_addr = bridge_halt_address;
             }
 
-            if (same_bridge_count >= 8) {
-                // Spinlock on same bridge — still handle it, wall clock limit is the real safeguard
+            // ── Scene Transition Deadlock Unblock ─────────────────────────────
+            // During level transitions, updateApplication spins on a bridge
+            // (typically clock_gettime or a yield stub) while waiting for the
+            // background scene-load thread to complete and set a "loaded" flag.
+            // That thread is queued in pending_threads but can't run because we
+            // are still inside this run() call.
+            //
+            // Fix: As soon as we detect the bridge spin AND pending threads exist,
+            // run them inline right here. The nested call() is safe because
+            // call() saves/restores all JIT registers around jit->Run().
+            if (same_bridge_count >= 4 && !pending_threads.empty()) {
+                static int thread_unblock_count = 0;
+                thread_unblock_count++;
+                if (thread_unblock_count <= 10) {
+                    std::cerr << "[Thread64/Dyn] UNBLOCKING spin at bridge 0x"
+                              << std::hex << bridge_halt_address
+                              << " (same_bridge_count=" << std::dec << same_bridge_count
+                              << " bridge_calls=" << bridge_calls
+                              << " pending=" << pending_threads.size() << ")" << std::endl;
+                }
+                // Handle the current bridge call first so the JIT state is clean
                 handle_bridge_call(bridge_halt_address);
                 bridge_halt_requested = false;
                 curr_pc = jit->GetPC();
                 if (curr_pc == MAGIC_LR) break;
-                chunk--;  // Don't count against MAX_CHUNKS — wall clock limit handles true infinite loops
+
+                // Now run all pending threads inline
+                run_pending_threads();
+
+                // Reset spin counter so we detect the NEXT spin wave too
+                same_bridge_count = 0;
+                chunk--;
                 continue;
             }
 
-            /*
-            if (verbose && bridge_calls <= 10) {
-                std::cerr << "[Dynarmic/dbg] Bridge call #" << bridge_calls
-                          << " addr=0x" << std::hex << bridge_halt_address << std::dec << std::endl;
+            if (same_bridge_count >= 50) {
+                // Spinlock on same bridge with no pending threads —
+                // wall clock limit is the real safeguard; don't count against MAX_CHUNKS
+                handle_bridge_call(bridge_halt_address);
+                bridge_halt_requested = false;
+                curr_pc = jit->GetPC();
+                if (curr_pc == MAGIC_LR) break;
+                chunk--;
+                continue;
             }
-            */
+
             handle_bridge_call(bridge_halt_address);
             bridge_halt_requested = false;
 
             curr_pc = jit->GetPC();
             if (curr_pc == MAGIC_LR) break;
-
-            // No bridge call limit — wall clock limit (30s) is the safety net
 
             // Normal bridge call — don't count as chunk
             chunk--;
@@ -585,9 +626,26 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
         // Check for MemoryAbort (e.g. NoExecuteFault or unmapped memory)
         if (Dynarmic::Has(hr, Dynarmic::HaltReason::MemoryAbort)) {
             std::cerr << "[Dynarmic] MemoryAbort halt at PC=0x" << std::hex << curr_pc << std::dec << " — stopping execution" << std::endl;
+            set_faulted(true);
             jit->SetPC(MAGIC_LR);
             jit->SetSP(entry_sp);
             break;
+        }
+
+        // Check for StepLimit / Tick budget expiration (normal JIT yield).
+        // If the JIT stops due to tick exhaustion without hitting a bridge,
+        // a memory fault, or a return, the guest is likely spinning on a
+        // memory flag in a tight guest assembly loop.
+        // We must run any pending threads now so they can execute and write the flag.
+        if (!Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined1) &&
+            !Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined2) &&
+            !Dynarmic::Has(hr, Dynarmic::HaltReason::MemoryAbort)) 
+        {
+            if (!pending_threads.empty()) {
+                std::cerr << "[Thread64/Dyn] TICK EXHAUSTED inside guest spin — executing "
+                          << pending_threads.size() << " pending threads to unblock it" << std::endl;
+                run_pending_threads();
+            }
         }
 
         // Check if function completed
@@ -650,13 +708,42 @@ uint64_t EmulatorDynarmic64::call(uint64_t addr, const std::vector<uint64_t>& ar
         std::cout << "[Dynarmic] Calling guest function at 0x" << std::hex << addr << std::dec << std::endl;
     }
 
+    // Save previous CPU register state and reentrancy flags
+    SavedCpuState state;
+    for (int i = 0; i < 31; ++i) {
+        state.regs[i] = jit->GetRegister(i);
+    }
+    state.sp = jit->GetSP();
+    state.pc = jit->GetPC();
+    state.pstate = jit->GetPstate();
+    for (int i = 0; i < 32; ++i) {
+        state.vectors[i] = jit->GetVector(i);
+    }
+    state.bridge_halt_requested = bridge_halt_requested;
+    state.bridge_halt_address = bridge_halt_address;
+    state.function_returned = function_returned;
+
     // ARM64 AAPCS: first 8 integer args go in X0-X7
     for (size_t i = 0; i < args.size() && i < 8; ++i) {
         set_reg(i, args[i]);
     }
 
     run(addr);
-    uint64_t result = get_reg(0);
+    uint64_t result = jit->GetRegister(0); // Read return value BEFORE restoring state
+
+    // Restore previous state
+    for (int i = 0; i < 31; ++i) {
+        jit->SetRegister(i, state.regs[i]);
+    }
+    jit->SetSP(state.sp);
+    jit->SetPC(state.pc);
+    jit->SetPstate(state.pstate);
+    for (int i = 0; i < 32; ++i) {
+        jit->SetVector(i, state.vectors[i]);
+    }
+    bridge_halt_requested = state.bridge_halt_requested;
+    bridge_halt_address = state.bridge_halt_address;
+    function_returned = state.function_returned;
 
     if (!quiet_mode) {
         std::cout << "[Dynarmic] Function returned with X0=0x" << std::hex << result << std::dec << std::endl;

@@ -109,6 +109,21 @@ PostFXPreset g_postfx_preset = PostFXPreset::OFF;
 SkyRenderer g_sky;
 SwordfareGUI g_swordfare_gui;  /* Swordfare: ImGui in-game overlay */
 
+// Direct control native symbol addresses
+uint64_t g_vaddr_StartMovingToDirection = 0;
+uint64_t g_vaddr_StopMovingToDirection = 0;
+uint64_t g_vaddr_StartJumping = 0;
+uint64_t g_vaddr_StopJumping = 0;
+uint64_t g_vaddr_Swing = 0;
+uint64_t g_vaddr_StopSwing = 0;
+uint64_t g_vaddr_Use = 0;
+uint64_t g_vaddr_BeginCasting = 0;
+static inline bool is_valid_guest_ptr(uint64_t ptr) {
+    return ptr >= 0x10000 && ptr < 0x80000000ULL;
+}
+uint64_t g_vaddr_sre_gamesceneview_ptr = 0;
+
+
 // Graphics API selection (enum defined in vulkan_backend.h)
 GraphicsAPI g_graphics_api = GraphicsAPI::OPENGL;
 #ifdef VULKAN_BACKEND
@@ -228,6 +243,8 @@ static uint64_t sre_gui_scene_active_addr = 0;  // int — 1 when scene is activ
 static uint64_t sre_gamestate_ptr_addr = 0;      // uint64_t — guest ptr to GameState
 static uint64_t sre_menu_active_addr = 0;        // int — bitfield, nonzero = menu open
 static uint64_t sre_text_input_active_addr = 0;  // int — nonzero = SRE text input active
+static uint64_t g_vaddr_sre_text_input_init_val = 0; // char* — SRE text input initial value
+
 static uint64_t sre_hardmode_addr = 0;            // int — nonzero = hard mode (no frame cap, double-tick)
 
 // SRE Lua write-back — setters (SetLevel, SetExp, SetHealth, SetMana, SetCoins) store
@@ -1013,8 +1030,9 @@ void load_and_boot() {
 
 
     
-    // Allocate some strings in guest memory for paths
-    uint32_t path_ptr = 0x20000;
+    // Allocate some strings in guest memory for paths.
+    // Use 0x00F00000 — safely above low memory structure offsets and below binary base address.
+    uint32_t path_ptr = 0x00F00000;
     uint32_t files_dir = path_ptr;
     strncpy((char*)(g_guest_memory + files_dir), g_save_dir.c_str(), 255);
     ((char*)(g_guest_memory + files_dir))[255] = '\0';
@@ -1970,8 +1988,7 @@ void load_and_boot() {
                                     handled_virtual = simulate_virtual_key("X", is_down);
                                 } else if (event.key.key == SDLK_V) {
                                     handled_virtual = simulate_virtual_key("Armory", is_down);
-                                } else if (event.key.key == SDLK_K) {
-                                    handled_virtual = simulate_virtual_key("Keybinds", is_down);
+                                // NOTE: K is the attack/swing key — do NOT intercept it for SRE overlays.
                                 } else if (event.key.key == SDLK_S) {
                                     handled_virtual = simulate_virtual_key("Settings", is_down);
                                 } else if (event.key.key == SDLK_P) {
@@ -2472,6 +2489,9 @@ void load_and_boot_arm64() {
     // 2. Internal Relocations
     g_loader_64->relocate(&g_main_mod_64);
     
+    // Initialize TrampolineMgr before symbol resolution
+    TrampolineMgr::instance().init(g_guest_memory, load_addr);
+
     // 3. External Symbol Resolution (to Bridge addresses)
     g_loader_64->resolve_all_to_bridge(&g_main_mod_64, &g_bridge_64, GUEST_GLOBALS_BASE);
     
@@ -2499,6 +2519,9 @@ void load_and_boot_arm64() {
                   << "' @ 0x" << std::hex << (g_main_mod_64.base_addr + closest_sym->st_value)
                   << " (diff: +" << std::dec << closest_diff << " bytes)" << std::endl;
     }
+
+
+
 
     // Dump disassembly bytes at 0x1478ccc
     std::cout << "[SRE DIAG] Hex bytes at 0x1478ccc (offset 0x478ccc):" << std::endl;
@@ -2746,6 +2769,8 @@ void load_and_boot_arm64() {
                 // Resolve imports (malloc, free, memcpy, strlen, etc.) through bridge
                 g_loader_64->resolve_all_to_bridge(&g_sre_mod, &g_bridge_64, GUEST_GLOBALS_BASE);
 
+
+
                 // ---- VFS pre-init ----
                 // Write VFS path globals and activate BEFORE sre_init so that
                 // sre_config_load_toml("/Assets/mini.toml") inside sre_init
@@ -2863,6 +2888,7 @@ void load_and_boot_arm64() {
                     {"lua_touserdata","_Z14lua_touserdataP9lua_Statei"},
                     {"lua_pushlightuserdata","_Z21lua_pushlightuserdataP9lua_StatePv"},
                     {"lua_error",     "_Z9lua_errorP9lua_State"},
+                    {"lua_topointer", "_Z13lua_topointerP9lua_Statei"},
                     {"getSpeedMultiplier", "_ZNK5Caver11SceneObject21updateSpeedMultiplierEv"},
                 };
                 const int NUM_LUA_SYMS = sizeof(lua_syms) / sizeof(lua_syms[0]);
@@ -3022,7 +3048,6 @@ void load_and_boot_arm64() {
                     {"sre_ProgramState_Execute", "_ZN5Caver12ProgramState7ExecuteEi"},
                     {"sre_ProgramState_Resume",  "_ZN5Caver12ProgramState6ResumeEi"},
                     {"sre_ProgramState_Update",  "_ZN5Caver12ProgramState6UpdateEf"},
-                    {"sre_updateApplication",    "Java_com_touchfoo_swordigo_Native_updateApplication"},
                     {"sre_CameraController_Update", "_ZN5Caver16CameraController6UpdateEf"},
                     {"sre_SceneGrid_UpdateVisibleAreasWithCamera", "_ZN5Caver9SceneGrid28UpdateVisibleAreasWithCameraEPNS_6CameraE"},
                     {"sre_GUIView_Update",             "_ZN5Caver7GUIView6UpdateEf"},
@@ -3099,6 +3124,7 @@ void load_and_boot_arm64() {
                     {"lua_pushthread",  "_Z14lua_pushthreadP9lua_State"},
                     {"lua_status",      "_Z10lua_statusP9lua_State"},
                     {"lua_gc",          "_Z6lua_gcP9lua_Stateii"},
+                    {"sre_GameOverlayView_SetControlsHidden", "_ZN5Caver15GameOverlayView17SetControlsHiddenEb"},
                 };
                 const int NUM_SYM_HOOKS = sizeof(sym_hooks) / sizeof(sym_hooks[0]);
 
@@ -3201,6 +3227,27 @@ void load_and_boot_arm64() {
                         std::cout << "[SRE] g_orig_SceneGrid_UpdateVisibleAreasWithCamera → relay @ 0x"
                                   << std::hex << sg_cave << std::dec << std::endl;
                     }
+
+                    // ─── GameOverlayView::SetControlsHidden relay ────────────────
+                    uint64_t set_controls_hidden_vaddr = g_loader_64->get_symbol_vaddr(
+                        &g_main_mod_64, "_ZN5Caver15GameOverlayView17SetControlsHiddenEb");
+                    if (set_controls_hidden_vaddr) {
+                        uint64_t g_orig_sch_addr = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "g_orig_GameOverlayView_SetControlsHidden");
+                        uint64_t sch_cave = TrampolineMgr::instance().reserve_cave("GameOverlayView_SetControlsHidden_relay");
+                        copy_and_relocate(g_guest_memory + sch_cave,
+                                          g_guest_memory + set_controls_hidden_vaddr,
+                                          sch_cave, set_controls_hidden_vaddr, 1);
+                        uint32_t* tail = (uint32_t*)(g_guest_memory + sch_cave + 4);
+                        int64_t ret_offset = (int64_t)(set_controls_hidden_vaddr + 4) - (int64_t)(sch_cave + 4);
+                        int64_t ret_imm = ret_offset / 4;
+                        tail[0] = 0x14000000 | (ret_imm & 0x3FFFFFF);
+                        if (g_orig_sch_addr)
+                            *(uint64_t*)(g_guest_memory + g_orig_sch_addr) = sch_cave;
+                        std::cout << "[SRE] g_orig_GameOverlayView_SetControlsHidden → relay @ 0x"
+                                  << std::hex << sch_cave << std::dec << std::endl;
+                    }
+
 
                     // ─── GUI relay stubs (TrampolineMgr — no hard-coded addresses) ──
                     // Each entry gets its own fresh cave slot from the arena.
@@ -4007,10 +4054,11 @@ void load_and_boot_arm64() {
                 if (sre_menu_active_addr)
                     std::cout << "[SRE] Menu detection: 0x" << std::hex << sre_menu_active_addr << std::dec << std::endl;
                 
-                // Text input state — SRE sets this when StartTextInputWithDelegate fires
                 sre_text_input_active_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_text_input_active");
                 if (sre_text_input_active_addr)
                     std::cout << "[SRE] TextInput detection: 0x" << std::hex << sre_text_input_active_addr << std::dec << std::endl;
+                g_vaddr_sre_text_input_init_val = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_text_input_init_val");
+
                 
                 // Hard mode — controls frame limiter + ProgramState double-tick
                 sre_hardmode_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hardmode");
@@ -4186,6 +4234,30 @@ void load_and_boot_arm64() {
     g_fw_textInputDidChange = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_textInputTextDidChange");
     g_fw_textInputDidFinish = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_textInputDidFinish");
 
+    // Direct control native symbol resolutions
+    g_vaddr_StartMovingToDirection = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent22StartMovingToDirectionEi");
+    g_vaddr_StopMovingToDirection = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent21StopMovingToDirectionEi");
+    g_vaddr_StartJumping = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent12StartJumpingEv");
+    g_vaddr_StopJumping = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent11StopJumpingEv");
+    g_vaddr_Swing = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent5SwingEv");
+    g_vaddr_StopSwing = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent9StopSwingEv");
+    g_vaddr_Use = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent3UseEv");
+    g_vaddr_BeginCasting = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent12BeginCastingERKN5boost13intrusive_ptrINS_14SkillComponentEEE");
+    g_vaddr_sre_gamesceneview_ptr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_gamesceneview_ptr");
+
+    std::cout << "[Boot64] Direct Native Control API Symbols: " << std::hex
+              << "StartMove=0x" << g_vaddr_StartMovingToDirection
+              << " StopMove=0x" << g_vaddr_StopMovingToDirection
+              << " StartJump=0x" << g_vaddr_StartJumping
+              << " StopJump=0x" << g_vaddr_StopJumping
+              << " Swing=0x" << g_vaddr_Swing
+              << " StopSwing=0x" << g_vaddr_StopSwing
+              << " Use=0x" << g_vaddr_Use
+              << " BeginCasting=0x" << g_vaddr_BeginCasting
+              << " GameSceneViewPtr=0x" << g_vaddr_sre_gamesceneview_ptr
+              << std::dec << std::endl;
+
+
     std::cout << "[Boot64] FWKeyboard API: sharedKeyboard=0x" << std::hex << g_fw_sharedKeyboard
               << " sendDown=0x" << g_fw_sendKeyDown << " sendUp=0x" << g_fw_sendKeyUp
               << " sendChar=0x" << g_fw_sendKeyChar << " menuBtn=0x" << g_fw_handleMenuBtn
@@ -4197,9 +4269,12 @@ void load_and_boot_arm64() {
     uint64_t env_ptr = setup_jni_env_arm64(g_guest_memory);
     std::cout << "[Debug64] env_ptr = 0x" << std::hex << env_ptr << " vtable_ptr = 0x" << *(uint64_t*)(g_guest_memory + env_ptr) << std::dec << std::endl;
 
-    // Allocate some strings in guest memory for paths
-    // Guest path pointers are still uint32_t addresses (guest memory < 4GB)
-    uint32_t path_ptr = 0x20000;
+    // Allocate some strings in guest memory for paths.
+    // IMPORTANT: Must NOT be in low memory (0x20000 / 0x3F000) — uninitialized
+    // structure offsets can mistakenly read low addresses as vtable pointers,
+    // crashing with PC=0x3F010 (path string bytes).
+    // Use 0x00F00000 — safely above low memory structure offsets and below binary base.
+    uint32_t path_ptr = 0x00F00000;
     uint32_t files_dir = path_ptr;
     strncpy((char*)(g_guest_memory + files_dir), g_save_dir.c_str(), 255);
     ((char*)(g_guest_memory + files_dir))[255] = '\0';
@@ -4487,6 +4562,40 @@ void load_and_boot_arm64() {
                 g_emulator_64->call(handleTouchEvent, {env_ptr, 0, (uint64_t)action, (uint64_t)id, (uint64_t)tap_count});
             };
 
+            auto dispatch_gameplay_button = [&](const std::string& name, bool is_down) -> bool {
+                if (g_vaddr_sre_gamesceneview_ptr && g_guest_memory && g_emulator_64) {
+                    uint64_t gamesceneview = *(uint64_t*)(g_guest_memory + g_vaddr_sre_gamesceneview_ptr);
+                    if (is_valid_guest_ptr(gamesceneview)) {
+                        uint64_t overlay = *(uint64_t*)(g_guest_memory + gamesceneview + 0x100);
+                        if (is_valid_guest_ptr(overlay)) {
+                            int native_key = 0;
+                            if      (name == "left")     native_key = 0x25; // VK_LEFT (37)
+                            else if (name == "right")    native_key = 0x27; // VK_RIGHT (39)
+                            else if (name == "jump")     native_key = 0x26; // VK_UP / JUMP (38)
+                            else if (name == "attack")   native_key = 0x11; // VK_CONTROL / ATTACK (17)
+                            else if (name == "magic")    native_key = 0x41; // VK_A / MAGIC (65)
+                            else if (name == "use_item") native_key = 0x31; // VK_1 / SPELL PICKER (49)
+
+                            if (native_key > 0) {
+                                // Write a GUIKeyboardEvent in guest scratch memory (e.g. 0x3F800)
+                                uint32_t guest_event_addr = 0x3F800;
+                                std::memset(g_guest_memory + guest_event_addr, 0, 128);
+                                *(int*)(g_guest_memory + guest_event_addr + 0xc) = is_down ? 1 : 2;  // Action (1=down, 2=up)
+                                *(int*)(g_guest_memory + guest_event_addr + 0x10) = native_key;       // Native VK code
+                                
+                                // Resolve GameOverlayView::HandleKeyboardEvent dynamically from the object's vtable (offset 0x28)
+                                uint64_t vtable = *(uint64_t*)(g_guest_memory + overlay);
+                                uint64_t handle_keyboard_event = *(uint64_t*)(g_guest_memory + vtable + 0x28);
+                                g_emulator_64->call(handle_keyboard_event, {overlay, (uint64_t)guest_event_addr});
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            };
+
+
             // Per-frame camera movement
             if (g_cam_active) {
                 bool any_cam_key = arrow_left || arrow_right || arrow_up || arrow_down || cam_key_pgup || cam_key_pgdn;
@@ -4514,9 +4623,37 @@ void load_and_boot_arm64() {
                 // Advance virtual clock for gettimeofday/clock_gettime hooks
                 advance_guest_virtual_clock(game_dt);
 
+                // Reset active gamesceneview ptr so we only detect active play if update updates it
+                if (g_vaddr_sre_gamesceneview_ptr && g_guest_memory) {
+                    *(uint64_t*)(g_guest_memory + g_vaddr_sre_gamesceneview_ptr) = 0;
+                }
+
                 // ARM64 AAPCS: float dt goes in S0, not X2
-                g_emulator_64->set_sreg(0, game_dt);
-                g_emulator_64->call(updateApp, {env_ptr, 0});
+                if (g_emulator_64->has_faulted()) {
+                    static bool logged_fault = false;
+                    if (!logged_fault) {
+                        std::cerr << "[SRE/Fault] Guest execution halted due to memory fault. Isolating guest context to prevent host SIGSEGV." << std::endl;
+                        logged_fault = true;
+                    }
+                } else {
+                    // Run any threads left over from the previous frame BEFORE updating.
+                    // Scene transitions queue a background load thread; running it here
+                    // ensures the "scene loaded" flag is set before updateApplication
+                    // tries to poll it.
+                    if (g_emulator_64->has_pending_threads()) {
+                        g_emulator_64->run_pending_threads();
+                    }
+
+                    g_emulator_64->set_sreg(0, game_dt);
+                    g_emulator_64->call(updateApp, {env_ptr, 0});
+
+                    // Run any threads spawned during this frame's updateApplication
+                    // (handles the edge case where spin count < 4 and the deadlock
+                    // unblock in run() did not trigger).
+                    if (g_emulator_64->has_pending_threads()) {
+                        g_emulator_64->run_pending_threads();
+                    }
+                }
                 if (g_step_one_frame) {
                     g_step_one_frame = false;
                     mod_toast("Stepped 1 frame", 0.8f);
@@ -5333,8 +5470,12 @@ void load_and_boot_arm64() {
                     int sre_ti = *(volatile int*)(mem + sre_text_input_active_addr);
                     if (sre_ti && !g_text_input_active) {
                         g_text_input_active = true;
-                        g_text_input_buffer.clear();
-                        std::cout << "[TextInput] SRE: text input activated" << std::endl;
+                        if (g_vaddr_sre_text_input_init_val && g_guest_memory) {
+                            g_text_input_buffer = (const char*)(g_guest_memory + g_vaddr_sre_text_input_init_val);
+                        } else {
+                            g_text_input_buffer.clear();
+                        }
+                        std::cout << "[TextInput] SRE: text input activated, initial value: \"" << g_text_input_buffer << "\"" << std::endl;
                     } else if (!sre_ti && g_text_input_active) {
                         g_text_input_active = false;
                         g_text_input_buffer.clear();
@@ -5387,6 +5528,37 @@ void load_and_boot_arm64() {
                                       << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
                             break;
                         case SDL_EVENT_KEY_DOWN:
+                            if (g_text_input_active) {
+                                if (event.key.key == SDLK_RETURN) {
+                                    std::cout << "[TextInput] Enter — confirming \"" << g_text_input_buffer << "\"" << std::endl;
+                                    call_text_change_64(g_text_input_buffer);
+                                    call_text_finish_64();
+                                    g_text_input_active = false;
+                                    g_text_input_buffer.clear();
+                                    if (g_fw_handleMenuBtn) {
+                                        g_emulator_64->call(g_fw_handleMenuBtn, {env_ptr, 0});
+                                    }
+                                } else if (event.key.key == SDLK_ESCAPE) {
+                                    std::cout << "[TextInput] Escape — cancelling" << std::endl;
+                                    g_text_input_buffer.clear();
+                                    call_text_change_64("");
+                                    call_text_finish_64();
+                                    g_text_input_active = false;
+                                    if (g_fw_handleMenuBtn) {
+                                        g_emulator_64->call(g_fw_handleMenuBtn, {env_ptr, 0});
+                                    }
+                                } else if (event.key.key == SDLK_BACKSPACE) {
+                                    if (!g_text_input_buffer.empty()) {
+                                        g_text_input_buffer.pop_back();
+                                        call_text_change_64(g_text_input_buffer);
+                                        if (g_vaddr_sre_text_input_init_val && g_guest_memory) {
+                                            g_text_input_buffer = (const char*)(g_guest_memory + g_vaddr_sre_text_input_init_val);
+                                        }
+                                        std::cout << "[TextInput] Backspace → \"" << g_text_input_buffer << "\"" << std::endl;
+                                    }
+                                }
+                                break;
+                            }
                             if (event.key.key == SDLK_A || event.key.key == SDLK_D) {
                                 if (g_cam_active && g_cam_pov_mode) {
                                     g_cam_pov_facing = (event.key.key == SDLK_A) ? -1.0f : 1.0f;
@@ -5617,6 +5789,9 @@ void load_and_boot_arm64() {
                             if (event.key.key == SDLK_0 && !event.key.repeat) { mod_speed_reset(); break; }
                             // fall through
                         case SDL_EVENT_KEY_UP: {
+                            if (g_text_input_active) {
+                                break;
+                            }
                             if (should_block_keyboard()) {
                                 bool is_toggle = (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3 || event.key.key == SDLK_F4 || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE);
                                 if (!is_toggle) break;
@@ -5637,8 +5812,8 @@ void load_and_boot_arm64() {
                                     handled_virtual = simulate_virtual_key("X", is_down);
                                 } else if (event.key.key == SDLK_V) {
                                     handled_virtual = simulate_virtual_key("Armory", is_down);
-                                } else if (event.key.key == SDLK_K) {
-                                    handled_virtual = simulate_virtual_key("Keybinds", is_down);
+                                // NOTE: K is the attack/swing key — do NOT intercept it for SRE overlays.
+                                // SRE overlay "Keybinds" button must be clicked with mouse instead.
                                 } else if (event.key.key == SDLK_S) {
                                     handled_virtual = simulate_virtual_key("Settings", is_down);
                                 } else if (event.key.key == SDLK_P) {
@@ -5649,43 +5824,33 @@ void load_and_boot_arm64() {
                                 break;
                             }
 
-                            // ---- TEXT INPUT MODE: intercept keys when game requests text input ----
-                            if (g_text_input_active && is_down) {
-                                if (event.key.key == SDLK_RETURN) {
-                                    std::cout << "[TextInput] Enter — confirming \"" << g_text_input_buffer << "\"" << std::endl;
-                                    call_text_change_64(g_text_input_buffer);
-                                    call_text_finish_64();
-                                    g_text_input_active = false;
-                                    g_text_input_buffer.clear();
-                                    // Recovery: press Back to exit the glitched text field screen
-                                    if (g_fw_handleMenuBtn) {
-                                        g_emulator_64->call(g_fw_handleMenuBtn, {env_ptr, 0});
-                                    }
-                                    break;
-                                } else if (event.key.key == SDLK_ESCAPE) {
-                                    std::cout << "[TextInput] Escape — cancelling + pressing Back to recover" << std::endl;
-                                    g_text_input_buffer.clear();
-                                    call_text_change_64("");
-                                    call_text_finish_64();
-                                    g_text_input_active = false;
-                                    // Recovery: press the menu/back button to escape the
-                                    // glitched set-name screen. The text field rendering is
-                                    // broken (primary vtable corrupt), so we navigate away.
-                                    if (g_fw_handleMenuBtn) {
-                                        g_emulator_64->call(g_fw_handleMenuBtn, {env_ptr, 0});
-                                    }
-                                    break;
-                                } else if (event.key.key == SDLK_BACKSPACE) {
-                                    if (!g_text_input_buffer.empty()) {
-                                        g_text_input_buffer.pop_back();
-                                        call_text_change_64(g_text_input_buffer);
-                                        std::cout << "[TextInput] Backspace → \"" << g_text_input_buffer << "\"" << std::endl;
-                                    }
-                                    break;
+                            // ---- NATIVE KEYBOARD DISPATCH (portals/dialogues via Enter key) ----
+                            if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) {
+                                uint64_t gamesceneview = 0;
+                                if (g_vaddr_sre_gamesceneview_ptr && g_guest_memory) {
+                                    gamesceneview = *(uint64_t*)(g_guest_memory + g_vaddr_sre_gamesceneview_ptr);
                                 }
-                                break; // Eat all other key_down events during text input
+                                if (is_valid_guest_ptr(gamesceneview)) {
+                                    uint64_t overlay = *(uint64_t*)(g_guest_memory + gamesceneview + 0x100);
+                                    if (is_valid_guest_ptr(overlay)) {
+                                        uint64_t listener = *(uint64_t*)(g_guest_memory + overlay + 0xf0);
+                                        if (is_valid_guest_ptr(listener)) {
+                                            // Write a GUIKeyboardEvent in guest scratch memory (e.g. 0x3F800)
+                                            uint32_t guest_event_addr = 0x3F800;
+                                            std::memset(g_guest_memory + guest_event_addr, 0, 128);
+                                            *(int*)(g_guest_memory + guest_event_addr + 0xc) = is_down ? 1 : 2;  // Action (1=down, 2=up)
+                                            *(int*)(g_guest_memory + guest_event_addr + 0x10) = 0xd;              // VK_RETURN (13)
+                                            
+                                            // Resolve GameOverlayView::HandleKeyboardEvent dynamically from the object's vtable (offset 0x28)
+                                            uint64_t vtable = *(uint64_t*)(g_guest_memory + overlay);
+                                            uint64_t handle_keyboard_event = *(uint64_t*)(g_guest_memory + vtable + 0x28);
+                                            g_emulator_64->call(handle_keyboard_event, {overlay, (uint64_t)guest_event_addr});
+                                            break;
+                                        }
+                                    }
+                                }
                             }
-                            if (g_text_input_active && !is_down) break; // Eat key-up too
+
 
                             // ---- TYPING MODE: route through FWKeyboard + text buffer ----
                             if (g_typing_mode && is_down) {
@@ -5737,6 +5902,9 @@ void load_and_boot_arm64() {
                             } else if (g_text_input_active) {
                                 g_text_input_buffer += text;
                                 call_text_change_64(g_text_input_buffer);
+                                if (g_vaddr_sre_text_input_init_val && g_guest_memory) {
+                                    g_text_input_buffer = (const char*)(g_guest_memory + g_vaddr_sre_text_input_init_val);
+                                }
                                 std::cout << "[TextInput] \"" << g_text_input_buffer << "\"" << std::endl;
                             }
                             break;
@@ -5895,10 +6063,35 @@ void load_and_boot_arm64() {
                             }
                         }
                         
+
+                        // Resolve player's GameSceneController / listener safely
+                        uint64_t gamesceneview = 0;
+                        if (g_vaddr_sre_gamesceneview_ptr && g_guest_memory) {
+                            gamesceneview = *(uint64_t*)(g_guest_memory + g_vaddr_sre_gamesceneview_ptr);
+                        }
+                        
+                        uint64_t overlay = 0;
+                        uint64_t listener = 0;
+                        if (is_valid_guest_ptr(gamesceneview)) {
+                            overlay = *(uint64_t*)(g_guest_memory + gamesceneview + 0x100);
+                            if (is_valid_guest_ptr(overlay)) {
+                                listener = *(uint64_t*)(g_guest_memory + overlay + 0xf0);
+                                if (!is_valid_guest_ptr(listener)) {
+                                    listener = 0;
+                                }
+                            }
+                        }
+
+                        // Intercept gameplay buttons if active play is detected
+                        bool is_gameplay_btn = (btn->name == "left" || btn->name == "right" || btn->name == "jump" || btn->name == "attack" || btn->name == "magic" || btn->name == "use_item");
+                        bool use_native = (listener != 0) && is_gameplay_btn;
+
                         if (is_down && !btn->is_pressed) {
                             btn->is_pressed = true;
                             
-                            if (btn->is_macro && btn->macro_open_touch_id >= 0) {
+                            if (use_native) {
+                                dispatch_gameplay_button(btn->name, true);
+                            } else if (btn->is_macro && btn->macro_open_touch_id >= 0) {
                                 // Macro step 1: press the magic menu button to open spell selection
                                 TouchButton* opener = nullptr;
                                 for (int j = 0; j < g_input_config.button_count(); j++) {
@@ -5927,7 +6120,10 @@ void load_and_boot_arm64() {
                             }
                         } else if (!is_down && btn->is_pressed) {
                             btn->is_pressed = false;
-                            if (!btn->is_macro) {
+                            
+                            if (use_native) {
+                                dispatch_gameplay_button(btn->name, false);
+                            } else if (!btn->is_macro) {
                                 call_touch_64(2, btn->touch_id, accumulated_time,
                                     btn->game_x, btn->game_y, btn->game_x, btn->game_y, 0);
                             }
@@ -6215,27 +6411,6 @@ int main(int argc, char* argv[]) {
     }
 
     if (!headless) {
-#ifdef VULKAN_BACKEND
-        if (g_graphics_api == GraphicsAPI::VULKAN) {
-            if (display.init_vulkan(GAME_W, GAME_H, "Swordigo")) {
-                g_display_active = true;
-                g_display_ptr = &display;
-                if (!g_vk_backend.init(display.get_window(), GAME_W, GAME_H)) {
-                    std::cerr << "[Main] Vulkan backend init failed, falling back to OpenGL" << std::endl;
-                    g_graphics_api = GraphicsAPI::OPENGL;
-                    // Recreate as OpenGL window
-                    display = Display();
-                    if (display.init(GAME_W, GAME_H, "Swordigo")) {
-                        g_display_active = true;
-                        g_display_ptr = &display;
-                    }
-                } else {
-                    std::cout << "[Main] Vulkan backend initialized" << std::endl;
-                }
-            }
-        } else
-#endif
-        // Get the display's native resolution for correct aspect ratio (16:10, 16:9, etc.)
         int native_w = 1920, native_h = 1080;
         {
             SDL_DisplayID display_id = SDL_GetPrimaryDisplay();
@@ -6247,9 +6422,35 @@ int main(int argc, char* argv[]) {
                           << " @ " << mode->refresh_rate << "Hz" << std::endl;
             }
         }
-        if (display.init(native_w, native_h, "Swordigo")) {
-            g_display_active = true;
-            g_display_ptr = &display;
+
+        bool display_initialized = false;
+
+#ifdef VULKAN_BACKEND
+        if (g_graphics_api == GraphicsAPI::VULKAN) {
+            if (display.init_vulkan(native_w, native_h, "Swordigo")) {
+                g_display_active = true;
+                g_display_ptr = &display;
+                if (!g_vk_backend.init(display.get_window(), GAME_W, GAME_H)) {
+                    std::cerr << "[Main] Vulkan backend init failed, falling back to OpenGL" << std::endl;
+                    g_graphics_api = GraphicsAPI::OPENGL;
+                    // Will fall back to OpenGL display creation below
+                } else {
+                    std::cout << "[Main] Vulkan backend initialized" << std::endl;
+                    display_initialized = true;
+                }
+            }
+        }
+#endif
+
+        if (g_graphics_api == GraphicsAPI::OPENGL) {
+            if (display.init(native_w, native_h, "Swordigo")) {
+                g_display_active = true;
+                g_display_ptr = &display;
+                display_initialized = true;
+            }
+        }
+
+        if (display_initialized) {
             // Get physical drawable dimensions (HiDPI)
             SDL_GetWindowSizeInPixels(display.get_window(), &g_draw_w, &g_draw_h);
 
@@ -6276,6 +6477,10 @@ int main(int argc, char* argv[]) {
                       << ((float)GAME_W / GAME_H) << std::endl;
             if (g_graphics_api == GraphicsAPI::OPENGL) {
                 g_swordfare_gui.init(display.get_window(), SDL_GL_GetCurrentContext());
+#ifdef VULKAN_BACKEND
+            } else if (g_graphics_api == GraphicsAPI::VULKAN) {
+                g_swordfare_gui.init_vulkan(display.get_window(), &g_vk_backend);
+#endif
             }
         } else {
             std::cerr << "[Main] Display init failed, falling back to headless" << std::endl;

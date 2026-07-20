@@ -4,11 +4,13 @@
 extern int* __errno(void);
 #define errno (*__errno())
 
+#define ENOENT 2
 #define EINTR 4
 #define EAGAIN 11
 #define ENOMEM 12
 #define EACCES 13
 #define EFAULT 14
+#define EEXIST 17
 #define EINVAL 22
 #define EMFILE 24
 #define ERANGE 34

@@ -37,20 +37,49 @@ namespace fs = std::filesystem;
 // Forward declarations (internal helpers)
 // =============================================================================
 
-static void      ApplyCustomTheme();
+// =============================================================================
+// Navigation pages + forward declarations
+// =============================================================================
+
+enum class LauncherPage {
+    HOME,
+    LIBRARY,
+    MODS,
+    MOD_BROWSER,
+    PROFILE,
+    SETTINGS,
+    SDK_TOOLS
+};
+
+static LauncherPage g_page        = LauncherPage::HOME;
+static bool         g_show_save_ed = false;
+
+static void      ApplyPremiumTheme();
 static GLuint    LoadTextureFromFile(const char* path, int* out_w, int* out_h);
-static void      DrawToolbar(bool& running, LaunchConfig& cfg, bool& show_options);
-static void      DrawInstancePanel(BinarySelector& selector, int& selected, float width);
-static void      DrawDetailPanel(BinarySelector& selector, int selected,
-                                 LaunchConfig& cfg, bool& running, int& api_sel,
-                                 int& engine_sel, bool& use_sre_sel, bool& adv_redstell_opts_sel, bool& show_save_editor, float mods_width);
-static void      DrawModsPanel(float width);
-static void      DrawStatusBar(int selected, const BinarySelector& selector);
-static void      DrawOptionsModal(bool& show_options);
+static void      DrawWindowControls(bool& running, LaunchConfig& cfg);
+static void      DrawSidebar(BinarySelector& selector, int& selected, bool& running, LaunchConfig& cfg);
+static void      DrawContentArea(BinarySelector& selector, int& selected,
+                                 LaunchConfig& cfg, bool& running,
+                                 int& api_sel, int& engine_sel,
+                                 bool& use_sre_sel, bool& adv_opts_sel);
+static void      DrawHomePage(BinarySelector& selector, int& selected,
+                              LaunchConfig& cfg, bool& running,
+                              int& api_sel, int& engine_sel,
+                              bool& use_sre_sel, bool& adv_opts_sel);
+static void      DrawLibraryPage(BinarySelector& selector, int& selected,
+                                 LaunchConfig& cfg, bool& running,
+                                 int& api_sel, int& engine_sel,
+                                 bool& use_sre_sel, bool& adv_opts_sel);
+static void      DrawModsPage();
+static void      DrawModBrowserPage();
+static void      DrawProfilePage();
+static void      DrawSettingsPage();
+static void      DrawSDKToolsPage();
 static void      DrawSaveEditor(bool& show_save_editor);
+static void      DrawStatusFooter(int selected, const BinarySelector& selector);
 
 // =============================================================================
-// Mod info (parsed from mod.json)
+// Module-level state
 // =============================================================================
 
 struct ModInfo {
@@ -59,34 +88,27 @@ struct ModInfo {
     std::string version;
     std::string author;
     std::string description;
-    std::string type;      // "music", "scene", "texture"
+    std::string type;
     std::string dir_path;
     bool        enabled = true;
 };
 
-// Loaded UI textures
 static GLuint g_tex_bg = 0;
 static int    g_tex_bg_w = 0, g_tex_bg_h = 0;
 static GLuint g_tex_logo = 0;
 static int    g_tex_logo_w = 0, g_tex_logo_h = 0;
-static GLuint g_tex_icon_swordigo = 0;
-static GLuint g_tex_icon_swmini = 0;
+static GLuint g_tex_icon_swordigo   = 0;
+static GLuint g_tex_icon_swmini     = 0;
 static GLuint g_tex_icon_rlswordigo = 0;
-static GLuint g_tex_icon_app = 0;
-static int    g_icon_w = 0, g_icon_h = 0; // reusable
+static GLuint g_tex_icon_app        = 0;
+static int    g_icon_w = 0, g_icon_h = 0;
 
-// Per-instance custom icon cache (keyed by icon_path)
 static std::map<std::string, GLuint> g_custom_icon_cache;
-
-// SDL window pointer (for borderless drag)
 static SDL_Window* g_sdl_window = nullptr;
 
-// Toolbar height constant
-static const float TOOLBAR_H = 64.0f;
-
-// =============================================================================
-// Module-level state (lives for the duration of show_launcher)
-// =============================================================================
+static const float SIDEBAR_W   = 240.0f;
+static const float STATUS_H    = 28.0f;
+static const float WIN_CTRL_W  = 120.0f;
 
 static ImFont* g_font_main    = nullptr;
 static ImFont* g_font_heading = nullptr;
@@ -94,7 +116,6 @@ static ImFont* g_font_heading = nullptr;
 static std::vector<ModInfo> g_mods;
 static bool g_mods_scanned = false;
 
-// Save editor state
 static bool                     g_save_loaded      = false;
 static std::vector<std::string> g_save_paths;
 static std::vector<SaveFile>    g_save_files;
@@ -103,171 +124,55 @@ static SaveFile                 g_edit_save;
 static std::string              g_save_status;
 static bool                     g_save_status_ok   = false;
 
-// Delete confirmation
 static bool g_confirm_delete    = false;
 static int  g_delete_target_idx = -1;
 
-// Add Instance popup state
-static bool g_show_add_instance = false;
-static char g_add_name[128] = "";
-static int  g_add_asset_type = 0;        // 0=vanilla, 1=RL assets, 2=custom folder
-static char g_add_custom_assets[512] = "";
-static bool g_add_use_sre = true;
-static char g_add_game_type[64] = "Swordigo";
+static bool  g_show_add_instance  = false;
+static char  g_add_name[128]      = "";
+static int   g_add_asset_type     = 0;
+static char  g_add_custom_assets[512] = "";
+static bool  g_add_use_sre        = true;
+static char  g_add_game_type[64]  = "Swordigo";
 static std::string g_add_status;
-static bool g_add_copying = false;       // true during async asset copy
-static float g_add_copy_progress = 0.0f; // 0.0-1.0 copy progress
+static bool  g_add_copying        = false;
+static float g_add_copy_progress  = 0.0f;
 
-// Animation state
 static float g_anim_time = 0.0f;
 
+// Profile state (future)
+static char  g_profile_username[64]  = "Player";
+static bool  g_profile_editing       = false;
+
+// Mod browser search state
+static char  g_modbrowser_search[128] = "";
+static int   g_modbrowser_cat         = 0;  // 0=All,1=Gameplay,2=Texture,3=Audio,4=Custom
+
+// Interactive states for polish
+static int   g_selected_skin = 0;
+static int   g_mock_mod_state[6] = { 0 };      // 0=Get, 1=Downloading, 2=Installed
+static float g_mock_mod_progress[6] = { 0.0f };
+
 // =============================================================================
-// Texture helper
+// Helpers
 // =============================================================================
 
 static GLuint LoadTextureFromFile(const char* path, int* out_w, int* out_h) {
     SDL_Surface* surf = IMG_Load(path);
     if (!surf) return 0;
-
-    // Convert to RGBA32
     SDL_Surface* rgba = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_ABGR8888);
     SDL_DestroySurface(surf);
     if (!rgba) return 0;
-
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba->w, rgba->h, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, rgba->pixels);
-
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba->w, rgba->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba->pixels);
     if (out_w) *out_w = rgba->w;
     if (out_h) *out_h = rgba->h;
-
     SDL_DestroySurface(rgba);
     return tex;
 }
-
-// =============================================================================
-// Theme — Modern dark premium (inspired by JetBrains/GitHub Dark/Discord)
-// =============================================================================
-
-static void ApplyCustomTheme() {
-    ImGui::StyleColorsDark();
-    ImGuiStyle& style = ImGui::GetStyle();
-
-    // Rounding — generous for modern feel
-    style.WindowRounding    = 0.0f;   // Full-window panels, no outer rounding
-    style.ChildRounding     = 10.0f;
-    style.FrameRounding     = 8.0f;
-    style.GrabRounding      = 8.0f;
-    style.PopupRounding     = 12.0f;
-    style.ScrollbarRounding = 12.0f;
-    style.TabRounding       = 8.0f;
-
-    // Sizing — comfortable padding
-    style.FramePadding      = ImVec2(12, 7);
-    style.ItemSpacing       = ImVec2(10, 8);
-    style.ItemInnerSpacing  = ImVec2(8, 6);
-    style.ScrollbarSize     = 12.0f;
-    style.GrabMinSize       = 12.0f;
-    style.IndentSpacing     = 20.0f;
-
-    // Borders — minimal, refined
-    style.WindowBorderSize  = 0.0f;
-    style.ChildBorderSize   = 1.0f;
-    style.FrameBorderSize   = 0.0f;
-    style.PopupBorderSize   = 1.0f;
-    style.TabBorderSize     = 0.0f;
-
-    // Anti-aliasing
-    style.AntiAliasedLines  = true;
-    style.AntiAliasedFill   = true;
-
-    // ─── Color palette ───
-    // Base:    #0d1117 (deep space black)
-    // Surface: #161b22 (elevated surface)
-    // Frame:   #1c2333 (input fields)
-    // Border:  #30363d (subtle dividers)
-    // Text:    #e6edf3 (bright, readable)
-    // Muted:   #8b949e (secondary text)
-    // Accent:  #e94560 (SRT red / coral)
-    // Accent2: #58a6ff (info blue)
-    // Success: #3fb950 (green)
-    // Warning: #d29922 (amber)
-    ImVec4* c = style.Colors;
-
-    // Backgrounds
-    c[ImGuiCol_WindowBg]          = ImVec4(0.051f, 0.067f, 0.090f, 1.00f); // #0d1117
-    c[ImGuiCol_ChildBg]           = ImVec4(0.086f, 0.106f, 0.133f, 1.00f); // #161b22
-    c[ImGuiCol_PopupBg]           = ImVec4(0.098f, 0.122f, 0.157f, 0.98f); // #1a1f28
-    c[ImGuiCol_Border]            = ImVec4(0.188f, 0.212f, 0.239f, 0.50f); // #30363d
-    c[ImGuiCol_BorderShadow]      = ImVec4(0.000f, 0.000f, 0.000f, 0.00f);
-
-    // Frames (inputs, combos, sliders)
-    c[ImGuiCol_FrameBg]           = ImVec4(0.110f, 0.137f, 0.200f, 1.00f); // #1c2333
-    c[ImGuiCol_FrameBgHovered]    = ImVec4(0.140f, 0.170f, 0.240f, 1.00f);
-    c[ImGuiCol_FrameBgActive]     = ImVec4(0.170f, 0.200f, 0.290f, 1.00f);
-
-    // Title bar
-    c[ImGuiCol_TitleBg]           = ImVec4(0.051f, 0.067f, 0.090f, 1.00f);
-    c[ImGuiCol_TitleBgActive]     = ImVec4(0.071f, 0.087f, 0.110f, 1.00f);
-    c[ImGuiCol_TitleBgCollapsed]  = ImVec4(0.051f, 0.067f, 0.090f, 0.50f);
-
-    c[ImGuiCol_MenuBarBg]         = ImVec4(0.086f, 0.106f, 0.133f, 1.00f);
-
-    // Scrollbar
-    c[ImGuiCol_ScrollbarBg]       = ImVec4(0.051f, 0.067f, 0.090f, 0.40f);
-    c[ImGuiCol_ScrollbarGrab]     = ImVec4(0.188f, 0.212f, 0.239f, 0.80f);
-    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.250f, 0.280f, 0.320f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.340f, 0.370f, 0.410f, 1.00f);
-
-    // Accent widgets
-    c[ImGuiCol_CheckMark]         = ImVec4(0.914f, 0.271f, 0.376f, 1.00f); // #e94560
-    c[ImGuiCol_SliderGrab]        = ImVec4(0.345f, 0.651f, 1.000f, 0.80f); // #58a6ff
-    c[ImGuiCol_SliderGrabActive]  = ImVec4(0.345f, 0.651f, 1.000f, 1.00f);
-
-    // Buttons — SRT red accent
-    c[ImGuiCol_Button]            = ImVec4(0.914f, 0.271f, 0.376f, 1.00f); // #e94560
-    c[ImGuiCol_ButtonHovered]     = ImVec4(1.000f, 0.380f, 0.478f, 1.00f); // lighter
-    c[ImGuiCol_ButtonActive]      = ImVec4(0.780f, 0.200f, 0.290f, 1.00f); // darker
-
-    // Headers (selectables, collapsing headers)
-    c[ImGuiCol_Header]            = ImVec4(0.110f, 0.137f, 0.200f, 1.00f);
-    c[ImGuiCol_HeaderHovered]     = ImVec4(0.914f, 0.271f, 0.376f, 0.30f);
-    c[ImGuiCol_HeaderActive]      = ImVec4(0.914f, 0.271f, 0.376f, 0.50f);
-
-    // Separators
-    c[ImGuiCol_Separator]         = ImVec4(0.188f, 0.212f, 0.239f, 0.40f);
-    c[ImGuiCol_SeparatorHovered]  = ImVec4(0.914f, 0.271f, 0.376f, 0.50f);
-    c[ImGuiCol_SeparatorActive]   = ImVec4(0.914f, 0.271f, 0.376f, 1.00f);
-
-    // Resize grip
-    c[ImGuiCol_ResizeGrip]        = ImVec4(0.914f, 0.271f, 0.376f, 0.15f);
-    c[ImGuiCol_ResizeGripHovered] = ImVec4(0.914f, 0.271f, 0.376f, 0.40f);
-    c[ImGuiCol_ResizeGripActive]  = ImVec4(0.914f, 0.271f, 0.376f, 0.85f);
-
-    // Tabs
-    c[ImGuiCol_Tab]               = ImVec4(0.110f, 0.137f, 0.200f, 1.00f);
-    c[ImGuiCol_TabHovered]        = ImVec4(0.914f, 0.271f, 0.376f, 0.50f);
-    c[ImGuiCol_TabSelected]       = ImVec4(0.914f, 0.271f, 0.376f, 0.80f);
-
-    // Text
-    c[ImGuiCol_Text]              = ImVec4(0.902f, 0.929f, 0.953f, 1.00f); // #e6edf3
-    c[ImGuiCol_TextDisabled]      = ImVec4(0.545f, 0.580f, 0.620f, 1.00f); // #8b949e
-
-    // Tables
-    c[ImGuiCol_TableHeaderBg]     = ImVec4(0.110f, 0.137f, 0.200f, 1.00f);
-    c[ImGuiCol_TableBorderStrong] = ImVec4(0.188f, 0.212f, 0.239f, 0.60f);
-    c[ImGuiCol_TableBorderLight]  = ImVec4(0.188f, 0.212f, 0.239f, 0.30f);
-    c[ImGuiCol_TableRowBg]        = ImVec4(0.000f, 0.000f, 0.000f, 0.00f);
-    c[ImGuiCol_TableRowBgAlt]     = ImVec4(1.000f, 1.000f, 1.000f, 0.02f);
-}
-
-// =============================================================================
-// Mod scanner
-// =============================================================================
 
 static std::string ReadFileToString(const std::string& path) {
     std::ifstream f(path);
@@ -277,7 +182,6 @@ static std::string ReadFileToString(const std::string& path) {
     return ss.str();
 }
 
-// Minimal JSON value extractor (no external dependency)
 static std::string JsonGetString(const std::string& json, const std::string& key) {
     std::string needle = "\"" + key + "\"";
     auto pos = json.find(needle);
@@ -294,25 +198,15 @@ static std::string JsonGetString(const std::string& json, const std::string& key
 static void ScanMods() {
     g_mods.clear();
     std::string mods_dir = get_user_data_dir() + "/mods";
-    if (!fs::exists(mods_dir) || !fs::is_directory(mods_dir)) {
-        g_mods_scanned = true;
-        return;
-    }
-
+    if (!fs::exists(mods_dir) || !fs::is_directory(mods_dir)) { g_mods_scanned = true; return; }
     for (auto& entry : fs::directory_iterator(mods_dir)) {
         if (!entry.is_directory()) continue;
-        
         std::string dirname = entry.path().filename().string();
-        
-        // Check if this is a disabled mod (dot-prefixed)
         bool is_disabled = (!dirname.empty() && dirname[0] == '.');
-        
         std::string mod_json_path = entry.path().string() + "/mod.json";
         if (!fs::exists(mod_json_path)) continue;
-
         std::string json = ReadFileToString(mod_json_path);
         if (json.empty()) continue;
-
         ModInfo mod;
         mod.id          = JsonGetString(json, "id");
         mod.name        = JsonGetString(json, "name");
@@ -322,206 +216,72 @@ static void ScanMods() {
         mod.type        = JsonGetString(json, "type");
         mod.dir_path    = entry.path().string();
         mod.enabled     = !is_disabled;
-
-        if (mod.name.empty()) {
-            // Strip dot prefix for display name
-            mod.name = is_disabled ? dirname.substr(1) : dirname;
-        }
+        if (mod.name.empty()) mod.name = is_disabled ? dirname.substr(1) : dirname;
         g_mods.push_back(mod);
     }
-
     g_mods_scanned = true;
 }
-
-// =============================================================================
-// Human-readable file size
-// =============================================================================
 
 static std::string FormatFileSize(size_t bytes) {
     if (bytes < 1024)               return std::to_string(bytes) + " B";
     if (bytes < 1024 * 1024)        return std::to_string(bytes / 1024) + " KB";
     if (bytes < 1024 * 1024 * 1024) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%.1f MB", bytes / (1024.0 * 1024.0));
-        return buf;
+        char buf[32]; snprintf(buf, sizeof(buf), "%.1f MB", bytes / (1024.0 * 1024.0)); return buf;
     }
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0));
-    return buf;
+    char buf[32]; snprintf(buf, sizeof(buf), "%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0)); return buf;
 }
-
-// =============================================================================
-// Toolbar — sleek top bar with logo image + control buttons + window drag
-// =============================================================================
-
-static void DrawToolbar(bool& running, LaunchConfig& cfg, bool& show_options) {
-    ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(vp->WorkPos);
-    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, TOOLBAR_H));
-
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.043f, 0.055f, 0.075f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.188f, 0.212f, 0.239f, 0.3f));
-    ImGui::Begin("##Toolbar", nullptr,
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus);
-
-    // ── Window drag (borderless mode) ──
-    // If mouse is in toolbar area and not over a button, allow dragging
-    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
-        !ImGui::IsAnyItemHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-        if (g_sdl_window) {
-            float dx = ImGui::GetIO().MouseDelta.x;
-            float dy = ImGui::GetIO().MouseDelta.y;
-            if (dx != 0.0f || dy != 0.0f) {
-                int wx, wy;
-                SDL_GetWindowPosition(g_sdl_window, &wx, &wy);
-                SDL_SetWindowPosition(g_sdl_window, wx + (int)dx, wy + (int)dy);
-            }
-        }
-    }
-
-    // ── Logo image (SWORDIGO / DESKTOP text) ──
-    if (g_tex_logo) {
-        // Fit within toolbar with padding: 52px tall max, 15:4 aspect
-        float logo_h = TOOLBAR_H - 12.0f; // 52px
-        float logo_w = logo_h * ((float)g_tex_logo_w / (float)g_tex_logo_h);
-        ImGui::SetCursorPos(ImVec2(12, (TOOLBAR_H - logo_h) * 0.5f));
-        ImGui::Image((ImTextureID)(intptr_t)g_tex_logo, ImVec2(logo_w, logo_h));
-    } else {
-        // Fallback: text title if logo not found
-        if (g_font_heading) ImGui::PushFont(g_font_heading);
-        ImGui::SetCursorPos(ImVec2(12, (TOOLBAR_H - ImGui::GetTextLineHeight()) * 0.5f));
-        ImGui::TextColored(ImVec4(0.902f, 0.929f, 0.953f, 1.0f), "SWORDIGO DESKTOP");
-        if (g_font_heading) ImGui::PopFont();
-    }
-
-    // ── Right-aligned buttons ──
-    float rhs = ImGui::GetWindowWidth();
-    float btn_y = (TOOLBAR_H - 38) * 0.5f;
-
-    // Close button (red)
-    ImGui::SetCursorPos(ImVec2(rhs - 50, btn_y));
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.12f, 0.8f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.80f, 0.18f, 0.18f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.65f, 0.10f, 0.10f, 1.0f));
-    if (ImGui::Button(ICON_FA_XMARK "##close", ImVec2(38, 38))) {
-        cfg.should_launch = false;
-        running = false;
-    }
-    ImGui::PopStyleColor(3);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close (ESC)");
-
-    // Settings button (subtle)
-    ImGui::SetCursorPos(ImVec2(rhs - 98, btn_y));
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.110f, 0.137f, 0.200f, 0.8f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.180f, 0.210f, 0.300f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.140f, 0.170f, 0.250f, 1.0f));
-    if (ImGui::Button(ICON_FA_GEAR "##opts", ImVec2(38, 38))) {
-        show_options = true;
-        ImGui::OpenPopup("Options");
-    }
-    ImGui::PopStyleColor(3);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Options");
-
-    // ── Subtle bottom border line ──
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 wp = ImGui::GetWindowPos();
-    dl->AddLine(
-        ImVec2(wp.x, wp.y + TOOLBAR_H - 1),
-        ImVec2(wp.x + vp->WorkSize.x, wp.y + TOOLBAR_H - 1),
-        IM_COL32(48, 54, 61, 180), 1.0f);
-
-    ImGui::End();
-    ImGui::PopStyleColor(2);
-}
-
-// =============================================================================
-// Icon helper — maps game_type to a loaded icon texture
-// =============================================================================
 
 static GLuint GetIconForInstance(const BinaryInfo& b) {
-    // Priority 1: custom icon_path from manifest (lazy load + cache)
     if (!b.icon_path.empty()) {
         auto it = g_custom_icon_cache.find(b.icon_path);
         if (it != g_custom_icon_cache.end()) {
             if (it->second) return it->second;
-            // Cached as 0 = failed to load, fall through to defaults
         } else {
-            // Try loading from multiple search paths
-            int w = 0, h = 0;
-            GLuint tex = 0;
+            int w = 0, h = 0; GLuint tex = 0;
             std::string paths[] = {
-                b.icon_path,  // as-is (absolute or relative)
+                b.icon_path,
                 get_user_data_dir() + "/launcher/icons/" + b.icon_path,
                 get_user_data_dir() + "/launcher/" + b.icon_path,
                 std::string("src/assets/icons/") + b.icon_path,
                 std::string("src/assets/") + b.icon_path,
             };
-            for (auto& p : paths) {
-                tex = LoadTextureFromFile(p.c_str(), &w, &h);
-                if (tex) {
-                    std::cout << "[Launcher] Custom icon loaded: " << p << std::endl;
-                    break;
-                }
-            }
-            g_custom_icon_cache[b.icon_path] = tex;  // cache (0 if failed)
+            for (auto& p : paths) { tex = LoadTextureFromFile(p.c_str(), &w, &h); if (tex) break; }
+            g_custom_icon_cache[b.icon_path] = tex;
             if (tex) return tex;
         }
     }
-    // Priority 2: game_type defaults
-    if (b.game_type == "RLSwordigo" && g_tex_icon_rlswordigo) return g_tex_icon_rlswordigo;
-    if (b.game_type == "SwordigoMini" && g_tex_icon_swmini) return g_tex_icon_swmini;
+    if (b.game_type == "RLSwordigo"   && g_tex_icon_rlswordigo) return g_tex_icon_rlswordigo;
+    if (b.game_type == "SwordigoMini" && g_tex_icon_swmini)     return g_tex_icon_swmini;
     if (g_tex_icon_swordigo) return g_tex_icon_swordigo;
     return g_tex_icon_app;
 }
 
-// =============================================================================
-// Display name helper — extracts a clean, user-friendly name for sidebar
-// =============================================================================
-
 static std::string GetDisplayName(const BinaryInfo& b) {
-    // For known game types, use a clean name + version
     if (b.game_type == "Swordigo")     return "Swordigo " + b.version;
     if (b.game_type == "RLSwordigo")   return "RLSwordigo " + b.version;
     if (b.game_type == "SwordigoMini") return "Swordigo Mini " + b.version;
-
-    // For custom instances, clean the label by stripping technical tags
     std::string name = b.label;
-    // Remove [ARM64], [ARM32], (Tested), (Testing), (Unknown), (SRE), [Custom], [RL], etc.
     auto strip = [&name](const std::string& tag) {
         size_t pos;
-        while ((pos = name.find(tag)) != std::string::npos) {
-            name.erase(pos, tag.size());
-        }
+        while ((pos = name.find(tag)) != std::string::npos) name.erase(pos, tag.size());
     };
-    strip("[ARM64]"); strip("[ARM32]");
-    strip("(Tested)"); strip("(Testing)"); strip("(Unknown)"); strip("(SRE)");
-    strip("[Custom]"); strip("[RL]"); strip("[Swordigo]");
-    // Trim whitespace
+    strip("[ARM64]"); strip("[ARM32]"); strip("(Tested)"); strip("(Testing)");
+    strip("(Unknown)"); strip("(SRE)"); strip("[Custom]"); strip("[RL]"); strip("[Swordigo]");
     while (!name.empty() && name.front() == ' ') name.erase(name.begin());
-    while (!name.empty() && name.back() == ' ') name.pop_back();
-    // Collapse multiple spaces
-    std::string clean;
-    bool prev_space = false;
+    while (!name.empty() && name.back()  == ' ') name.pop_back();
+    std::string clean; bool prev_space = false;
     for (char c : name) {
-        if (c == ' ') {
-            if (!prev_space) clean += c;
-            prev_space = true;
-        } else {
-            clean += c;
-            prev_space = false;
-        }
+        if (c == ' ') { if (!prev_space) clean += c; prev_space = true; }
+        else { clean += c; prev_space = false; }
     }
     return clean.empty() ? b.label : clean;
 }
 
 static std::string GetSubtitle(const BinaryInfo& b) {
-    std::string sub;
-    sub += BinarySelector::arch_string(b.arch);
+    std::string sub = BinarySelector::arch_string(b.arch);
     sub += "  ·  v" + b.version;
     switch (b.status) {
-        case BinaryStatus::TESTED:  sub += "  ·  Stable"; break;
+        case BinaryStatus::TESTED:  sub += "  ·  Stable";  break;
         case BinaryStatus::TESTING: sub += "  ·  Testing"; break;
         default: break;
     }
@@ -531,225 +291,448 @@ static std::string GetSubtitle(const BinaryInfo& b) {
 }
 
 // =============================================================================
-// Instance list panel (left sidebar)
+// Premium Theme — deep space dark with crimson accent
 // =============================================================================
 
-static void DrawInstancePanel(BinarySelector& selector, int& selected, float width) {
-    ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImVec2 panel_pos(vp->WorkPos.x, vp->WorkPos.y + TOOLBAR_H);
-    ImVec2 panel_size(width, vp->WorkSize.y - TOOLBAR_H - 30);
+static void ApplyPremiumTheme() {
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
 
-    ImGui::SetNextWindowPos(panel_pos);
-    ImGui::SetNextWindowSize(panel_size);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.059f, 0.075f, 0.098f, 1.0f));
-    ImGui::Begin("##Instances", nullptr,
+    // Rounding
+    style.WindowRounding    = 0.0f;
+    style.ChildRounding     = 12.0f;
+    style.FrameRounding     = 8.0f;
+    style.GrabRounding      = 8.0f;
+    style.PopupRounding     = 14.0f;
+    style.ScrollbarRounding = 14.0f;
+    style.TabRounding       = 8.0f;
+
+    // Spacing — breathable
+    style.FramePadding     = ImVec2(14, 8);
+    style.ItemSpacing      = ImVec2(12, 8);
+    style.ItemInnerSpacing = ImVec2(10, 6);
+    style.ScrollbarSize    = 10.0f;
+    style.GrabMinSize      = 10.0f;
+    style.IndentSpacing    = 22.0f;
+    style.WindowPadding    = ImVec2(18, 16);
+
+    // Borders
+    style.WindowBorderSize = 0.0f;
+    style.ChildBorderSize  = 1.0f;
+    style.FrameBorderSize  = 0.0f;
+    style.PopupBorderSize  = 1.0f;
+    style.TabBorderSize    = 0.0f;
+
+    style.AntiAliasedLines = true;
+    style.AntiAliasedFill  = true;
+
+    ImVec4* c = style.Colors;
+
+    // Deep space backgrounds
+    c[ImGuiCol_WindowBg]          = ImVec4(0.040f, 0.051f, 0.071f, 1.00f); // #0A0D12
+    c[ImGuiCol_ChildBg]           = ImVec4(0.063f, 0.082f, 0.114f, 1.00f); // #10152D/similar
+    c[ImGuiCol_PopupBg]           = ImVec4(0.071f, 0.090f, 0.122f, 0.98f);
+    c[ImGuiCol_Border]            = ImVec4(0.133f, 0.165f, 0.220f, 0.60f);
+    c[ImGuiCol_BorderShadow]      = ImVec4(0.000f, 0.000f, 0.000f, 0.00f);
+
+    // Frames
+    c[ImGuiCol_FrameBg]           = ImVec4(0.082f, 0.106f, 0.157f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]    = ImVec4(0.110f, 0.141f, 0.204f, 1.00f);
+    c[ImGuiCol_FrameBgActive]     = ImVec4(0.145f, 0.180f, 0.255f, 1.00f);
+
+    // Title
+    c[ImGuiCol_TitleBg]           = ImVec4(0.040f, 0.051f, 0.071f, 1.00f);
+    c[ImGuiCol_TitleBgActive]     = ImVec4(0.055f, 0.071f, 0.098f, 1.00f);
+    c[ImGuiCol_TitleBgCollapsed]  = ImVec4(0.040f, 0.051f, 0.071f, 0.50f);
+    c[ImGuiCol_MenuBarBg]         = ImVec4(0.063f, 0.082f, 0.114f, 1.00f);
+
+    // Scrollbar
+    c[ImGuiCol_ScrollbarBg]          = ImVec4(0.040f, 0.051f, 0.071f, 0.40f);
+    c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.133f, 0.165f, 0.220f, 0.80f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.200f, 0.240f, 0.310f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.280f, 0.330f, 0.420f, 1.00f);
+
+    // Accent — crimson #E94560
+    c[ImGuiCol_CheckMark]         = ImVec4(0.914f, 0.271f, 0.376f, 1.00f);
+    c[ImGuiCol_SliderGrab]        = ImVec4(0.345f, 0.651f, 1.000f, 0.80f);
+    c[ImGuiCol_SliderGrabActive]  = ImVec4(0.345f, 0.651f, 1.000f, 1.00f);
+
+    // Buttons — crimson
+    c[ImGuiCol_Button]            = ImVec4(0.914f, 0.271f, 0.376f, 1.00f);
+    c[ImGuiCol_ButtonHovered]     = ImVec4(1.000f, 0.380f, 0.490f, 1.00f);
+    c[ImGuiCol_ButtonActive]      = ImVec4(0.760f, 0.196f, 0.278f, 1.00f);
+
+    // Headers
+    c[ImGuiCol_Header]            = ImVec4(0.082f, 0.106f, 0.157f, 1.00f);
+    c[ImGuiCol_HeaderHovered]     = ImVec4(0.914f, 0.271f, 0.376f, 0.25f);
+    c[ImGuiCol_HeaderActive]      = ImVec4(0.914f, 0.271f, 0.376f, 0.45f);
+
+    // Separators
+    c[ImGuiCol_Separator]         = ImVec4(0.133f, 0.165f, 0.220f, 0.50f);
+    c[ImGuiCol_SeparatorHovered]  = ImVec4(0.914f, 0.271f, 0.376f, 0.50f);
+    c[ImGuiCol_SeparatorActive]   = ImVec4(0.914f, 0.271f, 0.376f, 1.00f);
+
+    // Resize
+    c[ImGuiCol_ResizeGrip]        = ImVec4(0.914f, 0.271f, 0.376f, 0.12f);
+    c[ImGuiCol_ResizeGripHovered] = ImVec4(0.914f, 0.271f, 0.376f, 0.35f);
+    c[ImGuiCol_ResizeGripActive]  = ImVec4(0.914f, 0.271f, 0.376f, 0.80f);
+
+    // Tabs
+    c[ImGuiCol_Tab]               = ImVec4(0.082f, 0.106f, 0.157f, 1.00f);
+    c[ImGuiCol_TabHovered]        = ImVec4(0.914f, 0.271f, 0.376f, 0.45f);
+    c[ImGuiCol_TabSelected]       = ImVec4(0.914f, 0.271f, 0.376f, 0.75f);
+
+    // Text
+    c[ImGuiCol_Text]         = ImVec4(0.918f, 0.941f, 0.969f, 1.00f); // #EAF0F7
+    c[ImGuiCol_TextDisabled] = ImVec4(0.447f, 0.494f, 0.557f, 1.00f); // #72808E
+
+    // Tables
+    c[ImGuiCol_TableHeaderBg]     = ImVec4(0.082f, 0.106f, 0.157f, 1.00f);
+    c[ImGuiCol_TableBorderStrong] = ImVec4(0.133f, 0.165f, 0.220f, 0.60f);
+    c[ImGuiCol_TableBorderLight]  = ImVec4(0.133f, 0.165f, 0.220f, 0.30f);
+    c[ImGuiCol_TableRowBg]        = ImVec4(0.000f, 0.000f, 0.000f, 0.00f);
+    c[ImGuiCol_TableRowBgAlt]     = ImVec4(1.000f, 1.000f, 1.000f, 0.025f);
+}
+
+// =============================================================================
+// Helper: secondary button style push/pop
+// =============================================================================
+
+static void PushSecondaryBtn() {
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.082f, 0.106f, 0.157f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.133f, 0.165f, 0.235f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.110f, 0.141f, 0.200f, 1.0f));
+}
+static void PopSecondaryBtn() { ImGui::PopStyleColor(3); }
+
+// Inline section label
+static void SectionLabel(const char* icon, const char* label) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.914f, 0.271f, 0.376f, 0.85f));
+    ImGui::Text("%s  %s", icon, label);
+    ImGui::PopStyleColor();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float avail = ImGui::GetContentRegionAvail().x;
+    dl->AddLine(p, ImVec2(p.x + avail, p.y), IM_COL32(233, 69, 96, 55), 1.0f);
+    ImGui::Dummy(ImVec2(0, 6));
+}
+
+// =============================================================================
+// Window controls overlay (top-right, always on top)
+// =============================================================================
+
+static void DrawWindowControls(bool& running, LaunchConfig& cfg) {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    float x = vp->WorkPos.x + vp->WorkSize.x - WIN_CTRL_W;
+    float y = vp->WorkPos.y;
+
+    ImGui::SetNextWindowPos(ImVec2(x, y));
+    ImGui::SetNextWindowSize(ImVec2(WIN_CTRL_W, 42));
+    ImGui::Begin("##WinCtrl", nullptr,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6, 0));
+
+    // Minimize
+    PushSecondaryBtn();
+    ImGui::SetCursorPosY(7);
+    if (ImGui::Button(ICON_FA_WINDOW_MINIMIZE "##min", ImVec2(34, 28))) {
+        if (g_sdl_window) SDL_MinimizeWindow(g_sdl_window);
+    }
+    PopSecondaryBtn();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimize");
+
+    // Close
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.55f, 0.12f, 0.12f, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.82f, 0.16f, 0.16f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.65f, 0.10f, 0.10f, 1.00f));
+    if (ImGui::Button(ICON_FA_XMARK "##close", ImVec2(34, 28))) {
+        cfg.should_launch = false;
+        running = false;
+    }
+    ImGui::PopStyleColor(3);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close  (ESC)");
+
+    ImGui::PopStyleVar(2);
+    ImGui::End();
+}
+
+// =============================================================================
+// Left Sidebar — logo + nav + profile
+// =============================================================================
+
+static void DrawSidebar(BinarySelector& selector, int& selected,
+                        bool& running, LaunchConfig& cfg) {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(ImVec2(SIDEBAR_W, vp->WorkSize.y));
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,   ImVec4(0.031f, 0.039f, 0.055f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,    ImVec4(0.031f, 0.039f, 0.055f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::Begin("##Sidebar", nullptr,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 wp = ImGui::GetWindowPos();
+
+    // ── Logo / branding ──
+    {
+        float logo_area_h = 72.0f;
+        if (g_tex_logo) {
+            float lh = 36.0f;
+            float lw = lh * ((float)g_tex_logo_w / (float)g_tex_logo_h);
+            ImGui::SetCursorPos(ImVec2(16, (logo_area_h - lh) * 0.5f));
+            ImGui::Image((ImTextureID)(intptr_t)g_tex_logo, ImVec2(lw, lh));
+        } else {
+            ImGui::SetCursorPos(ImVec2(16, (logo_area_h - ImGui::GetTextLineHeight()) * 0.5f));
+            if (g_font_heading) ImGui::PushFont(g_font_heading);
+            ImGui::TextColored(ImVec4(0.914f, 0.271f, 0.376f, 1.0f), "SWORDIGO");
+            if (g_font_heading) ImGui::PopFont();
+        }
+        // Bottom separator of logo area
+        dl->AddLine(ImVec2(wp.x + 16, wp.y + logo_area_h),
+                    ImVec2(wp.x + SIDEBAR_W - 16, wp.y + logo_area_h),
+                    IM_COL32(255, 255, 255, 18), 1.0f);
+        ImGui::SetCursorPosY(logo_area_h + 8);
+    }
+
+    // ── Nav items ──
+    struct NavEntry { LauncherPage page; const char* icon; const char* label; const char* tooltip; };
+    static const NavEntry nav[] = {
+        { LauncherPage::HOME,        ICON_FA_HOUSE,        "Home",        "Quick launch & overview"     },
+        { LauncherPage::LIBRARY,     ICON_FA_LAYER_GROUP,  "Library",     "Manage game instances"       },
+        { LauncherPage::MODS,        ICON_FA_PUZZLE_PIECE, "Mods",        "Installed mods"              },
+        { LauncherPage::MOD_BROWSER, ICON_FA_GLOBE,        "Mod Browser", "Browse & install mods"       },
+        { LauncherPage::SDK_TOOLS,   ICON_FA_WRENCH,       "SDK / Tools", "Asset viewer & dev tools"    },
+    };
+
+    ImGui::SetCursorPosX(0);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+
+    for (auto& e : nav) {
+        bool active = (g_page == e.page);
+        ImVec2 item_pos = ImGui::GetCursorScreenPos();
+
+        // Active bg highlight
+        if (active) {
+            dl->AddRectFilled(item_pos, ImVec2(item_pos.x + SIDEBAR_W, item_pos.y + 46),
+                              IM_COL32(233, 69, 96, 28));
+            // Left accent bar
+            dl->AddRectFilled(item_pos, ImVec2(item_pos.x + 3, item_pos.y + 46),
+                              IM_COL32(233, 69, 96, 255), 0.0f);
+        }
+
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(1, 1, 1, 0.06f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(1, 1, 1, 0.10f));
+        ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0, 0, 0, 0));
+
+        ImGui::SetCursorPosX(0);
+        ImGui::PushID((int)e.page);
+        if (ImGui::Selectable("##nav", active, 0, ImVec2(SIDEBAR_W, 46))) {
+            g_page = e.page;
+        }
+        ImGui::PopID();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.tooltip);
+        ImGui::PopStyleColor(3);
+
+        // Icon + label drawn over selectable
+        float ty = item_pos.y + (46 - ImGui::GetTextLineHeight()) * 0.5f;
+        ImU32 text_col = active ? IM_COL32(233, 69, 96, 255) : IM_COL32(180, 195, 215, 200);
+        dl->AddText(ImVec2(item_pos.x + 22, ty), text_col, e.icon);
+        dl->AddText(ImVec2(item_pos.x + 52, ty), text_col, e.label);
+
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2);
+    }
+    ImGui::PopStyleVar(2);
+
+    // ── Settings separator + nav ──
+    {
+        ImGui::Dummy(ImVec2(0, 8));
+        ImVec2 sp = ImGui::GetCursorScreenPos();
+        dl->AddLine(ImVec2(wp.x + 16, sp.y), ImVec2(wp.x + SIDEBAR_W - 16, sp.y),
+                    IM_COL32(255, 255, 255, 15), 1.0f);
+        ImGui::Dummy(ImVec2(0, 8));
+    }
+
+    // Settings nav
+    {
+        bool active = (g_page == LauncherPage::SETTINGS);
+        ImVec2 item_pos = ImGui::GetCursorScreenPos();
+        if (active) {
+            dl->AddRectFilled(item_pos, ImVec2(item_pos.x + SIDEBAR_W, item_pos.y + 46),
+                              IM_COL32(233, 69, 96, 28));
+            dl->AddRectFilled(item_pos, ImVec2(item_pos.x + 3, item_pos.y + 46),
+                              IM_COL32(233, 69, 96, 255), 0.0f);
+        }
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(1, 1, 1, 0.06f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(1, 1, 1, 0.10f));
+        ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0, 0, 0, 0));
+        ImGui::SetCursorPosX(0);
+        if (ImGui::Selectable("##navSettings", active, 0, ImVec2(SIDEBAR_W, 46)))
+            g_page = LauncherPage::SETTINGS;
+        ImGui::PopStyleColor(3);
+        float ty = item_pos.y + (46 - ImGui::GetTextLineHeight()) * 0.5f;
+        ImU32 tc = active ? IM_COL32(233, 69, 96, 255) : IM_COL32(180, 195, 215, 200);
+        dl->AddText(ImVec2(item_pos.x + 22, ty), tc, ICON_FA_GEAR);
+        dl->AddText(ImVec2(item_pos.x + 52, ty), tc, "Settings");
+    }
+
+    // ── Profile card at bottom ──
+    {
+        float card_h  = 74.0f;
+        float card_y  = ImGui::GetWindowHeight() - card_h - STATUS_H;
+        ImVec2 card_pos(wp.x, wp.y + card_y);
+        
+        bool active = (g_page == LauncherPage::PROFILE);
+        // Card bg - highlighted when active
+        ImU32 card_bg_color = active
+            ? IM_COL32(233, 69, 96, 28)
+            : IM_COL32(18, 24, 38, 255);
+            
+        dl->AddRectFilled(card_pos, ImVec2(card_pos.x + SIDEBAR_W, card_pos.y + card_h),
+                          card_bg_color);
+        dl->AddLine(ImVec2(card_pos.x, card_pos.y),
+                    ImVec2(card_pos.x + SIDEBAR_W, card_pos.y),
+                    IM_COL32(255, 255, 255, 18), 1.0f);
+
+        // Left accent bar if active
+        if (active) {
+            dl->AddRectFilled(card_pos, ImVec2(card_pos.x + 3, card_pos.y + card_h),
+                              IM_COL32(233, 69, 96, 255), 0.0f);
+        }
+
+        // Avatar circle
+        ImVec2 av_center(card_pos.x + 32, card_pos.y + card_h * 0.5f);
+        dl->AddCircleFilled(av_center, 20.0f, IM_COL32(35, 46, 68, 255));
+        dl->AddCircle(av_center, 20.0f, IM_COL32(233, 69, 96, 140), 32, 1.5f);
+        // Person icon inside circle
+        dl->AddText(ImVec2(av_center.x - 6, av_center.y - 7), IM_COL32(233, 69, 96, 255), ICON_FA_USER);
+
+        // Username
+        float tx = card_pos.x + 60;
+        float ty_top    = card_pos.y + 14;
+        float ty_bottom = card_pos.y + 36;
+        dl->AddText(ImVec2(tx, ty_top),    IM_COL32(230, 237, 243, 255), g_profile_username);
+        dl->AddText(ImVec2(tx, ty_bottom), IM_COL32(130, 150, 175, 180), "Local Profile");
+
+        // "Manage" link — bottom right of card
+        dl->AddText(ImVec2(card_pos.x + SIDEBAR_W - 72, card_pos.y + card_h - 18),
+                    IM_COL32(88, 166, 255, 180), ICON_FA_PEN "  Edit");
+
+        // Click to go to profile page
+        ImGui::SetCursorPos(ImVec2(0, card_y));
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(1, 1, 1, 0.06f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(1, 1, 1, 0.10f));
+        if (ImGui::Selectable("##profileCard", false, 0, ImVec2(SIDEBAR_W, card_h)))
+            g_page = LauncherPage::PROFILE;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Manage Profile");
+        ImGui::PopStyleColor(3);
+    }
+
+    // Right border
+    dl->AddLine(ImVec2(wp.x + SIDEBAR_W - 1, wp.y),
+                ImVec2(wp.x + SIDEBAR_W - 1, wp.y + ImGui::GetWindowHeight()),
+                IM_COL32(255, 255, 255, 14), 1.0f);
+
+    ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+}
+
+// =============================================================================
+// Status Footer
+// =============================================================================
+
+static void DrawStatusFooter(int selected, const BinarySelector& selector) {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y + vp->WorkSize.y - STATUS_H));
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, STATUS_H));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.024f, 0.031f, 0.043f, 1.0f));
+    ImGui::Begin("##StatusFooter", nullptr,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    ImGui::SetCursorPosX(SIDEBAR_W + 16);
+
+    const auto& bins = selector.get_binaries();
+    if (!bins.empty() && selected >= 0 && selected < (int)bins.size()) {
+        ImVec4 col;
+        const char* str;
+        switch (bins[selected].status) {
+            case BinaryStatus::TESTED:  str = ICON_FA_CIRCLE_CHECK "  Ready"; col = ImVec4(0.24f, 0.72f, 0.31f, 0.9f); break;
+            case BinaryStatus::TESTING: str = ICON_FA_CLOCK "  Testing"; col = ImVec4(0.82f, 0.60f, 0.13f, 0.9f); break;
+            default:                    str = ICON_FA_CIRCLE_EXCLAMATION "  Unknown"; col = ImVec4(0.55f, 0.58f, 0.62f, 0.9f); break;
+        }
+        ImGui::TextColored(col, "%s", str);
+    } else {
+        ImGui::TextDisabled(ICON_FA_CIRCLE_CHECK "  Ready");
+    }
+
+    // Right side — hints
+    ImGui::SameLine(ImGui::GetWindowWidth() - 360);
+    ImGui::TextDisabled("  v8.0 Remaster  |  Enter: Launch  |  ESC: Close");
+
+    ImGui::End();
+    ImGui::PopStyleColor();
+}
+
+// =============================================================================
+// Content area dispatcher
+// =============================================================================
+
+static void DrawContentArea(BinarySelector& selector, int& selected,
+                            LaunchConfig& cfg, bool& running,
+                            int& api_sel, int& engine_sel,
+                            bool& use_sre_sel, bool& adv_opts_sel) {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + SIDEBAR_W, vp->WorkPos.y));
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - SIDEBAR_W, vp->WorkSize.y - STATUS_H));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.040f, 0.051f, 0.071f, 1.0f));
+    ImGui::Begin("##Content", nullptr,
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-    // Header row
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.545f, 0.580f, 0.620f, 1.0f));
-    ImGui::Text(ICON_FA_LAYER_GROUP "  INSTANCES");
-    ImGui::PopStyleColor();
-
-    ImGui::SameLine(width - 50);
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.110f, 0.137f, 0.200f, 0.8f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.914f, 0.271f, 0.376f, 0.6f));
-    if (ImGui::Button(ICON_FA_PLUS "##add", ImVec2(30, 30))) {
-        g_show_add_instance = true;
-        // Reset form fields
-        memset(g_add_name, 0, sizeof(g_add_name));
-        strncpy(g_add_name, "My Instance", sizeof(g_add_name) - 1);
-        memset(g_add_custom_assets, 0, sizeof(g_add_custom_assets));
-        g_add_asset_type = 0;
-        g_add_use_sre = true;
-        strncpy(g_add_game_type, "Swordigo", sizeof(g_add_game_type) - 1);
-        g_add_status.clear();
-        g_add_copying = false;
-        g_add_copy_progress = 0.0f;
-    }
-    ImGui::PopStyleColor(2);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add new game instance");
-
-    ImGui::Spacing();
-    // Subtle separator line
-    ImDrawList* sep_dl = ImGui::GetWindowDrawList();
-    ImVec2 sep_p = ImGui::GetCursorScreenPos();
-    sep_dl->AddLine(ImVec2(sep_p.x, sep_p.y), ImVec2(sep_p.x + width - 20, sep_p.y),
-                    IM_COL32(48, 54, 61, 120), 1.0f);
-    ImGui::Spacing();
-
-    // Instance list
-    const auto& bins = selector.get_binaries();
-    if (bins.empty()) {
-        ImGui::Spacing(); ImGui::Spacing();
-        ImGui::TextDisabled("No instances found.");
-        ImGui::TextDisabled("Click '+' to add one.");
+    // Save editor hijacks the content area when open
+    if (g_show_save_ed) {
+        DrawSaveEditor(g_show_save_ed);
+        ImGui::End();
+        ImGui::PopStyleColor();
+        return;
     }
 
-    // Build sorted index: group by version first, with ARM64 before ARM32 within each version
-    std::vector<int> sorted_idx(bins.size());
-    std::iota(sorted_idx.begin(), sorted_idx.end(), 0);
-    std::sort(sorted_idx.begin(), sorted_idx.end(), [&bins](int a, int b_idx) {
-        const auto& ba = bins[a];
-        const auto& bb = bins[b_idx];
-        if (ba.version != bb.version) {
-            return ba.version > bb.version;
-        }
-        if (ba.arch != bb.arch) {
-            return ba.arch == BinaryArch::ARM64;
-        }
-        return false;
-    });
-
-    // Initial selection: prefer ARM64 v1.4.12
-    static bool first_frame = true;
-    if (first_frame && !bins.empty()) {
-        first_frame = false;
-        for (int i = 0; i < (int)bins.size(); i++) {
-            if (bins[i].arch == BinaryArch::ARM64 && bins[i].version.find("1.4.12") != std::string::npos) {
-                selected = i;
-                break;
-            }
-        }
-    }
-
-    for (int idx : sorted_idx) {
-        const auto& b = bins[idx];
-        ImGui::PushID(idx);
-
-        bool is_selected = (selected == idx);
-
-        // Hover highlight style
-        if (is_selected) {
-            ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.914f, 0.271f, 0.376f, 0.18f));
-            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.914f, 0.271f, 0.376f, 0.25f));
-        }
-
-        if (ImGui::Selectable("##instance", is_selected, 0, ImVec2(0, 60))) {
-            selected = idx;
-        }
-
-        if (is_selected) {
-            ImGui::PopStyleColor(2);
-        }
-
-        // Right-click context menu
-        if (ImGui::BeginPopupContextItem("InstanceCtx")) {
-            if (ImGui::MenuItem(ICON_FA_STAR "  Set Default")) {
-                selector.set_default(b.filepath);
-            }
-            if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN "  Open Folder")) {
-                std::string full = b.filepath[0] == '/' ? b.filepath : (get_user_data_dir() + "/" + b.filepath);
-                std::string dir = fs::path(full).parent_path().string();
-                pid_t pid = fork();
-                if (pid == 0) {
-                    execlp("xdg-open", "xdg-open", dir.c_str(), nullptr);
-                    _exit(1);
-                }
-            }
-            ImGui::Separator();
-            // Only show Remove for non-vanilla (custom) instances
-            bool is_vanilla_ctx = (b.game_type == "Swordigo" || b.game_type == "RLSwordigo" || b.game_type == "SwordigoMini");
-            if (!is_vanilla_ctx) {
-                if (ImGui::MenuItem(ICON_FA_TRASH "  Remove")) {
-                    g_confirm_delete = true;
-                    g_delete_target_idx = idx;
-                }
-            }
-            ImGui::EndPopup();
-        }
-
-        // Overlay content on the selectable
-        ImVec2 item_min = ImGui::GetItemRectMin();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-
-        // Selected indicator bar (left edge accent)
-        if (is_selected) {
-            dl->AddRectFilled(
-                ImVec2(item_min.x, item_min.y + 4),
-                ImVec2(item_min.x + 3, item_min.y + 56),
-                IM_COL32(233, 69, 96, 255), 2.0f);
-        }
-
-        // Instance icon (40x40) with rounded corners
-        float icon_x = item_min.x + 10;
-        float icon_y = item_min.y + 10;
-        GLuint icon = GetIconForInstance(b);
-        if (icon) {
-            dl->AddImageRounded(
-                (ImTextureID)(intptr_t)icon,
-                ImVec2(icon_x, icon_y),
-                ImVec2(icon_x + 40, icon_y + 40),
-                ImVec2(0, 0), ImVec2(1, 1),
-                IM_COL32(255, 255, 255, 255), 8.0f);
-        }
-
-        // Text content area (right of icon)
-        float text_x = icon_x + 48;
-
-        // Line 1: Clean display name (prominent)
-        std::string display_name = GetDisplayName(b);
-        dl->AddText(ImVec2(text_x, item_min.y + 8),
-            IM_COL32(230, 237, 243, 255), display_name.c_str());
-
-        // Line 2: Subtitle (arch · version · status — muted)
-        std::string subtitle = GetSubtitle(b);
-        dl->AddText(ImVec2(text_x, item_min.y + 28),
-            IM_COL32(139, 148, 158, 200), subtitle.c_str());
-
-        // Status dot (top-right area)
-        ImVec4 dot_color;
-        switch (b.status) {
-            case BinaryStatus::TESTED:  dot_color = ImVec4(0.247f, 0.725f, 0.314f, 1.0f); break;
-            case BinaryStatus::TESTING: dot_color = ImVec4(0.824f, 0.600f, 0.133f, 1.0f); break;
-            default:                    dot_color = ImVec4(0.600f, 0.300f, 0.300f, 1.0f); break;
-        }
-        dl->AddCircleFilled(
-            ImVec2(item_min.x + width - 28, item_min.y + 14),
-            4.0f, ImGui::ColorConvertFloat4ToU32(dot_color));
-
-        // Default star indicator (top-right)
-        if (b.is_default) {
-            dl->AddText(ImVec2(item_min.x + width - 48, item_min.y + 8),
-                IM_COL32(255, 215, 0, 255), ICON_FA_STAR);
-        }
-
-        ImGui::PopID();
-    }
-
-    // Delete confirmation popup
-    if (g_confirm_delete) {
-        ImGui::OpenPopup("Confirm Delete");
-        g_confirm_delete = false;
-    }
-    if (ImGui::BeginPopupModal("Confirm Delete", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text(ICON_FA_TRIANGLE_EXCLAMATION "  Remove this instance?");
-        ImGui::Separator();
-        if (g_delete_target_idx >= 0 && g_delete_target_idx < (int)bins.size()) {
-            ImGui::Text("  %s", bins[g_delete_target_idx].label.c_str());
-        }
-        ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.12f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.18f, 0.18f, 1.0f));
-        if (ImGui::Button(ICON_FA_TRASH "  Remove", ImVec2(120, 0))) {
-            selector.remove_instance(g_delete_target_idx);
-            if (selected >= (int)selector.get_binaries().size()) {
-                selected = std::max(0, (int)selector.get_binaries().size() - 1);
-            }
-            g_delete_target_idx = -1;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::PopStyleColor(2);
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.110f, 0.137f, 0.200f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.180f, 0.210f, 0.300f, 1.0f));
-        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
-            g_delete_target_idx = -1;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::PopStyleColor(2);
-        ImGui::EndPopup();
+    switch (g_page) {
+        case LauncherPage::HOME:
+            DrawHomePage(selector, selected, cfg, running, api_sel, engine_sel, use_sre_sel, adv_opts_sel);
+            break;
+        case LauncherPage::LIBRARY:
+            DrawLibraryPage(selector, selected, cfg, running, api_sel, engine_sel, use_sre_sel, adv_opts_sel);
+            break;
+        case LauncherPage::MODS:
+            DrawModsPage();
+            break;
+        case LauncherPage::MOD_BROWSER:
+            DrawModBrowserPage();
+            break;
+        case LauncherPage::PROFILE:
+            DrawProfilePage();
+            break;
+        case LauncherPage::SETTINGS:
+            DrawSettingsPage();
+            break;
+        case LauncherPage::SDK_TOOLS:
+            DrawSDKToolsPage();
+            break;
     }
 
     ImGui::End();
@@ -757,82 +740,442 @@ static void DrawInstancePanel(BinarySelector& selector, int& selected, float wid
 }
 
 // =============================================================================
-// Detail panel (center)
+// Home page — hero card + quick launch
 // =============================================================================
 
-static void DrawDetailPanel(BinarySelector& selector, int selected,
-                            LaunchConfig& cfg, bool& running, int& api_sel,
-                            int& engine_sel, bool& use_sre_sel, bool& adv_redstell_opts_sel, bool& show_save_editor, float mods_width) {
-    ImGuiViewport* vp = ImGui::GetMainViewport();
-    float inst_width = 260.0f;
-    ImVec2 panel_pos(vp->WorkPos.x + inst_width, vp->WorkPos.y + TOOLBAR_H);
-    ImVec2 panel_size(vp->WorkSize.x - inst_width - mods_width, vp->WorkSize.y - TOOLBAR_H - 30);
-
-    ImGui::SetNextWindowPos(panel_pos);
-    ImGui::SetNextWindowSize(panel_size);
-    ImGui::Begin("##Details", nullptr,
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoBringToFrontOnFocus);
-
-    // -- Save Editor sub-view --
-    if (show_save_editor) {
-        DrawSaveEditor(show_save_editor);
-        ImGui::End();
-        return;
-    }
-
+static void DrawHomePage(BinarySelector& selector, int& selected,
+                         LaunchConfig& cfg, bool& running,
+                         int& api_sel, int& engine_sel,
+                         bool& use_sre_sel, bool& adv_opts_sel) {
     const auto& bins = selector.get_binaries();
+
+    // ── Animated hero banner ──
+    {
+        float banner_h = 120.0f;
+        ImVec2 banner_pos = ImGui::GetCursorScreenPos();
+        float width = ImGui::GetContentRegionAvail().x;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+
+        // Animated gradient
+        float t = g_anim_time * 0.4f;
+        float r = 0.5f + 0.5f * sinf(t);
+        ImU32 col_tl = IM_COL32(14, 20, 35, 255);
+        ImU32 col_tr = IM_COL32((int)(80 + 40 * r), (int)(25 + 10 * r), (int)(55 + 20 * r), 255);
+        ImU32 col_bl = IM_COL32(10, 14, 25, 255);
+        ImU32 col_br = IM_COL32(14, 20, 35, 255);
+        dl->AddRectFilledMultiColor(banner_pos,
+                                    ImVec2(banner_pos.x + width, banner_pos.y + banner_h),
+                                    col_tl, col_tr, col_br, col_bl);
+
+        // Background logo texture faint watermark
+        if (g_tex_bg) {
+            dl->AddImage((ImTextureID)(intptr_t)g_tex_bg,
+                         banner_pos, ImVec2(banner_pos.x + width, banner_pos.y + banner_h),
+                         ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, 22));
+        }
+
+        // Headline
+        float text_y = banner_pos.y + 20;
+        if (g_font_heading) ImGui::PushFont(g_font_heading);
+        dl->AddText(ImVec2(banner_pos.x + 28, text_y),
+                    IM_COL32(230, 237, 243, 255), "Welcome back,");
+        float name_x = banner_pos.x + 28;
+        ImVec2 name_sz = ImGui::CalcTextSize(g_profile_username);
+        (void)name_sz;
+        dl->AddText(ImVec2(name_x, text_y + (g_font_heading ? ImGui::GetFontSize() : 20) + 6),
+                    IM_COL32(233, 69, 96, 255), g_profile_username);
+        if (g_font_heading) ImGui::PopFont();
+
+        // Subtext
+        dl->AddText(ImVec2(banner_pos.x + 28, text_y + 60),
+                    IM_COL32(139, 148, 158, 220),
+                    "Ready to play Swordigo Desktop");
+
+        // Banner bottom gradient fade
+        dl->AddRectFilledMultiColor(
+            ImVec2(banner_pos.x, banner_pos.y + banner_h - 30),
+            ImVec2(banner_pos.x + width, banner_pos.y + banner_h),
+            IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
+            IM_COL32(10, 14, 25, 220), IM_COL32(10, 14, 25, 220));
+
+        ImGui::Dummy(ImVec2(0, banner_h));
+    }
+
+    ImGui::Spacing();
+
+    // ── Quick stats row ──
+    {
+        float cw = (ImGui::GetContentRegionAvail().x - 36) / 3.0f;
+        struct StatCard { const char* icon; const char* val; const char* lbl; ImVec4 col; };
+        StatCard cards[] = {
+            { ICON_FA_GAMEPAD,  std::to_string(bins.size()).c_str(), "Instances",    ImVec4(0.35f, 0.65f, 1.0f, 1.0f) },
+            { ICON_FA_PUZZLE_PIECE, std::to_string(g_mods.size()).c_str(), "Mods Active", ImVec4(0.24f, 0.72f, 0.31f, 1.0f) },
+            { ICON_FA_CLOCK,    "—",                                "Hours Played", ImVec4(0.82f, 0.60f, 0.13f, 1.0f) },
+        };
+        for (int i = 0; i < 3; i++) {
+            if (i > 0) ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.063f, 0.082f, 0.120f, 1.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
+            ImGui::BeginChild(("##stat" + std::to_string(i)).c_str(), ImVec2(cw, 58), ImGuiChildFlags_Borders);
+            ImGui::SetCursorPos(ImVec2(14, 8));
+            ImGui::TextColored(cards[i].col, "%s", cards[i].icon);
+            ImGui::SameLine();
+            if (g_font_heading) ImGui::PushFont(g_font_heading);
+            ImGui::TextColored(ImVec4(0.92f, 0.94f, 0.97f, 1.0f), "%s", cards[i].val);
+            if (g_font_heading) ImGui::PopFont();
+            ImGui::SetCursorPosX(14);
+            ImGui::TextDisabled("%s", cards[i].lbl);
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor();
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Spacing();
+
     if (bins.empty()) {
-        ImGui::Spacing(); ImGui::Spacing(); ImGui::Spacing();
-        float avail = ImGui::GetContentRegionAvail().x;
-        float txt_w = ImGui::CalcTextSize("No instance selected.").x;
-        ImGui::SetCursorPosX((avail - txt_w) * 0.5f);
-        ImGui::TextDisabled("No instance selected.");
-        txt_w = ImGui::CalcTextSize("Add a game binary to get started.").x;
-        ImGui::SetCursorPosX((avail - txt_w) * 0.5f);
-        ImGui::TextDisabled("Add a game binary to get started.");
-        ImGui::End();
+        ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - 240) * 0.5f);
+        ImGui::TextDisabled("No instances found. Go to Library to add one.");
         return;
     }
+
+    // Clamp selected
+    if (selected < 0 || selected >= (int)bins.size()) selected = 0;
+    const BinaryInfo& b = bins[selected];
+
+    // ── Featured instance card ──
+    SectionLabel(ICON_FA_ROCKET, "FEATURED INSTANCE");
+    {
+        float cw = ImGui::GetContentRegionAvail().x;
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.063f, 0.082f, 0.120f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14.0f);
+        ImGui::BeginChild("##featured", ImVec2(cw, 130), ImGuiChildFlags_Borders);
+
+        // Icon
+        GLuint icon = GetIconForInstance(b);
+        ImGui::SetCursorPos(ImVec2(18, 18));
+        if (icon) ImGui::Image((ImTextureID)(intptr_t)icon, ImVec2(60, 60));
+
+        ImGui::SameLine();
+        ImGui::BeginGroup();
+        if (g_font_heading) ImGui::PushFont(g_font_heading);
+        ImGui::Text("%s", GetDisplayName(b).c_str());
+        if (g_font_heading) ImGui::PopFont();
+        ImGui::TextDisabled("%s", GetSubtitle(b).c_str());
+
+        // Arch badge
+        ImVec4 bc = (b.arch == BinaryArch::ARM64)
+            ? ImVec4(0.20f, 0.40f, 0.85f, 1.0f) : ImVec4(0.85f, 0.55f, 0.15f, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button, bc);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bc);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, bc);
+        ImGui::SmallButton(BinarySelector::arch_string(b.arch));
+        ImGui::PopStyleColor(3);
+        ImGui::SameLine();
+        if (b.is_default) {
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.60f, 0.45f, 0.00f, 0.6f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.60f, 0.45f, 0.00f, 0.6f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.60f, 0.45f, 0.00f, 0.6f));
+            ImGui::SmallButton(ICON_FA_STAR "  Default");
+            ImGui::PopStyleColor(3);
+        }
+        ImGui::EndGroup();
+
+        // LAUNCH button — right-aligned inside card
+        float btn_w  = 140.0f;
+        float btn_h  = 42.0f;
+        float btn_x  = cw - btn_w - 18;
+        float btn_y  = (130 - btn_h) * 0.5f;
+        ImGui::SetCursorPos(ImVec2(btn_x, btn_y));
+        if (g_font_heading) ImGui::PushFont(g_font_heading);
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.914f, 0.271f, 0.376f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.000f, 0.380f, 0.490f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.760f, 0.196f, 0.278f, 1.0f));
+        if (ImGui::Button(ICON_FA_PLAY "  PLAY", ImVec2(btn_w, btn_h))) {
+            cfg.graphics_api = (api_sel == 0) ? GraphicsAPI::OPENGL : GraphicsAPI::VULKAN;
+            cfg.use_dynarmic = (engine_sel == 1);
+            cfg.use_sre = use_sre_sel;
+            cfg.advanced_redstell_opts = adv_opts_sel;
+            cfg.selected_binary = b.filepath;
+            cfg.assets_dir = b.assets_dir;
+            cfg.game_type = b.game_type;
+            cfg.should_launch = true;
+            running = false;
+        }
+        ImGui::PopStyleColor(3);
+        if (g_font_heading) ImGui::PopFont();
+
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Spacing();
+
+    // ── Launch options row ──
+    SectionLabel(ICON_FA_SLIDERS, "LAUNCH OPTIONS");
+    {
+        float item_w = 180.0f;
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1.0f));
+        ImGui::Text(ICON_FA_MICROCHIP "  CPU Engine");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(item_w);
+        ImGui::RadioButton("Unicorn (TCG)##h", &engine_sel, 0); ImGui::SameLine();
+        ImGui::RadioButton("Dynarmic (JIT)##h", &engine_sel, 1);
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1.0f));
+        ImGui::Text(ICON_FA_PAINT_BRUSH "  Graphics API");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(item_w);
+        ImGui::RadioButton("OpenGL##h", &api_sel, 0); ImGui::SameLine();
+        ImGui::RadioButton("Vulkan (Experimental)##h",  &api_sel, 1);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Vulkan support is experimental and may crash on some GPUs.");
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1.0f));
+        ImGui::Text(ICON_FA_CODE "  SRE Hooks");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(item_w);
+        ImGui::Checkbox("Enable##h", &use_sre_sel);
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1.0f));
+        ImGui::Text(ICON_FA_WRENCH "  Redstell Opts");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(item_w);
+        ImGui::Checkbox("Advanced Memory Fixes##h", &adv_opts_sel);
+    }
+
+    ImGui::Spacing();
+    SectionLabel(ICON_FA_NEWSPAPER, "RECENT ACTIVITY");
+    {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.047f, 0.063f, 0.090f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 10.0f);
+        ImGui::BeginChild("##activity", ImVec2(-1, 56), ImGuiChildFlags_Borders);
+        ImGui::SetCursorPos(ImVec2(16, 18));
+        ImGui::TextDisabled(ICON_FA_CLOCK_ROTATE_LEFT "  No recent sessions. Played sessions will appear here.");
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+    }
+}
+
+// =============================================================================
+// Library page — full instance management
+// =============================================================================
+
+static void DrawLibraryPage(BinarySelector& selector, int& selected,
+                            LaunchConfig& cfg, bool& running,
+                            int& api_sel, int& engine_sel,
+                            bool& use_sre_sel, bool& adv_opts_sel) {
+    const auto& bins = selector.get_binaries();
+
+    // ── Header row ──
+    ImGui::Spacing();
+    {
+        if (g_font_heading) ImGui::PushFont(g_font_heading);
+        ImGui::Text(ICON_FA_LAYER_GROUP "  Game Library");
+        if (g_font_heading) ImGui::PopFont();
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 160);
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.24f, 0.72f, 0.31f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.85f, 0.40f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.18f, 0.58f, 0.25f, 1.0f));
+        if (ImGui::Button(ICON_FA_PLUS "  Add Instance", ImVec2(150, 32))) {
+            g_show_add_instance = true;
+            memset(g_add_name, 0, sizeof(g_add_name));
+            strncpy(g_add_name, "My Instance", sizeof(g_add_name) - 1);
+            memset(g_add_custom_assets, 0, sizeof(g_add_custom_assets));
+            g_add_asset_type = 0;
+            g_add_use_sre = true;
+            strncpy(g_add_game_type, "Swordigo", sizeof(g_add_game_type) - 1);
+            g_add_status.clear();
+        }
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Create a new game instance");
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (bins.empty()) {
+        float cw = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX((cw - 300) * 0.5f);
+        ImGui::Spacing(); ImGui::Spacing(); ImGui::Spacing();
+        ImGui::TextDisabled(ICON_FA_BOX_OPEN "  No instances found.");
+        ImGui::SetCursorPosX((cw - 300) * 0.5f + 20);
+        ImGui::TextDisabled("Click '+ Add Instance' to create one.");
+        return;
+    }
+
+    // Sort by version descending, ARM64 first
+    std::vector<int> sorted_idx(bins.size());
+    std::iota(sorted_idx.begin(), sorted_idx.end(), 0);
+    std::sort(sorted_idx.begin(), sorted_idx.end(), [&bins](int a, int b_idx) {
+        if (bins[a].version != bins[b_idx].version) return bins[a].version > bins[b_idx].version;
+        if (bins[a].arch != bins[b_idx].arch) return bins[a].arch == BinaryArch::ARM64;
+        return false;
+    });
+
+    // Auto-select ARM64 v1.4.12 on first frame
+    static bool first_frame = true;
+    if (first_frame && !bins.empty()) {
+        first_frame = false;
+        for (int i = 0; i < (int)bins.size(); i++) {
+            if (bins[i].arch == BinaryArch::ARM64 && bins[i].version.find("1.4.12") != std::string::npos) {
+                selected = i; break;
+            }
+        }
+    }
+
+    // Two-column layout: instance list | detail
+    float list_w = 280.0f;
+    float detail_w = ImGui::GetContentRegionAvail().x - list_w - 12;
+
+    // ── Instance list ──
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.035f, 0.047f, 0.067f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
+    ImGui::BeginChild("##InstList", ImVec2(list_w, -1), ImGuiChildFlags_Borders);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1.0f));
+    ImGui::SetCursorPos(ImVec2(12, 10));
+    ImGui::Text(ICON_FA_LIST "  INSTANCES  (%d)", (int)bins.size());
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+
+    for (int idx : sorted_idx) {
+        const auto& b = bins[idx];
+        ImGui::PushID(idx);
+        bool is_sel = (selected == idx);
+
+        ImVec2 item_pos = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+
+        // Hover/select highlight
+        ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0.914f, 0.271f, 0.376f, 0.14f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.914f, 0.271f, 0.376f, 0.20f));
+        if (ImGui::Selectable("##inst", is_sel, 0, ImVec2(0, 62))) selected = idx;
+        ImGui::PopStyleColor(2);
+
+        // Context menu
+        if (ImGui::BeginPopupContextItem("InstCtx")) {
+            if (ImGui::MenuItem(ICON_FA_STAR "  Set Default")) selector.set_default(b.filepath);
+            if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN "  Open Folder")) {
+                std::string full = b.filepath[0] == '/' ? b.filepath : (get_user_data_dir() + "/" + b.filepath);
+                std::string dir = fs::path(full).parent_path().string();
+                pid_t pid = fork();
+                if (pid == 0) { execlp("xdg-open", "xdg-open", dir.c_str(), nullptr); _exit(1); }
+            }
+            ImGui::Separator();
+            bool is_vanilla = (b.game_type == "Swordigo" || b.game_type == "RLSwordigo" || b.game_type == "SwordigoMini");
+            if (!is_vanilla && ImGui::MenuItem(ICON_FA_TRASH "  Remove")) {
+                g_confirm_delete = true; g_delete_target_idx = idx;
+            }
+            ImGui::EndPopup();
+        }
+
+        // Selected left bar
+        if (is_sel) {
+            dl->AddRectFilled(ImVec2(item_pos.x, item_pos.y + 4),
+                              ImVec2(item_pos.x + 3, item_pos.y + 58),
+                              IM_COL32(233, 69, 96, 255), 2.0f);
+        }
+
+        // Icon
+        GLuint icon = GetIconForInstance(b);
+        if (icon) {
+            dl->AddImageRounded((ImTextureID)(intptr_t)icon,
+                ImVec2(item_pos.x + 12, item_pos.y + 11),
+                ImVec2(item_pos.x + 52, item_pos.y + 51),
+                ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, 255), 8.0f);
+        }
+
+        float tx = item_pos.x + 60;
+        dl->AddText(ImVec2(tx, item_pos.y + 10),
+                    IM_COL32(225, 232, 242, 255), GetDisplayName(b).c_str());
+        dl->AddText(ImVec2(tx, item_pos.y + 30),
+                    IM_COL32(139, 148, 158, 200), GetSubtitle(b).c_str());
+
+        // Status dot
+        ImVec4 dc;
+        switch (b.status) {
+            case BinaryStatus::TESTED:  dc = ImVec4(0.24f, 0.72f, 0.31f, 1.0f); break;
+            case BinaryStatus::TESTING: dc = ImVec4(0.82f, 0.60f, 0.13f, 1.0f); break;
+            default:                    dc = ImVec4(0.55f, 0.30f, 0.30f, 1.0f); break;
+        }
+        dl->AddCircleFilled(ImVec2(item_pos.x + list_w - 22, item_pos.y + 16),
+                            4.5f, ImGui::ColorConvertFloat4ToU32(dc));
+
+        if (b.is_default)
+            dl->AddText(ImVec2(item_pos.x + list_w - 44, item_pos.y + 9),
+                        IM_COL32(255, 215, 0, 255), ICON_FA_STAR);
+
+        ImGui::PopID();
+    }
+
+    // Delete confirmation
+    if (g_confirm_delete) { ImGui::OpenPopup("Confirm Delete"); g_confirm_delete = false; }
+    if (ImGui::BeginPopupModal("Confirm Delete", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text(ICON_FA_TRIANGLE_EXCLAMATION "  Remove this instance?");
+        ImGui::Separator();
+        if (g_delete_target_idx >= 0 && g_delete_target_idx < (int)bins.size())
+            ImGui::Text("  %s", bins[g_delete_target_idx].label.c_str());
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.12f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.18f, 0.18f, 1.0f));
+        if (ImGui::Button(ICON_FA_TRASH "  Remove", ImVec2(120, 0))) {
+            selector.remove_instance(g_delete_target_idx);
+            if (selected >= (int)selector.get_binaries().size())
+                selected = std::max(0, (int)selector.get_binaries().size() - 1);
+            g_delete_target_idx = -1;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopStyleColor(2);
+        ImGui::SameLine();
+        PushSecondaryBtn();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) { g_delete_target_idx = -1; ImGui::CloseCurrentPopup(); }
+        PopSecondaryBtn();
+        ImGui::EndPopup();
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+
+    // ── Detail panel ──
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.047f, 0.063f, 0.090f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
+    ImGui::BeginChild("##Detail", ImVec2(detail_w, -1), ImGuiChildFlags_Borders);
 
     if (selected < 0 || selected >= (int)bins.size()) {
-        ImGui::End();
+        ImGui::Spacing(); ImGui::Spacing();
+        float avail = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX((avail - ImGui::CalcTextSize("Select an instance").x) * 0.5f);
+        ImGui::TextDisabled("Select an instance");
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
         return;
     }
 
     const BinaryInfo& b = bins[selected];
 
-    // === Instance icon + name (heading) ===
+    // Instance header in detail
     {
-        GLuint detail_icon = GetIconForInstance(b);
-        if (detail_icon) {
-            ImGui::Image((ImTextureID)(intptr_t)detail_icon, ImVec2(72, 72));
-            ImGui::SameLine();
-        }
+        GLuint di = GetIconForInstance(b);
+        ImGui::SetCursorPos(ImVec2(16, 16));
+        if (di) { ImGui::Image((ImTextureID)(intptr_t)di, ImVec2(64, 64)); ImGui::SameLine(); }
         ImGui::BeginGroup();
         if (g_font_heading) ImGui::PushFont(g_font_heading);
         ImGui::Text("%s", GetDisplayName(b).c_str());
         if (g_font_heading) ImGui::PopFont();
-
-        // Arch badge inline
-        {
-            ImVec4 badge_col = (b.arch == BinaryArch::ARM64)
-                ? ImVec4(0.20f, 0.40f, 0.85f, 1.0f) : ImVec4(0.85f, 0.55f, 0.15f, 1.0f);
-            ImGui::PushStyleColor(ImGuiCol_Button, badge_col);
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, badge_col);
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, badge_col);
-            ImGui::SmallButton(BinarySelector::arch_string(b.arch));
-            ImGui::PopStyleColor(3);
-            ImGui::SameLine();
-            const char* status_str;
-            switch (b.status) {
-                case BinaryStatus::TESTED:  status_str = "Stable"; break;
-                case BinaryStatus::TESTING: status_str = "Testing"; break;
-                default:                    status_str = "Unknown"; break;
-            }
-            ImGui::TextDisabled("(%s)", status_str);
-        }
+        ImGui::TextDisabled("%s", GetSubtitle(b).c_str());
+        ImVec4 bc = (b.arch == BinaryArch::ARM64)
+            ? ImVec4(0.20f, 0.40f, 0.85f, 1.0f) : ImVec4(0.85f, 0.55f, 0.15f, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button, bc);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bc);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, bc);
+        ImGui::SmallButton(BinarySelector::arch_string(b.arch));
+        ImGui::PopStyleColor(3);
         ImGui::EndGroup();
     }
 
@@ -840,21 +1183,21 @@ static void DrawDetailPanel(BinarySelector& selector, int selected,
     ImGui::Separator();
     ImGui::Spacing();
 
-    // === LAUNCH button — prominent, full-width ===
+    // LAUNCH
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.914f, 0.271f, 0.376f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(1.000f, 0.380f, 0.478f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.780f, 0.200f, 0.290f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.000f, 0.380f, 0.490f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.760f, 0.196f, 0.278f, 1.0f));
     if (g_font_heading) ImGui::PushFont(g_font_heading);
     float launch_w = ImGui::GetContentRegionAvail().x;
-    if (ImGui::Button(ICON_FA_ROCKET "  LAUNCH", ImVec2(launch_w, 52))) {
+    if (ImGui::Button(ICON_FA_PLAY "  PLAY", ImVec2(launch_w, 52))) {
         cfg.graphics_api = (api_sel == 0) ? GraphicsAPI::OPENGL : GraphicsAPI::VULKAN;
-        cfg.use_dynarmic = (engine_sel == 1);
-        cfg.use_sre = use_sre_sel;
-        cfg.advanced_redstell_opts = adv_redstell_opts_sel;
+        cfg.use_dynarmic  = (engine_sel == 1);
+        cfg.use_sre       = use_sre_sel;
+        cfg.advanced_redstell_opts = adv_opts_sel;
         cfg.selected_binary = b.filepath;
-        cfg.assets_dir = b.assets_dir;
-        cfg.game_type = b.game_type;
-        cfg.should_launch = true;
+        cfg.assets_dir      = b.assets_dir;
+        cfg.game_type       = b.game_type;
+        cfg.should_launch   = true;
         running = false;
     }
     if (g_font_heading) ImGui::PopFont();
@@ -862,77 +1205,60 @@ static void DrawDetailPanel(BinarySelector& selector, int selected,
 
     ImGui::Spacing();
 
-    // === Engine selection row (compact) ===
+    // Launch options (compact inline rows)
     {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.545f, 0.580f, 0.620f, 1.0f));
-        ImGui::Text(ICON_FA_MICROCHIP "  CPU Engine");
-        ImGui::PopStyleColor();
-        ImGui::SameLine(180);
-        ImGui::RadioButton("Unicorn (TCG)", &engine_sel, 0);
-        ImGui::SameLine();
-        ImGui::RadioButton("Dynarmic (JIT)", &engine_sel, 1);
-    }
+        float lw = 160.0f;
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1.0f));
+        ImGui::Text(ICON_FA_MICROCHIP "  CPU Engine"); ImGui::PopStyleColor();
+        ImGui::SameLine(lw);
+        ImGui::RadioButton("Unicorn##L", &engine_sel, 0); ImGui::SameLine();
+        ImGui::RadioButton("Dynarmic##L", &engine_sel, 1);
 
-    {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.545f, 0.580f, 0.620f, 1.0f));
-        ImGui::Text(ICON_FA_PAINT_BRUSH "  Graphics API");
-        ImGui::PopStyleColor();
-        ImGui::SameLine(180);
-        ImGui::RadioButton("OpenGL", &api_sel, 0);
-        ImGui::SameLine();
-        ImGui::RadioButton("Vulkan", &api_sel, 1);
-    }
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1.0f));
+        ImGui::Text(ICON_FA_PAINT_BRUSH "  Graphics API"); ImGui::PopStyleColor();
+        ImGui::SameLine(lw);
+        ImGui::RadioButton("OpenGL##L", &api_sel, 0); ImGui::SameLine();
+        ImGui::RadioButton("Vulkan (Experimental)##L",  &api_sel, 1);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Vulkan support is experimental and may crash on some GPUs.");
 
-    {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.545f, 0.580f, 0.620f, 1.0f));
-        ImGui::Text(ICON_FA_CODE "  SRE Hooks");
-        ImGui::PopStyleColor();
-        ImGui::SameLine(180);
-        ImGui::Checkbox("Enable SRE (libsre.so)", &use_sre_sel);
-    }
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1.0f));
+        ImGui::Text(ICON_FA_CODE "  SRE Hooks"); ImGui::PopStyleColor();
+        ImGui::SameLine(lw);
+        ImGui::Checkbox("Enable##L", &use_sre_sel);
 
-    {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.545f, 0.580f, 0.620f, 1.0f));
-        ImGui::Text(ICON_FA_WRENCH "  Memory Fixes");
-        ImGui::PopStyleColor();
-        ImGui::SameLine(180);
-        ImGui::Checkbox("Advanced Redstell Optimisations", &adv_redstell_opts_sel);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1.0f));
+        ImGui::Text(ICON_FA_WRENCH "  Memory Fixes"); ImGui::PopStyleColor();
+        ImGui::SameLine(lw);
+        ImGui::Checkbox("Advanced Redstell##L", &adv_opts_sel);
     }
 
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
-    // === Detail table ===
-    if (ImGui::BeginTable("DetailsTable", 2,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
-        ImGui::TableSetupColumn("Property", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-        ImGui::TableSetupColumn("Value",    ImGuiTableColumnFlags_WidthStretch);
-
-        auto Row = [](const char* prop, const char* val) {
+    // Details table
+    SectionLabel(ICON_FA_CIRCLE_INFO, "INSTANCE DETAILS");
+    if (ImGui::BeginTable("DetTbl", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+        ImGui::TableSetupColumn("Prop",  ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+        auto Row = [](const char* p, const char* v) {
             ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::TextDisabled("%s", prop);
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(val);
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", p);
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(v);
         };
-
         Row("Version",   b.version.c_str());
         Row("Arch",      BinarySelector::arch_string(b.arch));
         Row("Game Type", b.game_type.c_str());
         Row("Assets",    b.assets_dir.c_str());
-        Row("Path",      b.filepath.c_str());
-        Row("Size",      FormatFileSize(b.file_size).c_str());
-        Row("SHA256",    b.sha256.empty() ? "(not computed)" : b.sha256.substr(0, 16).c_str());
-
-        const char* status_str;
+        Row("File Size", FormatFileSize(b.file_size).c_str());
+        Row("SHA256",    b.sha256.empty() ? "—" : b.sha256.substr(0, 16).c_str());
+        const char* ss;
         switch (b.status) {
-            case BinaryStatus::TESTED:  status_str = "Tested (Stable)"; break;
-            case BinaryStatus::TESTING: status_str = "Testing"; break;
-            default:                    status_str = "Unknown"; break;
+            case BinaryStatus::TESTED:  ss = "Tested (Stable)"; break;
+            case BinaryStatus::TESTING: ss = "Testing"; break;
+            default:                    ss = "Unknown"; break;
         }
-        Row("Status", status_str);
-
+        Row("Status", ss);
         ImGui::EndTable();
     }
 
@@ -940,478 +1266,734 @@ static void DrawDetailPanel(BinarySelector& selector, int selected,
     ImGui::Separator();
     ImGui::Spacing();
 
-    // === Action buttons row ===
-    float btn_w = (ImGui::GetContentRegionAvail().x - 30) / 4.0f;
-
-    // Secondary button style (dark blue)
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.110f, 0.137f, 0.200f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.180f, 0.210f, 0.320f, 1.0f));
-
-    if (ImGui::Button(ICON_FA_FLOPPY_DISK "  Save Editor", ImVec2(btn_w, 36))) {
-        show_save_editor = true;
-        // Load saves
-        g_save_loaded = false;
-        g_save_sel = -1;
-        g_save_status.clear();
+    // Action buttons row
+    SectionLabel(ICON_FA_TOOLBOX, "ACTIONS");
+    float abw = (ImGui::GetContentRegionAvail().x - 24) / 3.0f;
+    PushSecondaryBtn();
+    if (ImGui::Button(ICON_FA_FLOPPY_DISK "  Save Editor", ImVec2(abw, 36))) {
+        g_show_save_ed = true;
+        g_save_loaded = false; g_save_sel = -1; g_save_status.clear();
         std::string home = getenv("HOME") ? getenv("HOME") : "/tmp";
-        std::string xdg = getenv("XDG_DATA_HOME") ? getenv("XDG_DATA_HOME") : (home + "/.local/share");
+        std::string xdg  = getenv("XDG_DATA_HOME") ? getenv("XDG_DATA_HOME") : (home + "/.local/share");
         std::string save_dir = xdg + "/swordigo-desktop/save/Documents";
         g_save_paths = save_list_dir(save_dir);
         g_save_files.clear();
-        for (auto& p : g_save_paths) {
-            SaveFile sf;
-            if (save_load(p, sf)) {
-                g_save_files.push_back(sf);
-            }
-        }
+        for (auto& p : g_save_paths) { SaveFile sf; if (save_load(p, sf)) g_save_files.push_back(sf); }
         g_save_loaded = true;
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit save files (.gplayer)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit .gplayer save files");
 
     ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_FOLDER_OPEN "  Open Folder", ImVec2(btn_w, 36))) {
+    if (ImGui::Button(ICON_FA_FOLDER_OPEN "  Open Folder", ImVec2(abw, 36))) {
         std::string full = b.filepath[0] == '/' ? b.filepath : (get_user_data_dir() + "/" + b.filepath);
-        std::string dir = fs::path(full).parent_path().string();
+        std::string dir  = fs::path(full).parent_path().string();
         pid_t pid = fork();
-        if (pid == 0) {
-            execlp("xdg-open", "xdg-open", dir.c_str(), nullptr);
-            _exit(1);
-        }
+        if (pid == 0) { execlp("xdg-open", "xdg-open", dir.c_str(), nullptr); _exit(1); }
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open instance folder in file manager");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open instance folder");
 
     ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_EYE "  Ruby Viewer", ImVec2(btn_w, 36))) {
+    if (ImGui::Button(ICON_FA_EYE "  Ruby Viewer", ImVec2(abw, 36))) {
         pid_t pid = fork();
-        if (pid == 0) {
-            // Try local build first, then installed path
-            execlp("./ruby", "ruby", nullptr);
-            execlp("ruby", "ruby", nullptr);
-            _exit(1);
-        }
+        if (pid == 0) { execlp("./ruby", "ruby", nullptr); execlp("ruby", "ruby", nullptr); _exit(1); }
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Browse game assets (textures, scenes)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Browse game assets");
+    PopSecondaryBtn();
 
-    // Only show Remove for non-vanilla (custom) instances
+    // Remove (non-vanilla only)
     {
         bool is_vanilla = (b.game_type == "Swordigo" || b.game_type == "RLSwordigo" || b.game_type == "SwordigoMini");
         if (!is_vanilla) {
-            ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.10f, 0.10f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.65f, 0.15f, 0.15f, 1.0f));
-            if (ImGui::Button(ICON_FA_TRASH "  Remove", ImVec2(btn_w, 36))) {
-                g_confirm_delete = true;
-                g_delete_target_idx = selected;
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.40f, 0.08f, 0.08f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.60f, 0.13f, 0.13f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.45f, 0.09f, 0.09f, 1.0f));
+            if (ImGui::Button(ICON_FA_TRASH "  Remove Instance", ImVec2(-1, 34))) {
+                g_confirm_delete = true; g_delete_target_idx = selected;
             }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove this instance");
-            ImGui::PopStyleColor(2);
+            ImGui::PopStyleColor(3);
         }
     }
 
-    ImGui::PopStyleColor(2);
-
-    // === Dependencies section ===
     if (!b.dependencies.empty()) {
         ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.545f, 0.580f, 0.620f, 1.0f));
-        ImGui::Text(ICON_FA_PUZZLE_PIECE "  Dependencies");
-        ImGui::PopStyleColor();
-        for (const auto& dep : b.dependencies) {
-            ImGui::BulletText("%s", dep.c_str());
-        }
+        SectionLabel(ICON_FA_PUZZLE_PIECE, "DEPENDENCIES");
+        for (const auto& dep : b.dependencies) ImGui::BulletText("%s", dep.c_str());
     }
 
-    ImGui::End();
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
 }
 
 // =============================================================================
-// Mods panel (right sidebar)
+// Mods page
 // =============================================================================
 
-static void DrawModsPanel(float width) {
-    ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImVec2 panel_pos(vp->WorkPos.x + vp->WorkSize.x - width, vp->WorkPos.y + TOOLBAR_H);
-    ImVec2 panel_size(width, vp->WorkSize.y - TOOLBAR_H - 30);
-
-    ImGui::SetNextWindowPos(panel_pos);
-    ImGui::SetNextWindowSize(panel_size);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.059f, 0.075f, 0.098f, 1.0f));
-    ImGui::Begin("##Mods", nullptr,
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoBringToFrontOnFocus);
-
-    // Header
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.545f, 0.580f, 0.620f, 1.0f));
-    ImGui::Text(ICON_FA_PUZZLE_PIECE "  MODS");
-    ImGui::PopStyleColor();
-
-    ImGui::SameLine(width - 120);
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.110f, 0.137f, 0.200f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.180f, 0.210f, 0.300f, 1.0f));
-    if (ImGui::Button(ICON_FA_FOLDER " Load Mod", ImVec2(105, 28))) {
-        std::string mods_dir = get_user_data_dir() + "/mods";
-        pid_t pid = fork();
-        if (pid == 0) {
-            execlp("xdg-open", "xdg-open", mods_dir.c_str(), nullptr);
-            _exit(1);
-        }
-    }
-    ImGui::PopStyleColor(2);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open mods folder");
-
-    ImGui::Spacing();
-    // Subtle separator
-    ImDrawList* sep_dl = ImGui::GetWindowDrawList();
-    ImVec2 sep_p = ImGui::GetCursorScreenPos();
-    sep_dl->AddLine(ImVec2(sep_p.x, sep_p.y), ImVec2(sep_p.x + width - 20, sep_p.y),
-                    IM_COL32(48, 54, 61, 120), 1.0f);
-    ImGui::Spacing();
-
-    // Scan mods on first draw
+static void DrawModsPage() {
     if (!g_mods_scanned) ScanMods();
 
-    if (g_mods.empty()) {
-        ImGui::Spacing(); ImGui::Spacing();
-        float avail = ImGui::GetContentRegionAvail().x;
-        float txt_w = ImGui::CalcTextSize("No mods installed").x;
-        ImGui::SetCursorPosX((avail - txt_w) / 2.0f);
-        ImGui::TextDisabled("No mods installed");
-
-        ImGui::Spacing();
-        txt_w = ImGui::CalcTextSize("Place mod folders with mod.json").x;
-        ImGui::SetCursorPosX((avail - txt_w) / 2.0f);
-        ImGui::TextDisabled("Place mod folders with mod.json");
-
-        txt_w = ImGui::CalcTextSize("in ~/.local/share/swordigo-desktop/mods/").x;
-        ImGui::SetCursorPosX((avail - txt_w) / 2.0f);
-        ImGui::TextDisabled("in ~/.local/share/swordigo-desktop/mods/");
-    } else {
-        for (int i = 0; i < (int)g_mods.size(); i++) {
-            auto& mod = g_mods[i];
-            ImGui::PushID(i);
-
-            bool prev_enabled = mod.enabled;
-            ImGui::Checkbox("##enabled", &mod.enabled);
-            
-            // Toggle: rename folder to add/remove dot prefix
-            if (mod.enabled != prev_enabled) {
-                fs::path old_path(mod.dir_path);
-                std::string dirname = old_path.filename().string();
-                std::string new_dirname;
-                
-                if (!mod.enabled) {
-                    // Disable: add dot prefix
-                    if (dirname[0] != '.') {
-                        new_dirname = "." + dirname;
-                    }
-                } else {
-                    // Enable: remove dot prefix
-                    if (dirname[0] == '.') {
-                        new_dirname = dirname.substr(1);
-                    }
-                }
-                
-                if (!new_dirname.empty()) {
-                    fs::path new_path = old_path.parent_path() / new_dirname;
-                    std::error_code ec;
-                    fs::rename(old_path, new_path, ec);
-                    if (!ec) {
-                        mod.dir_path = new_path.string();
-                        std::cout << "[Launcher] Mod " 
-                                  << (mod.enabled ? "enabled" : "disabled")
-                                  << ": " << mod.name << " -> " << new_dirname 
-                                  << std::endl;
-                    } else {
-                        // Revert checkbox if rename failed
-                        mod.enabled = prev_enabled;
-                        std::cerr << "[Launcher] Failed to rename mod folder: " 
-                                  << ec.message() << std::endl;
-                    }
-                }
-            }
-            
-            ImGui::SameLine();
-
-            ImGui::BeginGroup();
-            if (!mod.enabled) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
-            }
-            ImGui::Text("%s", mod.name.c_str());
-            ImGui::TextDisabled("v%s by %s", mod.version.c_str(), mod.author.c_str());
-            if (!mod.enabled) {
-                ImGui::PopStyleColor();
-            }
-            ImGui::EndGroup();
-
-            if (ImGui::IsItemHovered() && !mod.description.empty()) {
-                ImGui::SetTooltip("%s\nType: %s\nStatus: %s", 
-                    mod.description.c_str(), mod.type.c_str(),
-                    mod.enabled ? "Enabled" : "Disabled");
-            }
-
-            ImGui::PopID();
-        }
-    }
-
-    // Rescan button at bottom
-    ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 42);
-    // Subtle separator
-    ImDrawList* bot_dl = ImGui::GetWindowDrawList();
-    ImVec2 bot_p = ImGui::GetCursorScreenPos();
-    bot_dl->AddLine(ImVec2(bot_p.x, bot_p.y), ImVec2(bot_p.x + width - 20, bot_p.y),
-                    IM_COL32(48, 54, 61, 120), 1.0f);
     ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.110f, 0.137f, 0.200f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.180f, 0.210f, 0.300f, 1.0f));
-    if (ImGui::Button(ICON_FA_MAGNIFYING_GLASS "  Rescan Mods", ImVec2(-1, 28))) {
+    if (g_font_heading) ImGui::PushFont(g_font_heading);
+    ImGui::Text(ICON_FA_PUZZLE_PIECE "  Mods");
+    if (g_font_heading) ImGui::PopFont();
+
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 280);
+    PushSecondaryBtn();
+    if (ImGui::Button(ICON_FA_FOLDER_OPEN "  Open Mods Folder", ImVec2(165, 32))) {
+        std::string mods_dir = get_user_data_dir() + "/mods";
+        pid_t pid = fork();
+        if (pid == 0) { execlp("xdg-open", "xdg-open", mods_dir.c_str(), nullptr); _exit(1); }
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open ~/.local/share/swordigo-desktop/mods/");
+    ImGui::SameLine();
+    if (ImGui::Button(ICON_FA_ARROWS_ROTATE "  Rescan", ImVec2(95, 32)))
         g_mods_scanned = false;
-    }
-    ImGui::PopStyleColor(2);
+    PopSecondaryBtn();
 
-    ImGui::End();
+    ImGui::Spacing();
+    
+    // Local mods search bar
+    static char mods_search[128] = "";
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.063f, 0.082f, 0.120f, 1.0f));
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.4f);
+    ImGui::InputTextWithHint("##modssearch", ICON_FA_MAGNIFYING_GLASS "  Search local mods…", mods_search, sizeof(mods_search));
     ImGui::PopStyleColor();
-}
 
-// =============================================================================
-// Status bar — minimal bottom strip
-// =============================================================================
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
 
-static void DrawStatusBar(int selected, const BinarySelector& selector) {
-    ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImVec2 bar_pos(vp->WorkPos.x, vp->WorkPos.y + vp->WorkSize.y - 30);
-    ImVec2 bar_size(vp->WorkSize.x, 30);
-
-    ImGui::SetNextWindowPos(bar_pos);
-    ImGui::SetNextWindowSize(bar_size);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.035f, 0.043f, 0.060f, 1.0f));
-    ImGui::Begin("##StatusBar", nullptr,
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus);
-
-    // Left: status
-    const auto& bins = selector.get_binaries();
-    if (!bins.empty() && selected >= 0 && selected < (int)bins.size()) {
-        const char* status_str;
-        ImVec4 status_col;
-        switch (bins[selected].status) {
-            case BinaryStatus::TESTED:  status_str = ICON_FA_CIRCLE_CHECK " Ready"; status_col = ImVec4(0.247f, 0.725f, 0.314f, 0.8f); break;
-            case BinaryStatus::TESTING: status_str = ICON_FA_CLOCK " Testing"; status_col = ImVec4(0.824f, 0.600f, 0.133f, 0.8f); break;
-            default:                    status_str = "Unknown status"; status_col = ImVec4(0.545f, 0.580f, 0.620f, 0.8f); break;
-        }
-        ImGui::TextColored(status_col, "%s", status_str);
-    } else {
-        ImGui::TextDisabled(ICON_FA_CIRCLE_CHECK " Ready");
-    }
-
-    // Right: version + shortcuts
-    ImGui::SameLine(ImGui::GetWindowWidth() - 340);
-    ImGui::TextDisabled("v7.1  |  Enter: Launch  |  ESC: Close  |  Del: Remove");
-
-    ImGui::End();
-    ImGui::PopStyleColor();
-}
-
-// =============================================================================
-// Options modal
-// =============================================================================
-
-static void DrawOptionsModal(bool& show_options) {
-    // Center the modal
-    ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(
-        ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
-               vp->WorkPos.y + vp->WorkSize.y * 0.5f),
-        ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(650, 500), ImGuiCond_Appearing);
-
-    if (!ImGui::BeginPopupModal("Options", &show_options,
-            ImGuiWindowFlags_NoResize)) {
+    if (g_mods.empty()) {
+        float cw = ImGui::GetContentRegionAvail().x;
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.047f, 0.063f, 0.090f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14.0f);
+        ImGui::BeginChild("##noMods", ImVec2(cw, 180), ImGuiChildFlags_Borders);
+        ImGui::SetCursorPos(ImVec2((cw - 220) * 0.5f, 50));
+        ImGui::TextDisabled(ICON_FA_BOX_OPEN "  No mods installed.");
+        ImGui::SetCursorPosX((cw - 320) * 0.5f);
+        ImGui::TextDisabled("Drop mod folders with mod.json into your mods directory.");
+        ImGui::SetCursorPosX((cw - 400) * 0.5f + 40);
+        ImGui::TextDisabled("Path:  ~/.local/share/swordigo-desktop/mods/");
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
         return;
     }
 
-    if (ImGui::BeginTabBar("OptionsTabs")) {
-        // --- SRE Hooks tab ---
-        if (ImGui::BeginTabItem(ICON_FA_CODE "  SRE Hooks")) {
-            ImGui::TextWrapped("All 34 SRE hooks are always active when using libsre.so.");
-            ImGui::Spacing();
-
-            if (ImGui::BeginTable("HooksTable", 3,
-                    ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
-                    ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY,
-                    ImVec2(0, 350))) {
-                ImGui::TableSetupColumn("Hook Name",  ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("Category",   ImGuiTableColumnFlags_WidthFixed, 120.0f);
-                ImGui::TableSetupColumn("Status",     ImGuiTableColumnFlags_WidthFixed, 100.0f);
-                ImGui::TableHeadersRow();
-
-                struct HookEntry { const char* name; const char* category; };
-                static const HookEntry hooks[] = {
-                    // CppString (4)
-                    {"CppString::assign",            "CppString"},
-                    {"CppString::append",            "CppString"},
-                    {"CppString::c_str",             "CppString"},
-                    {"CppString::destructor",        "CppString"},
-                    // Lua (4)
-                    {"lua_pcall",                    "Lua"},
-                    {"luaL_loadbuffer",              "Lua"},
-                    {"lua_newstate",                 "Lua"},
-                    {"luaL_openlibs",                "Lua"},
-                    // Background (3)
-                    {"BackgroundLayer::render",      "Background"},
-                    {"BackgroundLayer::update",      "Background"},
-                    {"BackgroundLayer::setTexture",  "Background"},
-                    // GUI (8)
-                    {"GUI::render",                  "GUI"},
-                    {"GUI::update",                  "GUI"},
-                    {"GUI::handleInput",             "GUI"},
-                    {"GUI::showDialog",              "GUI"},
-                    {"GUI::hideDialog",              "GUI"},
-                    {"GUI::showHUD",                 "GUI"},
-                    {"GUI::hideHUD",                 "GUI"},
-                    {"GUI::setButtonState",          "GUI"},
-                    // Death (1)
-                    {"Player::onDeath",              "Death"},
-                    // Text Input (4)
-                    {"TextInput::show",              "Text Input"},
-                    {"TextInput::hide",              "Text Input"},
-                    {"TextInput::getText",           "Text Input"},
-                    {"TextInput::isActive",          "Text Input"},
-                    // Music (7)
-                    {"MusicPlayer::play",            "Music"},
-                    {"MusicPlayer::stop",            "Music"},
-                    {"MusicPlayer::pause",           "Music"},
-                    {"MusicPlayer::resume",          "Music"},
-                    {"MusicPlayer::setVolume",       "Music"},
-                    {"MusicPlayer::isPlaying",       "Music"},
-                    {"MusicPlayer::crossfade",       "Music"},
-                    // Stats (1)
-                    {"Stats::track",                 "Stats"},
-                    // Menu (2)
-                    {"MainMenu::show",               "Menu"},
-                    {"MainMenu::handleSelection",    "Menu"},
-                };
-
-                for (const auto& h : hooks) {
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn(); ImGui::TextUnformatted(h.name);
-                    ImGui::TableNextColumn(); ImGui::TextUnformatted(h.category);
-                    ImGui::TableNextColumn();
-                    ImGui::TextColored(ImVec4(0.247f, 0.725f, 0.314f, 1.0f), ICON_FA_CIRCLE_CHECK " Active");
-                }
-
-                ImGui::EndTable();
+    // Mod cards
+    ImGui::BeginChild("##ModsList", ImVec2(-1, -1), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    for (int i = 0; i < (int)g_mods.size(); i++) {
+        auto& mod = g_mods[i];
+        
+        if (strlen(mods_search) > 0) {
+            std::string search_str = mods_search;
+            std::transform(search_str.begin(), search_str.end(), search_str.begin(), ::tolower);
+            std::string m_name = mod.name;
+            std::transform(m_name.begin(), m_name.end(), m_name.begin(), ::tolower);
+            std::string m_desc = mod.description;
+            std::transform(m_desc.begin(), m_desc.end(), m_desc.begin(), ::tolower);
+            if (m_name.find(search_str) == std::string::npos && m_desc.find(search_str) == std::string::npos) {
+                continue;
             }
-            ImGui::EndTabItem();
+        }
+        ImGui::PushID(i);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+            mod.enabled ? ImVec4(0.063f, 0.082f, 0.120f, 1.0f)
+                        : ImVec4(0.039f, 0.051f, 0.075f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
+        ImGui::BeginChild(("##mc" + std::to_string(i)).c_str(), ImVec2(-1, 82), ImGuiChildFlags_Borders);
+
+        // Enable toggle
+        ImGui::SetCursorPos(ImVec2(14, 28));
+        bool prev = mod.enabled;
+        ImGui::Checkbox("##en", &mod.enabled);
+        if (mod.enabled != prev) {
+            fs::path old_path(mod.dir_path);
+            std::string dirname = old_path.filename().string();
+            std::string new_dn;
+            if (!mod.enabled && dirname[0] != '.') new_dn = "." + dirname;
+            else if (mod.enabled && dirname[0] == '.') new_dn = dirname.substr(1);
+            if (!new_dn.empty()) {
+                fs::path new_path = old_path.parent_path() / new_dn;
+                std::error_code ec;
+                fs::rename(old_path, new_path, ec);
+                if (!ec) mod.dir_path = new_path.string();
+                else mod.enabled = prev;
+            }
         }
 
-        // --- Graphics tab ---
+        // Name + meta
+        ImGui::SameLine();
+        ImGui::BeginGroup();
+        if (!mod.enabled) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.48f, 0.52f, 1.0f));
+        ImGui::Text("%s", mod.name.c_str());
+        if (!mod.enabled) ImGui::PopStyleColor();
+        ImGui::TextDisabled("v%s  ·  by %s  ·  %s",
+            mod.version.c_str(), mod.author.c_str(), mod.type.c_str());
+        if (!mod.description.empty())
+            ImGui::TextDisabled("  %s", mod.description.c_str());
+        ImGui::EndGroup();
+
+        // Status badge right
+        {
+            float bw = ImGui::GetWindowWidth();
+            ImVec4 bc = mod.enabled ? ImVec4(0.20f, 0.58f, 0.28f, 0.7f) : ImVec4(0.35f, 0.35f, 0.38f, 0.7f);
+            ImGui::SetCursorPos(ImVec2(bw - 76, 28));
+            ImGui::PushStyleColor(ImGuiCol_Button,        bc);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bc);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  bc);
+            ImGui::SmallButton(mod.enabled ? ICON_FA_CIRCLE_CHECK "  ON" : "  OFF");
+            ImGui::PopStyleColor(3);
+        }
+
+        if (ImGui::IsItemHovered() && !mod.description.empty())
+            ImGui::SetTooltip("%s", mod.description.c_str());
+
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+}
+
+// =============================================================================
+// Mod Browser page (UI shell — backend server coming soon)
+// =============================================================================
+
+static void DrawModBrowserPage() {
+    ImGui::Spacing();
+    if (g_font_heading) ImGui::PushFont(g_font_heading);
+    ImGui::Text(ICON_FA_GLOBE "  Mod Browser");
+    if (g_font_heading) ImGui::PopFont();
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 200);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.60f, 0.13f, 1.0f));
+    ImGui::Text(ICON_FA_CLOCK "  Backend server: coming soon");
+    ImGui::PopStyleColor();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // Search + category row
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.063f, 0.082f, 0.120f, 1.0f));
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
+    ImGui::InputTextWithHint("##mbsearch", ICON_FA_MAGNIFYING_GLASS "  Search mods…", g_modbrowser_search, sizeof(g_modbrowser_search));
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(160.0f);
+    const char* cats[] = { "All", "Gameplay", "Texture", "Audio", "Custom" };
+    ImGui::Combo("##mbcat", &g_modbrowser_cat, cats, 5);
+    ImGui::SameLine();
+    PushSecondaryBtn();
+    ImGui::Button(ICON_FA_ARROWS_ROTATE "  Refresh", ImVec2(100, 0));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Requires server connection (coming soon)");
+    PopSecondaryBtn();
+
+    ImGui::Spacing();
+
+    // Mock featured banner
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 bp = ImGui::GetCursorScreenPos();
+        float bw = ImGui::GetContentRegionAvail().x;
+        float bh = 100.0f;
+        dl->AddRectFilled(bp, ImVec2(bp.x + bw, bp.y + bh),
+                          IM_COL32(14, 20, 35, 255), 14.0f);
+        dl->AddRect(bp, ImVec2(bp.x + bw, bp.y + bh),
+                    IM_COL32(233, 69, 96, 60), 14.0f, 0, 1.5f);
+        // Animated shimmer
+        float t = g_anim_time;
+        float shimmer = 0.5f + 0.5f * sinf(t * 1.2f);
+        dl->AddRectFilled(ImVec2(bp.x + 16, bp.y + 22),
+                          ImVec2(bp.x + 220, bp.y + 40),
+                          IM_COL32(40, 52, 72, (int)(120 + 60 * shimmer)), 4.0f);
+        dl->AddRectFilled(ImVec2(bp.x + 16, bp.y + 48),
+                          ImVec2(bp.x + 140, bp.y + 64),
+                          IM_COL32(30, 40, 58, (int)(80 + 40 * shimmer)), 4.0f);
+        dl->AddText(ImVec2(bp.x + 16, bp.y + 72),
+                    IM_COL32(130, 150, 175, 160),
+                    ICON_FA_PLUG "  Connect to Swordigo Mod Server to browse and install mods.");
+        ImGui::Dummy(ImVec2(0, bh + 8));
+    }
+
+    // Mock mod cards grid (placeholder)
+    static const char* mock_names[]  = { "HD Texture Pack", "Speed Runner Suite", "Sword of Chaos", "Dark World Overhaul", "Debug Console+", "Custom HUD" };
+    static const char* mock_authors[]= { "PixelPro",         "FastFeet",           "ShadowBlade",   "NightCraft",          "DevTool",        "UIModder" };
+    static const char* mock_cats[]   = { "Texture",          "Gameplay",           "Gameplay",      "Texture",             "Custom",         "Custom" };
+
+    float cw = (ImGui::GetContentRegionAvail().x - 20) / 3.0f;
+    for (int i = 0; i < 6; i++) {
+        if (i % 3 != 0) ImGui::SameLine();
+        
+        // Push slightly different bg color if installed
+        ImVec4 bg_col = (g_mock_mod_state[i] == 2) 
+            ? ImVec4(0.063f, 0.088f, 0.114f, 1.0f) // Subtly highlighted if installed
+            : ImVec4(0.047f, 0.063f, 0.090f, 1.0f);
+            
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, bg_col);
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
+        ImGui::PushID(i + 900);
+        ImGui::BeginChild("##mc", ImVec2(cw, 125), ImGuiChildFlags_Borders); // slightly taller child to host controls
+
+        // Card content
+        ImGui::SetCursorPos(ImVec2(12, 12));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.914f, 0.271f, 0.376f, 0.85f));
+        ImGui::Text("%s", mock_cats[i]);
+        ImGui::PopStyleColor();
+        
+        ImGui::SetCursorPosX(12);
+        if (g_font_heading) ImGui::PushFont(g_font_heading);
+        ImGui::Text("%s", mock_names[i]);
+        if (g_font_heading) ImGui::PopFont();
+        
+        ImGui::SetCursorPosX(12);
+        ImGui::TextDisabled("by %s", mock_authors[i]);
+
+        // Interactive status / download button
+        ImGui::SetCursorPos(ImVec2(12, 85));
+        if (g_mock_mod_state[i] == 0) {
+            // Get button
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.24f, 0.72f, 0.31f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.85f, 0.40f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.18f, 0.58f, 0.25f, 1.0f));
+            if (ImGui::Button((ICON_FA_DOWNLOAD "  Install##" + std::to_string(i)).c_str(), ImVec2(cw - 24, 28))) {
+                g_mock_mod_state[i] = 1; // Start download!
+                g_mock_mod_progress[i] = 0.0f;
+            }
+            ImGui::PopStyleColor(3);
+        } else if (g_mock_mod_state[i] == 1) {
+            // Progress bar
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.914f, 0.271f, 0.376f, 1.0f));
+            char progress_text[32];
+            snprintf(progress_text, sizeof(progress_text), "Downloading %d%%", (int)(g_mock_mod_progress[i] * 100));
+            ImGui::ProgressBar(g_mock_mod_progress[i], ImVec2(cw - 24, 28), progress_text);
+            ImGui::PopStyleColor();
+        } else {
+            // Installed status badge (static style)
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.133f, 0.165f, 0.220f, 0.60f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.133f, 0.165f, 0.220f, 0.60f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.133f, 0.165f, 0.220f, 0.60f));
+            ImGui::Button((ICON_FA_CHECK "  Installed##" + std::to_string(i)).c_str(), ImVec2(cw - 24, 28));
+            ImGui::PopStyleColor(3);
+        }
+
+        ImGui::EndChild();
+        ImGui::PopID();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+    }
+}
+
+// =============================================================================
+// Profile page
+// =============================================================================
+
+static void DrawProfilePage() {
+    ImGui::Spacing();
+    if (g_font_heading) ImGui::PushFont(g_font_heading);
+    ImGui::Text(ICON_FA_USER "  Profile");
+    if (g_font_heading) ImGui::PopFont();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    float cw = ImGui::GetContentRegionAvail().x;
+
+    // Avatar section
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.047f, 0.063f, 0.090f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 16.0f);
+    ImGui::BeginChild("##profileCard", ImVec2(cw, 140), ImGuiChildFlags_Borders);
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 wp = ImGui::GetWindowPos();
+
+        // Large avatar circle
+        ImVec2 av(wp.x + 60, wp.y + 70);
+        dl->AddCircleFilled(av, 44.0f, IM_COL32(20, 28, 45, 255));
+        dl->AddCircle(av, 44.0f, IM_COL32(233, 69, 96, 180), 48, 2.0f);
+        // Big person icon
+        float icon_sz = 28.0f;
+        dl->AddText(nullptr, icon_sz, ImVec2(av.x - 14, av.y - 14),
+                    IM_COL32(233, 69, 96, 255), ICON_FA_USER);
+
+        ImGui::SetCursorPos(ImVec2(120, 24));
+        if (!g_profile_editing) {
+            if (g_font_heading) ImGui::PushFont(g_font_heading);
+            ImGui::Text("%s", g_profile_username);
+            if (g_font_heading) ImGui::PopFont();
+            ImGui::SetCursorPosX(120);
+            ImGui::TextDisabled("Local Profile  ·  No account sync");
+            ImGui::SetCursorPos(ImVec2(120, 80));
+            PushSecondaryBtn();
+            if (ImGui::Button(ICON_FA_PEN "  Edit Username", ImVec2(150, 30)))
+                g_profile_editing = true;
+            PopSecondaryBtn();
+        } else {
+            ImGui::SetCursorPos(ImVec2(120, 32));
+            ImGui::SetNextItemWidth(200);
+            ImGui::InputText("##uname", g_profile_username, sizeof(g_profile_username));
+            ImGui::SetCursorPos(ImVec2(120, 72));
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.24f, 0.72f, 0.31f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.85f, 0.40f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.18f, 0.58f, 0.25f, 1.0f));
+            if (ImGui::Button(ICON_FA_CHECK "  Save", ImVec2(90, 30))) g_profile_editing = false;
+            ImGui::PopStyleColor(3);
+            ImGui::SameLine();
+            PushSecondaryBtn();
+            if (ImGui::Button("Cancel", ImVec2(80, 30))) g_profile_editing = false;
+            PopSecondaryBtn();
+        }
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+
+    ImGui::Spacing();
+
+    // Skin selector placeholder
+    SectionLabel(ICON_FA_SHIRT, "CHARACTER SKIN");
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.047f, 0.063f, 0.090f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
+    ImGui::BeginChild("##skins", ImVec2(-1, 110), ImGuiChildFlags_Borders);
+    {
+        float sw = 80.0f, sh = 80.0f, pad = 12.0f;
+        const char* skins[] = { "Default", "Knight", "Shadow", "Golden", "Coming Soon" };
+        for (int i = 0; i < 5; i++) {
+            if (i > 0) ImGui::SameLine();
+            ImGui::BeginGroup();
+            
+            bool is_selected = (g_selected_skin == i);
+            bool is_locked = (i == 4); // "Coming Soon" is locked
+            
+            // Crimson accent highlight for selected skin, darker for others
+            ImVec4 box_bg = is_selected 
+                ? ImVec4(0.914f, 0.271f, 0.376f, 0.15f)
+                : ImVec4(0.063f, 0.082f, 0.120f, 1.0f);
+                
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, box_bg);
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 10.0f);
+            
+            // Selectable border
+            if (is_selected) {
+                ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.914f, 0.271f, 0.376f, 1.0f));
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.133f, 0.165f, 0.220f, 0.40f));
+            }
+            
+            ImGui::BeginChild(("##sk" + std::to_string(i)).c_str(),
+                              ImVec2(sw, sh - 10), ImGuiChildFlags_Borders);
+                              
+            // Simple click detection inside the child window
+            if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) && ImGui::IsMouseClicked(0) && !is_locked) {
+                g_selected_skin = i;
+            }
+            
+            ImGui::SetCursorPos(ImVec2((sw - 24) * 0.5f, (sh - 34) * 0.5f));
+            if (is_locked) {
+                ImGui::TextDisabled(ICON_FA_LOCK);
+            } else {
+                ImGui::TextColored(is_selected ? ImVec4(0.914f, 0.271f, 0.376f, 1.0f) : ImVec4(0.55f, 0.58f, 0.62f, 1.0f), ICON_FA_USER);
+            }
+            
+            ImGui::EndChild();
+            ImGui::PopStyleColor(); // pop border
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(); // pop bg
+            
+            float tw = ImGui::CalcTextSize(skins[i]).x;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (sw - tw) * 0.5f + pad * i);
+            if (is_selected) {
+                ImGui::TextColored(ImVec4(0.914f, 0.271f, 0.376f, 1.0f), "%s", skins[i]);
+            } else {
+                ImGui::TextDisabled("%s", skins[i]);
+            }
+            ImGui::EndGroup();
+        }
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+
+    ImGui::Spacing();
+
+    // Future account section
+    SectionLabel(ICON_FA_CLOUD, "ACCOUNT (FUTURE)");
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.047f, 0.063f, 0.090f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
+    ImGui::BeginChild("##account", ImVec2(-1, 90), ImGuiChildFlags_Borders);
+    ImGui::SetCursorPos(ImVec2(16, 16));
+    ImGui::TextDisabled(ICON_FA_LOCK "  Account sync is not yet available.");
+    ImGui::SetCursorPosX(16);
+    ImGui::TextDisabled("      A future update will allow signing in to sync");
+    ImGui::SetCursorPosX(16);
+    ImGui::TextDisabled("      your profile, skins, and mods across devices.");
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
+
+// =============================================================================
+// Settings page
+// =============================================================================
+
+static void DrawSettingsPage() {
+    ImGui::Spacing();
+    if (g_font_heading) ImGui::PushFont(g_font_heading);
+    ImGui::Text(ICON_FA_GEAR "  Settings");
+    if (g_font_heading) ImGui::PopFont();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (ImGui::BeginTabBar("SettingsTabs")) {
+        // ── Graphics tab ──
         if (ImGui::BeginTabItem(ICON_FA_PAINT_BRUSH "  Graphics")) {
             ImGui::Spacing();
             static bool postfx_enabled = true;
             ImGui::Checkbox("Enable PostFX (bloom, color grading)", &postfx_enabled);
+            ImGui::TextDisabled("   Applies screen-space post-processing effects during gameplay.");
 
             ImGui::Spacing();
-            ImGui::Checkbox("Use PVR Software Decompression", &g_pvr_software_decode);
-            ImGui::TextDisabled("When disabled, raw compressed PVR textures are uploaded directly to the GPU (Hardware Decode).");
+            ImGui::Checkbox("PVR Software Decompression", &g_pvr_software_decode);
+            ImGui::TextDisabled("   When off, raw compressed PVR textures are sent directly to GPU (hardware decode).");
 
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
 
-            ImGui::Text(ICON_FA_EYE "  Display Information:");
-            int display_count = 0;
-            SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
-            if (displays && display_count > 0) {
-                const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(displays[0]);
+            ImGui::Text(ICON_FA_DISPLAY "  Display:");
+            int dc = 0;
+            SDL_DisplayID* disps = SDL_GetDisplays(&dc);
+            if (disps && dc > 0) {
+                const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(disps[0]);
                 if (mode) {
                     ImGui::BulletText("Resolution: %dx%d", mode->w, mode->h);
                     ImGui::BulletText("Refresh Rate: %.1f Hz", mode->refresh_rate);
                 }
-                SDL_free(displays);
-            } else {
-                ImGui::TextDisabled("Could not query display info.");
-            }
+                SDL_free(disps);
+            } else { ImGui::TextDisabled("Could not query display."); }
 
             ImGui::Spacing();
-            ImGui::Text(ICON_FA_MICROCHIP "  OpenGL Info:");
+            ImGui::Text(ICON_FA_MICROCHIP "  OpenGL:");
             ImGui::BulletText("Renderer: %s", (const char*)glGetString(GL_RENDERER));
             ImGui::BulletText("Version:  %s", (const char*)glGetString(GL_VERSION));
 
             ImGui::EndTabItem();
         }
 
-        // --- About tab ---
+        // ── SRE Hooks tab ──
+        if (ImGui::BeginTabItem(ICON_FA_CODE "  SRE Hooks")) {
+            ImGui::TextWrapped("All 34 SRE hooks are active when libsre.so is enabled.");
+            ImGui::Spacing();
+            if (ImGui::BeginTable("HooksTbl", 3,
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
+                    ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY,
+                    ImVec2(0, 340))) {
+                ImGui::TableSetupColumn("Hook Name", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Category",  ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                ImGui::TableSetupColumn("Status",    ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                ImGui::TableHeadersRow();
+                struct HookEntry { const char* name; const char* category; };
+                static const HookEntry hooks[] = {
+                    {"CppString::assign","CppString"},{"CppString::append","CppString"},
+                    {"CppString::c_str","CppString"},{"CppString::destructor","CppString"},
+                    {"lua_pcall","Lua"},{"luaL_loadbuffer","Lua"},{"lua_newstate","Lua"},{"luaL_openlibs","Lua"},
+                    {"BackgroundLayer::render","Background"},{"BackgroundLayer::update","Background"},{"BackgroundLayer::setTexture","Background"},
+                    {"GUI::render","GUI"},{"GUI::update","GUI"},{"GUI::handleInput","GUI"},
+                    {"GUI::showDialog","GUI"},{"GUI::hideDialog","GUI"},{"GUI::showHUD","GUI"},
+                    {"GUI::hideHUD","GUI"},{"GUI::setButtonState","GUI"},
+                    {"Player::onDeath","Death"},
+                    {"TextInput::show","Text Input"},{"TextInput::hide","Text Input"},
+                    {"TextInput::getText","Text Input"},{"TextInput::isActive","Text Input"},
+                    {"MusicPlayer::play","Music"},{"MusicPlayer::stop","Music"},{"MusicPlayer::pause","Music"},
+                    {"MusicPlayer::resume","Music"},{"MusicPlayer::setVolume","Music"},
+                    {"MusicPlayer::isPlaying","Music"},{"MusicPlayer::crossfade","Music"},
+                    {"Stats::track","Stats"},
+                    {"MainMenu::show","Menu"},{"MainMenu::handleSelection","Menu"},
+                };
+                for (const auto& h : hooks) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(h.name);
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(h.category);
+                    ImGui::TableNextColumn();
+                    ImGui::TextColored(ImVec4(0.24f, 0.72f, 0.31f, 1.0f), ICON_FA_CIRCLE_CHECK "  Active");
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+
+        // ── Audio tab ──
+        if (ImGui::BeginTabItem(ICON_FA_VOLUME_HIGH "  Audio")) {
+            ImGui::Spacing();
+            static float master_vol = 1.0f, music_vol = 0.85f, sfx_vol = 1.0f;
+            ImGui::Text("Master Volume");  ImGui::SliderFloat("##mvol", &master_vol, 0.0f, 1.0f);
+            ImGui::Text("Music Volume");   ImGui::SliderFloat("##muvol",&music_vol,  0.0f, 1.0f);
+            ImGui::Text("SFX Volume");     ImGui::SliderFloat("##sfxv", &sfx_vol,    0.0f, 1.0f);
+            ImGui::Spacing();
+            ImGui::TextDisabled(ICON_FA_CIRCLE_INFO "  Volume controls will be connected to the audio backend in a future update.");
+            ImGui::EndTabItem();
+        }
+
+        // ── About tab ──
         if (ImGui::BeginTabItem(ICON_FA_CIRCLE_INFO "  About")) {
             ImGui::Spacing();
             if (g_font_heading) ImGui::PushFont(g_font_heading);
             ImGui::TextColored(ImVec4(0.914f, 0.271f, 0.376f, 1.0f),
-                ICON_FA_GAMEPAD " Swordigo Desktop v7.1");
+                               ICON_FA_GAMEPAD "  Swordigo Desktop  v8.0 Remaster");
             if (g_font_heading) ImGui::PopFont();
-
             ImGui::Spacing();
             ImGui::TextWrapped(
-                "A desktop runtime for Swordigo, using ARM binary translation "
-                "(Unicorn/Dynarmic) with custom SRE hooks for full playability.");
-
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-
+                "A desktop runtime for Swordigo using ARM binary translation (Unicorn / Dynarmic) "
+                "with custom SRE hooks for full playability, mod support, and save editing.");
+            ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
             ImGui::Text(ICON_FA_STAR "  Credits:");
             ImGui::BulletText("Touch Foo Games — original Swordigo");
-            ImGui::BulletText("FEX-Emu — ARM64 translation");
+            ImGui::BulletText("Unicorn Engine — TCG CPU emulation");
+            ImGui::BulletText("Dynarmic — JIT CPU emulation");
             ImGui::BulletText("Dear ImGui — immediate-mode UI");
             ImGui::BulletText("SDL3 — cross-platform windowing & input");
             ImGui::BulletText("Font Awesome — icon set");
-
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-
+            ImGui::BulletText("Space Grotesk — launcher typeface");
+            ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
             ImGui::Text(ICON_FA_CUBE "  Architecture:");
             ImGui::BulletText("SRT — Swordigo Runtime (overall architecture)");
             ImGui::BulletText("SRE — Swordigo Runtime Engine (libsre.so hooks)");
             ImGui::BulletText("Primary target: v1.4.12 ARM64");
-
+            ImGui::BulletText("Secondary: v1.4.12 ARM32, v1.2.x legacy");
             ImGui::EndTabItem();
         }
 
         ImGui::EndTabBar();
     }
-
-    ImGui::EndPopup();
 }
 
 // =============================================================================
-// Save editor (embedded in detail panel)
+// SDK Tools page
+// =============================================================================
+
+static void DrawSDKToolsPage() {
+    ImGui::Spacing();
+    if (g_font_heading) ImGui::PushFont(g_font_heading);
+    ImGui::Text(ICON_FA_WRENCH "  SDK & Developer Tools");
+    if (g_font_heading) ImGui::PopFont();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // Tools grid
+    struct ToolCard {
+        const char* icon; const char* name; const char* desc;
+        const char* status; bool available;
+        ImVec4 accent;
+    };
+    ToolCard tools[] = {
+        { ICON_FA_EYE,         "Ruby Asset Viewer",    "Browse textures, scenes and binary assets",       "Available",   true,  ImVec4(0.35f, 0.65f, 1.0f, 1.0f) },
+        { ICON_FA_CODE,        "Lua Script Editor",    "Edit and inject Lua scripts into the runtime",    "In-Game Only",false, ImVec4(0.24f, 0.72f, 0.31f, 1.0f) },
+        { ICON_FA_FLOPPY_DISK, "Save Editor",          "Edit .gplayer save files directly",               "Available",   true,  ImVec4(0.82f, 0.60f, 0.13f, 1.0f) },
+        { ICON_FA_TERMINAL,    "Lua Console",          "REPL console for live Lua commands",              "In-Game Only",false, ImVec4(0.55f, 0.45f, 0.90f, 1.0f) },
+        { ICON_FA_NETWORK_WIRED,"TCP Console",         "Remote Lua console over TCP (openport cmd)",       "In-Game Only",false, ImVec4(0.35f, 0.65f, 1.0f, 1.0f) },
+        { ICON_FA_CUBE,        "Scene Inspector",      "Visual scene graph and entity explorer",           "Coming Soon", false, ImVec4(0.914f, 0.271f, 0.376f, 1.0f) },
+        { ICON_FA_PAINTBRUSH,  "Texture Packer",       "Pack and convert texture atlases for modding",    "Coming Soon", false, ImVec4(0.35f, 0.65f, 1.0f, 1.0f) },
+        { ICON_FA_WAVEFORM,    "Audio Editor",         "Preview and replace game audio files",            "Coming Soon", false, ImVec4(0.24f, 0.72f, 0.31f, 1.0f) },
+    };
+
+    float cw = (ImGui::GetContentRegionAvail().x - 12) / 2.0f;
+    for (int i = 0; i < (int)(sizeof(tools) / sizeof(tools[0])); i++) {
+        if (i % 2 != 0) ImGui::SameLine();
+        auto& t = tools[i];
+        ImGui::PushID(i + 400);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+            t.available ? ImVec4(0.063f, 0.082f, 0.120f, 1.0f)
+                        : ImVec4(0.039f, 0.051f, 0.075f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
+        ImGui::BeginChild(("##tool" + std::to_string(i)).c_str(),
+                          ImVec2(cw, 92), ImGuiChildFlags_Borders);
+
+        // Icon circle bg
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 wp = ImGui::GetWindowPos();
+        dl->AddCircleFilled(ImVec2(wp.x + 30, wp.y + 46), 20.0f,
+                            IM_COL32(14, 20, 35, 255));
+        dl->AddText(ImVec2(wp.x + 22, wp.y + 38), ImGui::ColorConvertFloat4ToU32(t.accent), t.icon);
+
+        ImGui::SetCursorPos(ImVec2(58, 14));
+        ImGui::Text("%s", t.name);
+        ImGui::SetCursorPosX(58);
+        ImGui::TextDisabled("%s", t.desc);
+
+        // Status badge
+        ImVec4 stc = t.available ? ImVec4(0.24f, 0.72f, 0.31f, 0.7f)
+                    : (strncmp(t.status, "Coming", 6) == 0)
+                        ? ImVec4(0.50f, 0.35f, 0.80f, 0.7f)
+                        : ImVec4(0.35f, 0.65f, 1.0f, 0.7f);
+        ImGui::SetCursorPos(ImVec2(58, 64));
+        ImGui::PushStyleColor(ImGuiCol_Button,        stc);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, stc);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  stc);
+        ImGui::SmallButton(t.status);
+        ImGui::PopStyleColor(3);
+
+        // Action button if available
+        if (t.available) {
+            float bw = ImGui::GetWindowWidth();
+            ImGui::SetCursorPos(ImVec2(bw - 90, 30));
+            PushSecondaryBtn();
+            bool clicked = ImGui::Button(ICON_FA_PLAY "  Open", ImVec2(80, 30));
+            PopSecondaryBtn();
+            if (clicked) {
+                if (i == 0) { // Ruby Viewer
+                    pid_t pid = fork();
+                    if (pid == 0) { execlp("./ruby", "ruby", nullptr); execlp("ruby","ruby",nullptr); _exit(1); }
+                } else if (i == 2) { // Save Editor
+                    g_show_save_ed = true;
+                    g_save_loaded = false; g_save_sel = -1; g_save_status.clear();
+                    std::string home = getenv("HOME") ? getenv("HOME") : "/tmp";
+                    std::string xdg  = getenv("XDG_DATA_HOME") ? getenv("XDG_DATA_HOME") : (home + "/.local/share");
+                    std::string sd   = xdg + "/swordigo-desktop/save/Documents";
+                    g_save_paths = save_list_dir(sd);
+                    g_save_files.clear();
+                    for (auto& p : g_save_paths) { SaveFile sf; if (save_load(p, sf)) g_save_files.push_back(sf); }
+                    g_save_loaded = true;
+                }
+            }
+        }
+
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        ImGui::PopID();
+        if (i % 2 == 1) ImGui::Spacing();
+    }
+}
+
+// =============================================================================
+// Save Editor
 // =============================================================================
 
 static void DrawSaveEditor(bool& show_save_editor) {
-    // Back button
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.110f, 0.137f, 0.200f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.180f, 0.210f, 0.300f, 1.0f));
-    if (ImGui::Button(ICON_FA_ARROW_LEFT " Back", ImVec2(100, 30))) {
+    ImGui::SetCursorPos(ImVec2(0, 0));
+    PushSecondaryBtn();
+    if (ImGui::Button(ICON_FA_ARROW_LEFT "  Back", ImVec2(110, 32))) {
         show_save_editor = false;
         g_save_sel = -1;
-        ImGui::PopStyleColor(2);
+        PopSecondaryBtn();
         return;
     }
-    ImGui::PopStyleColor(2);
+    PopSecondaryBtn();
     ImGui::SameLine();
     if (g_font_heading) ImGui::PushFont(g_font_heading);
     ImGui::Text(ICON_FA_FLOPPY_DISK "  Save Editor");
     if (g_font_heading) ImGui::PopFont();
 
+    ImGui::Spacing();
     ImGui::Separator();
+    ImGui::Spacing();
 
-    if (!g_save_loaded) {
-        ImGui::TextDisabled("Loading saves...");
-        return;
-    }
+    if (!g_save_loaded) { ImGui::TextDisabled("Loading saves…"); return; }
 
     if (g_save_files.empty()) {
         ImGui::Spacing();
@@ -1420,73 +2002,50 @@ static void DrawSaveEditor(bool& show_save_editor) {
         return;
     }
 
-    // -- Editing a specific save --
+    // Editing a specific save
     if (g_save_sel >= 0 && g_save_sel < (int)g_save_files.size()) {
         SaveFile& sf = g_edit_save;
-
-        // Status message
         if (!g_save_status.empty()) {
-            ImVec4 col = g_save_status_ok
-                ? ImVec4(0.247f, 0.725f, 0.314f, 1.0f)
-                : ImVec4(0.9f, 0.3f, 0.3f, 1.0f);
+            ImVec4 col = g_save_status_ok ? ImVec4(0.24f, 0.72f, 0.31f, 1.0f) : ImVec4(0.9f, 0.3f, 0.3f, 1.0f);
             ImGui::TextColored(col, "%s", g_save_status.c_str());
             ImGui::Spacing();
         }
-
         ImGui::Text(ICON_FA_FILE "  File: %s", fs::path(sf.filepath).filename().c_str());
         ImGui::Text("Player: %s  |  Level: %d  |  %.0f%% complete",
             sf.name.c_str(), sf.experience_level, sf.percent_completed * 100.0f);
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        ImGui::Text("Character Stats:");
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        SectionLabel(ICON_FA_PERSON_RUNNING, "CHARACTER STATS");
         ImGui::InputInt("Coins",  &sf.game_state.character.coins);
         ImGui::InputInt("Health", &sf.game_state.character.health);
         ImGui::InputInt("Mana",   &sf.game_state.character.mana);
         ImGui::InputInt("XP",     &sf.game_state.character.xp);
         ImGui::InputInt("Level",  &sf.game_state.character.level);
-
         ImGui::Spacing();
-        ImGui::Text("Attributes:");
+        SectionLabel(ICON_FA_WAND_MAGIC_SPARKLES, "ATTRIBUTES");
         ImGui::InputInt("Health Attr", &sf.game_state.character.health_attr);
         ImGui::InputInt("Attack Attr", &sf.game_state.character.attack_attr);
         ImGui::InputInt("Magic Attr",  &sf.game_state.character.magic_attr);
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        // Apply / Discard
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.55f, 0.34f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.18f, 0.55f, 0.34f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.68f, 0.40f, 1.0f));
-        if (ImGui::Button(ICON_FA_CHECK " Apply & Save", ImVec2(160, 36))) {
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.15f, 0.44f, 0.27f, 1.0f));
+        if (ImGui::Button(ICON_FA_CHECK "  Apply & Save", ImVec2(160, 36))) {
             if (save_write(sf.filepath, sf)) {
-                g_save_status = "Save written successfully!";
-                g_save_status_ok = true;
-                // Update the list entry
+                g_save_status = "Save written successfully!"; g_save_status_ok = true;
                 g_save_files[g_save_sel] = sf;
-            } else {
-                g_save_status = "Failed to write save file!";
-                g_save_status_ok = false;
-            }
+            } else { g_save_status = "Failed to write save file!"; g_save_status_ok = false; }
         }
-        ImGui::PopStyleColor(2);
+        ImGui::PopStyleColor(3);
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.110f, 0.137f, 0.200f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.180f, 0.210f, 0.300f, 1.0f));
-        if (ImGui::Button("Discard", ImVec2(120, 36))) {
-            g_save_sel = -1;
-            g_save_status.clear();
-        }
-        ImGui::PopStyleColor(2);
-
+        PushSecondaryBtn();
+        if (ImGui::Button("Discard", ImVec2(120, 36))) { g_save_sel = -1; g_save_status.clear(); }
+        PopSecondaryBtn();
         return;
     }
 
-    // -- Save file list --
-    if (ImGui::BeginTable("SavesTable", 4,
+    // Save file list table
+    if (ImGui::BeginTable("SavesTbl", 4,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
             ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY,
             ImVec2(0, ImGui::GetContentRegionAvail().y - 10))) {
@@ -1495,31 +2054,27 @@ static void DrawSaveEditor(bool& show_save_editor) {
         ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableSetupColumn("File",     ImGuiTableColumnFlags_WidthFixed, 180.0f);
         ImGui::TableHeadersRow();
-
         for (int i = 0; i < (int)g_save_files.size(); i++) {
             auto& sf = g_save_files[i];
             ImGui::TableNextRow();
             ImGui::PushID(i);
-
             ImGui::TableNextColumn();
-            if (ImGui::Selectable(sf.name.c_str(), false,
-                    ImGuiSelectableFlags_SpanAllColumns)) {
-                g_save_sel = i;
-                g_edit_save = sf;  // Copy for editing
-                g_save_status.clear();
+            if (ImGui::Selectable(sf.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                g_save_sel = i; g_edit_save = sf; g_save_status.clear();
             }
-            ImGui::TableNextColumn();
-            ImGui::Text("%d", sf.experience_level);
-            ImGui::TableNextColumn();
-            ImGui::Text("%.0f%%", sf.percent_completed * 100.0f);
-            ImGui::TableNextColumn();
-            ImGui::TextDisabled("%s", fs::path(sf.filepath).filename().c_str());
-
+            ImGui::TableNextColumn(); ImGui::Text("%d", sf.experience_level);
+            ImGui::TableNextColumn(); ImGui::Text("%.0f%%", sf.percent_completed * 100.0f);
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", fs::path(sf.filepath).filename().c_str());
             ImGui::PopID();
         }
         ImGui::EndTable();
     }
 }
+
+
+
+
+
 
 // =============================================================================
 // show_launcher — main entry point
@@ -1618,7 +2173,7 @@ LaunchConfig show_launcher(BinarySelector& selector) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
     // Theme
-    ApplyCustomTheme();
+    ApplyPremiumTheme();
 
     // Font loading — Inter + Font Awesome 7 icons, DPI-aware
     {
@@ -1650,8 +2205,13 @@ LaunchConfig show_launcher(BinarySelector& selector) {
         icon_cfg.GlyphMinAdvanceX = font_size_main;
         icon_cfg.GlyphOffset = ImVec2(0, 2);
         
-        // Search paths for Megalopolis / Inter font
+        // Search paths — SpaceGrotesk is the primary launcher font
         std::string inter_paths[] = {
+            "src/assets/fonts/SpaceGrotesk-VariableFont_wght.ttf",
+            get_data_path("src/assets/fonts/SpaceGrotesk-VariableFont_wght.ttf"),
+            get_user_data_dir() + "launcher/fonts/SpaceGrotesk-VariableFont_wght.ttf",
+            get_user_data_dir() + "src/assets/fonts/SpaceGrotesk-VariableFont_wght.ttf",
+            // Fallbacks
             "src/assets/fonts/MegalopolisExtra-Regular.otf",
             get_data_path("src/assets/fonts/MegalopolisExtra-Regular.otf"),
             get_user_data_dir() + "launcher/fonts/MegalopolisExtra-Regular.otf",
@@ -1660,8 +2220,10 @@ LaunchConfig show_launcher(BinarySelector& selector) {
             get_user_data_dir() + "launcher/fonts/Inter-Regular.ttf",
             get_user_data_dir() + "src/assets/fonts/Inter-Regular.ttf",
             "src/assets/fonts/Inter-Regular.ttf",
+            "/usr/share/swordigo-desktop/launcher/fonts/SpaceGrotesk-VariableFont_wght.ttf",
             "/usr/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
             "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
+            "/usr/local/share/swordigo-desktop/launcher/fonts/SpaceGrotesk-VariableFont_wght.ttf",
             "/usr/local/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
             "/usr/local/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
             "/usr/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf",
@@ -1825,8 +2387,6 @@ LaunchConfig show_launcher(BinarySelector& selector) {
     int engine_sel = 1;     // 0 = Unicorn, 1 = Dynarmic (default: JIT for performance)
     bool use_sre_sel = true; // whether to load libsre.so (user choice)
     bool adv_redstell_opts_sel = false; // Advanced Redstell Optimisations (off by default)
-    bool show_options = false;
-    bool show_save_editor = false;
 
     while (running) {
         SDL_Event event;
@@ -1875,48 +2435,27 @@ LaunchConfig show_launcher(BinarySelector& selector) {
         // Animation timer
         g_anim_time += 1.0f / 60.0f;
 
+        // Update mock mod download progress
+        for (int i = 0; i < 6; i++) {
+            if (g_mock_mod_state[i] == 1) { // Downloading
+                g_mock_mod_progress[i] += 0.015f;
+                if (g_mock_mod_progress[i] >= 1.0f) {
+                    g_mock_mod_progress[i] = 1.0f;
+                    g_mock_mod_state[i] = 2; // Installed!
+                }
+            }
+        }
+
         // Start ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
 
-        // Panel widths
-        float inst_panel_w = 260.0f;
-        float mods_panel_w = 280.0f;
-
-        // Draw background
-        {
-            ImGuiViewport* vp = ImGui::GetMainViewport();
-            if (g_tex_bg) {
-                ImGui::GetBackgroundDrawList()->AddImage(
-                    (ImTextureID)(intptr_t)g_tex_bg,
-                    ImVec2(vp->WorkPos.x, vp->WorkPos.y),
-                    ImVec2(vp->WorkPos.x + vp->WorkSize.x, vp->WorkPos.y + vp->WorkSize.y),
-                    ImVec2(0, 0), ImVec2(1, 1),
-                    IM_COL32(255, 255, 255, 60)  // ~24% opacity — subtle
-                );
-                // Dark overlay for readability
-                ImGui::GetBackgroundDrawList()->AddRectFilledMultiColor(
-                    ImVec2(vp->WorkPos.x, vp->WorkPos.y),
-                    ImVec2(vp->WorkPos.x + vp->WorkSize.x, vp->WorkPos.y + vp->WorkSize.y),
-                    IM_COL32(13, 17, 23, 200),    // top
-                    IM_COL32(13, 17, 23, 200),
-                    IM_COL32(13, 17, 23, 235),    // bottom: darker
-                    IM_COL32(13, 17, 23, 235)
-                );
-            }
-        }
-
-        DrawToolbar(running, cfg, show_options);
-        DrawInstancePanel(selector, bin_sel, inst_panel_w);
-        DrawDetailPanel(selector, bin_sel, cfg, running, api_sel, engine_sel, use_sre_sel, adv_redstell_opts_sel, show_save_editor, mods_panel_w);
-        DrawModsPanel(mods_panel_w);
-        DrawStatusBar(bin_sel, selector);
-
-        // Options modal
-        if (show_options) {
-            DrawOptionsModal(show_options);
-        }
+        // New sidebar-based layout
+        DrawSidebar(selector, bin_sel, running, cfg);
+        DrawContentArea(selector, bin_sel, cfg, running, api_sel, engine_sel, use_sre_sel, adv_redstell_opts_sel);
+        DrawStatusFooter(bin_sel, selector);
+        DrawWindowControls(running, cfg);
 
         // Add Instance popup
         if (g_show_add_instance) {

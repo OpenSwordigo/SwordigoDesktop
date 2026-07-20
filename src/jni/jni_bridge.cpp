@@ -2398,6 +2398,10 @@ void bridge_mkdir(void* emu_ptr) {
     uint32_t path_ptr = emu->get_reg(0);
     uint32_t mode = emu->get_reg(1);
     const char* path = (const char*)(memory + path_ptr);
+    if (!path || !*path) {
+        emu->set_reg(0, 0);
+        return;
+    }
     
     std::string resolved_path = path;
     char resolved[512];
@@ -2405,14 +2409,16 @@ void bridge_mkdir(void* emu_ptr) {
         resolved_path = resolved;
     }
 
-    // std::cout << "[File] mkdir(\"" << path << "\" -> \"" << resolved_path << "\", " << std::oct << mode << std::dec << ")" << std::endl;
-    int result = mkdir(resolved_path.c_str(), (mode_t)mode);
-    if (result != 0 && errno == EEXIST) {
-        // Directory already exists — treat as success (game does recursive mkdir)
-        result = 0;
+    static std::unordered_set<std::string> s_created_dirs;
+    if (s_created_dirs.find(resolved_path) != s_created_dirs.end()) {
+        emu->set_reg(0, 0);
+        return;
     }
-    if (result != 0) {
-        // std::cout << "[File]   mkdir FAILED: " << strerror(errno) << std::endl;
+
+    int result = mkdir(resolved_path.c_str(), (mode_t)mode);
+    if (result == 0 || errno == EEXIST) {
+        s_created_dirs.insert(resolved_path);
+        result = 0;
     }
     emu->set_reg(0, (uint32_t)result);
 }
@@ -4235,7 +4241,7 @@ void bridge_gl_tex_image_2d(void* emu_ptr) {
         // Video background: register texture if a .mp4 video version exists
         if (g_last_opened_asset_arm32[0] != '\0') {
             VideoBackground::register_texture_maybe(
-                g_frame_stats.last_bound_texture, g_last_opened_asset_arm32, width, height);
+                g_frame_stats.last_bound_texture, g_last_opened_asset_arm32, width, height, pixels, format, type);
         }
     }
 }

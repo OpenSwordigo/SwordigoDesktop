@@ -23,7 +23,7 @@ void reset_void_fill_color(void);
 #endif
 
 namespace VideoBackground {
-    void register_texture_maybe(uint32_t tex_id, const std::string& asset_filename, int width, int height);
+    void register_texture_maybe(uint32_t tex_id, const std::string& asset_filename, int width, int height, const void* pixels, uint32_t format, uint32_t type);
     void update_texture_maybe(uint32_t tex_id);
     void cleanup();
 }

@@ -3,7 +3,7 @@
 
 CXX     := g++
 CC      := gcc
-CXXFLAGS := -std=c++17 -g -O3 -Isrc -Isrc/imgui -Isrc/sre/lua/src -Iinclude -Isrc/stb -MMD -MP
+CXXFLAGS := -std=c++17 -g -O3 -Isrc -Isrc/imgui -Isrc/sre/lua/src -Iinclude -Isrc/stb -DVULKAN_BACKEND -MMD -MP
 CFLAGS   := -g -O3 -Isrc -Isrc/sre/lua/src -Iinclude -MMD -MP
 
 # pkg-config queries
@@ -36,6 +36,22 @@ LIBS += -L$(DYNARMIC_BUILD)/src/dynarmic -ldynarmic \
         -L$(DYNARMIC_BUILD)/externals/fmt -lfmt \
         -L$(DYNARMIC_BUILD)/externals/zydis -lZydis \
         -L$(DYNARMIC_BUILD)/externals/zydis/zycore -lZycore
+
+# ========== Local Static FFmpeg Integration (Compulsory) ==========
+FFMPEG_DIR   := src/tools/ffmpeg
+FFMPEG_BUILD := $(FFMPEG_DIR)/build
+
+# Only check for static FFmpeg libs if we are NOT building ffmpeg-build or running clean
+ifneq ($(MAKECMDGOALS),ffmpeg-build)
+ifneq ($(MAKECMDGOALS),clean)
+ifeq ($(wildcard $(FFMPEG_BUILD)/lib/libavcodec.a),)
+$(error Local static FFmpeg libraries not found in $(FFMPEG_BUILD)/lib/. Please run 'make ffmpeg-build' first to compile the local FFmpeg source tree)
+endif
+endif
+endif
+
+ALL_CXXFLAGS += -I$(FFMPEG_BUILD)/include
+LIBS += -L$(FFMPEG_BUILD)/lib -lavformat -lavcodec -lswscale -lavutil
 
 # Source files
 CXX_SRCS := \
@@ -75,7 +91,9 @@ CXX_SRCS := \
     src/imgui/imgui_tables.cpp \
     src/imgui/imgui_widgets.cpp \
     src/imgui/backends/imgui_impl_sdl3.cpp \
-    src/imgui/backends/imgui_impl_opengl3.cpp
+    src/imgui/backends/imgui_impl_opengl3.cpp \
+    src/imgui/backends/imgui_impl_vulkan.cpp \
+    src/platform/vulkan_backend.cpp
 
 # Unconditionally include Dynarmic backend
 CXX_SRCS += src/platform/emulator_dynarmic64.cpp
@@ -169,6 +187,7 @@ SRE_CORE_SRCS := \
     src/sre/sre_mod.c \
     src/sre/sre_config.c \
     src/sre/sre_caver.c \
+    src/sre/sre_features.c \
     src/sre/toml-c/toml.c \
     src/sre/luafilesystem/src/lfs.c \
     src/sre/luasocket/src/auxiliar.c \
@@ -302,7 +321,7 @@ build/%.o: src/%.c
 clean:
 	rm -rf build swordigo_boot libsre.so ruby
 
-.PHONY: all clean install-sre ruby dynarmic-build dynarmic-clean
+.PHONY: all clean install-sre ruby dynarmic-build dynarmic-clean ffmpeg-build ffmpeg-clean
 
 # ========== Dynarmic Build from Source ==========
 # Run this ONCE before building with DYNARMIC=1
@@ -324,3 +343,44 @@ dynarmic-build:
 
 dynarmic-clean:
 	rm -rf $(DYNARMIC_BUILD)
+
+# ========== Local FFmpeg Static Build ==========
+ffmpeg-build:
+	@echo "[FFMPEG] Configuring and building local FFmpeg..."
+	@mkdir -p $(FFMPEG_BUILD)
+	@cd $(FFMPEG_DIR) && ./configure \
+		--prefix=build \
+		--enable-static \
+		--disable-shared \
+		--disable-all \
+		--enable-avformat \
+		--enable-avcodec \
+		--enable-swscale \
+		--enable-decoder=h264 \
+		--enable-demuxer=mov \
+		--enable-parser=h264 \
+		--enable-protocols \
+		--enable-protocol=file \
+		--disable-programs \
+		--disable-doc \
+		--disable-avdevice \
+		--disable-avfilter \
+		--disable-swresample \
+		--disable-libdrm \
+		--disable-vulkan \
+		--disable-hwaccels \
+		--disable-network \
+		--disable-iconv \
+		--disable-bzlib \
+		--disable-libxcb \
+		--disable-lzma \
+		--disable-sdl2 \
+		--disable-xlib \
+		--disable-zlib
+	@cd $(FFMPEG_DIR) && make -j$$(nproc) && make install
+	@echo "[FFMPEG] Build successful!"
+
+ffmpeg-clean:
+	@echo "[FFMPEG] Cleaning local FFmpeg build..."
+	-@cd $(FFMPEG_DIR) && make distclean
+	rm -rf $(FFMPEG_BUILD)

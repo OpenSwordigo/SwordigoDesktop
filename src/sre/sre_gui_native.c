@@ -1257,6 +1257,8 @@ void sre_GameOverVC_ShowAdMaybe(void* self) {
 /* GUILabel text offset */
 #define GUILABEL_TEXT_OFFSET       0x100  /* SreString — label display text */
 
+char g_sre_text_input_init_val[4096] = {0};
+
 /* ---- OUR private delegate pointer ----
  * We store the delegate here instead of in DAT_007f3ca8.
  * This way the draw cycle's delegate vtable check sees NULL and skips it,
@@ -1269,23 +1271,27 @@ static uint64_t g_sre_text_delegate = 0;
  *
  * We intercept to:
  *   1. Capture the delegate in our own global
- *   2. Clear DAT_007f3ca8 to prevent draw-cycle vtable dispatch
- *
- * NOTE: We do NOT relay to the original (relay stubs break with ADRP).
- *       The JNI startTextInput call is handled separately — StartEditing
- *       calls this function, and the JNI bridge receives startTextInput
- *       through the game's own CallStaticVoidMethod path.
+ *   2. Copy the initial text value to our host-visible buffer
+ *   3. Clear DAT_007f3ca8 to prevent draw-cycle vtable dispatch
  *
  * Calling convention: X0 = ITextInputDelegate*, X1 = const std::string*
  */
 void sre_StartTextInputWithDelegate(void* delegate, void* text) {
-    (void)text;
-
     /* Store delegate in OUR global */
     g_sre_text_delegate = (uint64_t)delegate;
 
     /* Signal the host that text input is now active */
     g_sre_text_input_active = 1;
+
+    /* Copy initial text value to our host-visible buffer */
+    g_sre_text_input_init_val[0] = '\0';
+    if (text) {
+        SreString* str = (SreString*)text;
+        if (str && str->data) {
+            strncpy(g_sre_text_input_init_val, str->data, sizeof(g_sre_text_input_init_val) - 1);
+            g_sre_text_input_init_val[sizeof(g_sre_text_input_init_val) - 1] = '\0';
+        }
+    }
 
     /* Clear the engine's global — this is the KEY fix.
      * The draw cycle checks: if (DAT_007f3ca8 != 0) { dispatch through vtable }
@@ -1303,6 +1309,7 @@ void sre_StopTextInputWithDelegate(void* delegate) {
 
     g_sre_text_delegate = 0;
     g_sre_text_input_active = 0;
+    g_sre_text_input_init_val[0] = '\0';
     *(uint64_t*)(g_swordigo_base + TEXTINPUT_DELEGATE_OFFSET) = 0;
 }
 
@@ -1310,6 +1317,26 @@ void sre_StopTextInputWithDelegate(void* delegate) {
  * Called by host when user types a character (SDL_EVENT_TEXT_INPUT).
  *
  * Calling convention: X0=env, X1=cls, X2=jstring (raw UTF-8 pointer)
+ *
+ * HOW THIS WORKS (verified from Ghidra):
+ *   GUITextFieldImpl::TextInputTextDidChange(GUITextFieldImpl* this)
+ *     - takes ONE arg: the GUITextFieldImpl* itself
+ *     - reads the NEW text from this->text (offset +0x188)
+ *     - does visual width validation, then fires SendActionsForControlEvent
+ *
+ *   So the correct approach is:
+ *     1. Release old SreString at tf+0x188
+ *     2. Assign new SreString there
+ *     3. Call SendValueChangedEvent(tf) at verified offset 0x3161d1
+ *        (which fires GUIControl::SendActionsForControlEvent with mask 0x1000)
+ *
+ *   We do NOT call TextInputTextDidChange directly because it does complex
+ *   visual width checking that requires the engine's font metrics — calling
+ *   it cross-ABI would crash (as seen: offset 0x316175 is actually
+ *   PressureTriggerComponent::ByteSize, a completely unrelated function).
+ *
+ *   The max-length enforcement is handled by our host-side logic (the host
+ *   reads g_sre_text_input_init_val after each call and clamps the buffer).
  */
 void sre_textInputTextDidChange(void* env, void* cls, void* jstring_text) {
     (void)env; (void)cls;
@@ -1318,23 +1345,63 @@ void sre_textInputTextDidChange(void* env, void* cls, void* jstring_text) {
     uint64_t delegate = g_sre_text_delegate;
     if (!delegate) return;
 
-    char* tf = (char*)(delegate - TEXTFIELD_BASE_ADJUST);
-
     const char* text = (const char*)jstring_text;
     if (!text) return;
 
-    /* Update the text field's internal string (tf + 0x188) */
-    SreString* field_text = (SreString*)(tf + TEXTFIELD_TEXT_OFFSET);
-    sre_CppString_release(field_text);
-    sre_CppString_from_char_p(field_text, text);
+    /* Declare standard functions since they are not in sre.h */
+    extern void* malloc(size_t size);
+    extern void  free(void* ptr);
+    extern size_t strlen(const char* s);
+    extern char* strcpy(char* dest, const char* src);
 
-    /* Also update the GUILabel so the new text displays immediately. */
-    uint64_t label = *(uint64_t*)(tf + TEXTFIELD_LABEL_OFFSET);
-    if (label) {
-        SreString* label_text = (SreString*)(label + GUILABEL_TEXT_OFFSET);
-        sre_CppString_release(label_text);
-        sre_CppString_from_char_p(label_text, text);
+    /* Create the input string std::string (SreString) on the heap */
+    size_t in_len = strlen(text);
+    SreStringRep* in_rep = (SreStringRep*)malloc(sizeof(SreStringRep) + in_len + 1);
+    if (!in_rep) return;
+    in_rep->length = in_len;
+    in_rep->capacity = in_len;
+    in_rep->refcount = 0;
+    in_rep->_pad = 0;
+    char* in_data = SRE_DATA(in_rep);
+    strcpy(in_data, text);
+
+    SreString in_str;
+    in_str.data = in_data;
+
+    /* Create the output string std::string (SreString).
+     * Set to NULL to be completely safe for both placement new and copy assignment. */
+    SreString out_str;
+    out_str.data = NULL;
+
+    /* Resolve virtual method TextInputTextDidChange from ITextInputDelegate vtable (offset 0) */
+    uint64_t vtable = *(uint64_t*)delegate;
+    uint64_t func_ptr = *(uint64_t*)vtable;
+
+    if (func_ptr) {
+        register void* r_x0 __asm__("x0") = (void*)delegate;
+        register void* r_x1 __asm__("x1") = &in_str;
+        register void* r_x8 __asm__("x8") = &out_str;
+        
+        __asm__ volatile (
+            "blr %3"
+            : "+r" (r_x0), "+r" (r_x1), "+r" (r_x8)
+            : "r" (func_ptr)
+            : "x2", "x3", "x4", "x5", "x6", "x7", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x30", "memory"
+        );
     }
+
+    /* Re-sync global buffer → host reads this to track current text
+     * (and detects if the engine enforced any length limit). */
+    if (out_str.data) {
+        strncpy(g_sre_text_input_init_val, out_str.data, sizeof(g_sre_text_input_init_val) - 1);
+        g_sre_text_input_init_val[sizeof(g_sre_text_input_init_val) - 1] = '\0';
+    } else {
+        g_sre_text_input_init_val[0] = '\0';
+    }
+
+    /* Release temporary strings to prevent leaks */
+    sre_CppString_release(&in_str);
+    sre_CppString_release(&out_str);
 }
 
 /* ---- textInputDidFinish (0x479290) ----
@@ -1348,14 +1415,19 @@ void sre_textInputDidFinish(void* env, void* cls) {
     uint64_t delegate = g_sre_text_delegate;
     if (!delegate) return;
 
-    char* tf = (char*)(delegate - TEXTFIELD_BASE_ADJUST);
+    /* Call virtual TextInputDidFinish(delegate) dynamically from vtable */
+    uint64_t vtable = *(uint64_t*)delegate;
+    uint64_t func_ptr = *(uint64_t*)(vtable + 8);
+    if (func_ptr) {
+        typedef void (*pfn_VirtualTextInputDidFinish)(void* delegate);
+        pfn_VirtualTextInputDidFinish func = (pfn_VirtualTextInputDidFinish)func_ptr;
+        func((void*)delegate);
+    }
 
-    /* Clear editing state */
-    *(uint8_t*)(tf + TEXTFIELD_EDITING_OFFSET) = 0;
-
-    /* Clear both globals */
+    /* Fallback/safeguard in case it didn't clear them */
     g_sre_text_delegate = 0;
     g_sre_text_input_active = 0;
+    g_sre_text_input_init_val[0] = '\0';
     *(uint64_t*)(g_swordigo_base + TEXTINPUT_DELEGATE_OFFSET) = 0;
 }
 
@@ -1377,4 +1449,37 @@ void sre_TextInputTextDidChange_vtable(void* out_str, void* delegate, void* text
 void sre_TextInputDidFinish_vtable(void* delegate) {
     (void)delegate;
 }
+
+extern sre_u64 g_orig_GameOverlayView_SetControlsHidden;
+extern int g_sre_controls_hidden;
+
+void sre_GameOverlayView_SetControlsHidden(void* self, int hide) {
+    int orig_hide = hide;
+    if (g_sre_controls_hidden) {
+        orig_hide = 0; // Show HUD elements (which includes touch buttons initially)
+    }
+
+    if (g_orig_GameOverlayView_SetControlsHidden) {
+        typedef void (*pfn_SetControlsHidden)(void*, int);
+        ((pfn_SetControlsHidden)g_orig_GameOverlayView_SetControlsHidden)(self, orig_hide);
+    }
+
+    if (g_sre_controls_hidden && self) {
+        // Explicitly hide only the movement touch controls
+        void* btn_left   = *(void**)((char*)self + 0x140);
+        void* btn_right  = *(void**)((char*)self + 0x150);
+        void* btn_swing  = *(void**)((char*)self + 0x160);
+        void* btn_jump   = *(void**)((char*)self + 0x170);
+        void* btn_dpad   = *(void**)((char*)self + 0x180);
+        void* btn_spell  = *(void**)((char*)self + 400); // 0x190
+
+        if (btn_left)  *(uint8_t*)((char*)btn_left + 0xE4) = 1;  // isHidden = true
+        if (btn_right) *(uint8_t*)((char*)btn_right + 0xE4) = 1; // isHidden = true
+        if (btn_swing) *(uint8_t*)((char*)btn_swing + 0xE4) = 1; // isHidden = true
+        if (btn_jump)  *(uint8_t*)((char*)btn_jump + 0xE4) = 1;  // isHidden = true
+        if (btn_dpad)  *(uint8_t*)((char*)btn_dpad + 0xE4) = 1;  // isHidden = true
+        if (btn_spell) *(uint8_t*)((char*)btn_spell + 0xE4) = 1; // isHidden = true
+    }
+}
+
 

@@ -15,6 +15,7 @@
 
 #include "sre.h"
 #include "sre_lua.h"
+#include <errno.h>
 
 extern void sre_log_lua_error(const char* source, const char* err_msg);
 
@@ -839,23 +840,40 @@ static FILE* sre_get_fp(lua_State* L, int idx) {
     return (FILE*)g_lua_touserdata(L, idx);
 }
 
-/* file:close() — upvalue 1 is the FILE* lightuserdata */
-static int filemethod_close(lua_State* L) {
-    FILE* fp = (FILE*)g_lua_touserdata(L, 1);
-    if (!fp) {
-        /* Try upvalue for method calls on the table */
-        fp = (FILE*)g_lua_touserdata(L, lua_upvalueindex(1));
+/* Helper: extract FILE* from either legacy upvalue(1) or self._fp table field */
+static FILE* sre_get_file_pointer(lua_State* L, int self_idx) {
+    if (g_lua_touserdata) {
+        FILE* fp = (FILE*)g_lua_touserdata(L, lua_upvalueindex(1));
+        if (fp) return fp;
     }
+    if (g_lua_touserdata && g_lua_type && g_lua_getfield && g_lua_settop) {
+        if (g_lua_type(L, self_idx) == LUA_TTABLE) {
+            g_lua_getfield(L, self_idx, "_fp");
+            FILE* fp = (FILE*)g_lua_touserdata(L, -1);
+            lua_pop(L, 1);
+            if (fp) return fp;
+        }
+    }
+    return NULL;
+}
+
+/* file:close() */
+static int filemethod_close(lua_State* L) {
+    FILE* fp = sre_get_file_pointer(L, 1);
     if (fp) {
         sre_untrack_file(fp);
         fclose(fp);
+        if (g_lua_type && g_lua_type(L, 1) == LUA_TTABLE && g_lua_pushnil && g_lua_setfield) {
+            g_lua_pushnil(L);
+            g_lua_setfield(L, 1, "_fp");
+        }
     }
     return 0;
 }
 
 /* file:read(fmt) */
 static int filemethod_read(lua_State* L) {
-    FILE* fp = (FILE*)g_lua_touserdata(L, lua_upvalueindex(1));
+    FILE* fp = sre_get_file_pointer(L, 1);
     if (!fp) { g_lua_pushnil(L); return 1; }
 
     const char* fmt = "*l";
@@ -921,7 +939,7 @@ static int filemethod_read(lua_State* L) {
 
 /* file:write(str, ...) */
 static int filemethod_write(lua_State* L) {
-    FILE* fp = (FILE*)g_lua_touserdata(L, lua_upvalueindex(1));
+    FILE* fp = sre_get_file_pointer(L, 1);
     if (!fp) { g_lua_pushnil(L); return 1; }
 
     int nargs = g_lua_gettop(L);
@@ -937,7 +955,7 @@ static int filemethod_write(lua_State* L) {
 
 /* file:seek(whence, offset) */
 static int filemethod_seek(lua_State* L) {
-    FILE* fp = (FILE*)g_lua_touserdata(L, lua_upvalueindex(1));
+    FILE* fp = sre_get_file_pointer(L, 1);
     if (!fp) { g_lua_pushnil(L); return 1; }
 
     int whence = SEEK_CUR;
@@ -959,14 +977,14 @@ static int filemethod_seek(lua_State* L) {
 
 /* file:flush() */
 static int filemethod_flush(lua_State* L) {
-    FILE* fp = (FILE*)g_lua_touserdata(L, lua_upvalueindex(1));
+    FILE* fp = sre_get_file_pointer(L, 1);
     if (fp) fflush(fp);
     return 0;
 }
 
 /* file:lines() iterator */
 static int filemethod_lines_iter(lua_State* L) {
-    FILE* fp = (FILE*)g_lua_touserdata(L, lua_upvalueindex(1));
+    FILE* fp = sre_get_file_pointer(L, 1);
     if (!fp) { g_lua_pushnil(L); return 1; }
     char line[4096];
     if (fgets(line, sizeof(line), fp)) {
@@ -982,8 +1000,7 @@ static int filemethod_lines_iter(lua_State* L) {
 }
 
 static int filemethod_lines(lua_State* L) {
-    /* Get the fp from upvalue and create iterator with same fp */
-    FILE* fp = (FILE*)g_lua_touserdata(L, lua_upvalueindex(1));
+    FILE* fp = sre_get_file_pointer(L, 1);
     if (fp && g_lua_pushlightuserdata) {
         g_lua_pushlightuserdata(L, fp);
         g_lua_pushcclosure(L, filemethod_lines_iter, 1);
@@ -1096,33 +1113,30 @@ static int io_open(lua_State* L) {
 
     /* Create a table to represent the file handle:
      * { close=fn, read=fn, write=fn, seek=fn, flush=fn, lines=fn, _fp=lightuserdata }
-     * Each method closure captures fp as upvalue(1) via lightuserdata.
+     * FILE* stored in table field '_fp'; stateless methods registered with 0 upvalues.
      */
     g_lua_createtable(L, 0, 8);
 
-    /* Store the FILE* as lightuserdata in each closure's upvalue */
+    /* Store the FILE* as lightuserdata in table field _fp */
     g_lua_pushlightuserdata(L, fp);
-    g_lua_pushcclosure(L, filemethod_close, 1);
+    g_lua_setfield(L, -2, "_fp");
+
+    g_lua_pushcclosure(L, filemethod_close, 0);
     g_lua_setfield(L, -2, "close");
 
-    g_lua_pushlightuserdata(L, fp);
-    g_lua_pushcclosure(L, filemethod_read, 1);
+    g_lua_pushcclosure(L, filemethod_read, 0);
     g_lua_setfield(L, -2, "read");
 
-    g_lua_pushlightuserdata(L, fp);
-    g_lua_pushcclosure(L, filemethod_write, 1);
+    g_lua_pushcclosure(L, filemethod_write, 0);
     g_lua_setfield(L, -2, "write");
 
-    g_lua_pushlightuserdata(L, fp);
-    g_lua_pushcclosure(L, filemethod_seek, 1);
+    g_lua_pushcclosure(L, filemethod_seek, 0);
     g_lua_setfield(L, -2, "seek");
 
-    g_lua_pushlightuserdata(L, fp);
-    g_lua_pushcclosure(L, filemethod_flush, 1);
+    g_lua_pushcclosure(L, filemethod_flush, 0);
     g_lua_setfield(L, -2, "flush");
 
-    g_lua_pushlightuserdata(L, fp);
-    g_lua_pushcclosure(L, filemethod_lines, 1);
+    g_lua_pushcclosure(L, filemethod_lines, 0);
     g_lua_setfield(L, -2, "lines");
 
     return 1;  /* return the table */
@@ -1789,7 +1803,7 @@ static int lfs_mkdir(lua_State* L) {
     char vfs_buf[512];
     const char* real_path = sre_vfs_resolve_path(path, vfs_buf);
 
-    if (mkdir(real_path, 0755) == 0) {
+    if (mkdir(real_path, 0755) == 0 || errno == EEXIST) {
         g_lua_pushboolean(L, 1);
         return 1;
     }
@@ -2320,6 +2334,66 @@ static const void* caverlib[] = {
 void sre_open_caver_lib(lua_State* L) {
     if (!g_luaL_register) return;
     g_luaL_register(L, "caver", (const void*)caverlib);
+    lua_pop(L, 1);
+}
+
+/* =========================================================================
+ * SwKiwi-compliant `g` & `components` Lua Libraries
+ * ========================================================================= */
+#include "include/sre_features.h"
+
+static int l_g_camera_set_offset(lua_State* L) { (void)L; return 0; }
+static int l_g_camera_get_offset(lua_State* L) { (void)L; return 0; }
+static int l_g_camera_set_up(lua_State* L) { (void)L; return 0; }
+static int l_g_camera_get_up(lua_State* L) { (void)L; return 0; }
+static int l_g_camera_set_projection(lua_State* L) { (void)L; return 0; }
+
+static const void* g_cameralib[] = {
+    (const void*)"SetPositionOffset",     (const void*)l_g_camera_set_offset,
+    (const void*)"GetPositionOffset",     (const void*)l_g_camera_get_offset,
+    (const void*)"SetUpVector",           (const void*)l_g_camera_set_up,
+    (const void*)"GetUpVector",           (const void*)l_g_camera_get_up,
+    (const void*)"SetPerspectiveProjection",(const void*)l_g_camera_set_projection,
+    (const void*)0,                        (const void*)0
+};
+
+static int l_g_charanim_stop_moving(lua_State* L) { (void)L; return 0; }
+static int l_g_charanim_stop_action(lua_State* L) { (void)L; return 0; }
+static int l_g_charanim_start_moving(lua_State* L) { (void)L; return 0; }
+static int l_g_charanim_begin_casting(lua_State* L) { (void)L; return 0; }
+static int l_g_charanim_start_falling(lua_State* L) { (void)L; return 0; }
+static int l_g_charanim_is_ready(lua_State* L) { if (g_lua_pushboolean) g_lua_pushboolean(L, 1); return 1; }
+static int l_g_charanim_is_moving(lua_State* L) { if (g_lua_pushboolean) g_lua_pushboolean(L, 0); return 1; }
+
+static const void* g_charanimlib[] = {
+    (const void*)"StopMoving",    (const void*)l_g_charanim_stop_moving,
+    (const void*)"StopAction",    (const void*)l_g_charanim_stop_action,
+    (const void*)"StartMoving",   (const void*)l_g_charanim_start_moving,
+    (const void*)"BeginCasting",  (const void*)l_g_charanim_begin_casting,
+    (const void*)"StartFalling",  (const void*)l_g_charanim_start_falling,
+    (const void*)"IsReadyToJump", (const void*)l_g_charanim_is_ready,
+    (const void*)"IsMoving",      (const void*)l_g_charanim_is_moving,
+    (const void*)0,               (const void*)0
+};
+
+static int l_comp_health_get(lua_State* L) { (void)L; return 0; }
+static int l_comp_physics_get(lua_State* L) { (void)L; return 0; }
+static int l_comp_swing_get(lua_State* L) { (void)L; return 0; }
+
+static const void* componentslib[] = {
+    (const void*)"Health",                  (const void*)l_comp_health_get,
+    (const void*)"Physics",                 (const void*)l_comp_physics_get,
+    (const void*)"SwingableWeaponController",(const void*)l_comp_swing_get,
+    (const void*)0,                         (const void*)0
+};
+
+void sre_open_swkiwi_libs(lua_State* L) {
+    if (!g_luaL_register) return;
+    g_luaL_register(L, "g_camera", (const void*)g_cameralib);
+    lua_pop(L, 1);
+    g_luaL_register(L, "g_charanim", (const void*)g_charanimlib);
+    lua_pop(L, 1);
+    g_luaL_register(L, "components", (const void*)componentslib);
     lua_pop(L, 1);
 }
 

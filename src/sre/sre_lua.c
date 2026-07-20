@@ -18,8 +18,18 @@
  * Based on SwMini's panic.c by Ijsd (itsjustsomedude).
  */
 
+#include "lua.h"
+#include "lstate.h"
+#include "lfunc.h"
+#include "ldo.h"
+extern int pthread_mutex_lock(void *mutex);
+extern int pthread_mutex_unlock(void *mutex);
+extern void *g_lua_mutex_ptr;
+#define g_lua_mutex (*(char*)g_lua_mutex_ptr)
+
 #include "sre.h"
 #include "sre_lua.h"
+#include "sre_caver.h"
 
 extern uint64_t g_swordigo_base;
 
@@ -45,6 +55,7 @@ pfn_lua_toboolean   g_lua_toboolean = 0;
 pfn_lua_type        g_lua_type = 0;
 pfn_luaL_register   g_luaL_register = 0;
 pfn_lua_touserdata  g_lua_touserdata = 0;
+pfn_lua_topointer   g_lua_topointer = 0;
 pfn_lua_pushlightuserdata g_lua_pushlightuserdata = 0;
 pfn_lua_error       g_lua_error = 0;
 
@@ -77,6 +88,7 @@ typedef struct {
     sre_u64 lua_touserdata;
     sre_u64 lua_pushlightuserdata;
     sre_u64 lua_error;
+    sre_u64 lua_topointer;
     sre_u64 getSpeedMultiplier;
 } SreLuaAddrs;
 
@@ -104,6 +116,7 @@ void sre_init_lua(SreLuaAddrs* addrs) {
     g_lua_type        = (pfn_lua_type)addrs->lua_type;
     g_luaL_register   = (pfn_luaL_register)addrs->luaL_register;
     g_lua_touserdata  = (pfn_lua_touserdata)addrs->lua_touserdata;
+    g_lua_topointer   = (pfn_lua_topointer)addrs->lua_topointer;
     g_lua_pushlightuserdata = (pfn_lua_pushlightuserdata)addrs->lua_pushlightuserdata;
     g_lua_error       = (pfn_lua_error)addrs->lua_error;
     g_getSpeedMultiplier = (pfn_getSpeedMultiplier)addrs->getSpeedMultiplier;
@@ -300,15 +313,17 @@ void sre_lua_call_safe(lua_State* L, int nargs, int nresults) {
         return;
     }
 
+    pthread_mutex_lock(&g_lua_mutex);
+
     /* Lazy Mini.* injection — injects on first call per lua_State */
     extern void sre_mini_ensure_injected(lua_State* L);
     sre_mini_ensure_injected(L);
     
-    /* Save stack top for recovery */
-    int saved_top = 0;
-    if (g_lua_gettop) {
-        saved_top = g_lua_gettop(L);
-    }
+    /* Save Lua VM state for recovery */
+    CallInfo* saved_ci = L->ci;
+    StkId saved_top = L->top;
+    StkId saved_base = L->base;
+    unsigned short saved_nCcalls = L->nCcalls;
     
     /* Push recovery entry */
     int my_depth = recovery_push(L);
@@ -316,6 +331,7 @@ void sre_lua_call_safe(lua_State* L, int nargs, int nresults) {
         /* Stack full — fall through to raw pcall without recovery */
         int result = g_lua_pcall(L, nargs, nresults, 0);
         if (result != 0 && g_lua_settop) g_lua_settop(L, -2);
+        pthread_mutex_unlock(&g_lua_mutex);
         return;
     }
     
@@ -323,14 +339,21 @@ void sre_lua_call_safe(lua_State* L, int nargs, int nresults) {
         /* Caught C++ exception via longjmp from sre_cxa_throw!
          * errorJmp was already restored by sre_cxa_throw. */
         recovery_pop(my_depth);
+        pthread_mutex_unlock(&g_lua_mutex);
         g_lua_call_safe_errors++;
-        /* Note: error message not available via longjmp path */
         g_sre_lua_error_count++;
         
-        /* Restore Lua stack to pre-call state (BUG 3 FIX: guard against underflow) */
-        int new_top = saved_top - (nargs + 1);
-        if (g_lua_settop && new_top >= 0) {
-            g_lua_settop(L, new_top);
+        /* ─── Lua VM State Recovery ─────────────────────────────────── */
+        luaF_close(L, saved_top);
+        L->ci = saved_ci;
+        L->top = saved_top;
+        L->base = saved_base;
+        L->nCcalls = saved_nCcalls;
+        
+        /* Pop function and arguments */
+        StkId new_top = saved_top - (nargs + 1);
+        if (new_top >= L->stack) {
+            L->top = new_top;
         }
         
         /* Push nils for expected return values */
@@ -372,6 +395,7 @@ void sre_lua_call_safe(lua_State* L, int nargs, int nresults) {
             }
         }
     }
+    pthread_mutex_unlock(&g_lua_mutex);
 }
 
 /* ========== sre_lua_resume_safe — PROTECTED lua_resume wrapper ==========
@@ -418,10 +442,20 @@ int sre_lua_resume_safe(lua_State* L, int narg) {
         return 2;  /* LUA_ERRRUN */
     }
 
+    pthread_mutex_lock(&g_lua_mutex);
+
+    /* Save Lua VM state for recovery */
+    CallInfo* saved_ci = L->ci;
+    StkId saved_top = L->top;
+    StkId saved_base = L->base;
+    unsigned short saved_nCcalls = L->nCcalls;
+
     int my_depth = recovery_push(L);
     if (my_depth < 0) {
         /* Recovery stack full — call without protection (fallback) */
-        return g_lua_resume(L, narg);
+        int result = g_lua_resume(L, narg);
+        pthread_mutex_unlock(&g_lua_mutex);
+        return result;
     }
 
     if (sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
@@ -429,10 +463,19 @@ int sre_lua_resume_safe(lua_State* L, int narg) {
          * The coroutine threw a Lua error during resume.
          * errorJmp was already restored by sre_cxa_throw. */
         recovery_pop(my_depth);
+        pthread_mutex_unlock(&g_lua_mutex);
         g_lua_resume_safe_errors++;
         g_sre_resume_err_count++;
         /* Try to get the error message from the Lua stack */
         capture_lua_error(L);
+
+        /* ─── Lua VM State Recovery ─────────────────────────────────── */
+        luaF_close(L, saved_top);
+        L->ci = saved_ci;
+        L->top = saved_top;
+        L->base = saved_base;
+        L->nCcalls = saved_nCcalls;
+
         return 2;  /* LUA_ERRRUN */
     }
 
@@ -445,6 +488,7 @@ int sre_lua_resume_safe(lua_State* L, int narg) {
         capture_lua_error(L);
     }
 
+    pthread_mutex_unlock(&g_lua_mutex);
     return result;
 }
 /* ========== Lua Console — Remastered Backend ==========
@@ -504,128 +548,368 @@ static int sre_strcopy(char* dst, const char* src, int max) {
     return i;
 }
 
+#define SRE_SERIALIZE_MAX_DEPTH 10
+#define SRE_SERIALIZE_MAX_VISITED 32
+
+static void sre_append_str(char* buf, int* pos, int max, const char* str) {
+    if (!str) return;
+    int p = *pos;
+    while (*str && p < max - 1) {
+        buf[p++] = *str++;
+    }
+    buf[p] = '\0';
+    *pos = p;
+}
+
+static void sre_append_indent(char* buf, int* pos, int max, int indent) {
+    int p = *pos;
+    for (int i = 0; i < indent && p < max - 1; i++) {
+        buf[p++] = ' ';
+        if (p < max - 1) buf[p++] = ' ';
+    }
+    buf[p] = '\0';
+    *pos = p;
+}
+
+static void sre_escape_string(char* buf, int* pos, int max, const char* str, size_t len) {
+    sre_append_str(buf, pos, max, "\"");
+    int p = *pos;
+    for (size_t i = 0; i < len && p < max - 2; i++) {
+        unsigned char c = (unsigned char)str[i];
+        if (c == '"') {
+            buf[p++] = '\\'; buf[p++] = '"';
+        } else if (c == '\\') {
+            buf[p++] = '\\'; buf[p++] = '\\';
+        } else if (c == '\n') {
+            buf[p++] = '\\'; buf[p++] = 'n';
+        } else if (c == '\r') {
+            buf[p++] = '\\'; buf[p++] = 'r';
+        } else if (c == '\t') {
+            buf[p++] = '\\'; buf[p++] = 't';
+        } else if (c < 32 || c >= 127) {
+            char hex[8];
+            int hlen = snprintf(hex, sizeof(hex), "\\x%02X", c);
+            for (int k = 0; k < hlen && p < max - 1; k++) buf[p++] = hex[k];
+        } else {
+            buf[p++] = c;
+        }
+    }
+    buf[p] = '\0';
+    *pos = p;
+    sre_append_str(buf, pos, max, "\"");
+}
+
+static void sre_format_number(double num, char* out, size_t out_size) {
+    int64_t inum = (int64_t)num;
+    if ((double)inum == num) {
+        if (inum == 0) {
+            if (out_size > 1) { out[0] = '0'; out[1] = '\0'; }
+            return;
+        }
+        char temp[32];
+        int tpos = 0;
+        uint64_t abs_val = (inum < 0) ? (uint64_t)(-inum) : (uint64_t)inum;
+        while (abs_val > 0) {
+            temp[tpos++] = '0' + (char)(abs_val % 10);
+            abs_val /= 10;
+        }
+        if (inum < 0) temp[tpos++] = '-';
+        
+        size_t opos = 0;
+        while (tpos > 0 && opos < out_size - 1) {
+            out[opos++] = temp[--tpos];
+        }
+        out[opos] = '\0';
+    } else {
+        snprintf(out, out_size, "%.14g", num);
+    }
+}
+
+static void sre_format_pointer(const char* prefix, const void* ptr, char* out, size_t out_size) {
+    uintptr_t val = (uintptr_t)ptr;
+    if (val == 0) {
+        snprintf(out, out_size, "%s: 0x0>", prefix);
+        return;
+    }
+    char hex[20];
+    int hpos = 0;
+    while (val > 0) {
+        int d = (int)(val & 0xF);
+        hex[hpos++] = (d < 10) ? ('0' + d) : ('a' + (d - 10));
+        val >>= 4;
+    }
+    size_t pos = 0;
+    while (*prefix && pos < out_size - 1) out[pos++] = *prefix++;
+    if (pos < out_size - 4) {
+        out[pos++] = ':'; out[pos++] = ' '; out[pos++] = '0'; out[pos++] = 'x';
+    }
+    while (hpos > 0 && pos < out_size - 2) {
+        out[pos++] = hex[--hpos];
+    }
+    if (pos < out_size - 1) out[pos++] = '>';
+    out[pos] = '\0';
+}
+
+static void sre_serialize_value_recursive(lua_State* L, int idx, char* buf, int* pos, int max, int depth, const void** visited, int visited_count) {
+    if (depth > SRE_SERIALIZE_MAX_DEPTH) {
+        sre_append_str(buf, pos, max, "{...}");
+        return;
+    }
+
+    int top_before = g_lua_gettop(L);
+    int abs_idx = (idx < 0 && idx > LUA_GLOBALSINDEX) ? (top_before + idx + 1) : idx;
+    if (abs_idx < 1 || abs_idx > top_before) {
+        sre_append_str(buf, pos, max, "nil");
+        return;
+    }
+
+    int type = g_lua_type ? g_lua_type(L, abs_idx) : 0;
+
+    switch (type) {
+        case 0: /* LUA_TNIL */
+            sre_append_str(buf, pos, max, "nil");
+            break;
+        case 1: /* LUA_TBOOLEAN */
+            if (g_lua_toboolean && g_lua_toboolean(L, abs_idx)) {
+                sre_append_str(buf, pos, max, "true");
+            } else {
+                sre_append_str(buf, pos, max, "false");
+            }
+            break;
+        case 3: { /* LUA_TNUMBER */
+            char nbuf[64];
+            double num = g_lua_tonumber ? g_lua_tonumber(L, abs_idx) : 0.0;
+            sre_format_number(num, nbuf, sizeof(nbuf));
+            sre_append_str(buf, pos, max, nbuf);
+            break;
+        }
+        case 4: { /* LUA_TSTRING */
+            size_t slen = 0;
+            const char* str = g_lua_tolstring ? g_lua_tolstring(L, abs_idx, &slen) : NULL;
+            if (str) {
+                /* Cap output to 256 visible chars to guard against binary memory blobs */
+                size_t safe_len = slen;
+                if (safe_len > 256) safe_len = 256;
+                sre_escape_string(buf, pos, max, str, safe_len);
+                if (slen > 256) sre_append_str(buf, pos, max, "...");
+            } else {
+                sre_append_str(buf, pos, max, "\"\"");
+            }
+            break;
+        }
+        case 5: { /* LUA_TTABLE */
+            const void* ptr = g_lua_topointer ? g_lua_topointer(L, abs_idx) : NULL;
+            if (ptr) {
+                for (int v = 0; v < visited_count; v++) {
+                    if (visited[v] == ptr) {
+                        sre_append_str(buf, pos, max, "<circular>");
+                        g_lua_settop(L, top_before);
+                        return;
+                    }
+                }
+                if (visited_count < SRE_SERIALIZE_MAX_VISITED) {
+                    visited[visited_count] = ptr;
+                }
+            }
+
+            /* Single pass check if table is a pure array (1..N contiguous integer keys).
+             * NOTE: Swordigo's Lua allocator injects hidden engine-userdata entries into
+             * every table's hash part. lua_next exposes them. We MUST use array_len from
+             * lua_objlen (which reads the sequence part only) and rawgeti to stay safe.
+             */
+            size_t array_len = g_lua_objlen ? g_lua_objlen(L, abs_idx) : 0;
+
+            /* Count only Lua-visible integer keys 1..array_len in the sequence part.
+             * Don't walk the hash part at all for the is_pure_array decision — use
+             * objlen as ground truth for the sequence and check for any mixed keys. */
+            int has_non_seq_keys = 0;
+
+            if (g_lua_pushnil && g_lua_next) {
+                g_lua_pushnil(L);
+                while (g_lua_next(L, abs_idx) != 0) {
+                    int ktype = g_lua_type(L, -2);
+                    /* Only count non-integer or out-of-range keys as "non-sequence" */
+                    if (ktype != 3 /* LUA_TNUMBER */) {
+                        /* Non-numeric key: string (user field) or engine userdata.
+                         * Userdata keys are engine-private — treat them as non-sequence
+                         * but only flag mixed if it's a string (user-defined field). */
+                        if (ktype == 4 /* LUA_TSTRING */) {
+                            has_non_seq_keys = 1;
+                        }
+                        /* ktype==7 (userdata/engine): ignore — don't set has_non_seq_keys */
+                    } else {
+                        double k = g_lua_tonumber ? g_lua_tonumber(L, -2) : 0;
+                        /* Flag mixed if non-integer or outside 1..array_len */
+                        if (k < 1.0 || (double)(int64_t)k != k) {
+                            has_non_seq_keys = 1;
+                        } else {
+                            int64_t ki = (int64_t)k;
+                            if (array_len == 0 || ki > (int64_t)array_len) {
+                                has_non_seq_keys = 1;
+                            }
+                        }
+                    }
+                    lua_pop(L, 1);
+                }
+            }
+
+            if (array_len == 0 && !has_non_seq_keys) {
+                /* Completely empty table */
+                sre_append_str(buf, pos, max, "{}");
+                g_lua_settop(L, top_before);
+                return;
+            }
+
+            /* ---- Pure sequence table: use rawgeti to bypass hash/engine entries ---- */
+            if (array_len > 0 && !has_non_seq_keys) {
+                /* Compact inline: {1, 2, 3}  or  multi-line if long */
+                int multiline = (array_len > 6);
+                sre_append_str(buf, pos, max, "{");
+                if (multiline) sre_append_str(buf, pos, max, "\n");
+                for (size_t i = 1; i <= array_len; i++) {
+                    if (multiline) {
+                        sre_append_indent(buf, pos, max, depth + 1);
+                    } else if (i > 1) {
+                        sre_append_str(buf, pos, max, ", ");
+                    }
+                    if (g_lua_rawgeti) {
+                        g_lua_rawgeti(L, abs_idx, (int)i);
+                        sre_serialize_value_recursive(L, -1, buf, pos, max, depth + 1, visited, visited_count + 1);
+                        lua_pop(L, 1);
+                    }
+                    if (multiline && i < array_len) sre_append_str(buf, pos, max, ",\n");
+                }
+                if (multiline) {
+                    sre_append_str(buf, pos, max, "\n");
+                    sre_append_indent(buf, pos, max, depth);
+                }
+                sre_append_str(buf, pos, max, "}");
+            } else {
+                /* ---- Mixed table: sequence + string keys, skip engine userdata keys ---- */
+                sre_append_str(buf, pos, max, "{\n");
+                int first = 1;
+
+                /* First, emit array part via rawgeti (safe, bypasses engine entries) */
+                if (array_len > 0 && g_lua_rawgeti) {
+                    for (size_t i = 1; i <= array_len; i++) {
+                        if (!first) sre_append_str(buf, pos, max, ",\n");
+                        first = 0;
+                        sre_append_indent(buf, pos, max, depth + 1);
+                        char ikey[24];
+                        sre_format_number((double)i, ikey, sizeof(ikey));
+                        sre_append_str(buf, pos, max, "[");
+                        sre_append_str(buf, pos, max, ikey);
+                        sre_append_str(buf, pos, max, "] = ");
+                        g_lua_rawgeti(L, abs_idx, (int)i);
+                        sre_serialize_value_recursive(L, -1, buf, pos, max, depth + 1, visited, visited_count + 1);
+                        lua_pop(L, 1);
+                    }
+                }
+
+                /* Second, emit string-keyed fields only (skip userdata/engine keys) */
+                if (g_lua_pushnil && g_lua_next) {
+                    g_lua_pushnil(L);
+                    while (g_lua_next(L, abs_idx) != 0) {
+                        int ktype = g_lua_type(L, -2);
+
+                        /* SKIP: engine-injected non-string non-integer keys (userdata, etc) */
+                        if (ktype != 4 /* LUA_TSTRING */ && ktype != 3 /* LUA_TNUMBER */) {
+                            lua_pop(L, 1); /* pop value, key stays for next iteration */
+                            continue;
+                        }
+                        /* SKIP: integer keys 1..array_len (already emitted via rawgeti) */
+                        if (ktype == 3) {
+                            double k = g_lua_tonumber ? g_lua_tonumber(L, -2) : -1.0;
+                            int64_t ki = (int64_t)k;
+                            if ((double)ki == k && ki >= 1 && ki <= (int64_t)array_len) {
+                                lua_pop(L, 1);
+                                continue;
+                            }
+                        }
+
+                        if (!first) sre_append_str(buf, pos, max, ",\n");
+                        first = 0;
+                        sre_append_indent(buf, pos, max, depth + 1);
+
+                        /* Emit key — push copy to avoid mutating lua_next key at -2 */
+                        if (g_lua_pushvalue) g_lua_pushvalue(L, -2);
+                        if (ktype == 4 /* LUA_TSTRING */) {
+                            size_t klen = 0;
+                            const char* kstr = g_lua_tolstring ? g_lua_tolstring(L, -1, &klen) : NULL;
+                            int is_ident = (kstr && kstr[0] && !(kstr[0] >= '0' && kstr[0] <= '9'));
+                            for (size_t c = 0; is_ident && kstr && c < klen; c++) {
+                                char ch = kstr[c];
+                                if (!(ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')))
+                                    is_ident = 0;
+                            }
+                            if (is_ident && kstr) {
+                                sre_append_str(buf, pos, max, kstr);
+                            } else if (kstr) {
+                                sre_append_str(buf, pos, max, "[");
+                                sre_escape_string(buf, pos, max, kstr, klen);
+                                sre_append_str(buf, pos, max, "]");
+                            }
+                        } else {
+                            sre_append_str(buf, pos, max, "[");
+                            sre_serialize_value_recursive(L, -1, buf, pos, max, depth + 1, visited, visited_count + 1);
+                            sre_append_str(buf, pos, max, "]");
+                        }
+                        lua_pop(L, 1); /* pop key copy */
+
+                        sre_append_str(buf, pos, max, " = ");
+                        sre_serialize_value_recursive(L, -1, buf, pos, max, depth + 1, visited, visited_count + 1);
+                        lua_pop(L, 1); /* pop value */
+                    }
+                }
+                sre_append_str(buf, pos, max, "\n");
+                sre_append_indent(buf, pos, max, depth);
+                sre_append_str(buf, pos, max, "}");
+            }
+            break;
+        }
+        case 6: { /* LUA_TFUNCTION */
+            char fbuf[64];
+            const void* ptr = g_lua_topointer ? g_lua_topointer(L, abs_idx) : NULL;
+            sre_format_pointer("<function", ptr, fbuf, sizeof(fbuf));
+            sre_append_str(buf, pos, max, fbuf);
+            break;
+        }
+        case 2: /* LUA_TLIGHTUSERDATA */
+        case 7: { /* LUA_TUSERDATA */
+            char ubuf[64];
+            const void* ptr = g_lua_topointer ? g_lua_topointer(L, abs_idx) : (g_lua_touserdata ? g_lua_touserdata(L, abs_idx) : NULL);
+            sre_format_pointer("<userdata", ptr, ubuf, sizeof(ubuf));
+            sre_append_str(buf, pos, max, ubuf);
+            break;
+        }
+        case 8: { /* LUA_TTHREAD */
+            char tbuf[64];
+            const void* ptr = g_lua_topointer ? g_lua_topointer(L, abs_idx) : NULL;
+            sre_format_pointer("<thread", ptr, tbuf, sizeof(tbuf));
+            sre_append_str(buf, pos, max, tbuf);
+            break;
+        }
+        default:
+            sre_append_str(buf, pos, max, "<unknown>");
+            break;
+    }
+
+    g_lua_settop(L, top_before);
+}
+
 /* ---- join N stack values from base+1 to top into result ---- */
 static void sre_collect_returns(lua_State* L, int base) {
     int top = g_lua_gettop(L);
     int pos = 0;
     for (int i = base + 1; i <= top; i++) {
-        if (i > base + 1 && pos < CONSOLE_BUF_SIZE - 2) { g_lua_console_result[pos++] = '\t'; }
-        size_t len = 0;
-        const char* s = g_lua_tolstring(L, i, &len);
-        if (!s) {
-            /* try type name */
-            int t = g_lua_type(L, i);
-            if      (t == 0) { s = "nil";      len = 3; }
-            else if (t == 1) { s = "<bool>";   len = 6; }
-            else if (t == 5) { s = "<table>";  len = 7; }
-            else if (t == 2) { s = "<udata>";  len = 7; }
-            else             { s = "?";         len = 1; }
+        if (i > base + 1 && pos < CONSOLE_BUF_SIZE - 2) {
+            g_lua_console_result[pos++] = '\t';
         }
-        for (size_t j = 0; j < len && pos < CONSOLE_BUF_SIZE - 2; j++)
-            g_lua_console_result[pos++] = s[j];
+        const void* visited[SRE_SERIALIZE_MAX_VISITED] = {0};
+        sre_serialize_value_recursive(L, i, g_lua_console_result, &pos, CONSOLE_BUF_SIZE, 0, visited, 0);
     }
     g_lua_console_result[pos] = 0;
 }
-
-/* commented out coroutine console helpers to match old logic
-#define MAX_ACTIVE_COROUTINES 16
-typedef struct {
-    lua_State* co;
-    int is_active;
-    int report_result;
-} ConsoleCoroutine;
-
-static ConsoleCoroutine g_sre_console_coroutines[MAX_ACTIVE_COROUTINES] = {{0}};
-
-static void sre_add_console_coroutine(lua_State* co, int report_result) {
-    for (int i = 0; i < MAX_ACTIVE_COROUTINES; i++) {
-        if (!g_sre_console_coroutines[i].is_active) {
-            g_sre_console_coroutines[i].co = co;
-            g_sre_console_coroutines[i].is_active = 1;
-            g_sre_console_coroutines[i].report_result = report_result;
-            return;
-        }
-    }
-}
-
-static void sre_remove_coroutine_from_registry(lua_State* L, lua_State* co) {
-    if (!g_lua_getfield || !g_lua_type || !g_lua_pushthread || !g_lua_xmove || !g_lua_pushnil || !g_lua_settable || !g_lua_settop) return;
-    
-    int base = g_lua_gettop(L);
-    g_lua_getfield(L, LUA_GLOBALSINDEX, "__sre_active_coroutines");
-    if (g_lua_type(L, -1) != LUA_TNIL) {
-        g_lua_pushthread(co);
-        g_lua_xmove(co, L, 1);
-        g_lua_pushnil(L);
-        g_lua_settable(L, -3);
-    }
-    g_lua_settop(L, base);
-}
-
-void sre_tick_console_coroutines(lua_State* L) {
-    if (!g_lua_resume || !g_lua_gettop || !g_lua_xmove || !g_lua_tolstring || !g_lua_pushcclosure || !g_lua_setfield || !g_lua_getfield || !g_lua_settop) return;
-
-    for (int i = 0; i < MAX_ACTIVE_COROUTINES; i++) {
-        if (g_sre_console_coroutines[i].is_active) {
-            lua_State* co = g_sre_console_coroutines[i].co;
-
-            int base = g_lua_gettop(L);
-            g_lua_getfield(L, LUA_GLOBALSINDEX, "print");
-            g_lua_pushcclosure(L, sre_console_print, 0);
-            g_lua_setfield(L, LUA_GLOBALSINDEX, "print");
-
-            int r = g_lua_resume(co, 0);
-
-            g_lua_settop(L, base + 1);
-            g_lua_setfield(L, LUA_GLOBALSINDEX, "print");
-            g_lua_settop(L, base);
-
-            if (r == 0) {
-                g_sre_console_coroutines[i].is_active = 0;
-
-                if (g_sre_console_coroutines[i].report_result) {
-                    int nres = g_lua_gettop(co);
-                    if (nres > 0) {
-                        g_lua_xmove(co, L, nres);
-                        sre_collect_returns(L, g_lua_gettop(L) - nres);
-                        g_lua_settop(L, g_lua_gettop(L) - nres);
-                    }
-                    
-                    if (!g_lua_console_result[0] && g_lua_console_print_buf[0]) {
-                        int p_len = strlen(g_lua_console_print_buf);
-                        while (p_len > 0 && g_lua_console_print_buf[p_len - 1] == '\n') {
-                            g_lua_console_print_buf[p_len - 1] = 0;
-                            p_len--;
-                        }
-                        sre_strcopy(g_lua_console_result, g_lua_console_print_buf, CONSOLE_BUF_SIZE);
-                    }
-                    
-                    if (!g_lua_console_result[0]) {
-                        g_lua_console_result[0] = 'O';
-                        g_lua_console_result[1] = 'K';
-                        g_lua_console_result[2] = 0;
-                    }
-                    g_lua_console_status = 1;
-                }
-
-                sre_remove_coroutine_from_registry(L, co);
-            } else if (r != LUA_YIELD) {
-                g_sre_console_coroutines[i].is_active = 0;
-
-                if (g_sre_console_coroutines[i].report_result) {
-                    const char* err = g_lua_tolstring ? g_lua_tolstring(co, -1, 0) : "runtime error";
-                    if (err) sre_strcopy(g_lua_console_result, err, CONSOLE_BUF_SIZE);
-                    else     sre_strcopy(g_lua_console_result, "runtime error", CONSOLE_BUF_SIZE);
-                    g_lua_console_status = 2;
-                }
-
-                sre_remove_coroutine_from_registry(L, co);
-            }
-        }
-    }
-}
-*/
-
 
 static void sre_run_console(lua_State* L) {
     if (!g_lua_getfield || !g_lua_pcall || !g_lua_pushstring || !g_lua_gettop) {
@@ -742,6 +1026,8 @@ static void sre_run_console(lua_State* L) {
 void sre_ProgramState_Execute(void* self, int stackIndex) {
     lua_State* L = PS_GET(self, PS_LUA_STATE, lua_State*);
     
+    pthread_mutex_lock(&g_lua_mutex);
+
     /* Capture the lua_State for the host and console */
     g_sre_last_lua_state = L;
 
@@ -755,17 +1041,33 @@ void sre_ProgramState_Execute(void* self, int stackIndex) {
     }
 
     
+    /* Save Lua VM state for recovery */
+    CallInfo* saved_ci = L->ci;
+    StkId saved_top = L->top;
+    StkId saved_base = L->base;
+    unsigned short saved_nCcalls = L->nCcalls;
+    
     /* Push recovery entry */
     int my_depth = recovery_push(L);
     if (my_depth < 0) {
         /* Stack full — no recovery, just run */
         g_lua_pcall(L, stackIndex, 0, 0);
+        pthread_mutex_unlock(&g_lua_mutex);
         return;
     }
     
     if (sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
         /* C++ exception caught — errorJmp restored by sre_cxa_throw */
         recovery_pop(my_depth);
+        pthread_mutex_unlock(&g_lua_mutex);
+
+        /* ─── Lua VM State Recovery ─────────────────────────────────── */
+        luaF_close(L, saved_top);
+        L->ci = saved_ci;
+        L->top = saved_top;
+        L->base = saved_base;
+        L->nCcalls = saved_nCcalls;
+
         return;
     }
     
@@ -778,6 +1080,7 @@ void sre_ProgramState_Execute(void* self, int stackIndex) {
         recovery_pop(my_depth);
         
         if (result == 0) {
+            pthread_mutex_unlock(&g_lua_mutex);
             return;
         }
         
@@ -794,6 +1097,7 @@ void sre_ProgramState_Execute(void* self, int stackIndex) {
             PS_SET(self, PS_COMPLETED, char, 1);
         }
     }
+    pthread_mutex_unlock(&g_lua_mutex);
 }
 
 /* ========== ProgramState::Resume replacement ==========
@@ -802,6 +1106,8 @@ void sre_ProgramState_Execute(void* self, int stackIndex) {
 void sre_ProgramState_Resume(void* self, int stackIndex) {
     lua_State* L = PS_GET(self, PS_LUA_STATE, lua_State*);
 
+    pthread_mutex_lock(&g_lua_mutex);
+
     /* Lazy Mini.* injection for coroutine states */
     extern void sre_mini_ensure_injected(lua_State* L);
     sre_mini_ensure_injected(L);
@@ -809,17 +1115,32 @@ void sre_ProgramState_Resume(void* self, int stackIndex) {
     /* Clear suspended flag */
     PS_SET(self, PS_IS_SUSPENDED, int, 0);
     
-    /* Push recovery entry */
+    /* Save Lua VM state for recovery */
+    CallInfo* saved_ci = L->ci;
+    StkId saved_top = L->top;
+    StkId saved_base = L->base;
+    unsigned short saved_nCcalls = L->nCcalls;
+
     int my_depth = recovery_push(L);
     if (my_depth < 0) {
         int result = g_lua_resume(L, stackIndex);
         if (result != LUA_YIELD) PS_SET(self, PS_COMPLETED, char, 1);
+        pthread_mutex_unlock(&g_lua_mutex);
         return;
     }
     
     if (sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
         recovery_pop(my_depth);
+        pthread_mutex_unlock(&g_lua_mutex);
         PS_SET(self, PS_COMPLETED, char, 1);
+
+        /* ─── Lua VM State Recovery ─────────────────────────────────── */
+        luaF_close(L, saved_top);
+        L->ci = saved_ci;
+        L->top = saved_top;
+        L->base = saved_base;
+        L->nCcalls = saved_nCcalls;
+
         return;
     }
     
@@ -829,6 +1150,7 @@ void sre_ProgramState_Resume(void* self, int stackIndex) {
     if (result != LUA_YIELD) {
         PS_SET(self, PS_COMPLETED, char, 1);
     }
+    pthread_mutex_unlock(&g_lua_mutex);
 }
 
 /* ========== ProgramState::Update replacement ==========
@@ -910,17 +1232,57 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
                  * the save/restore around the original call below. */
                 PS_SET(self, PS_IS_SUSPENDED, int, 0);
 
+                pthread_mutex_lock(&g_lua_mutex);
+
+                /* Save Lua VM state for recovery */
+                CallInfo* saved_ci = L->ci;
+                StkId saved_top = L->top;
+                StkId saved_base = L->base;
+                unsigned short saved_nCcalls = L->nCcalls;
+
                 int my_depth = recovery_push(L);
                 if (my_depth < 0) {
                     int r = g_lua_resume(L, 0);
-                    if (r != LUA_YIELD) PS_SET(self, PS_COMPLETED, char, 1);
+                    if (r != LUA_YIELD) {
+                        if (r != 0 && g_lua_tolstring && g_lua_gettop) {
+                            void* sceneObj = PS_GET(self, PS_SCENE_OBJECT, void*);
+                            const char* obj_id = sre_scene_object_identifier((SceneObject*)sceneObj);
+                            const char* err_msg = g_lua_gettop(L) > 0 ? lua_tostring(L, -1) : "unknown";
+                            fprintf(stderr, "[SRE/Lua] Coroutine ERROR (status %d) for object '%s' (%p): %s\n",
+                                    r, obj_id ? obj_id : "<unnamed>", sceneObj, err_msg ? err_msg : "nil");
+                        }
+                        PS_SET(self, PS_COMPLETED, char, 1);
+                    }
+                    pthread_mutex_unlock(&g_lua_mutex);
                 } else if (sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
                     recovery_pop(my_depth);
+                    pthread_mutex_unlock(&g_lua_mutex);
+                    void* sceneObj = PS_GET(self, PS_SCENE_OBJECT, void*);
+                    const char* obj_id = sre_scene_object_identifier((SceneObject*)sceneObj);
+                    fprintf(stderr, "[SRE/Lua] Coroutine PANIC/LONGJMP recovered for object '%s' (%p)\n",
+                            obj_id ? obj_id : "<unnamed>", sceneObj);
                     PS_SET(self, PS_COMPLETED, char, 1);
+
+                    /* ─── Lua VM State Recovery ─────────────────────────────── */
+                    luaF_close(L, saved_top);
+                    L->ci = saved_ci;
+                    L->top = saved_top;
+                    L->base = saved_base;
+                    L->nCcalls = saved_nCcalls;
                 } else {
                     int r = g_lua_resume(L, 0);
                     recovery_pop(my_depth);
-                    if (r != LUA_YIELD) PS_SET(self, PS_COMPLETED, char, 1);
+                    if (r != LUA_YIELD) {
+                        if (r != 0 && g_lua_tolstring && g_lua_gettop) {
+                            void* sceneObj = PS_GET(self, PS_SCENE_OBJECT, void*);
+                            const char* obj_id = sre_scene_object_identifier((SceneObject*)sceneObj);
+                            const char* err_msg = g_lua_gettop(L) > 0 ? lua_tostring(L, -1) : "unknown";
+                            fprintf(stderr, "[SRE/Lua] Coroutine ERROR (status %d) for object '%s' (%p): %s\n",
+                                    r, obj_id ? obj_id : "<unnamed>", sceneObj, err_msg ? err_msg : "nil");
+                        }
+                        PS_SET(self, PS_COMPLETED, char, 1);
+                    }
+                    pthread_mutex_unlock(&g_lua_mutex);
                 }
             }
             /* If timer still counting: do NOT touch isSuspended here.
@@ -945,6 +1307,35 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
      * every frame. The lua_resume setjmp inside the isSuspended==1 block
      * above (which IS a real call site) is retained unchanged. */
     if (g_orig_ProgramState_Update != 0) {
+        /* Sanitize child ProgramState linked list at self + 0x10 before calling original.
+         * Prevents ARM64 NoExecuteFault at 0x20202020202020 when a completed state node
+         * or shared_ptr control block is corrupted by uninitialized/space-filled heap memory. */
+        void** head = (void**)((char*)self + 0x10);
+        if (head && *head) {
+            void* node = *head;
+            int depth = 0;
+            int bad = 0;
+            while (node != (void*)head && depth < 256) {
+                uint64_t node_addr = (uint64_t)node;
+                if (node_addr < 0x10000 || node_addr >= 0x0000800000000000ULL) { bad = 1; break; }
+                void* child_ps = *(void**)((char*)node + 0x10);
+                uint64_t child_addr = (uint64_t)child_ps;
+                if (child_ps && (child_addr < 0x10000 || child_addr >= 0x0000800000000000ULL)) { bad = 1; break; }
+                if (child_ps) {
+                    void* shared_ctrl = *(void**)((char*)child_ps + 0x20);
+                    uint64_t ctrl_addr = (uint64_t)shared_ctrl;
+                    if (shared_ctrl && (ctrl_addr < 0x10000 || ctrl_addr >= 0x0000800000000000ULL)) { bad = 1; break; }
+                }
+                node = *(void**)node;
+                depth++;
+            }
+            if (bad || depth >= 256) {
+                fprintf(stderr, "[SRE/ProgramState] Corrupted child list node detected in %p — repairing sentinel\n", self);
+                *head = (void*)head;
+                *((void**)((char*)self + 0x18)) = (void*)head;
+            }
+        }
+
         int saved_suspended = PS_GET(self, PS_IS_SUSPENDED, int);
         PS_SET(self, PS_IS_SUSPENDED, int, 0);  /* suppress original's timer for *this* */
 
@@ -1020,12 +1411,25 @@ void sre_handleTouchEvent(void* env, void* obj, int action, int id, double time,
     if (g_orig_handleTouchEvent) {
         lua_State* L = g_sre_last_lua_state;
         if (L != NULL) {
+            /* Save Lua VM state for recovery */
+            CallInfo* saved_ci = L->ci;
+            StkId saved_top = L->top;
+            StkId saved_base = L->base;
+            unsigned short saved_nCcalls = L->nCcalls;
+
             int d = recovery_push(L);
             if (d < 0) {
                 g_orig_handleTouchEvent(env, obj, action, id, time, x, y, oldX, oldY, tapCount);
             } else if (sre_setjmp(g_sre_recovery_stack[d].buf) != 0) {
                 recovery_pop(d);
                 sre_log_lua_error("handleTouchEvent", "Exception caught in handleTouchEvent!");
+
+                /* ─── Lua VM State Recovery ─────────────────────────────────── */
+                luaF_close(L, saved_top);
+                L->ci = saved_ci;
+                L->top = saved_top;
+                L->base = saved_base;
+                L->nCcalls = saved_nCcalls;
             } else {
                 g_orig_handleTouchEvent(env, obj, action, id, time, x, y, oldX, oldY, tapCount);
                 recovery_pop(d);

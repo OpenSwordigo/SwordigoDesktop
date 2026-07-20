@@ -73,6 +73,9 @@ public:
 
     // --- Public state (accessed by bridge handlers) ---
     JniBridge64* bridge = nullptr;
+    bool fault_flag = false;
+    virtual bool has_faulted() const { return fault_flag; }
+    virtual void set_faulted(bool f) { fault_flag = f; }
     bool quiet_mode = false;
     uint64_t redirect_pc = 0;
     std::vector<DeferredThread> pending_threads;

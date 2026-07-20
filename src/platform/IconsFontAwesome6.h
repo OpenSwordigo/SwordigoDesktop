@@ -66,3 +66,28 @@
 #define ICON_FA_SLIDERS          "\xef\x87\x9e"  // U+F1DE
 #define ICON_FA_LAYER_GROUP      "\xef\x97\xbd"  // U+F5FD
 #define ICON_FA_COPY             "\xef\x83\x85"  // U+F0C5
+
+// --- Added for Remastered Launcher ---
+#define ICON_FA_WINDOW_MINIMIZE  "\xef\x8b\x91"  // U+F2D1
+#define ICON_FA_HOUSE            "\xef\x80\x95"  // U+F015
+#define ICON_FA_USER             "\xef\x80\x87"  // U+F007
+#define ICON_FA_LOCK             "\xef\x80\xa3"  // U+F023
+#define ICON_FA_GLOBE            "\xef\x82\xac"  // U+F0AC
+#define ICON_FA_PEN              "\xef\x8c\x84"  // U+F304
+#define ICON_FA_CIRCLE_EXCLAMATION "\xef\x81\xaa" // U+F06A
+#define ICON_FA_BOX_OPEN         "\xef\x92\x9e"  // U+F49E
+#define ICON_FA_ARROWS_ROTATE    "\xef\x82\x9f"  // U+F021
+#define ICON_FA_NEWSPAPER        "\xef\x87\xaa"  // U+F1EA
+#define ICON_FA_CLOCK_ROTATE_LEFT "\xef\x87\xda" // U+F1F6
+#define ICON_FA_LIST             "\xef\x80\xba"  // U+F03A
+#define ICON_FA_TOOLBOX          "\xef\x92\x91"  // U+F491
+#define ICON_FA_PLUG             "\xef\x8e\xac"  // U+F1E6
+#define ICON_FA_SHIRT            "\xef\x95\x93"  // U+F553
+#define ICON_FA_CLOUD            "\xef\x83\x82"  // U+F0C2
+#define ICON_FA_DISPLAY          "\xef\x97\xbc"  // U+F5FC
+#define ICON_FA_NETWORK_WIRED    "\xef\x9b\xbf"  // U+F6FF
+#define ICON_FA_PAINTBRUSH       "\xef\x87\xbc"  // U+F1FC
+#define ICON_FA_WAVEFORM         "\xef\x8f\xb6"  // U+F3F6
+#define ICON_FA_PERSON_RUNNING   "\xef\x9c\x8c"  // U+F70C
+#define ICON_FA_WAND_MAGIC_SPARKLES "\xef\x9c\xab" // U+F72B
+

@@ -541,6 +541,20 @@ public:
     FixedFunctionState&       state()       { return current_state_; }
     const FixedFunctionState& state() const { return current_state_; }
 
+    // -----------------------------------------------------------------------
+    // Expose Vulkan handles for Dear ImGui integration
+    // -----------------------------------------------------------------------
+    VkInstance get_instance() const { return instance_; }
+    VkPhysicalDevice get_physical_device() const { return physical_device_; }
+    VkDevice get_device() const { return device_; }
+    VkQueue get_graphics_queue() const { return graphics_queue_; }
+    uint32_t get_graphics_family() const { return graphics_family_; }
+    VkRenderPass get_render_pass() const { return render_pass_; }
+    VkDescriptorPool get_descriptor_pool() const { return descriptor_pool_; }
+    VkCommandBuffer get_current_command_buffer() const { return command_buffers_[current_frame_]; }
+    uint32_t get_image_count() const { return (uint32_t)swapchain_images_.size(); }
+    VkPipelineCache get_pipeline_cache() const { return pipeline_cache_; }
+
 private:
     // -----------------------------------------------------------------------
     // Vulkan core handles

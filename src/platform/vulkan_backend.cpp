@@ -796,6 +796,7 @@ void VulkanBackend::create_default_texture() {
     bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     VmaAllocationCreateInfo saci = {};
     saci.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+    saci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
     VmaAllocationInfo sinfo;
     vmaCreateBuffer(allocator_, &bci, &saci, &staging_buf, &staging_alloc, &sinfo);
     memcpy(sinfo.pMappedData, white_pixel, 4);
@@ -1245,6 +1246,7 @@ void VulkanBackend::tex_image_2d(uint32_t target, int level, int internal_fmt,
     bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     VmaAllocationCreateInfo saci = {};
     saci.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+    saci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
     VmaAllocationInfo sinfo;
     vmaCreateBuffer(allocator_, &bci, &saci, &staging_buf, &staging_alloc, &sinfo);
     memcpy(sinfo.pMappedData, rgba_data.data(), data_size);

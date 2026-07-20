@@ -16,6 +16,7 @@ struct BridgeFunction64 {
     std::string name;
     uint64_t address;
     BridgeHandler64 handler;
+    uint64_t call_count = 0;
 };
 
 // --- Frame Statistics (shared with ARM32) ---

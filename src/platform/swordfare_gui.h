@@ -28,6 +28,14 @@
 #define GL_GLEXT_PROTOTYPES
 #include "platform/gl_inc.h"
 
+#ifdef VULKAN_BACKEND
+#include <vulkan/vulkan.h>
+#else
+// Stub so VkDescriptorPool / VK_NULL_HANDLE exist without the full Vulkan SDK
+typedef struct VkDescriptorPool_T* VkDescriptorPool;
+#define VK_NULL_HANDLE nullptr
+#endif
+
 #include "platform/srt_overlay.h"
 #include "platform/gui.h"
 #include <vector>
@@ -79,6 +87,7 @@ public:
 
     // Lifecycle
     void init(SDL_Window* window, SDL_GLContext gl_ctx);
+    void init_vulkan(SDL_Window* window, class VulkanBackend* vk_backend);
     void shutdown();
 
     // Event pass-through — call before your own SDL event handling
@@ -168,6 +177,9 @@ private:
 
     SDL_Window*   m_window   = nullptr;
     SDL_GLContext m_gl_ctx   = nullptr;
+    class VulkanBackend* m_vk_backend = nullptr;
+    bool                 m_vulkan_active = false;
+    VkDescriptorPool     m_imgui_vk_descriptor_pool = VK_NULL_HANDLE;
     void*         m_imgui_ctx = nullptr;   // ImGuiContext*
     void*         m_font_main = nullptr;   // ImFont*
     void*         m_font_button = nullptr; // ImFont*

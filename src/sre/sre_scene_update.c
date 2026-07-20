@@ -453,6 +453,52 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
         void* overlay = (void*)*(uint64_t*)(this_ + 0x100);
         int hide = (g_sre_controls_hidden || combat_flag != 0) ? 1 : 0;
         if (g_sre_GameOverlayView_SetControlsHidden) g_sre_GameOverlayView_SetControlsHidden(overlay, hide);
+
+        if (overlay) {
+            uint64_t spell_picker = *(uint64_t*)((char*)overlay + 0x1B8);
+            uint64_t settings_btn = *(uint64_t*)((char*)overlay + 0x1C8);
+            uint64_t mana_bar = *(uint64_t*)((char*)overlay + 0x1F8);
+
+            // Print diagnostic log for first few frames
+            static int print_count = 0;
+            if (print_count < 10) {
+                extern int printf(const char* format, ...);
+                printf("[SRE-HUD] overlay=0x%X hide=%d\n", (unsigned int)(uintptr_t)overlay, (int)hide);
+                if (settings_btn) {
+                    printf("  settings_btn=0x%X isHidden_before=%d\n", (unsigned int)settings_btn, (int)*(uint8_t*)(settings_btn + 0xE4));
+                }
+                if (spell_picker) {
+                    printf("  spell_picker=0x%X isHidden_before=%d\n", (unsigned int)spell_picker, (int)*(uint8_t*)(spell_picker + 0xE4));
+                }
+                if (mana_bar) {
+                    printf("  mana_bar=0x%X isHidden_before=%d\n", (unsigned int)mana_bar, (int)*(uint8_t*)(mana_bar + 0xE4));
+                }
+                print_count++;
+            }
+
+            // Force the settings button to remain visible
+            if (settings_btn) {
+                *(uint8_t*)(settings_btn + 0xE4) = 0; // isHidden = false
+            }
+
+            // Force the spell picker button to remain visible if player has spells
+            if (spell_picker) {
+                int has_spells = 0;
+                if (gamestate) {
+                    has_spells = (int)((uint64_t)(*(long *)(gamestate + 0x58) - *(long *)(gamestate + 0x50)) >> 4) > 0;
+                }
+                *(uint8_t*)(spell_picker + 0xE4) = has_spells ? 0 : 1;
+            }
+
+            // Force the mana bar to remain visible if the player has at least one spell
+            if (mana_bar) {
+                int has_spells = 0;
+                if (gamestate) {
+                    has_spells = (int)((uint64_t)(*(long *)(gamestate + 0x58) - *(long *)(gamestate + 0x50)) >> 4) > 0;
+                }
+                *(uint8_t*)(mana_bar + 0xE4) = has_spells ? 0 : 1;
+            }
+        }
     }
     
     /* ---- 5. USE/PICKUP BUTTON ---- */

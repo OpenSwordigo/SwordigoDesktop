@@ -144,10 +144,10 @@ SreHookEntry sre_hook_table[] = {
      *
      * Layer 3: Host maps a safety RET-page at 0x2d6ce4c to catch any
      *          remaining wild vtable jumps from the PRIMARY vtable. */
-    // { 0x4792ac, "sre_StartTextInputWithDelegate" },  /* Caver::StartTextInputWithDelegate */
-    //{ 0x4793dc, "sre_StopTextInputWithDelegate"  },  /* Caver::StopTextInputWithDelegate  */
-    // { 0x4790dc, "sre_textInputTextDidChange" },       /* Java_..._textInputTextDidChange   */
-    // { 0x479290, "sre_textInputDidFinish"     },       /* Java_..._textInputDidFinish       */
+    { 0x4792ac, "sre_StartTextInputWithDelegate" },  /* Caver::StartTextInputWithDelegate */
+    { 0x4793dc, "sre_StopTextInputWithDelegate"  },  /* Caver::StopTextInputWithDelegate  */
+    { 0x4790dc, "sre_textInputTextDidChange" },       /* Java_..._textInputTextDidChange   */
+    { 0x479290, "sre_textInputDidFinish"     },       /* Java_..._textInputDidFinish       */
     // { 0x478f84, "sre_handleTouchEvent"      },       /* Java_..._handleTouchEvent (Disabled) */
 
     /* Lua error safety — wraps ALL lua_call with pcall
@@ -190,6 +190,7 @@ SreHookEntry sre_hook_table[] = {
      { 0x34ed2c, "sre_GameSceneView_Update" },  /* GameSceneView::Update(float) */
       { 0, "sre_CameraController_Update" },
       { 0, "sre_SceneGrid_UpdateVisibleAreasWithCamera" },
+      { 0, "sre_GameOverlayView_SetControlsHidden" },
 
     /* Force GLES 2.0 Mode (hook RenderingContext constructor) */
     { 0x2fc03c, "sre_RenderingContext_C1" },

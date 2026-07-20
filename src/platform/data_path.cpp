@@ -405,10 +405,7 @@ extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_p
     candidates.push_back(data_dir + "/resources/" + path);
     // 5. custom_assets/resources/X (fallback to configured assets dir)
     candidates.push_back(data_dir + "/" + g_instance_assets_dir + "/resources/" + path);
-    // 6. vanilla assets fallback (always fallback to vanilla if custom assets directory is configured)
-    if (g_instance_assets_dir != "assets") {
-        candidates.push_back(data_dir + "/assets/resources/" + path);
-    }
+
 
     // Search through candidates in priority order
     for (const auto& candidate : candidates) {

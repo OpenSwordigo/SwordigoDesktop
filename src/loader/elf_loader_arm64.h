@@ -49,6 +49,15 @@ struct so_default_dynlib_arm64 {
     uint64_t func; // Bridge trampoline address (64-bit)
 };
 
+struct FastCRuntime64 {
+    uint64_t memcmp_vaddr = 0;
+    uint64_t memcpy_vaddr = 0;
+    uint64_t memset_vaddr = 0;
+    uint64_t strlen_vaddr = 0;
+    uint64_t strcmp_vaddr = 0;
+};
+extern FastCRuntime64 g_fast_c_runtime_64;
+
 class ElfLoaderArm64 {
 public:
     ElfLoaderArm64(uint8_t* guest_mem_base, uint64_t guest_mem_size);

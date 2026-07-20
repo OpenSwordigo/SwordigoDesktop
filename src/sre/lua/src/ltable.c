@@ -454,10 +454,17 @@ const TValue *luaH_getnum (Table *t, int key) {
 */
 const TValue *luaH_getstr (Table *t, TString *key) {
   Node *n = hashstr(t, key);
+  int loop_count = 0;
   do {  /* check whether `key' is somewhere in the chain */
     if (ttisstring(gkey(n)) && rawtsvalue(gkey(n)) == key)
       return gval(n);  /* that's it */
     else n = gnext(n);
+    loop_count++;
+    if (loop_count > 1000) {
+      extern int printf(const char* format, ...);
+      printf("[SRE-Table] Cycle detected in luaH_getstr for table %p! Breaking chain.\n", t);
+      break;
+    }
   } while (n);
   return luaO_nilobject;
 }

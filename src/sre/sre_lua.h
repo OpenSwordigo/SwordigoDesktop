@@ -58,6 +58,7 @@ typedef int   (*pfn_lua_toboolean)(lua_State* L, int idx);
 typedef int   (*pfn_lua_type)(lua_State* L, int idx);
 typedef void  (*pfn_luaL_register)(lua_State* L, const char* libname, const void* l);
 typedef void* (*pfn_lua_touserdata)(lua_State* L, int idx);
+typedef const void* (*pfn_lua_topointer)(lua_State* L, int idx);
 typedef void  (*pfn_lua_pushlightuserdata)(lua_State* L, void* p);
 typedef int   (*pfn_lua_error)(lua_State* L);
 
@@ -81,6 +82,7 @@ extern pfn_lua_toboolean   g_lua_toboolean;
 extern pfn_lua_type        g_lua_type;
 extern pfn_luaL_register   g_luaL_register;
 extern pfn_lua_touserdata  g_lua_touserdata;
+extern pfn_lua_topointer   g_lua_topointer;
 extern pfn_lua_pushlightuserdata g_lua_pushlightuserdata;
 extern pfn_lua_error       g_lua_error;
 
@@ -177,5 +179,7 @@ extern pfn_lua_isuserdata  g_lua_isuserdata;
 typedef void (*pfn_ProgramState_destructor)(void* self);
 extern pfn_ProgramState_destructor g_orig_ProgramState_destructor;
 void sre_ProgramState_destructor(void* self);
+
+void sre_open_swkiwi_libs(lua_State* L);
 
 #endif /* SRE_LUA_H */

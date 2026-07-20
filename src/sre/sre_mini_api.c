@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <errno.h>
 
 /* g_swordigo_base — loaded base address of libswordigo.so in guest space */
 extern uint64_t g_swordigo_base;
@@ -3273,6 +3274,28 @@ static int l_fs_exists(lua_State* L) {
     return 1;
 }
 
+/* Helper: recursive mkdir -p */
+static int sre_mkdir_p(const char* path, mode_t mode) {
+    char temp[512];
+    char* p = NULL;
+    size_t len;
+
+    if (!path || !path[0]) return 0;
+    snprintf(temp, sizeof(temp), "%s", path);
+    len = strlen(temp);
+    if (len > 0 && temp[len - 1] == '/') temp[len - 1] = '\0';
+
+    for (p = temp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(temp, mode);
+            *p = '/';
+        }
+    }
+    if (mkdir(temp, mode) == 0 || errno == EEXIST) return 0;
+    return -1;
+}
+
 /* fs.mkdir(path) */
 static int l_fs_mkdir(lua_State* L) {
     const char* path = lua_tostring(L, 1);
@@ -3282,7 +3305,7 @@ static int l_fs_mkdir(lua_State* L) {
     }
     char buf[512];
     const char* real = sre_api_minipath_translate(path, buf, 512);
-    int ret = mkdir(real, 0755);
+    int ret = sre_mkdir_p(real, 0755);
     if (ret == 0) {
         g_lua_pushboolean(L, 1);
     } else {
@@ -5386,18 +5409,8 @@ void sre_mini_ensure_injected(lua_State* L) {
         "    end\n"
         "  end\n"
         "\n"
-        "  -- Compute stable C++ address for an object via identifier() or tostring\n"
+        "  -- Compute stable runtime identity string for an object (using unique pointer tostring)\n"
         "  local function get_addr(obj, og_idx)\n"
-        "    local id_fn\n"
-        "    if type(og_idx) == 'function' then\n"
-        "      id_fn = og_idx(obj, 'identifier')\n"
-        "    elseif type(og_idx) == 'table' then\n"
-        "      id_fn = og_idx['identifier']\n"
-        "    end\n"
-        "    if type(id_fn) == 'function' then\n"
-        "      local ok, res = pcall(id_fn, obj)\n"
-        "      if ok and type(res) == 'string' and res ~= '' then return res end\n"
-        "    end\n"
         "    return tostring(obj)\n"
         "  end\n"
         "\n"
@@ -5594,6 +5607,8 @@ void sre_mini_ensure_injected(lua_State* L) {
 
     /* Inject Mini.*, LNI.*, Components.*, Game.*, Health.*, fs tables */
     sre_register_mini_api(L);
+    extern void sre_open_swkiwi_libs(lua_State* L);
+    sre_open_swkiwi_libs(L);
 
     /* Register luasocket, luamime, luafilesystem, and toml in package.preload */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "package");

@@ -268,6 +268,26 @@ unsigned long long g_sre_cxa_throw_caller = 0;  /* LR of whoever called __cxa_th
 int g_sre_cxa_throw_unrecovered = 0;  /* count of unrecovered throws */
 
 void sre_cxa_throw(void* thrown_exception, void* tinfo, void(*dest)(void*)) {
+    const char* type_name = "unknown";
+    if (tinfo) {
+        struct abi_type_info {
+            void* vtable;
+            const char* name;
+        } *ti = (struct abi_type_info*)tinfo;
+        if (ti->name) {
+            type_name = ti->name;
+        }
+    }
+    
+    fprintf(stderr, "[SRE/cxa_throw] Exception of type '%s' thrown! recovery_depth=%d\n", type_name, g_sre_recovery_depth);
+    
+    // Log to file for persistent diagnostics
+    FILE* fp = fopen("/home/quantumcreeper/.local/share/swordigo-desktop/sre_exceptions.log", "a");
+    if (fp) {
+        fprintf(fp, "[SRE/cxa_throw] Exception of type '%s' thrown! recovery_depth=%d\n", type_name, g_sre_recovery_depth);
+        fclose(fp);
+    }
+
     if (g_sre_recovery_depth > 0) {
         int target = g_sre_recovery_depth - 1;
         

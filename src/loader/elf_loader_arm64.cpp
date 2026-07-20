@@ -18,6 +18,8 @@
 //   - .init_array contains 8-byte pointers instead of 4-byte
 // ============================================================================
 
+FastCRuntime64 g_fast_c_runtime_64;
+
 ElfLoaderArm64::ElfLoaderArm64(uint8_t* guest_mem_base, uint64_t guest_mem_size)
     : guest_base(guest_mem_base), guest_limit(guest_mem_size) {}
 
@@ -47,7 +49,7 @@ int ElfLoaderArm64::resolve_all_to_bridge(so_module_arm64* mod, JniBridge64* bri
                 if (at_pos != std::string::npos) {
                     sname = sname.substr(0, at_pos);
                 }
-                
+
                 // Known data symbols → map to guest globals area
                 bool is_data = (sname == "__stack_chk_guard" || sname == "_ctype_" || sname == "__sF");
                 

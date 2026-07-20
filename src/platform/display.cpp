@@ -1,3 +1,4 @@
+// VULKAN_BACKEND compile guard now required — see init_vulkan below
 #include "platform/display.h"
 #include "platform/data_path.h"
 #include <iostream>

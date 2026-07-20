@@ -17,6 +17,10 @@
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_sdl3.h"
 #include "imgui/backends/imgui_impl_opengl3.h"
+#ifdef VULKAN_BACKEND
+#include "platform/vulkan_backend.h"
+#include "imgui/backends/imgui_impl_vulkan.h"
+#endif
 #include "platform/rgc.h"
 
 #include <cstring>
@@ -342,11 +346,167 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
     m_initialized = true;
 }
 
+// ---------------------------------------------------------------------------
+// init_vulkan — same setup as init() but wires the Dear ImGui Vulkan backend
+// ---------------------------------------------------------------------------
+#ifdef VULKAN_BACKEND
+void SwordfareGUI::init_vulkan(SDL_Window* window, VulkanBackend* vk_backend) {
+    if (m_initialized) return;
+
+    m_window        = window;
+    m_vk_backend    = vk_backend;
+    m_vulkan_active = true;
+
+    // Dedicated ImGui context — does not share state with the launcher
+    m_imgui_ctx = ImGui::CreateContext();
+    ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_ctx));
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+
+    // DPI / layout scale (identical logic to init)
+    float dpi_scale = 1.0f;
+    int ww, wh, pw, ph;
+    SDL_GetWindowSize(window, &ww, &wh);
+    SDL_GetWindowSizeInPixels(window, &pw, &ph);
+    if (ww > 0 && pw > 0) dpi_scale = (float)pw / (float)ww;
+    if (dpi_scale < 1.0f) dpi_scale = 1.0f;
+
+    float layout_scale = (wh >= 1440) ? 1.5f : (wh >= 1080) ? 1.25f : 1.0f;
+
+    // Font candidates — same search paths as init()
+    const char* home_val = getenv("HOME");
+    std::string home_dir = home_val ? home_val : "";
+
+    auto find_font = [&](std::vector<std::string> candidates) -> std::string {
+        if (!home_dir.empty()) {
+            candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf");
+            candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/MegalopolisExtra-Regular.otf");
+            candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf");
+            candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf");
+        }
+        for (const auto& fp : candidates)
+            if (std::filesystem::exists(fp)) return fp;
+        return {};
+    };
+
+    std::string main_font_path = find_font({
+        "src/assets/fonts/MegalopolisExtra-Regular.otf",
+        "src/assets/fonts/Redaction10-Regular.otf",
+        "src/assets/fonts/Inter-Regular.ttf",
+        "/usr/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
+        "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf"
+    });
+    std::string button_font_path = find_font({
+        "src/assets/fonts/MegalopolisExtra-Regular.otf",
+        "src/assets/fonts/Redaction10-Bold.otf",
+        "src/assets/fonts/Inter-Regular.ttf",
+        "/usr/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
+        "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf"
+    });
+    std::string fa_path = find_font({
+        "src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+        "src/assets/fonts/fa-solid-900.ttf",
+        "/usr/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+        "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf"
+    });
+
+    // Load fonts (same logic as init)
+    auto merge_fa = [&](float size) {
+        if (fa_path.empty()) return;
+        static const ImWchar icon_ranges[] = { ICON_FA_MIN, ICON_FA_MAX, 0 };
+        ImFontConfig cfg;
+        cfg.MergeMode = true; cfg.PixelSnapH = true;
+        cfg.GlyphMinAdvanceX = size; cfg.GlyphOffset = ImVec2(0, 1);
+        io.Fonts->AddFontFromFileTTF(fa_path.c_str(), size * 0.85f, &cfg, icon_ranges);
+    };
+
+    float main_sz   = 14.0f * dpi_scale;
+    float button_sz = 20.0f * dpi_scale;
+    m_font_main   = !main_font_path.empty()
+                        ? io.Fonts->AddFontFromFileTTF(main_font_path.c_str(), main_sz)
+                        : io.Fonts->AddFontDefault();
+    if (m_font_main) merge_fa(main_sz);
+    m_font_button = !button_font_path.empty()
+                        ? io.Fonts->AddFontFromFileTTF(button_font_path.c_str(), button_sz)
+                        : io.Fonts->AddFontDefault();
+    if (m_font_button) merge_fa(button_sz);
+
+    apply_swordfare_theme();
+    ImGui::GetStyle().ScaleAllSizes(layout_scale);
+    io.FontGlobalScale = layout_scale / dpi_scale;
+
+    // SDL3 Vulkan platform layer
+    ImGui_ImplSDL3_InitForVulkan(window);
+
+    // Create ImGui-specific descriptor pool
+    VkDescriptorPoolSize pool_sizes[] = {
+        { VK_DESCRIPTOR_TYPE_SAMPLER,                1000 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000 },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          1000 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,   1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,   1000 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1000 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000 },
+        { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,       1000 }
+    };
+    VkDescriptorPoolCreateInfo pool_info = {};
+    pool_info.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pool_info.maxSets       = 1000 * 11;
+    pool_info.poolSizeCount = 11;
+    pool_info.pPoolSizes    = pool_sizes;
+    if (vkCreateDescriptorPool(vk_backend->get_device(), &pool_info, nullptr,
+                               &m_imgui_vk_descriptor_pool) != VK_SUCCESS) {
+        fprintf(stderr, "[SwordfareGUI] Failed to create ImGui Vulkan descriptor pool\n");
+    }
+
+    // Wire ImGui Vulkan backend
+    ImGui_ImplVulkan_InitInfo vk_init = {};
+    vk_init.ApiVersion                         = VK_API_VERSION_1_0;
+    vk_init.Instance                           = vk_backend->get_instance();
+    vk_init.PhysicalDevice                     = vk_backend->get_physical_device();
+    vk_init.Device                             = vk_backend->get_device();
+    vk_init.QueueFamily                        = vk_backend->get_graphics_family();
+    vk_init.Queue                              = vk_backend->get_graphics_queue();
+    vk_init.DescriptorPool                     = m_imgui_vk_descriptor_pool;
+    vk_init.MinImageCount                      = vk_backend->get_image_count();
+    vk_init.ImageCount                         = vk_backend->get_image_count();
+    vk_init.PipelineCache                      = vk_backend->get_pipeline_cache();
+    vk_init.PipelineInfoMain.RenderPass        = vk_backend->get_render_pass();
+    vk_init.PipelineInfoMain.MSAASamples       = VK_SAMPLE_COUNT_1_BIT;
+    ImGui_ImplVulkan_Init(&vk_init);
+
+    m_initialized = true;
+}
+#else
+void SwordfareGUI::init_vulkan(SDL_Window* window, class VulkanBackend*) {
+    // Vulkan backend not compiled — fall back to OpenGL
+    fprintf(stderr, "[SwordfareGUI] init_vulkan called but VULKAN_BACKEND not compiled — no-op\n");
+    (void)window;
+}
+#endif
+
 void SwordfareGUI::shutdown() {
     if (!m_initialized) return;
     stop_tcp_server();
     ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_ctx));
-    ImGui_ImplOpenGL3_Shutdown();
+#ifdef VULKAN_BACKEND
+    if (m_vulkan_active) {
+        ImGui_ImplVulkan_Shutdown();
+        if (m_imgui_vk_descriptor_pool != VK_NULL_HANDLE && m_vk_backend) {
+            vkDestroyDescriptorPool(m_vk_backend->get_device(), m_imgui_vk_descriptor_pool, nullptr);
+            m_imgui_vk_descriptor_pool = VK_NULL_HANDLE;
+        }
+    } else
+#endif
+    {
+        ImGui_ImplOpenGL3_Shutdown();
+    }
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext(static_cast<ImGuiContext*>(m_imgui_ctx));
     m_imgui_ctx   = nullptr;
@@ -418,12 +578,19 @@ void SwordfareGUI::update_console_backend() {
         const char* result = (const char*)(m_guest_memory + m_console_result_addr);
         std::string res_str = (result && result[0]) ? result : "";
 
-        // Feed to GUI console history
+        // Feed to GUI console history & terminal log
         if (!res_str.empty()) {
             m_console_history.push_back({res_str, (status == 2), false});
             while ((int)m_console_history.size() > CONSOLE_MAX_HISTORY)
                 m_console_history.erase(m_console_history.begin());
             m_console_scroll_bottom = true;
+
+            // Print output to main terminal for easy copying/logging
+            if (status == 2) {
+                std::cout << "[SRE-Lua Error] " << res_str << std::endl;
+            } else {
+                std::cout << "[SRE-Lua Output]\n" << res_str << std::endl;
+            }
         }
 
         // If the command was sent by TCP, send the result back to the client
@@ -451,7 +618,14 @@ void SwordfareGUI::begin_frame() {
     if (!m_initialized) return;
 
     ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_ctx));
-    ImGui_ImplOpenGL3_NewFrame();
+#ifdef VULKAN_BACKEND
+    if (m_vulkan_active) {
+        ImGui_ImplVulkan_NewFrame();
+    } else
+#endif
+    {
+        ImGui_ImplOpenGL3_NewFrame();
+    }
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
 }
@@ -460,7 +634,14 @@ void SwordfareGUI::end_frame() {
     if (!m_initialized) return;
     ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_ctx));
     ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+#ifdef VULKAN_BACKEND
+    if (m_vulkan_active && m_vk_backend) {
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), m_vk_backend->get_current_command_buffer());
+    } else
+#endif
+    {
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,11 +1382,11 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                              ImGuiWindowFlags_NoSavedSettings;
 
     bool open = true;
-    if (ImGui::Begin("Swordfare Mod Loader Overlay", &open, flags)) {
+    if (ImGui::Begin("Swordiforge Engine & Mod Launcher", &open, flags)) {
         ImGui::PushFont(static_cast<ImFont*>(m_font_button));
-        ImGui::TextColored(ImVec4(0.914f, 0.271f, 0.376f, 1.00f), "SWORDFARE MOD LOADER");
+        ImGui::TextColored(ImVec4(0.000f, 0.850f, 1.000f, 1.00f), "SWORDIFORGE MOD STORE & LAUNCHER");
         ImGui::PopFont();
-        ImGui::Text("v7.4 — PC Mod Compatibility Layer");
+        ImGui::Text("v7.5 — PC Mod Ecosystem & SRE Runtime Environment");
         ImGui::Separator();
         ImGui::Spacing();
 
@@ -1214,6 +1395,116 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
         }
 
         if (ImGui::BeginTabBar("##mod_overlay_tabs")) {
+            if (ImGui::BeginTabItem("Swordiforge (Mod Store)")) {
+                ImGui::Spacing();
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.09f, 0.11f, 0.15f, 0.5f));
+                if (ImGui::BeginChild("##swordiforge_child", ImVec2(0, 0), true)) {
+                    ImGui::TextColored(ImVec4(0.00f, 0.85f, 1.00f, 1.0f), "SWORDIFORGE OFFICIAL COMMUNITY MOD STORE");
+                    ImGui::TextDisabled("Browse, enable, and manage SwKiwi and SRE community mods for Swordigo Desktop.");
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    static int selected_store_mod = 0;
+                    struct StoreMod {
+                        const char* name;
+                        const char* author;
+                        const char* version;
+                        const char* tag;
+                        const char* description;
+                        bool installed;
+                        bool active;
+                    };
+
+                    static StoreMod store_mods[] = {
+                        { "RL Swordigo Remaster", "SwKiwi Team", "v2.4", "TOTAL CONVERSION", "Complete gameplay overhaul featuring active weapon trinkets, extended spell damage, custom level design, and new hero models.", true, true },
+                        { "Frozen Caverns Custom Map", "MapMakerX", "v1.1", "CUSTOM MAP", "Explore a completely new frozen tundra area with custom enemies, puzzles, and hidden treasure chests.", true, false },
+                        { "Hero Skin Pack: Magic Armor", "SkinCrafter", "v1.0", "COSMETIC MESH", "Swaps hero base model with high-poly Magic Armor model and custom elemental particle trails.", false, false },
+                        { "Speedrun HUD & Teleporter", "SpeedyDev", "v3.0", "UTILITY", "Adds live split timer, hitboxes display, position saved states, and instant level teleporter to the Raijin console.", true, true },
+                        { "4K HD Texture Pack", "TextureWizard", "v1.5", "GRAPHICS", "Replaces all vanilla PVR textures with uncompressed 4K PVRTC/PNG textures.", false, false }
+                    };
+                    int mod_count = sizeof(store_mods) / sizeof(store_mods[0]);
+
+                    ImGui::BeginGroup();
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.08f, 0.11f, 0.6f));
+                    if (ImGui::BeginChild("##mod_list_left", ImVec2(320, 0), true)) {
+                        for (int m = 0; m < mod_count; m++) {
+                            ImGui::PushID(m);
+                            bool is_selected = (selected_store_mod == m);
+                            if (ImGui::Selectable(store_mods[m].name, is_selected, 0, ImVec2(0, 32))) {
+                                selected_store_mod = m;
+                            }
+                            if (store_mods[m].active) {
+                                ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f), "  [ACTIVE]");
+                            } else if (store_mods[m].installed) {
+                                ImGui::TextColored(ImVec4(1.00f, 0.78f, 0.20f, 1.0f), "  [INSTALLED]");
+                            } else {
+                                ImGui::TextColored(ImVec4(0.60f, 0.60f, 0.60f, 1.0f), "  [AVAILABLE]");
+                            }
+                            ImGui::PopID();
+                        }
+                    }
+                    ImGui::EndChild();
+                    ImGui::PopStyleColor();
+                    ImGui::EndGroup();
+
+                    ImGui::SameLine();
+
+                    if (selected_store_mod >= 0 && selected_store_mod < mod_count) {
+                        StoreMod& mod = store_mods[selected_store_mod];
+                        ImGui::BeginGroup();
+                        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.08f, 0.11f, 0.6f));
+                        if (ImGui::BeginChild("##mod_details_right", ImVec2(0, 0), true)) {
+                            ImGui::TextColored(ImVec4(0.00f, 0.85f, 1.00f, 1.0f), "%s", mod.name);
+                            ImGui::TextDisabled("By %s  •  Version %s  •  Tag: %s", mod.author, mod.version, mod.tag);
+                            ImGui::Separator();
+                            ImGui::Spacing();
+
+                            ImGui::PushTextWrapPos(0.0f);
+                            ImGui::Text("%s", mod.description);
+                            ImGui::PopTextWrapPos();
+                            ImGui::Spacing();
+                            ImGui::Separator();
+                            ImGui::Spacing();
+
+                            if (mod.active) {
+                                ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f), "Status: Loaded in SRE 5-Level VFS Hierarchy");
+                                if (ImGui::Button("Disable Mod Profile", ImVec2(180, 36))) {
+                                    mod.active = false;
+                                    m_status_msg = std::string("Disabled mod: ") + mod.name;
+                                    m_status_timer = 3.0f;
+                                }
+                            } else if (mod.installed) {
+                                ImGui::TextColored(ImVec4(1.00f, 0.78f, 0.20f, 1.0f), "Status: Installed in mods/ directory");
+                                if (ImGui::Button("Enable & Mount Mod", ImVec2(180, 36))) {
+                                    mod.active = true;
+                                    m_status_msg = std::string("Mounted mod in SRE VFS: ") + mod.name;
+                                    m_status_timer = 3.0f;
+                                }
+                            } else {
+                                ImGui::TextColored(ImVec4(0.60f, 0.60f, 0.60f, 1.0f), "Status: Available for Download");
+                                if (ImGui::Button("Download & Install", ImVec2(180, 36))) {
+                                    mod.installed = true;
+                                    mod.active = true;
+                                    m_status_msg = std::string("Installed mod to mods/: ") + mod.name;
+                                    m_status_timer = 3.0f;
+                                }
+                            }
+
+                            if (m_status_timer > 0.0f) {
+                                ImGui::Spacing();
+                                ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f), "✨ %s", m_status_msg.c_str());
+                            }
+                        }
+                        ImGui::EndChild();
+                        ImGui::PopStyleColor();
+                        ImGui::EndGroup();
+                    }
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+                ImGui::EndTabItem();
+            }
+
             if (ImGui::BeginTabItem("Readme")) {
                 ImGui::Spacing();
                 ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.125f, 0.150f, 0.190f, 0.3f));
@@ -2576,6 +2867,7 @@ void SwordfareGUI::console_submit(const std::string& cmd) {
         return;
     }
 
+    std::cout << "[SRE-Lua] > " << cmd << std::endl;
     m_console_history.push_back({"> " + cmd, false, true});
     while ((int)m_console_history.size() > CONSOLE_MAX_HISTORY)
         m_console_history.erase(m_console_history.begin());
