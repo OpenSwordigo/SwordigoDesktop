@@ -1,3 +1,14 @@
+// SPDX-FileCopyrightText: Copyright 2024 SwordigoDesktop Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// ARM64 Dynarmic JIT Backend — emulator_dynarmic64.cpp
+// Improvements inspired by the Yuzu Nintendo Switch emulator's Dynarmic integration.
+// Key additions:
+//   [YUZU-INSPIRED] WFE/WFI/Yield exception interception (softlock prevention)
+//   [YUZU-INSPIRED] InstructionCacheOperationRaised (IC IVAU / IC IALLU support)
+//   [YUZU-INSPIRED] MemoryWriteExclusive* CAS callbacks (LDXR/STXR correctness)
+//   [LEGACY]        Original spinloop/bridge-spin detection is preserved below.
+
 #include "emulator_dynarmic64.h"
 #include "platform/binary_selector.h"
 #include "jni/jni_bridge_arm64.h"
@@ -13,6 +24,8 @@ extern "C" const char* sre_resolve_symbol(uint64_t addr);
 #include "dynarmic/interface/halt_reason.h"
 #include "dynarmic/interface/optimization_flags.h"
 #include "dynarmic/interface/exclusive_monitor.h"
+#include <atomic>    // for MemoryWriteExclusive CAS operations
+#include <cstddef>   // for size_t
 
 struct SavedCpuState {
     uint64_t regs[31];
@@ -109,6 +122,69 @@ public:
         if (vaddr + 15 < mem_size) std::memcpy(memory + vaddr, &value, 16);
     }
 
+    // =========================================================================
+    // [YUZU-INSPIRED] MemoryWriteExclusive* — Proper CAS-based exclusive writes
+    // =========================================================================
+    // Yuzu reference: core/arm/dynarmic/arm_dynarmic_64.cpp, WriteExclusive*
+    // These are needed for correct LDXR/STXR (Load/Store Exclusive) emulation.
+    // Without these, guest spinlocks and mutexes can corrupt shared state.
+    // We implement them via std::atomic CAS on the guest memory buffer.
+    // =========================================================================
+
+    bool MemoryWriteExclusive8(Dynarmic::A64::VAddr vaddr, std::uint8_t value, std::uint8_t expected) override {
+        if (vaddr >= mem_size) return false;
+        auto* ptr = reinterpret_cast<std::atomic<std::uint8_t>*>(memory + vaddr);
+        return ptr->compare_exchange_weak(expected, value, std::memory_order_seq_cst);
+    }
+
+    bool MemoryWriteExclusive16(Dynarmic::A64::VAddr vaddr, std::uint16_t value, std::uint16_t expected) override {
+        if (vaddr + 1 >= mem_size) return false;
+        auto* ptr = reinterpret_cast<std::atomic<std::uint16_t>*>(memory + vaddr);
+        return ptr->compare_exchange_weak(expected, value, std::memory_order_seq_cst);
+    }
+
+    bool MemoryWriteExclusive32(Dynarmic::A64::VAddr vaddr, std::uint32_t value, std::uint32_t expected) override {
+        if (vaddr + 3 >= mem_size) return false;
+        auto* ptr = reinterpret_cast<std::atomic<std::uint32_t>*>(memory + vaddr);
+        return ptr->compare_exchange_weak(expected, value, std::memory_order_seq_cst);
+    }
+
+    bool MemoryWriteExclusive64(Dynarmic::A64::VAddr vaddr, std::uint64_t value, std::uint64_t expected) override {
+        if (vaddr + 7 >= mem_size) return false;
+        auto* ptr = reinterpret_cast<std::atomic<std::uint64_t>*>(memory + vaddr);
+        return ptr->compare_exchange_weak(expected, value, std::memory_order_seq_cst);
+    }
+
+    // =========================================================================
+    // [YUZU-INSPIRED] InstructionCacheOperationRaised
+    // =========================================================================
+    // Yuzu reference: core/arm/dynarmic/arm_dynarmic_64.cpp, InstructionCacheOperationRaised
+    // Handles IC IVAU (invalidate by VA) and IC IALLU (invalidate all) instructions.
+    // Without this, any self-modifying guest code or JIT-generated code will
+    // crash with a stale code cache hit. HLT the JIT after invalidation.
+    // =========================================================================
+    void InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op,
+                                         std::uint64_t value) override {
+        static constexpr std::uint64_t ICACHE_LINE_SIZE = 64;
+        switch (op) {
+        case Dynarmic::A64::InstructionCacheOperation::InvalidateByVAToPoU: {
+            // Invalidate a single cache line aligned to 64 bytes
+            const std::uint64_t cache_line_start = value & ~(ICACHE_LINE_SIZE - 1);
+            emu->get_jit()->InvalidateCacheRange(cache_line_start, ICACHE_LINE_SIZE);
+            break;
+        }
+        case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoU:
+        case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoUInnerSharable:
+            emu->get_jit()->ClearCache();
+            break;
+        default:
+            // Unknown cache op — silently ignore rather than crash
+            break;
+        }
+        // Halt and re-enter so the JIT picks up the freshly invalidated blocks
+        emu->get_jit()->HaltExecution(Dynarmic::HaltReason::CacheInvalidation);
+    }
+
     // Read-only optimization: code section is read-only
     // EXCEPTION: RLSwordigo requires writable text segments for modded game data
     bool IsReadOnlyMemory(Dynarmic::A64::VAddr vaddr) override {
@@ -163,11 +239,23 @@ public:
             emu->get_jit()->HaltExecution(Dynarmic::HaltReason::UserDefined1);
             return;
         }
-        // Dynarmic can't JIT this instruction — skip past it to avoid infinite loop.
-        // This happens with some system register instructions (MRS/MSR/etc).
-        if (!emu->quiet_mode) {
-            std::cerr << "[Dynarmic] InterpreterFallback at 0x" << std::hex << pc
-                      << " for " << std::dec << num_instructions << " instructions — skipping" << std::endl;
+        // [YUZU-INSPIRED] Log unhandled interpreter fallbacks like Yuzu does.
+        // Yuzu reference: arm_dynarmic_64.cpp InterpreterFallback — logs + PrefetchAbort.
+        // We skip past the instruction (can't abort since we don't have OS kernel),
+        // but we log it at a reduced rate to avoid log spam.
+        {
+            static int fallback_log_count = 0;
+            if (!emu->quiet_mode && fallback_log_count < 50) {
+                fallback_log_count++;
+                std::cerr << "[Dynarmic] InterpreterFallback at 0x" << std::hex << pc
+                          << " for " << std::dec << num_instructions
+                          << " instr (raw=0x" << std::hex;
+                if (pc + 3 < mem_size)
+                    std::cerr << *(std::uint32_t*)(memory + pc);
+                else
+                    std::cerr << "????";
+                std::cerr << std::dec << ") — skipping" << std::endl;
+            }
         }
         emu->get_jit()->SetPC(pc + num_instructions * 4);
     }
@@ -182,6 +270,42 @@ public:
 
     void ExceptionRaised(Dynarmic::A64::VAddr pc, Dynarmic::A64::Exception exception) override {
         using Exception = Dynarmic::A64::Exception;
+
+        // =====================================================================
+        // [YUZU-INSPIRED] Synchronisation / power-management exception interception.
+        // =====================================================================
+        // Yuzu reference: arm_dynarmic_64.cpp ExceptionRaised, cases:
+        //   WaitForInterrupt / WaitForEvent / SendEvent / SendEventLocal / Yield
+        // These ARM64 instructions (WFI, WFE, SEV, SEVL, YIELD) are frequently
+        // used by guest spinlocks, condition variables, and the OS scheduler.
+        // Without handling them the JIT will fall through to the default branch
+        // which prints a critical error and aborts, causing a hard softlock.
+        //
+        // Strategy: when we see a WFE/WFI/Yield — run any pending deferred
+        // threads immediately so they can write the flag the main loop is waiting
+        // for. This turns what was a true softlock into a cooperative yield.
+        // =====================================================================
+        if (exception == Exception::WaitForInterrupt ||
+            exception == Exception::WaitForEvent     ||
+            exception == Exception::SendEvent        ||
+            exception == Exception::SendEventLocal   ||
+            exception == Exception::Yield) {
+            // Run pending threads inline so they can release locks / write flags
+            if (!emu->pending_threads.empty()) {
+                static int wfe_unblock_count = 0;
+                wfe_unblock_count++;
+                if (wfe_unblock_count <= 10 || wfe_unblock_count % 100 == 0) {
+                    std::cerr << "[Dynarmic/WFE] Cooperative yield at 0x" << std::hex << pc
+                              << " (exc=" << static_cast<int>(exception) << std::dec
+                              << ") — running " << emu->pending_threads.size()
+                              << " pending thread(s)" << std::endl;
+                }
+                emu->run_pending_threads();
+            }
+            // Always return — let the JIT continue after the WFE/WFI instruction.
+            // Returning without halting means Dynarmic advances PC past the instruction.
+            return;
+        }
 
         if (exception == Exception::Breakpoint) {
             // Magic LR — guest function returned normally
@@ -473,11 +597,25 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
     uint64_t last_chunk_pc = 0;
     int bridge_calls = 0;
 
-    // Bridge spinloop detection: track consecutive calls to same bridge
-    // (regardless of return_pc, to catch alternating caller patterns)
+    // =========================================================================
+    // [YUZU-INSPIRED] Bridge/PC spinloop detection — NEW + LEGACY both present.
+    // =========================================================================
+    // NEW:    WFE/WFI/Yield exceptions are handled inside ExceptionRaised() above,
+    //         which runs pending threads cooperatively without needing PC counting.
+    // LEGACY: The bridge-spin counter (same_bridge_count) and PC-repetition counter
+    //         (same_pc_count) below are preserved as a belt-and-suspenders fallback
+    //         for spinloops that do NOT use ARM sync instructions.
+    // =========================================================================
+
+    /* LEGACY_SPINLOOP_DETECTION_START
+     * Original bridge-spin tracker variables.
+     * Still active — these handle non-WFE spinloops (e.g. tight assembly busy-waits
+     * that check a memory flag without issuing any synchronisation instruction).
+     */
     uint64_t last_bridge_addr = 0;
     int same_bridge_count = 0;
     static int total_spinloop_logs = 0;  // Suppress after too many
+    /* LEGACY_SPINLOOP_DETECTION_END */
 
     // Wall clock time limit per function call
     auto wall_start = std::chrono::steady_clock::now();
@@ -505,9 +643,11 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
         // Reset tick budget
         g_dyn_memory->ResetTicks(TICK_BUDGET);
 
-        // Clear any previous halt
+        // Clear any previous halt — also clear CacheInvalidation so JIT resumes
+        // after an IC IVAU / IC IALLU issued by InstructionCacheOperationRaised.
         jit->ClearHalt(Dynarmic::HaltReason::UserDefined1);
         jit->ClearHalt(Dynarmic::HaltReason::UserDefined2);
+        jit->ClearHalt(Dynarmic::HaltReason::CacheInvalidation); // [YUZU-INSPIRED]
         bridge_halt_requested = false;
         function_returned = false;
 
@@ -533,13 +673,26 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
         }
         */
 
+        // [YUZU-INSPIRED] Handle CacheInvalidation halt — JIT needs to re-enter
+        // after flushing invalidated blocks. Don't count this as a chunk.
+        if (Dynarmic::Has(hr, Dynarmic::HaltReason::CacheInvalidation)) {
+            chunk--;
+            continue;
+        }
+
         // Check for bridge call (UserDefined1)
         if (bridge_halt_requested && Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined1)) {
             bridge_calls++;
 
-            // Spinloop detection: track consecutive calls to same bridge address.
-            // Don't track return_pc — callers can alternate between two sites
-            // (e.g. mutex_lock and mutex_unlock) creating an undetectable pattern.
+            /* LEGACY_SPINLOOP_DETECTION_START
+             * Bridge-spin counter: tracks consecutive halts at the same bridge
+             * address. This catches busy-wait loops that call a bridge stub
+             * (e.g. clock_gettime, yield shim) in a tight loop without using
+             * ARM WFE/WFI, which would be caught by ExceptionRaised instead.
+             *
+             * Don't track return_pc — callers can alternate between two sites
+             * (e.g. mutex_lock and mutex_unlock) creating an undetectable pattern.
+             */
             if (bridge_halt_address == last_bridge_addr) {
                 same_bridge_count++;
             } else {
@@ -561,7 +714,7 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
                 static int thread_unblock_count = 0;
                 thread_unblock_count++;
                 if (thread_unblock_count <= 10) {
-                    std::cerr << "[Thread64/Dyn] UNBLOCKING spin at bridge 0x"
+                    std::cerr << "[Thread64/Dyn] LEGACY UNBLOCKING spin at bridge 0x"
                               << std::hex << bridge_halt_address
                               << " (same_bridge_count=" << std::dec << same_bridge_count
                               << " bridge_calls=" << bridge_calls
@@ -592,6 +745,7 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
                 chunk--;
                 continue;
             }
+            /* LEGACY_SPINLOOP_DETECTION_END */
 
             handle_bridge_call(bridge_halt_address);
             bridge_halt_requested = false;
@@ -651,11 +805,18 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
         // Check if function completed
         if (curr_pc == MAGIC_LR) break;
 
-        // Spin loop detection (non-bridge)
+        /* LEGACY_SPINLOOP_DETECTION_START
+         * PC-repetition spin detector: if the PC doesn't advance across tick
+         * budget boundaries, the guest is stuck in a tight loop that neither
+         * uses WFE/WFI (caught by ExceptionRaised) nor calls a bridge stub
+         * (caught by bridge_spin counter above). Force a return as last resort.
+         * The [YUZU-INSPIRED] WFE path above should handle most real cases;
+         * this is the final belt-and-suspenders guard.
+         */
         if (curr_pc == last_chunk_pc) {
             same_pc_count++;
             if (same_pc_count >= 3) {
-                std::cerr << "[Dynarmic] Spin loop: PC=0x" << std::hex << curr_pc
+                std::cerr << "[Dynarmic] LEGACY Spin loop: PC=0x" << std::hex << curr_pc
                           << std::dec << " unchanged for " << same_pc_count
                           << " chunks — force-returning" << std::endl;
                 jit->SetPC(MAGIC_LR);
@@ -666,6 +827,7 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
             same_pc_count = 0;
         }
         last_chunk_pc = curr_pc;
+        /* LEGACY_SPINLOOP_DETECTION_END */
 
         // Log heavy functions
         if (chunk == 1) {

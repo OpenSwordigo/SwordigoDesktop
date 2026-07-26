@@ -375,19 +375,27 @@ static inline float sre_health_get_max_hp(void* hc) {
 
 /* =========================================================================
  * TransformComponent field accessors (ARM64)
- * position: TransformComponent + 0x10 (Vec3 = 3 floats)
+ * position translation vector: Column 3 of Local Matrix at TransformComponent + 0xa0
  * ========================================================================= */
 static inline void sre_transform_get_position(void* tc, float* x, float* y, float* z) {
     if (!tc) { *x = *y = *z = 0.0f; return; }
-    *x = $F(float, tc, 0x10);
-    *y = $F(float, tc, 0x14);
-    *z = $F(float, tc, 0x18);
+    *x = $F(float, tc, 0xa0);
+    *y = $F(float, tc, 0xa4);
+    *z = $F(float, tc, 0xa8);
 }
 static inline void sre_transform_set_position(void* tc, float x, float y, float z) {
     if (!tc) return;
-    $W(float, tc, 0x10, x);
-    $W(float, tc, 0x14, y);
-    $W(float, tc, 0x18, z);
+    $W(float, tc, 0xa0, x);
+    $W(float, tc, 0xa4, y);
+    $W(float, tc, 0xa8, z);
+
+    /* Synchronize coordinates with the parent SceneObject to maintain physics/collision consistency */
+    void* obj = *(void**)((char*)tc + 0x28); /* Component + 0x28 is parent SceneObject* */
+    if (obj) {
+        $W(float, obj, 0x70, x);
+        $W(float, obj, 0x74, y);
+        $W(float, obj, 0x78, z);
+    }
 }
 
 extern int g_sre_cam_active;

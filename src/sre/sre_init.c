@@ -57,7 +57,7 @@ SreHookEntry sre_hook_table[] = {
      * per-frame overhead. Lua resume errors will crash without this. */
      { 0, "sre_ProgramState_Update" },
      // { 0, "sre_ProgramState_destructor" },
-     // { 0, "sre_updateApplication" },
+     { 0x479aac, "sre_updateApplication" },
 
 
     /* luaD_throw — ROOT of all Lua error handling. Every Lua error goes

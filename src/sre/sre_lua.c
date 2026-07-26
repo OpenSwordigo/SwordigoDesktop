@@ -1368,9 +1368,8 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
 typedef void (*pfn_orig_updateApp)(void* env, void* obj);
 pfn_orig_updateApp g_orig_updateApplication = 0;
 
-void sre_updateApplication(void* env, void* obj, float dt) {
-    /* commented out to revert to old behavior
-    (void)env; (void)obj;
+void sre_updateApplication(void* env, void* obj) {
+    /* 1. Service console & pending Lua coroutines */
     if (g_sre_last_lua_state) {
         extern void sre_mini_ensure_injected(lua_State* L);
         sre_mini_ensure_injected(g_sre_last_lua_state);
@@ -1383,16 +1382,46 @@ void sre_updateApplication(void* env, void* obj, float dt) {
         sre_tick_console_coroutines(g_sre_last_lua_state);
     }
 
-    void* active_state = *(void**)(g_swordigo_base + 0x6e9c20);
-    if (active_state != NULL) {
-        void** vtable = *(void***)active_state;
-        typedef void (*pfn_Update)(void* self, float dt);
-        pfn_Update update_func = (pfn_Update)vtable[13];
-        if (update_func) {
-            update_func(active_state, dt);
+    /* 2. Execute original updateApplication if relay is set, OR call FWShell::Update */
+    if (g_orig_updateApplication) {
+        lua_State* L = g_sre_last_lua_state;
+        if (L != NULL) {
+            CallInfo* saved_ci = L->ci;
+            StkId saved_top = L->top;
+            StkId saved_base = L->base;
+            unsigned short saved_nCcalls = L->nCcalls;
+
+            int my_depth = recovery_push(L);
+            if (my_depth >= 0 && sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
+                recovery_pop(my_depth);
+                pthread_mutex_unlock(&g_lua_mutex);
+                fprintf(stderr, "[SRE/Lua] Exception recovered during updateApplication frame tick!\n");
+                luaF_close(L, saved_top);
+                L->ci = saved_ci;
+                L->top = saved_top;
+                L->base = saved_base;
+                L->nCcalls = saved_nCcalls;
+                return;
+            }
+            g_orig_updateApplication(env, obj);
+            if (my_depth >= 0) {
+                recovery_pop(my_depth);
+            }
+        } else {
+            g_orig_updateApplication(env, obj);
+        }
+    } else {
+        /* Fallback: Direct FWShell::Update call */
+        void* shell = *(void**)(g_swordigo_base + 0x7e9c20);
+        if (shell != NULL) {
+            void** vtable = *(void***)shell;
+            typedef void (*pfn_Update)(void* self, float dt);
+            pfn_Update update_func = (pfn_Update)vtable[13]; /* vtable slot 13 (offset 0x68) */
+            if (update_func) {
+                update_func(shell, 0.016666667f);
+            }
         }
     }
-    */
 }
 
 

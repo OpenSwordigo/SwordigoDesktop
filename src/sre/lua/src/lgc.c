@@ -321,17 +321,7 @@ static l_mem propagatemark (global_State *g) {
 
 
 static void propagateall (global_State *g) {
-  int count = 0;
-  while (g->gray) {
-    propagatemark(g);
-    count++;
-    if (count > 20000) {
-      extern int printf(const char* format, ...);
-      printf("[SRE-GC] Cycle detected in propagateall for L=%p! Wiping gray list to recover.\n", g->mainthread);
-      g->gray = NULL;
-      break;
-    }
-  }
+  while (g->gray) propagatemark(g);
 }
 
 
@@ -561,31 +551,18 @@ static void atomic (lua_State *L) {
 }
 
 
-static int g_gc_propagate_count = 0;
-
 static l_mem singlestep (lua_State *L) {
   global_State *g = G(L);
   /*lua_checkmemory(L);*/
   switch (g->gcstate) {
     case GCSpause: {
-      g_gc_propagate_count = 0;
       markroot(L);  /* start a new collection */
       return 0;
     }
     case GCSpropagate: {
-      if (g->gray) {
-        g_gc_propagate_count++;
-        if (g_gc_propagate_count > 20000) {
-          extern int printf(const char* format, ...);
-          printf("[SRE-GC] Cycle detected in GCSpropagate for L=%p (count=%d)! Wiping gray list to recover.\n", L, g_gc_propagate_count);
-          g->gray = NULL;
-          g_gc_propagate_count = 0;
-          return 0;
-        }
+      if (g->gray)
         return propagatemark(g);
-      }
       else {  /* no more `gray' objects */
-        g_gc_propagate_count = 0;
         atomic(L);  /* finish mark phase */
         return 0;
       }

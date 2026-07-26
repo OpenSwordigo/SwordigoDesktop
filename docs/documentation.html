@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Documentation Center — Swordigo Desktop</title>
+    <meta name="description" content="Native HTML documentation hub for Swordigo Desktop — Architecture, ARM64 JIT, Graphics, APIs, Formats, and Modding.">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <header>
+        <div class="container nav-container">
+            <a href="index.html" class="nav-brand">SwordigoDesktop</a>
+            <ul class="nav-menu">
+                <li><a href="index.html">Overview</a></li>
+                <li><a href="technical.html">Technical Architecture</a></li>
+                <li><a href="research.html">Reverse Engineering</a></li>
+                <li><a href="documentation.html" class="active">Documentation Center</a></li>
+                <li><a href="download.html">Downloads</a></li>
+                <li><a href="changelog.html">Changelog</a></li>
+            </ul>
+        </div>
+    </header>
+
+    <div class="container docs-layout">
+        <aside class="docs-sidebar">
+            <div class="sidebar-group">
+                <div class="sidebar-title">Architecture &amp; Design</div>
+                <ul class="sidebar-links">
+                    <li><a href="#sre-arch">SRE Engine Architecture</a></li>
+                    <li><a href="#platform-plan">Platform Master Plan</a></li>
+                    <li><a href="#legacy-removal">Legacy Engine Removal</a></li>
+                    <li><a href="#dynarmic-research">Yuzu Dynarmic Research</a></li>
+                    <li><a href="#linux-loader">Linux ELF Loader Design</a></li>
+                </ul>
+            </div>
+
+            <div class="sidebar-group">
+                <div class="sidebar-title">ARM64 &amp; Emulation</div>
+                <ul class="sidebar-links">
+                    <li><a href="#arm64-jit">JIT Execution Correctness</a></li>
+                    <li><a href="#exclusive-monitors">LDXR/STXR Exclusive Locks</a></li>
+                    <li><a href="#relocation-inventory">ELF Relocation Inventory</a></li>
+                    <li><a href="#memory-layout">Guest Memory Layout Audit</a></li>
+                </ul>
+            </div>
+
+            <div class="sidebar-group">
+                <div class="sidebar-title">Graphics &amp; Shaders</div>
+                <ul class="sidebar-links">
+                    <li><a href="#fbo-scaler">FBO Viewport Scaler</a></li>
+                    <li><a href="#postfx-pipeline">PostFX Render Pipeline</a></li>
+                    <li><a href="#gpu-threading">GPU Rendering Threading</a></li>
+                </ul>
+            </div>
+
+            <div class="sidebar-group">
+                <div class="sidebar-title">APIs &amp; Subsystems</div>
+                <ul class="sidebar-links">
+                    <li><a href="#sre-hooks">SRE Hook Table (34 Hooks)</a></li>
+                    <li><a href="#lua-api">Lua Scripting Catalog</a></li>
+                    <li><a href="#gui-api">GUI &amp; Overlay API</a></li>
+                    <li><a href="#vfs-api">Virtual Filesystem (VFS)</a></li>
+                </ul>
+            </div>
+
+            <div class="sidebar-group">
+                <div class="sidebar-title">File Formats</div>
+                <ul class="sidebar-links">
+                    <li><a href="#pod-spec">PowerVR POD 3D Spec</a></li>
+                    <li><a href="#pvr-spec">PVR Texture Format Spec</a></li>
+                    <li><a href="#scene-spec">Scene File Specification</a></li>
+                </ul>
+            </div>
+
+            <div class="sidebar-group">
+                <div class="sidebar-title">Modding &amp; SDK</div>
+                <ul class="sidebar-links">
+                    <li><a href="#modding-guide">Swordigo Modding Guide</a></li>
+                    <li><a href="#swkiwi-arch">SwKiwi Modloader Arch</a></li>
+                </ul>
+            </div>
+        </aside>
+
+        <main class="docs-content">
+            <h1 style="margin-bottom: 0.5rem;">Documentation Center</h1>
+            <p style="color: var(--text-muted); margin-bottom: 2rem;">Comprehensive technical documentation for SwordigoDesktop, SRE engine hooks, ARM64 reverse engineering, and modding toolchains.</p>
+
+            <!-- Architecture Section -->
+            <section id="sre-arch" style="padding-top: 1rem; border-top: 1px solid var(--border);">
+                <h2>SRE Engine Architecture</h2>
+                <p>The Swordigo Runtime Engine (SRE) is a native C11 guest library compiled for ARM64 (<code>libsre.so</code>) and mapped into guest memory at <code>0x2000000</code> alongside the original game engine (<code>0x1000000</code>).</p>
+                <p>SRE applies 16-byte ARM64 absolute function trampolines to intercept core game routines, bypassing legacy single-threaded CPU limits, mobile GLES immediate matrix calls, and GNU atomic string reference count locks.</p>
+                
+                <pre><code>// ARM64 16-Byte Absolute Trampoline Injection Sequence
+LDR X16, [PC, #8]    // Load 64-bit target address from literal pool
+BR  X16              // Branch to SRE replacement function in libsre.so
+.quad 0x02001234     // Absolute 64-bit destination pointer</code></pre>
+            </section>
+
+            <!-- Platform Plan Section -->
+            <section id="platform-plan" style="padding-top: 2rem;">
+                <h2>Platform Master Plan</h2>
+                <p>SwordigoDesktop targets 100% platform independence across Linux x86_64, BSD, and handheld ARM64 Linux devices. The core compatibility layer maps Android Bionic libc and JNI OS calls directly into native host equivalents without relying on Android runtime daemons.</p>
+            </section>
+
+            <!-- ARM64 JIT Section -->
+            <section id="arm64-jit" style="padding-top: 2rem; border-top: 1px solid var(--border);">
+                <h2>ARM64 JIT Correctness &amp; Memory Audits</h2>
+                <p>The JIT execution subsystem relies on <strong>Dynarmic</strong>, allocating a 512MB code cache buffer. Unsafe fast-path flags (<code>Unsafe_UnfuseFMA</code> and <code>Unsafe_InaccurateNaN</code>) are enabled to allow host x86 hardware vector units to execute NEON instructions directly.</p>
+            </section>
+
+            <!-- Exclusive Locks Section -->
+            <section id="exclusive-monitors" style="padding-top: 2rem;">
+                <h2>LDXR/STXR Exclusive Locks Analysis</h2>
+                <p>Under ARM64 emulation, atomic copy-on-write <code>std::string</code> refcount loops using <code>LDXR</code>/<code>STXR</code> instructions caused catastrophic thread spinlocks. SRE hooks replace these with single-threaded direct integer increment/decrement operations, completely eliminating the spinlock failure mode.</p>
+            </section>
+
+            <!-- SRE Hook Table Section -->
+            <section id="sre-hooks" style="padding-top: 2rem; border-top: 1px solid var(--border);">
+                <h2>Active SRE Hook Table (34 Hooks)</h2>
+                <p>The SRE trampoline table intercepts major engine routines to resolve crashes and improve performance:</p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Category</th>
+                            <th>Target Address</th>
+                            <th>Host Hook Function</th>
+                            <th>Purpose</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Memory / String</td>
+                            <td><code>0x566bb8</code></td>
+                            <td><code>sre_CppString_from_char_p</code></td>
+                            <td>Eliminates GNU COW atomic reference count spinlocks.</td>
+                        </tr>
+                        <tr>
+                            <td>GUI / Overlay</td>
+                            <td><code>0x4a28bc</code></td>
+                            <td><code>sre_GUIWindow_DrawRect</code></td>
+                            <td>Renders vector UI buttons and HUD overlays directly.</td>
+                        </tr>
+                        <tr>
+                            <td>Audio Subsystem</td>
+                            <td><code>0x4811a0</code></td>
+                            <td><code>sre_PlayMusicWithName</code></td>
+                            <td>Routes audio calls to native OpenAL Soft 3D audio.</td>
+                        </tr>
+                        <tr>
+                            <td>Scene Loop</td>
+                            <td><code>0x34ed2c</code></td>
+                            <td><code>sre_GameSceneView_Update</code></td>
+                            <td>Enforces deterministic 60Hz physics step decoupled from FPS.</td>
+                        </tr>
+                        <tr>
+                            <td>Exception Guard</td>
+                            <td><code>0x572110</code></td>
+                            <td><code>sre_luaD_throw</code></td>
+                            <td>Prevents guest Lua VM longjmp unwinding crashes.</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </section>
+
+            <!-- FBO Scaler Section -->
+            <section id="fbo-scaler" style="padding-top: 2rem; border-top: 1px solid var(--border);">
+                <h2>FBO Viewport Scaler &amp; PostFX</h2>
+                <p>Decouples internal game rendering (960x544) from desktop window dimensions. Implements multi-pass GLSL shaders for upscaling (AMD FSR 1.0, Sharp Bilinear) and post-processing (16-sample SSAO, 64-sample radial god rays, bloom extraction).</p>
+            </section>
+
+            <!-- Modding Guide Section -->
+            <section id="modding-guide" style="padding-top: 2rem; border-top: 1px solid var(--border);">
+                <h2>Swordigo Modding Guide &amp; SwKiwi SDK</h2>
+                <p>SwKiwi is the native modding framework supported by SRE. Mods define custom Lua scripts (`mini.toml` profiles) and hook engine variables directly through the Lua-Native Interface (LNI) without JNI overhead.</p>
+            </section>
+        </main>
+    </div>
+
+    <footer>
+        <div class="container">
+            <p>SwordigoDesktop Documentation Center — Released under the GNU General Public License v2.0 or later.</p>
+        </div>
+    </footer>
+
+</body>
+</html>
