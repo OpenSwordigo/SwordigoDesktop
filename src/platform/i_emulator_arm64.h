@@ -34,6 +34,7 @@ public:
     // --- Integer registers X0-X30, SP ---
     virtual void set_reg(int reg, uint64_t value) = 0;
     virtual uint64_t get_reg(int reg) = 0;
+    virtual void set_tpidr_el0(uint64_t val) = 0;
 
     // --- SIMD/FP registers ---
     virtual void set_dreg(int reg, double value) = 0;

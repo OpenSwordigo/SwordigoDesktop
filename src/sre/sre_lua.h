@@ -119,11 +119,15 @@ typedef int   (*pfn_lua_isuserdata)(lua_State* L, int idx);
 typedef void       (*pfn_lua_xmove)(lua_State* from, lua_State* to, int n);
 typedef lua_State* (*pfn_lua_newthread)(lua_State* L);
 typedef int        (*pfn_lua_pushthread)(lua_State* L);
+struct lua_Debug;
+typedef void       (*lua_Hook)(lua_State *L, struct lua_Debug *ar);
+typedef int        (*pfn_lua_sethook)(lua_State *L, lua_Hook func, int mask, int count);
 
 /* Extended globals (set by sre_init_lua_ext) */
 extern pfn_lua_xmove       g_lua_xmove;
 extern pfn_lua_newthread   g_lua_newthread;
 extern pfn_lua_pushthread  g_lua_pushthread;
+extern pfn_lua_sethook     g_lua_sethook;
 extern pfn_lua_pushvalue   g_lua_pushvalue;
 extern pfn_lua_remove      g_lua_remove;
 extern pfn_lua_insert      g_lua_insert;

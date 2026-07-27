@@ -159,11 +159,18 @@ extern void *BoneControlledCollisionShapeComponent_Interface;
 typedef void* (*pfn_SceneObject_ComponentWithInterface)(const SceneObject*, void*);
 extern pfn_SceneObject_ComponentWithInterface g_SceneObject_ComponentWithInterface;
 
-/* Query a component from a SceneObject by interface pointer */
+typedef void (*pfn_SceneObject_InitWithTemplate)(SceneObject*, void*);
+extern pfn_SceneObject_InitWithTemplate g_SceneObject_InitWithTemplate;
+
 static inline void* sre_scene_object_component(const SceneObject* obj, void* iface) {
     if (!obj || !iface || !g_SceneObject_ComponentWithInterface) return (void*)0;
     return g_SceneObject_ComponentWithInterface(obj, iface);
 }
+
+typedef void (*pfn_CreateHeroObjectAt)(void*, void*, int, int);
+extern pfn_CreateHeroObjectAt g_sre_CreateHeroObjectAt;
+
+
 
 /* =========================================================================
  * ProgramState::FromLuaState function pointer
@@ -300,8 +307,8 @@ void sre_CameraController_Update(void* self, float dt);
 /* Get identifier as C-string (reads SreString data pointer) */
 static inline const char* sre_scene_object_identifier(SceneObject* obj) {
     if (!obj) return (void*)0;
-    /* Read SreString object directly at offset 0x50 */
     SreString* str = (SreString*)((char*)obj + 0x50);
+    if ((uintptr_t)str->data < 0x10000) return (void*)0;
     return str->data;
 }
 
@@ -389,7 +396,7 @@ static inline void sre_transform_set_position(void* tc, float x, float y, float 
     $W(float, tc, 0xa4, y);
     $W(float, tc, 0xa8, z);
 
-    /* Synchronize coordinates with the parent SceneObject to maintain physics/collision consistency */
+    /* Synchronize 3D coordinates with parent SceneObject */
     void* obj = *(void**)((char*)tc + 0x28); /* Component + 0x28 is parent SceneObject* */
     if (obj) {
         $W(float, obj, 0x70, x);

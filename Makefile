@@ -3,7 +3,7 @@
 
 CXX     := g++
 CC      := gcc
-CXXFLAGS := -std=c++17 -g -O3 -Isrc -Isrc/imgui -Isrc/sre/lua/src -Iinclude -Isrc/stb -DVULKAN_BACKEND -MMD -MP
+CXXFLAGS := -std=c++17 -g -O3 -Isrc -Isrc/imgui -Isrc/sre/lua/src -Iinclude -Isrc/stb -DVULKAN_BACKEND -DVK_NO_PROTOTYPES -MMD -MP
 CFLAGS   := -g -O3 -Isrc -Isrc/sre/lua/src -Iinclude -MMD -MP
 
 # pkg-config queries
@@ -180,6 +180,8 @@ SRE_CORE_SRCS := \
     src/sre/sre_gui.c \
     src/sre/sre_gui_native.c \
     src/sre/sre_scene_update.c \
+    src/sre/sre_frame_loop.c \
+    src/sre/sre_gui_nav.c \
     src/sre/sre_setjmp.S \
     src/sre/sre_mini_api.c \
     src/sre/sre_vfs.c \

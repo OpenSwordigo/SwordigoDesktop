@@ -253,13 +253,74 @@ void sre_WeaponTrailComponent_Draw(void* self, void* ctx, void* matrix_ref, void
  * This is critical for ProgramState::Update which has try/catch around
  * its child iteration — without this, Wastelands crashes.
  */
+#include "sre.h"
 #include "sre_setjmp.h"
 
 /* Recovery stack — defined in sre_lua.c */
 extern sre_recovery_entry g_sre_recovery_stack[];
 extern int g_sre_recovery_depth;
 
-/* Pointer to original __cxa_throw (set by host via relay stub) */
+/* ========== UnwindRaiseException hook ==========
+ * Original: sub_5818C4 at nm offset 0x5818C4 (v1.4.12 arm64-v8a)
+ *
+ * IDA: _QWORD* __fastcall sub_5818C4(_QWORD *a1, ..., char a9)
+ *   sub_58128C(v14, &a9, x30);    // init unwind frame (hooked → zeros it)
+ *   memcpy(v15, v14, 0x3C0);
+ *   if (a1[2]) sub_581474(a1,v15) else sub_5813B4(a1,v15);
+ *   if (v11 != 7) abort();
+ *   sub_57FF60(...);  return a1;
+ *
+ * Problem chain (even after sre_ExceptionFrameInit suppresses the abort in
+ * sub_58128C):
+ *   1. sub_58128C hook zeros v14 → memcpy gives sub_5813B4 a zeroed frame
+ *   2. sub_5813B4 reads personality function ptr from zeroed frame → 0
+ *   3. sub_5813B4 computes jump target from zeroed/garbage data
+ *   4. BLR lands at 0x16e9ce0 (BlendAnimationComponent::default_instance_+0xce0)
+ *      which is raw DATA, not code → undefined instruction → Dynarmic halts
+ *   5. Dynarmic force-returns to LR = sre_ExceptionFrameInit → re-enters
+ *      hook → infinite loop
+ *
+ * Root cause: EHABI tables for the guest binary are NOT registered with the
+ * host dynamic linker (custom ELF loader, not ld.so), so dl_iterate_phdr
+ * can never find them.  The entire unwinding machinery is broken.
+ * sre_cxa_throw (0x51e108) already intercepts __cxa_throw and longjmps to
+ * a recovery point, so sub_5818C4 should NOT be reached in normal gameplay.
+ * It is only reached via the audio landing-pad / sre_cxa_throw returning
+ * silently in contexts with no recovery depth.
+ *
+ * Fix: return a1 (the exception object) immediately — identical to what
+ * sub_5818C4 would return on success, but without calling the broken
+ * unwinding sub-functions.  This silently drops the unhandled exception,
+ * exactly what the previous abort-recovery was doing anyway (just faster).
+ *
+ * nm -D libswordigo.so v1.4.12 arm64-v8a: static function, not in dynctab.
+ * Address cross-checked: LR=0x1581918 saved on stack at crash (instruction
+ * after "BL sub_58128C" inside sub_5818C4) and sub_5818C4 confirmed by IDA.
+ */
+void* sre_UnwindRaiseException(void* a1) {
+    /* Return the exception object pointer immediately — same as the normal
+     * success path of sub_5818C4 (return a1), but without touching the
+     * broken EHABI unwind machinery that causes crash/loop. */
+    return a1;
+}
+
+/* ========== ExceptionFrameInit hook ==========
+ * Original: sub_58128C at nm offset 0x58128C (v1.4.12 arm64-v8a)
+ *
+ * sub_58128C initializes the unwind control block and calls sub_5806A8 which
+ * uses dl_iterate_phdr to look up EHABI tables for the caller's address.
+ * Since the guest binary is not registered with the host linker, this always
+ * returns 5 → abort().  This hook zeros the frame and returns without
+ * aborting.  sub_5818C4 is now hooked directly (sre_UnwindRaiseException),
+ * but sub_58128C is also called from sub_581658, sub_5817D0, sub_5819C0, and
+ * sub_581ADC — those paths still need to be suppressed here.
+ */
+void sre_ExceptionFrameInit(uint64_t* a1, uint64_t a2, uint64_t a3) {
+    __builtin_memset(a1, 0, 0x3C0);
+    a1[104] = (uint64_t)0x4000000000000000ULL;
+}
+
+
 typedef void (*pfn_cxa_throw)(void*, void*, void(*)(void*));
 pfn_cxa_throw g_original_cxa_throw = 0;
 
@@ -316,12 +377,31 @@ void sre_cxa_throw(void* thrown_exception, void* tinfo, void(*dest)(void*)) {
     g_sre_cxa_throw_caller = lr;
     g_sre_cxa_throw_unrecovered++;
 
-    /* Instead of BRK (which freezes the game permanently), just return.
-     * __cxa_throw is [[noreturn]] but the ARM64 code after the BL has
-     * instructions that continue execution. The calling code (luaD_throw)
-     * will proceed to call ProgramPanic (which we've hooked to be safe)
-     * and then exit(1) (which we've made non-fatal). */
-    return;
+    /* CRITICAL: Do NOT silently return from __cxa_throw when there is no
+     * recovery point.  __cxa_throw is [[noreturn]], so the ARM64 instruction
+     * immediately after "BL __cxa_throw" is unreachable dead code.  If we
+     * return here, execution falls through into that dead code.  In practice
+     * that dead code is often "BL <function_ptr_in_register>" where the
+     * register still holds 0 (the empty boost::function's vtable dispatch
+     * computes (0 & ~1)+8 = 8).  Dynarmic then attempts to execute guest
+     * code at host address 8, which is a null-pointer fault → silent freeze.
+     *
+     * Instead, call abort().  The SRE abort-recovery mechanism (installed in
+     * sre_abort.c) intercepts abort() and unwinds the stack back to the SRE
+     * dispatch loop, giving a visible "[SRE/Abort-Recovery]" log line rather
+     * than a silent hang.  This is safe: the abort-recovery was specifically
+     * designed for exactly this kind of unhandled fatal condition.
+     *
+     * NOTE: if this fires frequently, it means a C++ exception is being thrown
+     * from a code path that has no active Lua pcall frame on the recovery
+     * stack.  Fix the root cause (ensure exceptions don't escape non-Lua
+     * contexts) rather than suppressing this abort. */
+    fprintf(stderr,
+            "[SRE/cxa_throw] No recovery point for exception '%s' (caller=0x%llx, "
+            "unrecovered=%d) — calling abort() for SRE recovery\n",
+            type_name, lr, g_sre_cxa_throw_unrecovered);
+    fflush(stderr);
+    abort();
 }
 
 /* ========== ProgramPanic hook ==========

@@ -136,14 +136,21 @@ void sre_AudioSystem_SetMusicVolume(void* self, float vol) {
  *   If nothing playing → load immediately with fadein
  */
 void sre_PlayMusicWithName(void* self, void* name_ref, int restart) {
-    /* Read the std::string */
+    if (!name_ref) return;
+
+    /* Read the std::string data pointer */
     char* data = *(char**)name_ref;
     if (!data) return;
-    
-    /* Length is at data - 24 (COW _Rep::_M_length) */
-    sre_u64 len = *(sre_u64*)(data - 24);
-    if (len == 0 || len >= 255) return;
-    
+
+    /* Try length at name_ref + 8 (C++11 SSO layout) */
+    sre_u64 len = *(sre_u64*)((char*)name_ref + 8);
+    if (len == 0 || len >= 255) {
+        /* Fallback: compute string length directly from null terminator */
+        len = 0;
+        while (data[len] && len < 255) len++;
+    }
+    if (len == 0) return;
+
     /* Build name string */
     char new_name[256];
     sre_u64 i;

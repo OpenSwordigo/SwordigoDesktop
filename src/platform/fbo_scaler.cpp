@@ -2143,7 +2143,9 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
     switch (p) {
         case PostFXPreset::OFF:
             s.enabled = true;
-            s.ssao = false; // Disabled for performance/clarity on Low
+            s.ssao = true;
+            s.ssao_radius = 0.036f;
+            s.ssao_intensity = 0.95f; // Enabled again :)
             s.shadow_intensity = 0.20f;
             s.shadow_softness = 0.004f;
             s.shadow_light_x = 0.3f;
@@ -2176,14 +2178,14 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
 
             // Volumetric atmosphere
             s.volumetric_light = true;
-            s.volumetric_intensity = 0.22f;
+            s.volumetric_intensity = 0.32f;
 
             // Color grading — vibrant, warm, bright, rich
             s.color_adjust = true;
             s.warmth = 0.08f;
             s.contrast = 1.02f;
             s.saturation = 1.10f;
-            s.brightness = 0.01f;
+            s.brightness = 0.0095f;
 
             // Soft vignette
             s.vignette = true;
@@ -2196,11 +2198,11 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
             // Controlled bloom
             s.bloom = true;
             s.bloom_threshold = 0.82f;
-            s.bloom_intensity = 0.55f;
+            s.bloom_intensity = 0.59f;
 
             // Soft directional shadows
             s.shadows = true;
-            s.shadow_intensity = 0.25f;
+            s.shadow_intensity = 0.35f;
             s.shadow_softness = 0.0080f;
             s.shadow_light_x = -0.10f;
             s.shadow_light_y = 0.85f;

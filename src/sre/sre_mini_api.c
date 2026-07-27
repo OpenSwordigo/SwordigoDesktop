@@ -1180,19 +1180,47 @@ static void sre_btn_strcpy(volatile char* dst, const char* src, int maxlen) {
     dst[i] = '\0';
 }
 
-/* ButtonController.New(id, label, x, y, w, h) → 0 */
+static const char* sre_get_btn_id(lua_State* L, int idx) {
+    if (!g_lua_type || !g_lua_tolstring) return NULL;
+    if (g_lua_type(L, idx) == 5 && g_lua_getfield && g_lua_settop) { /* 5 = LUA_TTABLE */
+        g_lua_getfield(L, idx, "id");
+        const char* id = lua_tostring(L, -1);
+        g_lua_settop(L, -2);
+        if (id) return id;
+    }
+    return lua_tostring(L, idx);
+}
+
+/* ButtonController.New(id, label, x, y, w, h) or Button.New(label, x, y, w, h) → button_obj */
 static int l_btn_new(lua_State* L) {
-    const char* id    = lua_tostring(L, 1);
-    const char* label = lua_tostring(L, 2);
+    int top = g_lua_gettop ? g_lua_gettop(L) : 0;
+    const char* id = NULL;
+    const char* label = NULL;
+    float bx = 0, by = 0, bw = 0, bh = 0;
+    char generated_id[64];
+
+    if (top <= 5) {
+        /* Kiwi signature: Button.New(label, x, y, w, h) */
+        label = lua_tostring(L, 1);
+        bx = (float)g_lua_tonumber(L, 2);
+        by = (float)g_lua_tonumber(L, 3);
+        bw = (float)g_lua_tonumber(L, 4);
+        bh = (float)g_lua_tonumber(L, 5);
+        static unsigned int s_btn_counter = 0;
+        snprintf(generated_id, sizeof(generated_id), "btn_%u", ++s_btn_counter);
+        id = generated_id;
+    } else {
+        /* SRE / SwMini signature: ButtonController.New(id, label, x, y, w, h) */
+        id    = lua_tostring(L, 1);
+        label = lua_tostring(L, 2);
+        bx = (float)g_lua_tonumber(L, 3);
+        by = (float)g_lua_tonumber(L, 4);
+        bw = (float)g_lua_tonumber(L, 5);
+        bh = (float)g_lua_tonumber(L, 6);
+    }
     if (!id) return 0;
     if (!label) label = "";
 
-    float bx = (float)g_lua_tonumber(L, 3);
-    float by = (float)g_lua_tonumber(L, 4);
-    float bw = (float)g_lua_tonumber(L, 5);
-    float bh = (float)g_lua_tonumber(L, 6);
-
-    /* Find existing or allocate new */
     volatile SreBtnSlot* btn = sre_find_btn(id);
     if (!btn) {
         int i;
@@ -1200,7 +1228,7 @@ static int l_btn_new(lua_State* L) {
             if (!g_sre_buttons[i].active) { btn = &g_sre_buttons[i]; break; }
         }
     }
-    if (!btn) return 0;  /* table full */
+    if (!btn) return 0;
 
     sre_btn_strcpy(btn->id, id, SRE_BTN_ID_LEN);
     sre_btn_strcpy(btn->label, label, SRE_BTN_LABEL_LEN);
@@ -1220,7 +1248,7 @@ static int l_btn_new(lua_State* L) {
     btn->padding_l = 0; btn->padding_t = 0;
     btn->padding_r = 0; btn->padding_b = 0;
     btn->alignment = 0;
-    btn->overlay_id[0] = '\0';  /* Clear any stale overlay association from previous slot use */
+    btn->overlay_id[0] = '\0';
     btn->confined = 0;
     btn->pressed = 0;
     btn->released = 0;
@@ -1228,12 +1256,31 @@ static int l_btn_new(lua_State* L) {
     btn->active = 1;
     btn->dirty = 1;
     g_sre_btn_dirty = 1;
+
+    /* Push button object table so OO methods work: btn = { id = id, label = label } */
+    if (g_lua_createtable && g_lua_setfield && g_lua_pushstring && g_lua_getfield) {
+        g_lua_createtable(L, 0, 2);
+        g_lua_pushstring(L, id);
+        g_lua_setfield(L, -2, "id");
+        g_lua_pushstring(L, label);
+        g_lua_setfield(L, -2, "label");
+
+        g_lua_getfield(L, LUA_GLOBALSINDEX, "ButtonController");
+        if (g_lua_type(L, -1) == 5) {
+            g_lua_createtable(L, 0, 1);
+            g_lua_pushvalue(L, -2);
+            g_lua_setfield(L, -2, "__index");
+            g_lua_setmetatable(L, -3);
+        }
+        g_lua_settop(L, -2);
+        return 1;
+    }
     return 0;
 }
 
 /* ButtonController.Delete(id) */
 static int l_btn_delete(lua_State* L) {
-    const char* id = lua_tostring(L, 1);
+    const char* id = sre_get_btn_id(L, 1);
     volatile SreBtnSlot* btn = sre_find_btn(id);
     if (btn) {
         btn->active = 0;
@@ -1258,7 +1305,7 @@ static int l_btn_delete_all(lua_State* L) {
 
 /* ButtonController.SetHidden(id, bool) */
 static int l_btn_set_hidden(lua_State* L) {
-    const char* id = lua_tostring(L, 1);
+    const char* id = sre_get_btn_id(L, 1);
     volatile SreBtnSlot* btn = sre_find_btn(id);
     if (btn) {
         btn->hidden = g_lua_toboolean(L, 2);
@@ -1277,7 +1324,7 @@ static int l_btn_set_hidden_all(lua_State* L) {
 
 /* ButtonController.IsPressed(id) → boolean */
 static int l_btn_is_pressed(lua_State* L) {
-    const char* id = lua_tostring(L, 1);
+    const char* id = sre_get_btn_id(L, 1);
     volatile SreBtnSlot* btn = sre_find_btn(id);
     if (!btn) {
         g_lua_pushboolean(L, 0);
@@ -1294,7 +1341,7 @@ static int l_btn_is_pressed(lua_State* L) {
 
 /* ButtonController.IsDragging(id) → boolean */
 static int l_btn_is_dragging(lua_State* L) {
-    const char* id = lua_tostring(L, 1);
+    const char* id = sre_get_btn_id(L, 1);
     volatile SreBtnSlot* btn = sre_find_btn(id);
     g_lua_pushboolean(L, btn ? btn->dragging : 0);
     return 1;
@@ -1302,15 +1349,15 @@ static int l_btn_is_dragging(lua_State* L) {
 
 /* ButtonController.Exists(id) → boolean */
 static int l_btn_exists(lua_State* L) {
-    const char* id = lua_tostring(L, 1);
+    const char* id = sre_get_btn_id(L, 1);
     volatile SreBtnSlot* btn = sre_find_btn(id);
     g_lua_pushboolean(L, (btn && btn->active) ? 1 : 0);
     return 1;
 }
 
-/* ButtonController.SetText(id, text) — truncate text if too long to fit button */
+/* ButtonController.SetText(id, text) */
 static int l_btn_set_text(lua_State* L) {
-    const char* id = lua_tostring(L, 1);
+    const char* id = sre_get_btn_id(L, 1);
     const char* text = lua_tostring(L, 2);
     volatile SreBtnSlot* btn = sre_find_btn(id);
     if (btn && text) {
@@ -1336,7 +1383,7 @@ static int l_btn_set_text(lua_State* L) {
 
 /* ButtonController.SetPosition(id, x, y) */
 static int l_btn_set_position(lua_State* L) {
-    const char* id = lua_tostring(L, 1);
+    const char* id = sre_get_btn_id(L, 1);
     volatile SreBtnSlot* btn = sre_find_btn(id);
     if (btn) {
         float nx = (float)g_lua_tonumber(L, 2);
@@ -1351,7 +1398,7 @@ static int l_btn_set_position(lua_State* L) {
 
 /* ButtonController.GetPosition(id) → x, y */
 static int l_btn_get_position(lua_State* L) {
-    const char* id = lua_tostring(L, 1);
+    const char* id = sre_get_btn_id(L, 1);
     volatile SreBtnSlot* btn = sre_find_btn(id);
     if (btn) {
         g_lua_pushnumber(L, (double)btn->cur_x);
@@ -1381,7 +1428,7 @@ static int l_btn_get_position_y(lua_State* L) {
 
 /* ButtonController.SetAlpha(id, alpha) */
 static int l_btn_set_alpha(lua_State* L) {
-    const char* id = lua_tostring(L, 1);
+    const char* id = sre_get_btn_id(L, 1);
     volatile SreBtnSlot* btn = sre_find_btn(id);
     if (btn) {
         btn->alpha = (float)g_lua_tonumber(L, 2);
@@ -1393,7 +1440,7 @@ static int l_btn_set_alpha(lua_State* L) {
 
 /* ButtonController.SetScaling(id, sx [, sy]) */
 static int l_btn_set_scaling(lua_State* L) {
-    const char* id = lua_tostring(L, 1);
+    const char* id = sre_get_btn_id(L, 1);
     volatile SreBtnSlot* btn = sre_find_btn(id);
     if (btn) {
         float sx = (float)g_lua_tonumber(L, 2);
@@ -1858,12 +1905,29 @@ static int l_mini_toggle_debug(lua_State* L) {
     return 0;
 }
 
-/* Mini.RecreateHero() — sets pending flag for host to poll.
- * The real implementation needs Caver::GameSceneController::RecreateHero()
- * called at the engine offset via a guest→host callback mechanism. */
+/* Mini.RecreateHero() — dynamically recreates hero object at current location (matching SwKiwi recreate_hero.c) */
 static int l_mini_recreate_hero(lua_State* L) {
-    (void)L;
     g_sre_recreate_hero_pending = 1;
+
+    SceneController* sc = sre_scene_controller_from_L(L);
+    if (!sc) return 0;
+
+    SceneObject* hero = sre_hero_object_from_sc(sc);
+    if (!hero) return 0;
+
+    /* Hero position is at hero + 0x70 (Vector3) */
+    void* pos = (char*)hero + 0x70;
+
+    /* Facing direction from TransformComponent (0x70) */
+    int facing_dir = 1;
+    if (g_SceneObject_ComponentWithInterface && TransformComponent_Interface) {
+        void* comp = g_SceneObject_ComponentWithInterface(hero, TransformComponent_Interface);
+        if (comp) facing_dir = *(int*)((char*)comp + 0x70);
+    }
+
+    if (g_sre_CreateHeroObjectAt) {
+        g_sre_CreateHeroObjectAt(sc, pos, facing_dir, 0);
+    }
     return 0;
 }
 
@@ -1976,13 +2040,62 @@ static int l_camctrl_get_up_vector(lua_State* L) {
     return 1;
 }
 
-/* Mini.SceneFindAll() → table of scene object names
- * Placeholder — returns empty table. SwKiwi's implementation iterates an
- * engine scene tree (ARM offset-based), which we cannot do on PC without
- * the right guest memory layout. A future implementation can hook scene
- * events to build this list dynamically. */
+/* Helper: Red-Black Tree increment (matching SwKiwi scene_find_all.c) */
+static void* rbTreeIncrement(void* node) {
+    if (!node) return (void*)0;
+    void* right = *(void**)((char*)node + 0x18);
+    if (right != (void*)0) {
+        void* leftmost = right;
+        while (*(void**)((char*)leftmost + 0x10) != (void*)0) {
+            leftmost = *(void**)((char*)leftmost + 0x10);
+        }
+        return leftmost;
+    }
+    
+    void* parent = *(void**)((char*)node + 0x8);
+    while (parent != (void*)0 && node == *(void**)((char*)parent + 0x18)) {
+        node = parent;
+        parent = *(void**)((char*)parent + 0x8);
+    }
+    return parent;
+}
+
+/* Mini.SceneFindAll() → table of active scene objects (matching SwKiwi 100%) */
 static int l_mini_scene_find_all(lua_State* L) {
-    g_lua_createtable(L, 0, 0);
+    if (g_lua_createtable) g_lua_createtable(L, 0, 0);
+
+    /* Retrieve global 'scene' or scene controller from Lua VM */
+    void* scene = (void*)0;
+    if (g_lua_getfield && g_lua_touserdata && g_lua_settop) {
+        g_lua_getfield(L, -10002, "scene");
+        scene = g_lua_touserdata(L, -1);
+        g_lua_settop(L, -2);
+    }
+
+    if (!scene) {
+        SceneController* sc = sre_scene_controller_from_L(L);
+        if (sc) scene = (void*)sc;
+    }
+
+    if (!scene) return 1;
+
+    /* On 64-bit ARM, sentinel RB-tree node is at scene + 0xb8 */
+    void* sentinel = (char*)scene + 0xb8;
+    void* node = *(void**)((char*)sentinel + 0x10);
+
+    int idx = 1;
+    int depth = 0;
+    while (node && node != sentinel && depth < 2048) {
+        SceneObject* obj = *(SceneObject**)((char*)node + 0x28);
+        if (obj && g_lua_pushinteger && g_lua_pushlightuserdata && g_lua_settable) {
+            g_lua_pushinteger(L, idx++);
+            g_lua_pushlightuserdata(L, obj);
+            g_lua_settable(L, -3);
+        }
+        node = rbTreeIncrement(node);
+        depth++;
+    }
+
     return 1;
 }
 
@@ -2759,30 +2872,26 @@ static int l_edgetest_test(lua_State* L) {
     float oy = cam_y + viewport_h / 2.0f - viewport_h * 0.52f;
 
     int pushed = 0;
-    if (g_lua_getfield && g_lua_type && g_lua_pcall && g_lua_pushnumber && g_lua_settop && g_lua_gettop) {
-        int base = g_lua_gettop(L);
+    if (g_lua_getfield && g_lua_type && g_lua_pcall && g_lua_pushnumber) {
         g_lua_getfield(L, LUA_GLOBALSINDEX, "Vector3");
-        if (g_lua_type(L, -1) == LUA_TTABLE) {
+        if (g_lua_type(L, -1) == 5) { /* LUA_TTABLE */
             g_lua_getfield(L, -1, "New");
-            if (g_lua_type(L, -1) == LUA_TFUNCTION) {
+            if (g_lua_type(L, -1) == 6) { /* LUA_TFUNCTION */
                 g_lua_pushnumber(L, (double)ox);
                 g_lua_pushnumber(L, (double)oy);
                 g_lua_pushnumber(L, depth);
                 if (g_lua_pcall(L, 3, 1, 0) == 0) {
                     pushed = 1;
-                    g_lua_setfield(L, LUA_GLOBALSINDEX, "__et_tmp");
-                    g_lua_settop(L, base);
-                    g_lua_getfield(L, LUA_GLOBALSINDEX, "__et_tmp");
-                    g_lua_pushnil(L);
-                    g_lua_setfield(L, LUA_GLOBALSINDEX, "__et_tmp");
+                    /* Replace Vector3 global table with the returned Vector3 object */
+                    g_lua_replace(L, -2);
                 } else {
-                    g_lua_settop(L, base);
+                    lua_pop(L, 2);
                 }
             } else {
-                g_lua_settop(L, base);
+                lua_pop(L, 2);
             }
         } else {
-            g_lua_settop(L, base);
+            lua_pop(L, 1);
         }
     }
 
@@ -5059,7 +5168,14 @@ static void sre_eval_lua(lua_State* L, const char* code) {
         if (g_lua_pcall(L, 1, 2, 0) == 0) {
             if (g_lua_type(L, -2) == 6) {
                 g_lua_settop(L, -2); /* Pop errmsg, leave function */
-                g_lua_pcall(L, 0, 0, 0);
+                int res = g_lua_pcall(L, 0, 0, 0);
+                if (res != 0 && g_lua_tolstring) {
+                    const char* msg = lua_tostring(L, -1);
+                    fprintf(stderr, "[SRE/LuaEval] Runtime Error (%d): %s\n", res, msg ? msg : "unknown");
+                }
+            } else if (g_lua_tolstring) {
+                const char* msg = lua_tostring(L, -1);
+                fprintf(stderr, "[SRE/LuaEval] Syntax Error: %s\n", msg ? msg : "unknown");
             }
         }
     }
@@ -5385,56 +5501,49 @@ void sre_mini_ensure_injected(lua_State* L) {
          *     Scans active_wrappers to find live addrs, deletes any           *
          *     shared_envs entry whose addr has zero live wrappers.            *
          * ------------------------------------------------------------------ */
-        "if not _G.__sre_so_hooked then\n"
+                "if not _G.__sre_so_hooked then\n"
         "  _G.__sre_so_hooked = true\n"
         "  local get_mt = (debug and debug.getmetatable) or getmetatable\n"
         "\n"
-        "  -- Weak-keyed table: userdata wrapper object -> C++ address string\n"
-        "  -- Entries vanish automatically when Lua GC collects the wrapper\n"
-        "  local active_wrappers = setmetatable({}, { __mode = 'k' })\n"
-        "\n"
-        "  -- Strong table: C++ address string -> custom field env table\n"
         "  local shared_envs = {}\n"
+        "  _G.__sre_shared_envs = shared_envs\n"
         "\n"
-        "  -- Periodic mark-and-sweep: prune envs for fully-GC'd objects\n"
-        "  local _sweep_ctr = 0\n"
-        "  local function sweep_shared_envs()\n"
-        "    _sweep_ctr = _sweep_ctr + 1\n"
-        "    if _sweep_ctr < 200 then return end\n"
-        "    _sweep_ctr = 0\n"
-        "    local live = {}\n"
-        "    for _, addr in pairs(active_wrappers) do live[addr] = true end\n"
-        "    for addr in pairs(shared_envs) do\n"
-        "      if not live[addr] then shared_envs[addr] = nil end\n"
-        "    end\n"
+        "  _G.sre_purge_obj_env = function(obj)\n"
+        "    if obj then shared_envs[obj] = nil end\n"
         "  end\n"
         "\n"
-        "  -- Compute stable runtime identity string for an object (using unique pointer tostring)\n"
-        "  local function get_addr(obj, og_idx)\n"
-        "    return tostring(obj)\n"
+        "  _G.sre_clear_all_obj_envs = function()\n"
+        "    _G.__sre_shared_envs = {}\n"
+        "    shared_envs = _G.__sre_shared_envs\n"
         "  end\n"
         "\n"
         "  _G.sre_hook_obj = function(obj)\n"
         "    if not obj then return obj end\n"
         "    local mt = get_mt and get_mt(obj)\n"
         "    if mt and type(mt) == 'table' then\n"
-        "      -- For already-hooked metatables, retrieve the stashed originals\n"
         "      local og_index    = mt.__sre_og_index    or mt.__index\n"
         "      local og_newindex = mt.__sre_og_newindex or mt.__newindex\n"
         "      if not mt.__sre_hooked then\n"
         "        mt.__sre_hooked      = true\n"
-        "        mt.__sre_og_index    = og_index    -- stash so later registrations work\n"
+        "        mt.__sre_og_index    = og_index\n"
         "        mt.__sre_og_newindex = og_newindex\n"
         "        mt.__index = function(self_obj, key)\n"
-        "          sweep_shared_envs()\n"
-        "          local addr = get_addr(self_obj, og_index)\n"
-        "          active_wrappers[self_obj] = addr\n"
-        "          local env = shared_envs[addr]\n"
+        "          local env = shared_envs[self_obj]\n"
         "          if env and env[key] ~= nil then return env[key] end\n"
         "          if key == 'setAlwaysActive' then\n"
         "            return function(self_act, active)\n"
         "              if SceneObject and SceneObject.SetAlwaysActive then\n"
         "                SceneObject.SetAlwaysActive(self_act, active)\n"
+        "              end\n"
+        "            end\n"
+        "          end\n"
+        "          if key == 'destroy' or key == 'Destroy' then\n"
+        "            return function(self_act)\n"
+        "              shared_envs[self_act] = nil\n"
+        "              if type(og_index) == 'table' and type(og_index[key]) == 'function' then\n"
+        "                return og_index[key](self_act)\n"
+        "              elseif SceneObject and SceneObject.Destroy then\n"
+        "                return SceneObject.Destroy(self_act)\n"
         "              end\n"
         "            end\n"
         "          end\n"
@@ -5445,23 +5554,20 @@ void sre_mini_ensure_injected(lua_State* L) {
         "          end\n"
         "        end\n"
         "        mt.__newindex = function(self_obj, key, val)\n"
-        "          sweep_shared_envs()\n"
         "          if og_newindex then\n"
         "            pcall(function()\n"
         "              if type(og_newindex) == 'function' then og_newindex(self_obj, key, val)\n"
         "              elseif type(og_newindex) == 'table' then og_newindex[key] = val end\n"
         "            end)\n"
         "          end\n"
-        "          local addr = get_addr(self_obj, og_index)\n"
-        "          active_wrappers[self_obj] = addr\n"
-        "          if not shared_envs[addr] then shared_envs[addr] = {} end\n"
-        "          shared_envs[addr][key] = val\n"
+        "          local env = shared_envs[self_obj]\n"
+        "          if not env then\n"
+        "            env = {}\n"
+        "            shared_envs[self_obj] = env\n"
+        "          end\n"
+        "          env[key] = val\n"
         "        end\n"
         "      end\n"
-        "      -- Register this wrapper in the weak table so GC can track it\n"
-        "      local addr = get_addr(obj, og_index)\n"
-        "      active_wrappers[obj] = addr\n"
-        "      if not shared_envs[addr] then shared_envs[addr] = {} end\n"
         "    end\n"
         "    return obj\n"
         "  end\n"
@@ -5879,6 +5985,51 @@ void sre_mini_ensure_injected(lua_State* L) {
         "    end\n"
         "    debug.setmetatable(_G, _env_mt)\n"
         "  end\n"
+        "end\n"
+    );
+
+    /* ---- SCL Script & Component Safety Layer ----
+     * SCL entity scripts (e.g. snowy_beetle, snailshell, spikey_walker) call:
+     *   KeyframeAnimation.TimeToFrame(self, anim_id, frame)
+     *   KeyframeAnimation.TimeToCompletion(self, anim_id)
+     *   KeyframeAnimation.SetCurrentTime(self, anim_id, time)
+     *   KeyframeAnimation.SetRunning(self, anim_id, running)
+     *   AnimationController.BlendToAnimation(self, anim_id)
+     *   CollisionShape.SetEnabled(self, shape_id, enabled)
+     *   EntityController.PerformAction(self, action_id)
+     * If an animation ID or argument is nil (due to script typos like unhideanimation vs unhideAnimation),
+     * passing nil into native C++ engine methods crashes the engine with a segfault/exception.
+     * This layer wraps KeyframeAnimation, AnimationController, CollisionShape, and EntityController
+     * with nil-checks and pcall guards so typos fail gracefully without crashing SRE. */
+    sre_eval_lua(L,
+        "if not _G.__sre_scl_safety_wrapped then\n"
+        "  _G.__sre_scl_safety_wrapped = true\n"
+        "  local function wrap_comp(name)\n"
+        "    local orig = rawget(_G, name)\n"
+        "    if not orig or orig.__sre_wrapped then return end\n"
+        "    local proxy = { __sre_wrapped = true }\n"
+        "    setmetatable(proxy, {\n"
+        "      __index = function(t, k)\n"
+        "        local fn = orig[k]\n"
+        "        if type(fn) == 'function' then\n"
+        "          return function(self_obj, ...)\n"
+        "            if self_obj == nil then return end\n"
+        "            local ok, res = pcall(fn, self_obj, ...)\n"
+        "            if not ok and type(res) == 'string' then\n"
+        "              print('[SRE/' .. name .. '] Error in ' .. tostring(k) .. ': ' .. tostring(res))\n"
+        "            end\n"
+        "            return res\n"
+        "          end\n"
+        "        end\n"
+        "        return fn\n"
+        "      end,\n"
+        "      __newindex = function(t, k, v) orig[k] = v end\n"
+        "    })\n"
+        "    rawset(_G, name, proxy)\n"
+        "  end\n"
+        "  wrap_comp('KeyframeAnimation')\n"
+        "  wrap_comp('AnimationController')\n"
+        "  wrap_comp('CollisionShape')\n"
         "end\n"
     );
 

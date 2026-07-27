@@ -119,7 +119,9 @@ void *BoneControlledCollisionShapeComponent_Interface;
  * Function pointer globals
  * ========================================================================= */
 pfn_SceneObject_ComponentWithInterface g_SceneObject_ComponentWithInterface = 0;
+pfn_SceneObject_InitWithTemplate        g_SceneObject_InitWithTemplate        = 0;
 pfn_ProgramState_FromLuaState          g_ProgramState_FromLuaState          = 0;
+pfn_CreateHeroObjectAt                 g_sre_CreateHeroObjectAt              = 0;
 
 pfn_GameOverVC_DidContinue g_sre_GameOverVC_DidContinue = 0;
 
@@ -357,4 +359,53 @@ void sre_SceneGrid_UpdateVisibleAreasWithCamera(void* self, void* camera) {
             }
         }
     }
+}
+
+/* ========== AudioSystem::EndAudioInterruptionIfNecessary no-op ==========
+ * nm -D v1.4.12 arm64-v8a offset: 0x47ef50
+ *   _ZN5Caver11AudioSystem31EndAudioInterruptionIfNecessaryEv
+ *   (confirmed from crash label: 0x147ef50 [_ZN5Caver11AudioSystem31EndAudioInterruptionIfNecessaryEv])
+ *
+ * IDA: iOS audio session resumption — calls SetAudioSessionActive(1),
+ * alcMakeContextCurrent, alcProcessContext inside a canary-guarded frame.
+ * The Dynarmic guest/host context switches for these JNI calls change
+ * TPIDR_EL0, causing the canary comparison at function exit to always fail
+ * → __stack_chk_fail → recovery loop.
+ * On desktop, iOS audio session interruption management is irrelevant.
+ * Return 'self' immediately (same as the function's early-out when no
+ * interruption is active: `if (!this[128]) return this;`).
+ */
+void* sre_AudioSystem_EndAudioInterruptionIfNecessary(void* self) {
+    return self;
+}
+
+/* ========== __stack_chk_fail replacement ==========
+ * PLT stub: 0x1F62D0 (IDA-confirmed: EndAudioInterruptionIfNecessary callee list
+ *   entry "0x00000000001F62D0 — .__stack_chk_fail")
+ * Real symbol: 0x6FE6F8 (__stack_chk_fail in dynamic segment)
+ *
+ * Why this fires: ARM64 stack canary is read from TPIDR_EL0+40 at function
+ * entry and compared again at exit.  JNI bridge calls (alcMakeContextCurrent,
+ * SetAudioSessionActive, etc.) inside EndAudioInterruptionIfNecessary switch
+ * between guest and host Dynarmic contexts, changing TPIDR_EL0.  The saved
+ * canary no longer matches → __stack_chk_fail is called every time.
+ *
+ * The current SRE recovery "unwinds to LR" via longjmp, which may leave
+ * callee-saved registers (X19 = 'this', etc.) in undefined state.
+ *
+ * This replacement just returns to LR.  Since __stack_chk_fail is called
+ * right before the function epilogue:
+ *   BL  __stack_chk_fail   ; LR = 0x147eebc
+ *   ; 0x147eebc: shared epilogue (gets MusicPlayer, calls SetSuspended, RET)
+ * returning to LR drops straight into the epilogue with the full stack frame
+ * still intact (callee-saved regs on stack, SP unchanged).  The epilogue
+ * restores everything cleanly.  Canary mismatch is silently ignored.
+ *
+ * NOTE: EndAudioInterruptionIfNecessary is ALSO hooked at 0x47ED50 so it
+ * never reaches __stack_chk_fail in the first place.  This hook is
+ * belt-and-suspenders for any OTHER function whose canary check fails due
+ * to the same TPIDR_EL0 drift.
+ */
+void sre_stack_chk_fail(void) {
+    /* Return to LR — all registers preserved, epilogue runs cleanly. */
 }

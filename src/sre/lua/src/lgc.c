@@ -609,9 +609,10 @@ void luaC_step (lua_State *L) {
   if (lim == 0)
     lim = (MAX_LUMEM-1)/2;  /* no limit */
   g->gcdept += g->totalbytes - g->GCthreshold;
+  int step_count = 0;
   do {
     lim -= singlestep(L);
-    if (g->gcstate == GCSpause)
+    if (g->gcstate == GCSpause || ++step_count >= 10)
       break;
   } while (lim > 0);
   if (g->gcstate != GCSpause) {

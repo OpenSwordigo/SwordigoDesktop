@@ -19,6 +19,7 @@
 //   - call() passes up to 8 integer args in X0-X7
 // ============================================================================
 
+#include <SDL3/SDL.h>
 // Forward declarations from game/camera_override.cpp
 extern uint32_t g_cam_ctrl_ptr;
 extern void cam_capture_controller(uint32_t this_ptr);
@@ -360,7 +361,14 @@ void EmulatorArm64::run(uint64_t start_pc) {
     int chunk = 0;
     int same_pc_count = 0;     // Count consecutive chunks at the SAME PC
     uint64_t last_chunk_pc = 0; // Track PC from previous chunk
+    auto last_keepalive = std::chrono::steady_clock::now();
     for (chunk = 0; chunk < MAX_CHUNKS; chunk++) {
+        auto now_keepalive = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now_keepalive - last_keepalive).count() >= 15) {
+            last_keepalive = now_keepalive;
+            SDL_PumpEvents();
+        }
+
         err = uc_emu_start((uc_engine*)uc, 
                            chunk == 0 ? start_pc : curr_pc, 
                            magic_lr, 0, CHUNK);
@@ -722,4 +730,8 @@ void EmulatorArm64::print_trace() {
         std::cerr << "  #" << i << ": 0x" << std::hex << last_pcs[i] << std::dec << std::endl;
     }
     std::cerr << "---------------------------------------------" << std::endl;
+}
+
+void EmulatorArm64::set_tpidr_el0(uint64_t val) {
+    uc_reg_write((uc_engine*)uc, UC_ARM64_REG_TPIDR_EL0, &val);
 }

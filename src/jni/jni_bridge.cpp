@@ -1,5 +1,8 @@
 #include "jni_bridge.h"
 #include "platform/emulator.h"
+
+extern "C" uint64_t sre_resolve_address(const char* symbol);
+extern "C" const char* sre_resolve_symbol(uint64_t addr);
 #include "platform/io_thread.h"
 #include "platform/data_path.h"
 #include "android/asset_manager_arm32.h"
@@ -291,6 +294,7 @@ static uint32_t host_malloc_locked(uint32_t size) {
         }
         g_guest_allocs[addr] = found_size;
         g_alloc_counter++;
+        if (addr >= 0x10000) memset(g_guest_memory + addr, 0, found_size);
         return addr;
     }
     
@@ -298,6 +302,7 @@ static uint32_t host_malloc_locked(uint32_t size) {
     g_guest_heap_ptr += size;
     g_guest_allocs[addr] = size;
     g_alloc_counter++;
+    if (addr >= 0x10000) memset(g_guest_memory + addr, 0, size);
     return addr;
 }
 
@@ -461,6 +466,17 @@ void bridge_strlen(void* emu_ptr) {
         std::cout << "[STR] strlen(str=0x" << std::hex << str << ") -> \"" << s << "\"" << std::dec << std::endl;
     }
     emu->set_reg(0, std::strlen(s));
+}
+
+void bridge_strnlen(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    uint32_t str = emu->get_reg(0);
+    uint32_t maxlen = emu->get_reg(1);
+    if (!str) { emu->set_reg(0, 0); return; }
+    const char* s = (const char*)(emu->get_memory_base() + str);
+    size_t len = 0;
+    while (len < maxlen && s[len] != '\0') len++;
+    emu->set_reg(0, len);
 }
 
 void bridge_memcmp(void* emu_ptr) {
@@ -1590,7 +1606,7 @@ void bridge_CallStaticBooleanMethodV(void* emu_ptr) {
     } else if (mid == 0x13180001) { // getPlatformConsentState
         res = 3; // Return 3 — OBTAINED
     } else if (mid == 0x13260001) { // isGoogleGameServicesAvailable
-        res = 1; // Return true — we handle snapshots locally
+        res = 0; // Return false — GGS sign-in flow blocks forever on desktop.
     } else if (mid == 0x13280001) { // getBooleanFromSP(String key)
         uint8_t* memory = emu->get_memory_base();
         uint32_t va_ptr = emu->get_reg(3);
@@ -5365,7 +5381,44 @@ void bridge_gettimeofday(void* emu_ptr) {
     emu->set_reg(0, 0);
 }
 
+static void bridge_sre_resolve_address(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    uint32_t sym_g = emu->get_reg(0);
+    const char* sym = sym_g ? (const char*)(memory + sym_g) : nullptr;
+    
+    if (sym) {
+        uint64_t addr = sre_resolve_address(sym);
+        // Return 32-bit address, although sre_resolve_address returns uint64_t
+        emu->set_reg(0, (uint32_t)addr);
+    } else {
+        emu->set_reg(0, 0);
+    }
+}
+
+static void bridge_sre_resolve_symbol(void* emu_ptr) {
+    Emulator* emu = (Emulator*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    uint32_t addr = emu->get_reg(0);
+    uint32_t out_buf_g = emu->get_reg(1);
+    uint32_t max_len = emu->get_reg(2);
+    
+    char* out_buf = out_buf_g ? (char*)(memory + out_buf_g) : nullptr;
+    if (!out_buf || max_len == 0) return;
+    
+    const char* sym = sre_resolve_symbol(addr);
+    if (sym) {
+        strncpy(out_buf, sym, max_len - 1);
+        out_buf[max_len - 1] = '\0';
+    } else {
+        out_buf[0] = '\0';
+    }
+}
+
 void JniBridge::init_standard_bridges() {
+    register_handler("sre_resolve_address", bridge_sre_resolve_address);
+    register_handler("sre_resolve_symbol", bridge_sre_resolve_symbol);
+
     register_handler("malloc", bridge_malloc);
     register_handler("calloc", bridge_calloc);
     register_handler("realloc", bridge_realloc);
@@ -5375,6 +5428,7 @@ void JniBridge::init_standard_bridges() {
     register_handler("memset", bridge_memset);
     register_handler("memmove", bridge_memmove);
     register_handler("strlen", bridge_strlen);
+    register_handler("strnlen", bridge_strnlen);
     register_handler("memcmp", bridge_memcmp);
     register_handler("memchr", bridge_memchr_impl);
 

@@ -12,6 +12,10 @@
 
 #include "jni_bridge.h"
 #include "jni_bridge_arm64.h"
+
+extern "C" uint64_t sre_resolve_address(const char* symbol);
+extern "C" const char* sre_resolve_symbol(uint64_t addr);
+
 #include "jni/gl_render_state.h"  // GL state handshake — bridge writes, FBO reads
 #include "platform/i_emulator_arm64.h"
 #include "platform/emulator_arm64.h"  // For backward compat — EmulatorArm64 inherits IEmulatorArm64
@@ -41,6 +45,12 @@
 #endif
 #include <sys/time.h>
 #include <sched.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <strings.h>
 #include "platform/draw_batcher.h"
 #include <filesystem>
 namespace fs = std::filesystem;
@@ -67,7 +77,9 @@ extern uint8_t* g_guest_memory;
 #include <poll.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
-#define GL_GLEXT_PROTOTYPES
+#ifndef GL_GLEXT_PROTOTYPES
+#define GL_GLEXT_PROTOTYPES 1
+#endif
 #include "platform/gl_inc.h"
 #include <GL/glext.h>
 #include <AL/al.h>
@@ -351,12 +363,14 @@ static uint32_t host_malloc_locked(uint32_t size) {
             }
             g_guest_allocs[addr] = found_size;
             g_alloc_counter++;
+            if (addr >= 0x10000) memset(g_guest_memory + addr, 0, found_size);
             return addr;
         }
         addr = g_guest_heap_ptr;
         g_guest_heap_ptr += size;
         g_guest_allocs[addr] = size;
         g_alloc_counter++;
+        if (addr >= 0x10000) memset(g_guest_memory + addr, 0, size);
         return addr;
     }
 
@@ -382,6 +396,7 @@ static uint32_t host_malloc_locked(uint32_t size) {
         }
         g_guest_allocs[addr] = found_size;
         g_alloc_counter++;
+        if (addr >= 0x10000) memset(g_guest_memory + addr, 0, found_size);
         return addr;
     }
     
@@ -389,6 +404,7 @@ static uint32_t host_malloc_locked(uint32_t size) {
     g_guest_heap_ptr += size;
     g_guest_allocs[addr] = size;
     g_alloc_counter++;
+    if (addr >= 0x10000) memset(g_guest_memory + addr, 0, size);
     return addr;
 }
 
@@ -742,6 +758,67 @@ static void bridge_memcmp(void* emu_ptr) {
     emu->set_reg(0, (uint64_t)(int64_t)res);
 }
 
+static void bridge_strnlen(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint64_t str = emu->get_reg(0);
+    uint64_t maxlen = emu->get_reg(1);
+    if (!str) { emu->set_reg(0, 0); return; }
+    const char* s = (const char*)(emu->get_memory_base() + str);
+    size_t len = 0;
+    while (len < maxlen && s[len] != '\0') len++;
+    emu->set_reg(0, len);
+}
+
+static void bridge_strdup(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint64_t str = emu->get_reg(0);
+    if (!str) { emu->set_reg(0, 0); return; }
+    const char* s = (const char*)(emu->get_memory_base() + str);
+    size_t len = std::strlen(s);
+    uint32_t addr = host_malloc_locked((uint32_t)(len + 1));
+    std::memcpy(emu->get_memory_base() + addr, s, len + 1);
+    emu->set_reg(0, addr);
+}
+
+static void bridge_strndup(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint64_t str = emu->get_reg(0);
+    uint64_t n = emu->get_reg(1);
+    if (!str) { emu->set_reg(0, 0); return; }
+    const char* s = (const char*)(emu->get_memory_base() + str);
+    size_t len = 0;
+    while (len < n && s[len] != '\0') len++;
+    uint32_t addr = host_malloc_locked((uint32_t)(len + 1));
+    std::memcpy(emu->get_memory_base() + addr, s, len);
+    *(char*)(emu->get_memory_base() + addr + len) = '\0';
+    emu->set_reg(0, addr);
+}
+
+static void bridge_strcasecmp(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint64_t str1 = emu->get_reg(0);
+    uint64_t str2 = emu->get_reg(1);
+    if (!str1 || !str2) { emu->set_reg(0, 0); return; }
+    const char* s1 = (const char*)(emu->get_memory_base() + str1);
+    const char* s2 = (const char*)(emu->get_memory_base() + str2);
+    int res = strcasecmp(s1, s2);
+    emu->set_reg(0, (uint64_t)(int64_t)res);
+}
+
+static void bridge_strncasecmp(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint64_t str1 = emu->get_reg(0);
+    uint64_t str2 = emu->get_reg(1);
+    uint64_t n = emu->get_reg(2);
+    if (!str1 || !str2) { emu->set_reg(0, 0); return; }
+    const char* s1 = (const char*)(emu->get_memory_base() + str1);
+    const char* s2 = (const char*)(emu->get_memory_base() + str2);
+    int res = strncasecmp(s1, s2, n);
+    emu->set_reg(0, (uint64_t)(int64_t)res);
+}
+
+
+
 // --- Soft-Float Math Bridges ---
 static void bridge_cosf(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
@@ -1025,7 +1102,7 @@ static void bridge_GetMethodID(void* emu_ptr) {
     else if (strcmp(name, "startTextInput") == 0) id = 0x13290001;
     else if (strcmp(name, "stopTextInput") == 0) id = 0x13290002;
     else id = 0x56780001;
-    if (!emu->quiet_mode) {
+    if (!emu->quiet_mode && id != 0x56780001) {
         std::cout << "[JNI] GetMethodID: " << name << " -> 0x" << std::hex << id << std::dec << std::endl;
     }
     emu->set_reg(0, id);
@@ -1727,7 +1804,10 @@ static void bridge_CallStaticBooleanMethodV(void* emu_ptr) {
     } else if (mid == 0x13180001) { // getPlatformConsentState
         res = 3; // Return 3 — OBTAINED
     } else if (mid == 0x13260001) { // isGoogleGameServicesAvailable
-        res = 1; // Return true — we handle snapshots locally
+        res = 0; // Return false — GGS sign-in flow blocks forever on desktop.
+                 // Returning 1 triggers HandleGoogleSignInCompleted(true) which
+                 // waits for Android Sign-In UI/network that never completes.
+                 // Snapshots are handled locally; GGS is not needed.
     } else if (mid == 0x13280001) { // getBooleanFromSP(String key)
         uint8_t* memory = emu->get_memory_base();
         uint32_t va_ptr = emu->get_reg(3);
@@ -1795,7 +1875,7 @@ static void bridge_CallStaticFloatMethodV(void* emu_ptr) {
 static void bridge_CallStaticVoidMethodV(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t mid = emu->get_reg(2);
-    if (!emu->quiet_mode) {
+    if (!emu->quiet_mode && mid != 0x56780001) {
         std::cout << "[JNI] CallStaticVoidMethodV(mid=0x" << std::hex << mid << ")" << std::dec << std::endl;
     }
 
@@ -1839,15 +1919,6 @@ static void bridge_CallStaticVoidMethodV(void* emu_ptr) {
             if (array_len > 0 && array_len < 0x1000000) {
                 std::vector<uint8_t> data_to_save(array_data, array_data + array_len);
                 std::string snap_path = g_save_dir + "/snapshot.bin";
-                
-                // Write synchronously first as an extra safety measure so it's ready immediately
-                FILE* fp = fopen(snap_path.c_str(), "wb");
-                if (fp) {
-                    fwrite(array_data, 1, array_len, fp);
-                    fclose(fp);
-                    std::cout << "[SAVE] Synchronously saved " << array_len << " bytes to " << snap_path << std::endl;
-                }
-                
                 io_thread_post_save(snap_path, std::move(data_to_save));
                 std::cout << "[SAVE] Wrote " << array_len << " bytes asynchronously via IO thread" << std::endl;
             }
@@ -3054,6 +3125,8 @@ static bool parse_legacy_pvr_uncompressed_format(uint32_t flags, GLenum& gl_form
     }
 }
 
+static std::unordered_map<size_t, PVRGzBuffer> g_pvr_decomp_cache;
+
 static bool try_decode_pvr_from_fd(int real_fd, PVRGzBuffer& out) {
     // Save position, read data, restore
     off_t orig = lseek(real_fd, 0, SEEK_CUR);
@@ -3064,6 +3137,20 @@ static bool try_decode_pvr_from_fd(int real_fd, PVRGzBuffer& out) {
     std::vector<uint8_t> buf(sz);
     if (read(real_fd, buf.data(), sz) != sz) { lseek(real_fd, orig, SEEK_SET); return false; }
     lseek(real_fd, orig, SEEK_SET);
+
+    // Fast cache lookup by buffer size + header hash to bypass CPU PVRTC decompressor
+    size_t hash = (size_t)sz ^ 0x9e3779b9;
+    for (size_t i = 0; i < std::min((size_t)sz, (size_t)64); i += 4) {
+        uint32_t val = 0;
+        memcpy(&val, buf.data() + i, 4);
+        hash ^= val + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    }
+    auto it = g_pvr_decomp_cache.find(hash);
+    if (it != g_pvr_decomp_cache.end()) {
+        out = it->second;
+        out.offset = 0; // reset read position
+        return true;
+    }
 
     std::vector<uint8_t> decompressed;
     const uint8_t* data = buf.data();
@@ -3168,10 +3255,12 @@ static bool try_decode_pvr_from_fd(int real_fd, PVRGzBuffer& out) {
     out.width  = width;
     out.height = height;
 
+    g_pvr_decomp_cache[hash] = out;
+
     extern IEmulatorArm64* g_emulator_64;
     if (g_emulator_64 && !g_emulator_64->quiet_mode) {
         std::cerr << "[SRE-PVR] gzdopen: decoded PVR " << width << "x" << height
-                  << " format=" << caver_format << " -> TEX stream" << std::endl;
+                  << " format=" << caver_format << " -> TEX stream (cached)" << std::endl;
     }
     return true;
 }
@@ -3302,6 +3391,16 @@ static void bridge_fopen(void* emu_ptr) {
     
     FILE* f = fopen(resolved_path.c_str(), mode);
     
+    /* Fallback: if a file in external/ (e.g. external/saves, external/main.lua) does not exist,
+     * auto-create an empty file so mod scripts don't loop endlessly waiting for it. */
+    if (!f && resolved_path.find("/external/") != std::string::npos) {
+        FILE* create_f = fopen(resolved_path.c_str(), "w+b");
+        if (create_f) {
+            fclose(create_f);
+            f = fopen(resolved_path.c_str(), mode);
+        }
+    }
+
     if (f) {
         uint32_t handle = g_next_file_handle++;
         g_file_handles[handle] = f;
@@ -3313,9 +3412,6 @@ static void bridge_fopen(void* emu_ptr) {
         }
         
         emu->set_reg(0, handle);
-        if (!emu->quiet_mode) {
-            // printf("[AssetMgr/fopen] Opened: %s -> %s (handle=%u)\n", path, resolved_path.c_str(), handle);
-        }
     } else {
         emu->set_reg(0, 0);
         if (!emu->quiet_mode) {
@@ -3535,23 +3631,8 @@ static void bridge_rename(void* emu_ptr) {
         } catch (...) {}
     }
 
-    // Write diagnostic logs to a debug file
-    std::ofstream log_file("/home/quantumcreeper/.local/share/swordigo-desktop/file_debug.log", std::ios::app);
-    if (log_file.is_open()) {
-        log_file << "--- rename request ---\n";
-        log_file << "old_path: " << old_path << "\n";
-        log_file << "new_path: " << new_path << "\n";
-        log_file << "resolved_old: " << resolved_old << "\n";
-        log_file << "resolved_new: " << resolved_new << "\n";
-        log_file << "resolved_old exists: " << (fs::exists(resolved_old) ? "YES" : "NO") << "\n";
-        log_file << "resolved_new parent exists: " << (last_slash != std::string::npos && fs::exists(resolved_new.substr(0, last_slash)) ? "YES" : "NO") << "\n";
-    }
-
     int result = rename(resolved_old.c_str(), resolved_new.c_str());
     if (result != 0) {
-        if (log_file.is_open()) {
-            log_file << "rename syscall failed: " << strerror(errno) << " (errno " << errno << ")\n";
-        }
         // Fallback: Copy and remove (cross-device/permissions fallback)
         try {
             if (fs::exists(resolved_old)) {
@@ -3559,23 +3640,9 @@ static void bridge_rename(void* emu_ptr) {
                 fs::remove(resolved_old);
                 result = 0; // Success!
                 std::cout << "[File] rename fallback (copy+remove) succeeded for " << old_path << " -> " << new_path << std::endl;
-                if (log_file.is_open()) {
-                    log_file << "fallback copy+remove succeeded\n";
-                }
-            } else {
-                if (log_file.is_open()) {
-                    log_file << "fallback skipped: resolved_old does not exist\n";
-                }
             }
         } catch (const std::exception& e) {
             std::cerr << "[File] rename fallback FAILED: " << e.what() << std::endl;
-            if (log_file.is_open()) {
-                log_file << "fallback exception: " << e.what() << "\n";
-            }
-        }
-    } else {
-        if (log_file.is_open()) {
-            log_file << "rename syscall succeeded\n";
         }
     }
 
@@ -3601,20 +3668,11 @@ static void bridge_rename(void* emu_ptr) {
                         ((char*)(memory + g_sre_vfs_profile_addr))[63] = '\0';
                     }
                     std::cout << "[SRE/Rename] Dynamically updated active profile ID to: " << profile_id << std::endl;
-                    if (log_file.is_open()) {
-                        log_file << "dynamic profile update to " << profile_id << " successful\n";
-                    }
                 }
             } catch (const std::exception& e) {
-                if (log_file.is_open()) {
-                    log_file << "profile update exception: " << e.what() << "\n";
-                }
+                // ignore
             }
         }
-    }
-    if (log_file.is_open()) {
-        log_file << "returning result: " << result << "\n\n";
-        log_file.close();
     }
     emu->set_reg(0, (uint32_t)result);
 }
@@ -3659,10 +3717,10 @@ static void bridge_abort(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
     g_abort_count++;
-    
+
     uint64_t lr = emu->get_lr();
     uint64_t sp = emu->get_reg(31);
-    
+
     // Detect abort retry loop: same LR means same callsite retrying
     if (lr == g_last_abort_lr) {
         g_same_lr_count++;
@@ -3670,19 +3728,19 @@ static void bridge_abort(void* emu_ptr) {
         g_same_lr_count = 1;
         g_last_abort_lr = lr;
     }
-    
+
     if (g_abort_count <= 3) {
-        std::cerr << "[WARN] abort() #" << g_abort_count 
+        std::cerr << "[WARN] abort() #" << g_abort_count
                   << " PC=0x" << std::hex << emu->get_pc()
                   << " LR=0x" << lr
                   << " SP=0x" << sp << std::dec << std::endl;
-        
+
         // Dump registers for debugging
         std::cerr << "  X0=0x" << std::hex << emu->get_reg(0)
                   << " X1=0x" << emu->get_reg(1)
                   << " X19=0x" << emu->get_reg(19)
                   << " X20=0x" << emu->get_reg(20) << std::dec << std::endl;
-        
+
         // If called from the parser assert (LR near 0x15812e4), dump the object
         uint64_t x19 = emu->get_reg(19);
         if (x19 > 0x1000 && x19 < 0xF0000000) {
@@ -3694,69 +3752,54 @@ static void bridge_abort(void* emu_ptr) {
             if (val792 > 0x1000000 && val792 < 0x2000000) {
                 uint32_t code1 = *(uint32_t*)(memory + (uint32_t)val792);
                 uint32_t code2 = *(uint32_t*)(memory + (uint32_t)val792 + 4);
-                std::cerr << "  code@[792]: 0x" << std::hex << code1 
+                std::cerr << "  code@[792]: 0x" << std::hex << code1
                           << " 0x" << code2 << std::dec << std::endl;
             }
         }
     }
-    
-    if (g_abort_count == 50) {
-        std::cerr << "[WARN] abort() called 50+ times — suppressing further logs" << std::endl;
-    }
-    
-    // ABORT LOOP BREAKER: If the same callsite aborts 3+ times, it's a retry loop.
-    // Unwind two stack frames to skip past the entire exception handling chain.
-    // This is the key fix for C++ exceptions that fail to unwind in our emulator.
-    if (g_same_lr_count >= 3) {
-        // Walk UP the frame chain: X29 → saved {X29, X30} → caller → caller's caller
-        uint64_t fp = emu->get_reg(29);  // current frame pointer
-        if (fp > 0x1000 && fp < 0xF0000000) {
-            // First frame: the function that called abort (e.g. unwind helper)
-            uint64_t fp1 = *(uint64_t*)(memory + (uint32_t)fp);
-            uint64_t lr1 = *(uint64_t*)(memory + (uint32_t)fp + 8);
-            
-            // Second frame: the function that called the thrower
-            uint64_t fp2 = 0, lr2 = 0;
-            if (fp1 > 0x1000 && fp1 < 0xF0000000) {
-                fp2 = *(uint64_t*)(memory + (uint32_t)fp1);
-                lr2 = *(uint64_t*)(memory + (uint32_t)fp1 + 8);
-            }
-            
-            // Try to return to the second frame's caller (skip 2 frames)
-            if (lr2 > 0x1000000 && lr2 < 0x2000000) {
-                if (g_same_lr_count == 3) {
-                    std::cerr << "[ABORT-FIX] Exception loop at LR=0x" 
-                              << std::hex << lr << " — skipping 2 frames to 0x" 
-                              << lr2 << std::dec << std::endl;
-                }
-                emu->set_reg(29, fp2);     // restore grandparent FP
-                emu->set_reg(31, fp1 + 16); // pop both frames
-                emu->set_reg(0, 0);         // return 0 (no error)
-                emu->redirect_pc = lr2;
-                g_same_lr_count = 0;
-                return;
-            }
-            // Fallback: skip just 1 frame
-            else if (lr1 > 0x1000000 && lr1 < 0x2000000) {
-                if (g_same_lr_count == 3) {
-                    std::cerr << "[ABORT-FIX] Exception loop at LR=0x" 
-                              << std::hex << lr << " — skipping 1 frame to 0x" 
-                              << lr1 << std::dec << std::endl;
-                }
-                emu->set_reg(29, fp1);
-                emu->set_reg(31, fp + 16);
-                emu->set_reg(0, 0);
-                emu->redirect_pc = lr1;
-                g_same_lr_count = 0;
-                return;
-            }
+
+    // ABORT RECOVERY: Immediately unwind stack frame to skip past the aborting exception/assert
+    uint64_t fp = emu->get_reg(29);  // current frame pointer
+    if (fp > 0x1000 && fp < 0xF0000000) {
+        uint64_t fp1 = *(uint64_t*)(memory + (uint32_t)fp);
+        uint64_t lr1 = *(uint64_t*)(memory + (uint32_t)fp + 8);
+        uint64_t fp2 = 0, lr2 = 0;
+        if (fp1 > 0x1000 && fp1 < 0xF0000000) {
+            fp2 = *(uint64_t*)(memory + (uint32_t)fp1);
+            lr2 = *(uint64_t*)(memory + (uint32_t)fp1 + 8);
         }
-        g_same_lr_count = 0;  // couldn't unwind, reset
+
+        if (lr2 > 0x1000000 && lr2 < 0x3000000) {
+            std::cerr << "[SRE/Abort-Recovery] Intercepted abort() — unwinding 2 frames to 0x"
+                      << std::hex << lr2 << std::dec << std::endl;
+            emu->set_reg(29, fp2);
+            emu->set_reg(31, fp1 + 16);
+            emu->set_reg(0, 0);
+            emu->redirect_pc = lr2;
+            return;
+        } else if (lr1 > 0x1000000 && lr1 < 0x3000000) {
+            std::cerr << "[SRE/Abort-Recovery] Intercepted abort() — unwinding 1 frame to 0x"
+                      << std::hex << lr1 << std::dec << std::endl;
+            emu->set_reg(29, fp1);
+            emu->set_reg(31, fp + 16);
+            emu->set_reg(0, 0);
+            emu->redirect_pc = lr1;
+            return;
+        }
     }
-    
-    // Normal case: just return and let guest continue past the bl abort
-    emu->set_reg(0, 0);
+
+    // Fallback: redirect directly to LR or MAGIC_LR
+    if (lr >= 0x1000000ULL && lr < 0x3000000ULL) {
+        std::cerr << "[SRE/Abort-Recovery] Intercepted abort() — returning to LR=0x"
+                  << std::hex << lr << std::dec << std::endl;
+        emu->redirect_pc = lr;
+        emu->set_reg(0, 0);
+    } else {
+        std::cerr << "[SRE/Abort-Recovery] Intercepted abort() — returning to MAGIC_LR" << std::endl;
+        emu->redirect_pc = 0xE0000000ULL;  // MAGIC_LR
+    }
 }
+
 
 static void bridge_localtime(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
@@ -4955,12 +4998,7 @@ static void bridge_glTexEnvi(void* emu_ptr) {
     GLenum pname = (GLenum)emu->get_reg(1);
     GLint param = (GLint)emu->get_reg(2);
     
-    static int tei_diag = 0;
-    if (tei_diag < 10) {
-        std::cout << "[GL64-TEX] glTexEnvi(target=0x" << std::hex << target 
-                  << ", pname=0x" << pname << ", param=0x" << param << std::dec << ")" << std::endl;
-        tei_diag++;
-    }
+    (void)target; (void)pname; (void)param;
 #ifdef VULKAN_BACKEND
     if (g_graphics_api == GraphicsAPI::VULKAN) {
         g_vk_backend.tex_envi(target, pname, param);
@@ -4977,15 +5015,6 @@ static void bridge_glTexEnvfv(void* emu_ptr) {
     GLenum pname = (GLenum)emu->get_reg(1);
     uint32_t params_ptr = emu->get_reg(2);
     
-    static int tefv_diag = 0;
-    if (tefv_diag < 10 && params_ptr != 0) {
-        float p[4];
-        memcpy(p, memory + params_ptr, 16);
-        std::cout << "[GL64-TEX] glTexEnvfv(target=0x" << std::hex << target 
-                  << ", pname=0x" << pname << std::dec 
-                  << ", vals=[" << p[0] << ", " << p[1] << ", " << p[2] << ", " << p[3] << "])" << std::endl;
-        tefv_diag++;
-    }
 #ifdef VULKAN_BACKEND
     if (g_graphics_api == GraphicsAPI::VULKAN) {
         if (params_ptr != 0) {
@@ -5762,6 +5791,7 @@ static void bridge_gl_draw_elements(void* emu_ptr) {
         std::cout << "  GL_TEXTURE_2D: " << (glIsEnabled(GL_TEXTURE_2D) ? "ON" : "OFF") << std::endl;
         std::cout << "  GL_DEPTH_TEST: " << (glIsEnabled(GL_DEPTH_TEST) ? "ON" : "OFF") << std::endl;
         std::cout << "  GL_BLEND: " << (glIsEnabled(GL_BLEND) ? "ON" : "OFF") << std::endl;
+
         std::cout << "  GL_CULL_FACE: " << (glIsEnabled(GL_CULL_FACE) ? "ON" : "OFF") << std::endl;
         std::cout << "  GL_LIGHTING: " << (glIsEnabled(GL_LIGHTING) ? "ON" : "OFF") << std::endl;
         std::cout << "  GL_ALPHA_TEST: " << (glIsEnabled(GL_ALPHA_TEST) ? "ON" : "OFF") << std::endl;
@@ -6309,7 +6339,15 @@ static void bridge_gl_compressed_tex_image_2d(void* emu_ptr) {
             }
         }
         
-        glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+#ifdef VULKAN_BACKEND
+        if (g_graphics_api == GraphicsAPI::VULKAN) {
+            g_vk_backend.tex_image_2d(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        } else
+#endif
+        if (g_display_active) {
+            glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        }
+        
         RedstellGC::instance().track_gl_tex_image(
             g_frame_stats.last_bound_texture, width, height, GL_RGBA,
             g_last_opened_asset, rgba.data(), rgba.size()
@@ -6325,7 +6363,15 @@ static void bridge_gl_compressed_tex_image_2d(void* emu_ptr) {
         std::vector<uint8_t> rgba(width * height * 4, 255);
         pvr::PVRTDecompressPVRTC(src, do2bitMode, width, height, rgba.data());
         
-        glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+#ifdef VULKAN_BACKEND
+        if (g_graphics_api == GraphicsAPI::VULKAN) {
+            g_vk_backend.tex_image_2d(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        } else
+#endif
+        if (g_display_active) {
+            glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        }
+        
         RedstellGC::instance().track_gl_tex_image(
             g_frame_stats.last_bound_texture, width, height, GL_RGBA,
             g_last_opened_asset, rgba.data(), rgba.size()
@@ -7814,8 +7860,20 @@ static void bridge_cxa_atexit(void* emu_ptr) {
 
 
 static void bridge_stack_chk_fail(void* emu_ptr) {
-    std::cerr << "[FATAL] __stack_chk_fail called!" << std::endl;
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint64_t lr = emu->get_lr();
+    uint64_t sp = emu->get_reg(31);
+    std::cerr << "[SRE/Recovery] __stack_chk_fail called at PC=0x" << std::hex << emu->get_pc()
+              << " — unwinding to LR=0x" << lr << " (SP=0x" << sp << ")" << std::dec << std::endl;
+
+    if (lr >= 0x1000000ULL && lr < 0x3000000ULL) {
+        emu->set_pc(lr);
+        emu->set_reg(0, 0);
+    } else {
+        emu->set_pc(0xE0000000ULL);  // MAGIC_LR
+    }
 }
+
 
 static void bridge_cxa_guard_acquire(void* emu_ptr) {
     // __cxa_guard_acquire(int64_t* guard_object)
@@ -8386,7 +8444,44 @@ static void bridge_inet_addr(void* emu_ptr) {
     emu->set_reg(0, ret);
 }
 
+static void bridge_sre_resolve_address(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    uint64_t sym_g = emu->get_reg(0);
+    const char* sym = sym_g ? (const char*)(memory + sym_g) : nullptr;
+    
+    if (sym) {
+        uint64_t addr = sre_resolve_address(sym);
+        emu->set_reg(0, addr);
+    } else {
+        emu->set_reg(0, 0);
+    }
+}
+
+static void bridge_sre_resolve_symbol(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    uint64_t addr = emu->get_reg(0);
+    uint64_t out_buf_g = emu->get_reg(1);
+    uint32_t max_len = (uint32_t)emu->get_reg(2);
+    
+    char* out_buf = out_buf_g ? (char*)(memory + out_buf_g) : nullptr;
+    if (!out_buf || max_len == 0) return;
+    
+    const char* sym = sre_resolve_symbol(addr);
+    if (sym) {
+        strncpy(out_buf, sym, max_len - 1);
+        out_buf[max_len - 1] = '\0';
+    } else {
+        out_buf[0] = '\0';
+    }
+}
+
+
 void JniBridge64::init_standard_bridges() {
+    register_handler("sre_resolve_address", bridge_sre_resolve_address);
+    register_handler("sre_resolve_symbol", bridge_sre_resolve_symbol);
+
     register_handler("malloc", bridge_malloc);
     register_handler("calloc", bridge_calloc);
     register_handler("realloc", bridge_realloc);
@@ -8398,8 +8493,24 @@ void JniBridge64::init_standard_bridges() {
     register_handler("memset", bridge_memset);
     register_handler("memmove", bridge_memmove);
     register_handler("strlen", bridge_strlen);
+    register_handler("strnlen", bridge_strnlen);
+    register_handler("strdup", bridge_strdup);
+    register_handler("strndup", bridge_strndup);
+    register_handler("strcasecmp", bridge_strcasecmp);
+    register_handler("strncasecmp", bridge_strncasecmp);
     register_handler("memcmp", bridge_memcmp);
     register_handler("memchr", bridge_memchr_impl);
+
+    register_handler("socket", bridge_socket);
+    register_handler("connect", bridge_connect);
+    register_handler("send", bridge_send);
+    register_handler("recv", bridge_recv);
+    register_handler("bind", bridge_bind);
+    register_handler("listen", bridge_listen);
+    register_handler("accept", bridge_accept);
+    register_handler("setsockopt", bridge_setsockopt);
+    register_handler("getsockopt", bridge_getsockopt);
+    register_handler("fcntl", bridge_fcntl);
 
     register_handler("strchr", bridge_strchr);
     register_handler("strrchr", bridge_strrchr);
@@ -9088,6 +9199,11 @@ bool sre_music_host_load(const std::string& name) {
     
     bool loaded = false;
     for (size_t i = 0; i < paths.size() && !loaded; i++) {
+        // Check if file exists on disk first to prevent libmpg123 error noise
+        std::ifstream check_file(paths[i]);
+        if (!check_file.good()) continue;
+        check_file.close();
+
         std::cout << "[SRE-Music]   try[" << i << "]: " << paths[i] << std::endl;
         // Detect format by extension
         std::string ext = paths[i].substr(paths[i].rfind('.'));

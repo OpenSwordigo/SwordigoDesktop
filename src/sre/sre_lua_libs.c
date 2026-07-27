@@ -17,6 +17,7 @@
 #include "sre_lua.h"
 #include <errno.h>
 
+extern uint64_t g_swordigo_base;
 extern void sre_log_lua_error(const char* source, const char* err_msg);
 
 /* =========================================================================
@@ -29,6 +30,7 @@ extern void sre_log_lua_error(const char* source, const char* err_msg);
 pfn_lua_xmove          g_lua_xmove          = 0;
 pfn_lua_newthread      g_lua_newthread      = 0;
 pfn_lua_pushthread     g_lua_pushthread     = 0;
+pfn_lua_sethook        g_lua_sethook        = 0;
 pfn_lua_pushvalue      g_lua_pushvalue      = 0;
 pfn_lua_remove         g_lua_remove         = 0;
 pfn_lua_insert         g_lua_insert         = 0;
@@ -91,6 +93,7 @@ typedef struct {
     sre_u64 lua_xmove;
     sre_u64 lua_newthread;
     sre_u64 lua_pushthread;
+    sre_u64 lua_sethook;
 } SreLuaExtAddrs;
 
 void sre_init_lua_ext(SreLuaExtAddrs* a) {
@@ -125,7 +128,12 @@ void sre_init_lua_ext(SreLuaExtAddrs* a) {
     g_lua_xmove          = (pfn_lua_xmove)a->lua_xmove;
     g_lua_newthread      = (pfn_lua_newthread)a->lua_newthread;
     g_lua_pushthread     = (pfn_lua_pushthread)a->lua_pushthread;
+    g_lua_sethook        = (pfn_lua_sethook)a->lua_sethook;
+    if (!g_lua_sethook && g_swordigo_base) {
+        g_lua_sethook = (pfn_lua_sethook)(g_swordigo_base + 0x4ea334);
+    }
 }
+
 
 
 /* =========================================================================
@@ -2185,6 +2193,36 @@ static int l_caver_getBase(lua_State* L) {
 }
 
 /* =========================================================================
+ * Symbol Resolution
+ * ========================================================================= */
+extern uint64_t sre_resolve_address(const char* symbol);
+extern void sre_resolve_symbol(uint64_t addr, char* out_buf, int max_len);
+
+static int l_caver_resolve(lua_State* L) {
+    const char* symbol = luaL_checkstring(L, 1);
+    uint64_t addr = sre_resolve_address(symbol);
+    if (addr == 0) {
+        lua_pushnil(L);
+    } else {
+        g_lua_pushnumber(L, (double)addr);
+    }
+    return 1;
+}
+
+static int l_caver_symbol(lua_State* L) {
+    uint64_t addr = (uint64_t)luaL_checknumber(L, 1);
+    char buf[512];
+    buf[0] = '\0';
+    sre_resolve_symbol(addr, buf, sizeof(buf));
+    if (buf[0] == '\0') {
+        lua_pushnil(L);
+    } else {
+        lua_pushstring(L, buf);
+    }
+    return 1;
+}
+
+/* =========================================================================
  * caver.call(addr [, a1 [, a2 [, a3 [, a4]]]]) → number
  *
  * Calls a native ARM64 function at the given absolute guest address.
@@ -2201,6 +2239,19 @@ static int l_caver_getBase(lua_State* L) {
 static int l_caver_call(lua_State* L) {
     uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
     if (!addr) { g_lua_pushnumber(L, 0.0); return 1; }
+
+    /* If address is an ELF offset (< 0x1000000), translate to absolute guest RAM address (+ 0x1000000) */
+    if (addr < 0x1000000ULL) {
+        extern uint64_t g_swordigo_base;
+        uint64_t base = g_swordigo_base ? g_swordigo_base : 0x1000000ULL;
+        addr += base;
+    }
+
+    if (addr < 0x1000000ULL || addr >= 0xE0000000ULL) {
+        printf("[caver] FATAL: caver.call attempted to execute invalid address 0x%lx\n", (unsigned long)addr);
+        g_lua_pushnumber(L, 0.0);
+        return 1;
+    }
 
     /* Helper: read arg N as uint64 — handles both numbers and lightuserdata */
 #define ARG(n) \
@@ -2236,59 +2287,66 @@ static int l_caver_call(lua_State* L) {
  * equivalent to what SCL scripts can do via native bindings.
  * ========================================================================= */
 
+static inline uint64_t sre_caver_translate_addr(uint64_t addr) {
+    if (addr && addr < 0x1000000ULL) {
+        extern uint64_t g_swordigo_base;
+        uint64_t base = g_swordigo_base ? g_swordigo_base : 0x1000000ULL;
+        return addr + base;
+    }
+    return addr;
+}
+
 static int l_caver_read8(lua_State* L) {
-    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    uint64_t addr = sre_caver_translate_addr((uint64_t)(int64_t)g_lua_tonumber(L, 1));
     if (!addr) { g_lua_pushinteger(L, 0); return 1; }
     g_lua_pushinteger(L, (int64_t)(*(uint8_t*)addr));
     return 1;
 }
 
 static int l_caver_read16(lua_State* L) {
-    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    uint64_t addr = sre_caver_translate_addr((uint64_t)(int64_t)g_lua_tonumber(L, 1));
     if (!addr) { g_lua_pushinteger(L, 0); return 1; }
     g_lua_pushinteger(L, (int64_t)(*(uint16_t*)addr));
     return 1;
 }
 
 static int l_caver_read32(lua_State* L) {
-    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    uint64_t addr = sre_caver_translate_addr((uint64_t)(int64_t)g_lua_tonumber(L, 1));
     if (!addr) { g_lua_pushinteger(L, 0); return 1; }
     g_lua_pushinteger(L, (int64_t)(*(uint32_t*)addr));
     return 1;
 }
 
 static int l_caver_read64(lua_State* L) {
-    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    uint64_t addr = sre_caver_translate_addr((uint64_t)(int64_t)g_lua_tonumber(L, 1));
     if (!addr) { g_lua_pushnumber(L, 0.0); return 1; }
-    /* Use pushnumber — lua_Integer is int64 on some platforms but
-     * unsigned 64-bit values > 2^63 need number anyway. */
     g_lua_pushnumber(L, (double)(*(uint64_t*)addr));
     return 1;
 }
 
 static int l_caver_write8(lua_State* L) {
-    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    uint64_t addr = sre_caver_translate_addr((uint64_t)(int64_t)g_lua_tonumber(L, 1));
     uint8_t  val  = (uint8_t)g_lua_tointeger(L, 2);
     if (addr) *(uint8_t*)addr = val;
     return 0;
 }
 
 static int l_caver_write16(lua_State* L) {
-    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    uint64_t addr = sre_caver_translate_addr((uint64_t)(int64_t)g_lua_tonumber(L, 1));
     uint16_t val  = (uint16_t)g_lua_tointeger(L, 2);
     if (addr) *(uint16_t*)addr = val;
     return 0;
 }
 
 static int l_caver_write32(lua_State* L) {
-    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    uint64_t addr = sre_caver_translate_addr((uint64_t)(int64_t)g_lua_tonumber(L, 1));
     uint32_t val  = (uint32_t)g_lua_tointeger(L, 2);
     if (addr) *(uint32_t*)addr = val;
     return 0;
 }
 
 static int l_caver_write64(lua_State* L) {
-    uint64_t addr = (uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    uint64_t addr = sre_caver_translate_addr((uint64_t)(int64_t)g_lua_tonumber(L, 1));
     uint64_t val  = (uint64_t)(int64_t)g_lua_tonumber(L, 2);
     if (addr) *(uint64_t*)addr = val;
     return 0;
@@ -2317,6 +2375,10 @@ static const void* caverlib[] = {
     (const void*)"getBase",           (const void*)l_caver_getBase,
     /* caver.call(addr, ...) → call native ARM64 function */
     (const void*)"call",              (const void*)l_caver_call,
+    /* caver.resolve(symbol) → address */
+    (const void*)"resolve",           (const void*)l_caver_resolve,
+    /* caver.symbol(address) → symbol name */
+    (const void*)"symbol",            (const void*)l_caver_symbol,
     /* caver.read8/16/32/64(addr) — raw memory reads */
     (const void*)"read8",             (const void*)l_caver_read8,
     (const void*)"read16",            (const void*)l_caver_read16,

@@ -35,6 +35,7 @@ public:
 
     void set_reg(int reg, uint64_t value) override;
     uint64_t get_reg(int reg) override;
+    void set_tpidr_el0(uint64_t val) override { tpidr_el0_value = val; }
 
     void set_dreg(int reg, double value) override;
     double get_dreg(int reg) override;

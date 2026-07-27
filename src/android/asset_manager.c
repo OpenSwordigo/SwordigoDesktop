@@ -224,6 +224,25 @@ static AAsset* make_null_asset(const char* filename) {
         char dummy_path[512];
         snprintf(dummy_path, sizeof(dummy_path), "%s/blackbg_2x.tex.png", g_mgr.base_path);
         f = fopen(dummy_path, "rb");
+    } else if (strstr(filename, ".pod") != NULL || strstr(filename, ".POD") != NULL) {
+        /* Return a tiny dummy file to prevent C++ parsers spinning on EOF/0-byte buffers */
+        char dummy_path[512];
+        snprintf(dummy_path, sizeof(dummy_path), "%s/dummy.pod", g_mgr.base_path);
+        f = fopen(dummy_path, "rb");
+        if (!f) {
+            f = fopen(dummy_path, "wb+");
+            if (f) {
+                /* To prevent infinite loops in CPVRTModelPOD::ReadFromMemory,
+                 * we provide a dummy header with a huge chunk length.
+                 * The chunk parsing loop does: name = *ptr; length = *(ptr+4); ptr += 8 + length;
+                 * If we write 32 zeros, length is 0 and ptr doesn't advance, causing a spin loop.
+                 * If we write length=0xFFFFFFFF, it immediately exceeds the buffer and cleanly exits. */
+                uint32_t dummy_data[2] = { 0xFFFFFFFF, 0xFFFFFFFF };
+                fwrite(dummy_data, 1, sizeof(dummy_data), f);
+                fflush(f);
+                rewind(f);
+            }
+        }
     }
     if (!f) {
         f = fopen("/dev/null", "rb");
@@ -233,7 +252,10 @@ static AAsset* make_null_asset(const char* filename) {
     if (!a) { fclose(f); return NULL; }
     a->fp = f;
     snprintf(a->name, sizeof(a->name), "[NULL]%.200s", filename);
-    printf("[AssetMgr] DUMMY: %s (using %s)\n", filename, strstr(filename, ".tex.png") ? "blackbg_2x.tex.png" : "/dev/null");
+    const char* dummy_type = "/dev/null";
+    if (strstr(filename, ".tex.png")) dummy_type = "blackbg_2x.tex.png";
+    else if (strstr(filename, ".pod") || strstr(filename, ".POD")) dummy_type = "dummy.pod";
+    printf("[AssetMgr] DUMMY: %s (using %s)\n", filename, dummy_type);
     return a;
 }
 

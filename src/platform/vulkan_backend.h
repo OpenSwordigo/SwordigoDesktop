@@ -185,6 +185,8 @@ constexpr int MAX_TEXTURE_UNITS = 2;
 
 } // namespace gl
 
+constexpr int MAX_FRAMES_IN_FLIGHT = 2;
+
 // ---------------------------------------------------------------------------
 // Vertex array pointer descriptor
 // ---------------------------------------------------------------------------
@@ -395,6 +397,8 @@ struct StagingBuffer {
 // VulkanBackend — the main interface
 // ---------------------------------------------------------------------------
 
+struct PostFXState;
+
 class VulkanBackend {
 public:
     VulkanBackend() = default;
@@ -411,7 +415,7 @@ public:
     void destroy();
 
     void begin_frame();
-    void end_frame_and_present();
+    void end_frame_and_present(const PostFXState* postfx = nullptr, int scale_mode = 0);
 
     // -----------------------------------------------------------------------
     // Matrix operations
@@ -437,13 +441,12 @@ public:
     void texcoord_pointer(int size, uint32_t type, int stride, uint32_t pointer);
     void color_pointer(int size, uint32_t type, int stride, uint32_t pointer);
     void normal_pointer(uint32_t type, int stride, uint32_t pointer);
-
-    void enable_client_state(uint32_t cap);
-    void disable_client_state(uint32_t cap);
+    void enable_client_state(uint32_t array);
+    void disable_client_state(uint32_t array);
     void client_active_texture(uint32_t texture);
 
     // -----------------------------------------------------------------------
-    // State setting (glEnable / glDisable family)
+    // Capability enable / disable
     // -----------------------------------------------------------------------
     void enable(uint32_t cap);
     void disable(uint32_t cap);
@@ -549,7 +552,8 @@ public:
     VkDevice get_device() const { return device_; }
     VkQueue get_graphics_queue() const { return graphics_queue_; }
     uint32_t get_graphics_family() const { return graphics_family_; }
-    VkRenderPass get_render_pass() const { return render_pass_; }
+    VkRenderPass get_render_pass() const { return offscreen_render_pass_ ? offscreen_render_pass_ : render_pass_; }
+    VkRenderPass get_swapchain_render_pass() const { return render_pass_; }
     VkDescriptorPool get_descriptor_pool() const { return descriptor_pool_; }
     VkCommandBuffer get_current_command_buffer() const { return command_buffers_[current_frame_]; }
     uint32_t get_image_count() const { return (uint32_t)swapchain_images_.size(); }
@@ -580,8 +584,21 @@ private:
     std::vector<VkFramebuffer>  swapchain_framebuffers_;
 
     // -----------------------------------------------------------------------
-    // Depth / stencil attachment
+    // Offscreen render target & render pass
     // -----------------------------------------------------------------------
+    VkImage        offscreen_color_image_ = VK_NULL_HANDLE;
+    VmaAllocation  offscreen_color_alloc_ = VK_NULL_HANDLE;
+    VkImageView    offscreen_color_view_  = VK_NULL_HANDLE;
+    VkImage        offscreen_depth_image_ = VK_NULL_HANDLE;
+    VmaAllocation  offscreen_depth_alloc_ = VK_NULL_HANDLE;
+    VkImageView    offscreen_depth_view_  = VK_NULL_HANDLE;
+    VkRenderPass   offscreen_render_pass_ = VK_NULL_HANDLE;
+    VkFramebuffer  offscreen_framebuffer_ = VK_NULL_HANDLE;
+
+    // -----------------------------------------------------------------------
+    // Depth / stencil attachment (Swapchain)
+    // -----------------------------------------------------------------------
+    VkFormat       depth_format_     = VK_FORMAT_UNDEFINED;
     VkImage        depth_image_      = VK_NULL_HANDLE;
     VmaAllocation  depth_allocation_ = VK_NULL_HANDLE;
     VkImageView    depth_image_view_ = VK_NULL_HANDLE;
@@ -594,7 +611,22 @@ private:
     VkPipelineCache  pipeline_cache_  = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout descriptor_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout ubo_set_layout_        = VK_NULL_HANDLE;
     VkDescriptorPool      descriptor_pool_       = VK_NULL_HANDLE;
+    VkDescriptorSet       ubo_descriptor_sets_[MAX_FRAMES_IN_FLIGHT] = {};
+    
+    uint32_t min_ubo_alignment_ = 256;
+
+    // -----------------------------------------------------------------------
+    // PostFX Pipeline Infrastructure
+    // -----------------------------------------------------------------------
+    VkShaderModule        postfx_vert_shader_ = VK_NULL_HANDLE;
+    VkShaderModule        postfx_frag_shader_ = VK_NULL_HANDLE;
+    VkPipelineLayout      postfx_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline            postfx_pipeline_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout postfx_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSet       postfx_descriptor_set_ = VK_NULL_HANDLE;
+    VkSampler             postfx_sampler_ = VK_NULL_HANDLE;
 
     // -----------------------------------------------------------------------
     // Command recording
@@ -658,12 +690,14 @@ private:
     // -----------------------------------------------------------------------
     bool create_swapchain(SDL_Window* window);
     bool create_render_pass();
+    bool create_offscreen_target();
+    bool create_postfx_pipeline();
     bool create_framebuffers();
     bool compile_shaders();
     void create_default_texture();
 
-    VkPipeline     get_or_create_pipeline();
-    uint64_t       compute_pipeline_hash() const;
+    VkPipeline     get_or_create_pipeline(uint32_t mode);
+    uint64_t       compute_pipeline_hash(uint32_t mode) const;
     VkShaderModule create_shader_module(const uint32_t* code, size_t size);
 };
 

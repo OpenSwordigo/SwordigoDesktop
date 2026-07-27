@@ -51,7 +51,7 @@ layout(push_constant) uniform PushConstants {
 // Total: 112 bytes. 16 bytes of headroom within 128-byte minimum.
 
 // --- UBO for scene/lighting data ---
-layout(std140, set = 0, binding = 1) uniform SceneData {
+layout(std140, set = 1, binding = 0) uniform SceneData {
     mat4 modelview;       // eye-space transform
     mat4 normal_matrix;   // transpose(inverse(modelview)), upper 3x3 used
     vec4 light_ambient;   // global ambient + light[0] ambient
@@ -168,7 +168,7 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 // --- UBO (must match vertex shader layout) ---
-layout(std140, set = 0, binding = 1) uniform SceneData {
+layout(std140, set = 1, binding = 0) uniform SceneData {
     mat4 modelview;
     mat4 normal_matrix;
     vec4 light_ambient;
@@ -353,3 +353,120 @@ enum VkFogMode : int {
     VK_FOG_EXP    = 2, // GL_EXP     0x0800
     VK_FOG_EXP2   = 3, // GL_EXP2    0x0801
 };
+
+// ============================================================================
+// PostFX Vertex Shader
+// ============================================================================
+static const char* VK_VERT_POSTFX_GLSL = R"glsl(
+#version 450
+
+layout(location = 0) out vec2 v_uv;
+
+void main() {
+    v_uv = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
+    gl_Position = vec4(v_uv * 2.0 - 1.0, 0.0, 1.0);
+}
+)glsl";
+
+// ============================================================================
+// PostFX Fragment Shader
+// ============================================================================
+static const char* VK_FRAG_POSTFX_GLSL = R"glsl(
+#version 450
+
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 out_color;
+
+layout(set = 0, binding = 0) uniform sampler2D u_color_tex;
+
+layout(push_constant) uniform PostFXPushConstants {
+    vec4  color_adjust; // x=brightness, y=contrast, z=saturation, w=warmth
+    vec4  effects_a;    // x=vignette_intensity, y=grain_intensity, z=ca_offset, w=sharpen_strength
+    vec4  effects_b;    // x=time, y=enabled(0/1), z=scale_mode(0=bilinear,1=nearest,2=crt,3=fsr), w=unused
+    vec2  tex_size;     // texture resolution (w, h)
+    vec2  out_size;     // window resolution (w, h)
+} pc;
+
+float rand(vec2 co) {
+    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void main() {
+    if (pc.effects_b.y < 0.5) {
+        out_color = texture(u_color_tex, v_uv);
+        return;
+    }
+
+    vec2 uv = v_uv;
+    int scale_mode = int(pc.effects_b.z);
+    
+    // 1. Chromatic Aberration
+    vec3 col;
+    float ca = pc.effects_a.z;
+    if (ca > 0.0001) {
+        vec2 dist = (uv - 0.5) * ca;
+        col.r = texture(u_color_tex, uv - dist).r;
+        col.g = texture(u_color_tex, uv).g;
+        col.b = texture(u_color_tex, uv + dist).b;
+    } else {
+        col = texture(u_color_tex, uv).rgb;
+    }
+
+    // 2. Color Adjustments (Brightness, Contrast, Saturation, Warmth)
+    col += pc.color_adjust.x;
+
+    float contrast = pc.color_adjust.y;
+    if (abs(contrast - 1.0) > 0.001) {
+        col = (col - 0.5) * contrast + 0.5;
+    }
+
+    float sat = pc.color_adjust.z;
+    if (abs(sat - 1.0) > 0.001) {
+        float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
+        col = mix(vec3(luma), col, sat);
+    }
+
+    float warmth = pc.color_adjust.w;
+    if (abs(warmth) > 0.001) {
+        col.r += warmth * 0.1;
+        col.b -= warmth * 0.1;
+    }
+
+    // 3. Sharpening
+    float sharpen = pc.effects_a.w;
+    if (sharpen > 0.001 && pc.tex_size.x > 0.0) {
+        vec2 step_val = 1.0 / pc.tex_size;
+        vec3 center = col;
+        vec3 n = texture(u_color_tex, uv + vec2(0.0, -step_val.y)).rgb;
+        vec3 s = texture(u_color_tex, uv + vec2(0.0, step_val.y)).rgb;
+        vec3 e = texture(u_color_tex, uv + vec2(step_val.x, 0.0)).rgb;
+        vec3 w = texture(u_color_tex, uv + vec2(-step_val.x, 0.0)).rgb;
+        vec3 sharp = center * 5.0 - n - s - e - w;
+        col = mix(col, sharp, sharpen * 0.5);
+    }
+
+    // 4. Vignette
+    float vig_intensity = pc.effects_a.x;
+    if (vig_intensity > 0.001) {
+        float d = distance(uv, vec2(0.5));
+        float vig = smoothstep(0.8, 0.2, d * (1.0 + vig_intensity));
+        col *= mix(1.0 - vig_intensity, 1.0, vig);
+    }
+
+    // 5. Film Grain
+    float grain_intensity = pc.effects_a.y;
+    if (grain_intensity > 0.001) {
+        float g = (rand(uv + pc.effects_b.x * 0.05) - 0.5) * grain_intensity;
+        col += vec3(g);
+    }
+
+    // 6. CRT Scanlines
+    if (scale_mode == 2) {
+        float scanline = sin(uv.y * pc.out_size.y * 3.14159) * 0.15;
+        col -= scanline;
+    }
+
+    out_color = vec4(clamp(col, 0.0, 1.0), 1.0);
+}
+)glsl";
+

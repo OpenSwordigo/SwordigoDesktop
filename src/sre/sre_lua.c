@@ -29,9 +29,16 @@ extern void *g_lua_mutex_ptr;
 
 #include "sre.h"
 #include "sre_lua.h"
+#include "sre_setjmp.h"
 #include "sre_caver.h"
 
+/* clock_gettime forward declarations (freestanding — no <time.h> in sre.h) */
+struct timespec { long tv_sec; long tv_nsec; };
+#define CLOCK_MONOTONIC 1
+extern int clock_gettime(int clk_id, struct timespec *tp);
+
 extern uint64_t g_swordigo_base;
+
 
 /* ========== Lua API Function Pointers ========== */
 
@@ -119,6 +126,9 @@ void sre_init_lua(SreLuaAddrs* addrs) {
     g_lua_topointer   = (pfn_lua_topointer)addrs->lua_topointer;
     g_lua_pushlightuserdata = (pfn_lua_pushlightuserdata)addrs->lua_pushlightuserdata;
     g_lua_error       = (pfn_lua_error)addrs->lua_error;
+    if (!g_lua_error && g_swordigo_base) {
+        g_lua_error = (pfn_lua_error)(g_swordigo_base + 0x4e9d44);
+    }
     g_getSpeedMultiplier = (pfn_getSpeedMultiplier)addrs->getSpeedMultiplier;
 
     /* Diagnostic: log that libsre initialized Lua function pointers */
@@ -386,7 +396,9 @@ void sre_lua_call_safe(lua_State* L, int nargs, int nresults) {
             }
         }
         if (g_lua_settop) {
-            g_lua_settop(L, -2);
+            int target_top = (int)(saved_top - L->base) - (nargs + 1);
+            if (target_top >= 0) g_lua_settop(L, target_top);
+            else g_lua_settop(L, 0);
         }
         if (nresults != -1 && g_lua_pushnil) {
             int i;
@@ -436,6 +448,15 @@ static void capture_lua_error(lua_State* L) {
     }
 }
 
+static void sre_lua_timeout_hook(lua_State* L, lua_Debug* ar) {
+    (void)ar;
+    if (g_lua_sethook) g_lua_sethook(L, NULL, 0, 0);
+    if (g_lua_pushstring && g_lua_error) {
+        g_lua_pushstring(L, "[SRE] Runaway script execution limit reached (infinite loop prevented)");
+        g_lua_error(L);
+    }
+}
+
 int sre_lua_resume_safe(lua_State* L, int narg) {
     if (!g_lua_resume) {
         /* Should never happen — lua_resume not resolved */
@@ -453,7 +474,9 @@ int sre_lua_resume_safe(lua_State* L, int narg) {
     int my_depth = recovery_push(L);
     if (my_depth < 0) {
         /* Recovery stack full — call without protection (fallback) */
+        if (g_lua_sethook) g_lua_sethook(L, (lua_Hook)sre_lua_timeout_hook, LUA_MASKCOUNT, 100000);
         int result = g_lua_resume(L, narg);
+        if (g_lua_sethook) g_lua_sethook(L, NULL, 0, 0);
         pthread_mutex_unlock(&g_lua_mutex);
         return result;
     }
@@ -463,6 +486,7 @@ int sre_lua_resume_safe(lua_State* L, int narg) {
          * The coroutine threw a Lua error during resume.
          * errorJmp was already restored by sre_cxa_throw. */
         recovery_pop(my_depth);
+        if (g_lua_sethook) g_lua_sethook(L, NULL, 0, 0);
         pthread_mutex_unlock(&g_lua_mutex);
         g_lua_resume_safe_errors++;
         g_sre_resume_err_count++;
@@ -479,7 +503,9 @@ int sre_lua_resume_safe(lua_State* L, int narg) {
         return 2;  /* LUA_ERRRUN */
     }
 
+    if (g_lua_sethook) g_lua_sethook(L, (lua_Hook)sre_lua_timeout_hook, LUA_MASKCOUNT, 100000);
     int result = g_lua_resume(L, narg);
+    if (g_lua_sethook) g_lua_sethook(L, NULL, 0, 0);
     recovery_pop(my_depth);
 
     /* Also capture errors from normal lua_resume return (non-exception path) */
@@ -491,6 +517,7 @@ int sre_lua_resume_safe(lua_State* L, int narg) {
     pthread_mutex_unlock(&g_lua_mutex);
     return result;
 }
+
 /* ========== Lua Console — Remastered Backend ==========
  * 
  * Protocol (host ↔ SRE guest via shared guest memory):
@@ -1201,6 +1228,20 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
         }
     }
 
+    /* DEADLOCK GUARD: while scene loading is in progress, do NOT call lua_resume.
+     * Scene::FinishLoad runs inside the updateApplication call chain. If any
+     * SceneObject Lua script throws during FinishLoad, sre_cxa_throw longjmps
+     * out of a pthread_mutex_lock we may be holding here. Skipping lua_resume
+     * entirely while loading keeps the mutex clean. Children still iterate;
+     * their timers count down but no coroutines fire until load completes. */
+    extern volatile int g_sre_scene_loading;
+    if (g_sre_scene_loading) {
+        /* Still need to call child iteration (so children get registered and
+         * cleaned up), but skip the lua_resume block above. Jump straight to
+         * child propagation at the bottom. */
+        goto child_update;
+    }
+
     /* Ghidra line 332: outer guard — skip entire body if both flags are zero.
      * (Constructor sets condition1=1 so active states always enter.) */
     char condition1 = PS_GET(self, PS_CONDITION1, char);
@@ -1242,7 +1283,9 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
 
                 int my_depth = recovery_push(L);
                 if (my_depth < 0) {
+                    if (g_lua_sethook) g_lua_sethook(L, (lua_Hook)sre_lua_timeout_hook, LUA_MASKCOUNT, 100000);
                     int r = g_lua_resume(L, 0);
+                    if (g_lua_sethook) g_lua_sethook(L, NULL, 0, 0);
                     if (r != LUA_YIELD) {
                         if (r != 0 && g_lua_tolstring && g_lua_gettop) {
                             void* sceneObj = PS_GET(self, PS_SCENE_OBJECT, void*);
@@ -1256,6 +1299,7 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
                     pthread_mutex_unlock(&g_lua_mutex);
                 } else if (sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
                     recovery_pop(my_depth);
+                    if (g_lua_sethook) g_lua_sethook(L, NULL, 0, 0);
                     pthread_mutex_unlock(&g_lua_mutex);
                     void* sceneObj = PS_GET(self, PS_SCENE_OBJECT, void*);
                     const char* obj_id = sre_scene_object_identifier((SceneObject*)sceneObj);
@@ -1270,7 +1314,9 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
                     L->base = saved_base;
                     L->nCcalls = saved_nCcalls;
                 } else {
+                    if (g_lua_sethook) g_lua_sethook(L, (lua_Hook)sre_lua_timeout_hook, LUA_MASKCOUNT, 100000);
                     int r = g_lua_resume(L, 0);
+                    if (g_lua_sethook) g_lua_sethook(L, NULL, 0, 0);
                     recovery_pop(my_depth);
                     if (r != LUA_YIELD) {
                         if (r != 0 && g_lua_tolstring && g_lua_gettop) {
@@ -1284,6 +1330,7 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
                     }
                     pthread_mutex_unlock(&g_lua_mutex);
                 }
+
             }
             /* If timer still counting: do NOT touch isSuspended here.
              * It stays 1 so next frame we keep counting down.
@@ -1324,7 +1371,16 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
                 if (child_ps) {
                     void* shared_ctrl = *(void**)((char*)child_ps + 0x20);
                     uint64_t ctrl_addr = (uint64_t)shared_ctrl;
-                    if (shared_ctrl && (ctrl_addr < 0x10000 || ctrl_addr >= 0x0000800000000000ULL)) { bad = 1; break; }
+                    if (shared_ctrl) {
+                        if (ctrl_addr < 0x10000 || ctrl_addr >= 0x0000800000000000ULL) {
+                            *(void**)((char*)child_ps + 0x20) = NULL;
+                        } else {
+                            uint64_t vtable_ptr = *(uint64_t*)shared_ctrl;
+                            if (!sre_is_valid_vtable_ptr(vtable_ptr)) {
+                                *(void**)((char*)child_ps + 0x20) = NULL;
+                            }
+                        }
+                    }
                 }
                 node = *(void**)node;
                 depth++;
@@ -1339,11 +1395,58 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
         int saved_suspended = PS_GET(self, PS_IS_SUSPENDED, int);
         PS_SET(self, PS_IS_SUSPENDED, int, 0);  /* suppress original's timer for *this* */
 
-        g_orig_ProgramState_Update(self, deltaTime);
+        /* TIME-SLICE GUARD: if this frame's coroutine budget is exhausted,
+         * skip child-state iteration entirely. The children will be resumed
+         * on the next frame. This prevents SDL/X11 starvation when hundreds
+         * of coroutines are active simultaneously (e.g. large mod scripts). */
+        if (!sre_frame_budget_check()) {
+            /* RECOVERY WRAPPER: wrap child iteration in setjmp so that any
+             * longjmp that escapes from a child coroutine error (sre_cxa_throw)
+             * does NOT escape with the mutex still locked.
+             *
+             * Without this, the sequence:
+             *   child ProgramState::Update
+             *     → lua_resume (mutex locked)
+             *       → Lua error → sre_luaD_throw → sre_cxa_throw → longjmp
+             *         → longjmp escapes past pthread_mutex_unlock
+             *           → mutex left locked FOREVER → game hangs
+             *
+             * With this wrapper, the longjmp lands HERE. We force-unlock the
+             * mutex and continue — the child that threw is marked completed. */
+            if (L != NULL) {
+                int child_depth = recovery_push(L);
+                if (child_depth >= 0 && sre_setjmp(g_sre_recovery_stack[child_depth].buf) != 0) {
+                    /* longjmp fired from inside child iteration */
+                    recovery_pop(child_depth);
+                    pthread_mutex_unlock(&g_lua_mutex);  /* FORCE UNLOCK — may have been left locked */
+                    fprintf(stderr, "[SRE/ProgramState] Child exception caught — mutex force-released, continuing.\n");
+                    /* Don't restore suspended — fall through to restore below */
+                } else {
+                    g_orig_ProgramState_Update(self, deltaTime);
+                    if (child_depth >= 0) recovery_pop(child_depth);
+                }
+            } else {
+                /* No Lua state — just call directly (scene objects without scripts) */
+                g_orig_ProgramState_Update(self, deltaTime);
+            }
+        }
+        /* else: budget expired — skip child iteration for this frame. */
 
+child_update_done:
         /* Restore: the original only iterates/cleans children, it never
          * modifies isSuspended for *this* when we passed isSuspended=0.
          * So restoring is always safe and correct. */
+        PS_SET(self, PS_IS_SUSPENDED, int, saved_suspended);
+    }
+    return;
+
+child_update:
+    /* Scene loading fast path: skip lua_resume but still propagate to children
+     * so the state tree stays consistent. No mutex taken here. */
+    if (g_orig_ProgramState_Update != 0) {
+        int saved_suspended = PS_GET(self, PS_IS_SUSPENDED, int);
+        PS_SET(self, PS_IS_SUSPENDED, int, 0);
+        g_orig_ProgramState_Update(self, deltaTime);
         PS_SET(self, PS_IS_SUSPENDED, int, saved_suspended);
     }
 }
@@ -1369,7 +1472,7 @@ typedef void (*pfn_orig_updateApp)(void* env, void* obj);
 pfn_orig_updateApp g_orig_updateApplication = 0;
 
 void sre_updateApplication(void* env, void* obj) {
-    /* 1. Service console & pending Lua coroutines */
+    /* 1. Service Lua console & Mini injection BEFORE the frame tick */
     if (g_sre_last_lua_state) {
         extern void sre_mini_ensure_injected(lua_State* L);
         sre_mini_ensure_injected(g_sre_last_lua_state);
@@ -1382,47 +1485,29 @@ void sre_updateApplication(void* env, void* obj) {
         sre_tick_console_coroutines(g_sre_last_lua_state);
     }
 
-    /* 2. Execute original updateApplication if relay is set, OR call FWShell::Update */
-    if (g_orig_updateApplication) {
-        lua_State* L = g_sre_last_lua_state;
-        if (L != NULL) {
-            CallInfo* saved_ci = L->ci;
-            StkId saved_top = L->top;
-            StkId saved_base = L->base;
-            unsigned short saved_nCcalls = L->nCcalls;
+    /* 2. Compute delta time from host wall clock.
+     *    We maintain our own dt here so we can apply g_sre_game_speed and
+     *    cap dt to avoid physics explosions after lag spikes (e.g. alt-tab). */
+    static uint64_t s_last_frame_ns = 0;
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        float dt = 0.016666667f;  /* Default: 60 Hz */
+        if (s_last_frame_ns != 0) {
+            dt = (float)(now_ns - s_last_frame_ns) / 1e9f;
+            /* Clamp: minimum 1ms, maximum 100ms (avoids physics explosion after stall) */
+            if (dt < 0.001f) dt = 0.001f;
+            if (dt > 0.1f)   dt = 0.1f;
+        }
+        s_last_frame_ns = now_ns;
 
-            int my_depth = recovery_push(L);
-            if (my_depth >= 0 && sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
-                recovery_pop(my_depth);
-                pthread_mutex_unlock(&g_lua_mutex);
-                fprintf(stderr, "[SRE/Lua] Exception recovered during updateApplication frame tick!\n");
-                luaF_close(L, saved_top);
-                L->ci = saved_ci;
-                L->top = saved_top;
-                L->base = saved_base;
-                L->nCcalls = saved_nCcalls;
-                return;
-            }
-            g_orig_updateApplication(env, obj);
-            if (my_depth >= 0) {
-                recovery_pop(my_depth);
-            }
-        } else {
-            g_orig_updateApplication(env, obj);
-        }
-    } else {
-        /* Fallback: Direct FWShell::Update call */
-        void* shell = *(void**)(g_swordigo_base + 0x7e9c20);
-        if (shell != NULL) {
-            void** vtable = *(void***)shell;
-            typedef void (*pfn_Update)(void* self, float dt);
-            pfn_Update update_func = (pfn_Update)vtable[13]; /* vtable slot 13 (offset 0x68) */
-            if (update_func) {
-                update_func(shell, 0.016666667f);
-            }
-        }
+        /* 3. Dispatch PC-safe frame tick (sre_frame_loop.c) */
+        extern void sre_frame_update(void* env, void* obj, float dt);
+        sre_frame_update(env, obj, dt);
     }
 }
+
 
 
 /* ========== handleTouchEvent hook ==========

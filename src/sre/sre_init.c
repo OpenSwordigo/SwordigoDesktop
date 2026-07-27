@@ -43,6 +43,24 @@ SreHookEntry sre_hook_table[] = {
     { 0x567254, "sre_CppString_append"      },  /* std::string::append()    */
     { 0x565220, "sre_CppString_release"     },  /* std::string destructor   */
 
+    /* AudioSystem::EndAudioInterruptionIfNecessary — iOS audio session resumption.
+     * IDA: _ZN5Caver11AudioSystem31EndAudioInterruptionIfNecessaryEv @ 0x47ED50
+     *   (IDA-verified real entry; confirmed by __stack_chk_fail LR=0x147eebc = 0x47ED50+0x16C)
+     * NOTE: nm -D reports a thunk at 0x47ef50 — that is the non-virtual call path only.
+     *   Vtable dispatch (from setApplicationViewSize→CaverShell::Init vtable[10]) calls
+     *   0x47ED50 directly, bypassing the thunk.  We must hook 0x47ED50 to catch ALL calls.
+     * Calls alcMakeContextCurrent inside a canary frame; TPIDR_EL0 changes on
+     * JNI context switch → canary mismatch → __stack_chk_fail → recovery loop.
+     * On desktop OpenAL, audio session management is irrelevant. No-op it. */
+    // { 0x47ED50, "sre_AudioSystem_EndAudioInterruptionIfNecessary" },
+
+    /* __stack_chk_fail replacement — PLT stub 0x1F62D0.
+     * IDA-verified: 0x1F62D0 = .__stack_chk_fail (EndAudioInterruptionIfNecessary
+     *   callee entry; real sym at 0x6FE6F8).
+     * TPIDR_EL0 drifts on JNI context switch → canary mismatch on every return.
+     * Pure return-to-LR: all callee-saved regs intact, epilogue runs cleanly. */
+    // { 0x1F62D0, "sre_stack_chk_fail" },
+
     /* ProgramState — catch Lua errors instead of aborting */
     { 0, "sre_ProgramState_Execute" },  /* offset resolved dynamically by symbol */
     { 0, "sre_ProgramState_Resume"  },  /* offset resolved dynamically by symbol */
@@ -59,6 +77,23 @@ SreHookEntry sre_hook_table[] = {
      // { 0, "sre_ProgramState_destructor" },
      { 0x479aac, "sre_updateApplication" },
 
+    /* Scene Loading Pipeline Hooks — Safety Filters & Error Recovery */
+    /* SceneLoadingView::InitWithGameState — offset resolved via sym_hooks (not yet wired,
+     * kept as 0 until we add sym_hooks entry). Scene::FinishLoad and SceneObject::FinishLoad
+     * have hardcoded nm offsets so they ARE installed without sym_hooks entries:
+     *   Scene::FinishLoad     nm arm64 v1.4.12: 0x4642a8
+     *   SceneObject::FinishLoad nm arm64 v1.4.12: 0x470ec4
+     * These two are the PRIMARY cause of scene-transition freeze:
+     *   without the hook, corrupted component vtable[9] calls jump into .dynstr
+     *   (PC=0x10771ac) and Dynarmic force-returns to LR inside the original code
+     *   instead of our setjmp recovery. */
+    { 0,        "sre_SceneLoadingView_InitWithGameState" },
+    { 0,        "sre_GameSceneController_InitWithScene"  },
+    { 0x4642a8, "sre_Scene_FinishLoad"                   },
+    { 0x470ec4, "sre_SceneObject_FinishLoad"             },
+    { 0, "sre_ReadPODModelFromFile"               },
+    { 0, "sre_CPVRTModelPOD_ReadFromMemory"       },
+
 
     /* luaD_throw — ROOT of all Lua error handling. Every Lua error goes
      * through luaD_throw(L, errcode). Original calls __cxa_throw or
@@ -67,8 +102,9 @@ SreHookEntry sre_hook_table[] = {
     { 0x4eb814, "sre_luaD_throw" },
 
     /* ProgramPanic — safety net (should never fire now that luaD_throw
-     * is hooked, but kept as backup). */
-    { 0x5c0ab4, "sre_ProgramPanic" },
+     * is hooked, but kept as backup).
+     * nm -D libswordigo.so v1.4.12 arm64-v8a: 0x4c0d60 */
+    { 0x4c0d60, "sre_ProgramPanic" },
 
     /* Background rendering — our own sky renderer
      * Addresses verified via: aarch64-linux-gnu-nm -D libswordigo.so | grep BackgroundComponent
@@ -77,8 +113,8 @@ SreHookEntry sre_hook_table[] = {
      * STXR/LDXR loops (boost::shared_ptr refcount) and bad pointer
      * dereferences that branch into the files_dir string area (0x20010).
      * We replace both with safe no-ops. */
-    //{ 0x49e55c, "sre_GUIView_Update"             },  /* GUIView::Update(float) */
-    { 0x37d8f4, "sre_AchievementsManager_Update" },  /* AchievementsManager::Update(float) */
+    //{ 0, "sre_GUIView_Update"             },  /* GUIView::Update(float) */
+    { 0, "sre_AchievementsManager_Update" },  /* AchievementsManager::Update(float) */
 
     { 0x21ded4, "sre_BackgroundComponent_Draw"             },  /* BackgroundComponent::Draw (const) */
     { 0x2b6760, "sre_RotatingBackgroundComponent_Draw"     },  /* RotatingBackgroundComponent::Draw (const) */
@@ -161,6 +197,31 @@ SreHookEntry sre_hook_table[] = {
      * (set by sre_lua_call_safe). */
     { 0x51e108, "sre_cxa_throw" },
 
+    /* Exception frame initializer — sub_58128C at 0x58128C.
+     * Prevents the infinite abort() loop: when C++ exceptions are thrown,
+     * the EHABI unwind calls sub_5806A8 which uses dl_iterate_phdr to look
+     * up EHABI tables for the guest binary. Since our custom loader does NOT
+     * register the binary with the system dynamic linker, dl_iterate_phdr
+     * always returns 5. sub_58128C then calls abort() on EVERY exception →
+     * infinite recovery loop → eventual PC jump into RTTI data string.
+     * Our replacement zeros the unwind frame and returns 0 so sub_5818C4
+     * can proceed to a single controlled abort (caught by abort-recovery). */
+    { 0, "sre_ExceptionFrameInit" },
+
+    /* C++ exception unwinder dispatcher — sub_5818C4 at 0x5818C4.
+     * Even after sre_ExceptionFrameInit suppresses the abort inside
+     * sub_58128C, sub_5818C4 passes a zeroed frame to sub_5813B4/sub_581474
+     * which compute garbage jump targets → PC lands in RTTI data string
+     * (observed: 0x10771ac = "_ZN5Caver11CaverShell...").
+     * Fix: return a1 immediately (the same as sub_5818C4's success path)
+     * so the exception is silently absorbed without any pointer arithmetic
+     * on the zeroed/corrupted frame data.
+     *
+     * NOTE: This hook has 2744 callers — it is the global C++ exception
+     * dispatcher. Disabling it causes the abort loop to return immediately. */
+    { 0, "sre_UnwindRaiseException" },
+
+
     /* MusicPlayer — FULL native replacement.
      * The original uses boost::shared_ptr + C++ exceptions for playlist
      * management, all of which break under Unicorn. Our SRE version
@@ -187,13 +248,69 @@ SreHookEntry sre_hook_table[] = {
     /* GUI System — game state extraction.
      * Hooks GameSceneView::Update to read HP/mana/coins from GameState
      * every frame. The native HUD won't animate (we own the display). */
-     { 0x34ed2c, "sre_GameSceneView_Update" },  /* GameSceneView::Update(float) */
+     { 0x34ed2c, "sre_GameSceneView_Update" },  /* GameSceneView::Update(float)  nm arm64: 0x34ed2c ✓ */
       { 0, "sre_CameraController_Update" },
       { 0, "sre_SceneGrid_UpdateVisibleAreasWithCamera" },
       { 0, "sre_GameOverlayView_SetControlsHidden" },
 
-    /* Force GLES 2.0 Mode (hook RenderingContext constructor) */
-    { 0x2fc03c, "sre_RenderingContext_C1" },
+     /* =========================================================================
+      * Frame Loop Control Trampolines — sre_frame_loop.c
+      * =========================================================================
+      *
+      * CaverShell::Update: PC-safe replacement strips Android-specific
+      * calls (AchievementsManager, GUIApplication::DispatchEvents) and routes
+      * AudioSystem::Update + GameSceneView vtable dispatch correctly.
+      *
+      * GameSceneController::Update: Call-through hook. Required so that
+      * the time-sliced ProgramState::Update trampoline sits inside the call chain.
+      *
+      * Scene::Update: Call-through hook so ProgramState budget applies.
+      *
+      * GUIApplication::DispatchEvents: Pure PC no-op. SDL drives input events
+      * before updateApplication; the game's internal event queue is never needed.
+      *
+      * Offsets verified from nm -D libswordigo.so v1.4.12 arm64-v8a.
+      */
+     { 0, "sre_CaverShell_Update_trampoline"    },  /* CaverShell::Update(float)        nm arm64: 0x210efc */
+     { 0, "sre_GameSceneController_Update"       },  /* GameSceneController::Update(float) nm arm64: 0x349d84 */
+     { 0, "sre_Scene_Update"                     },  /* Scene::Update(float)             nm arm64: 0x465968 */
+
+    /* ─── GUINavigationController Safety Hooks ────────────────────────────────
+     * These three functions form the level-transition vtable dispatch chain.
+     * During scene unload, a ViewController's vtable pointer can be corrupted
+     * (freed), causing the CPU to branch into .dynstr string data at 0x10771ac.
+     *
+     * Addresses verified from nm -D libswordigo.so v1.4.12 arm64-v8a (CORRECT):
+     *   GUINavigationController::Update                   0x49923c
+     *   GUINavigationController::ViewControllerViewLoaded 0x499288
+     *   GUINavigationController::FinishTransitionToVC     0x49a42c
+     */
+    { 0, "sre_GUINavigationController_Update"           },
+    { 0, "sre_GUINavigationController_VCLoaded"         },
+    { 0, "sre_GUINavigationController_FinishTransition" },
+
+
+    /* ─── GameData::Clear crash guard ─────────────────────────────────────────
+     * GameData::Clear iterates 5 repeated protobuf fields calling vtable[0x20]
+     * on each element. If a count field is corrupted (e.g. 0x1077 = 4215),
+     * the loop runs over garbage pointers → PC jumps into .dynstr at 0x10771ac.
+     *
+     * nm -D libswordigo.so v1.4.12 arm64-v8a:
+     *   Caver::Proto::GameData::Clear  0x2e6d60
+     */
+    { 0x2e6d60, "sre_GameData_Clear" },
+
+    /* ─── SceneObject::ComponentWithInterface safety guard ─────────────────────
+     * Filters out corrupted component pointers / bad vtables created by mods,
+     * preventing Dynarmic Halt exceptions and jumps into .dynstr data.
+     * nm -D libswordigo.so v1.4.12 arm64-v8a: 0x47462c
+     */
+    { 0x47462c, "sre_SceneObject_ComponentWithInterface" },
+
+    /* Force GLES 2.0 Mode — hook RenderingContext::C1.
+     * nm arm64 v1.4.12: 0x48afb0. Relay built by gui_relays[] in main.cpp
+     * (runs BEFORE hook patcher → copy_and_relocate captures real insn). */
+    { 0x48afb0, "sre_RenderingContext_C1" },
 
     /* NOTE: Death/Respawn hook at 0x347efc is already defined above
      * (sre_GameOverVC_ShowAdMaybe). Do NOT duplicate — the old
@@ -211,8 +328,9 @@ SreHookEntry sre_hook_table[] = {
      * of the old "optimistic return 1" stub that broke vanilla asset queries.
      * sre_NewByteBufferFromAndroidAsset also does real fopen/fread loading.
      * Hook offset 0x4b44b8 = Caver::FileExistsAtPath (v1.4.12 ARM64). */
-     { 0x4b44b8, "sre_FileExistsAtPath" },
-     { 0x5196cc, "sre_PVRTTextureLoadFromPVRBuffer_hook", 0 },
+     { 0x4b44b8, "sre_FileExistsAtPath"                    },  /* nm arm64: 0x4b44b8 ✓ */
+     { 0x4b4254, "sre_NewByteBufferFromAndroidAsset"        },  /* nm arm64: 0x4b4254 ✓ */
+     { 0x5196c4, "sre_PVRTTextureLoadFromPVRBuffer_hook", 0 },  /* nm arm64: 0x5196c4 ✓ */
      { 0, "sre_SetResourcesPath" },
      /* IsAndroidAssetsPath — ARM64 offset NOT YET VERIFIED.
       * README offsets are ARM32/Thumb — 0x084472 was wrong (mid-instruction).
@@ -267,12 +385,12 @@ SreHookEntry sre_hook_table[] = {
     { 0, "luaL_loadstring" },
     { 0, "luaL_loadbuffer" },
     { 0, "luaL_loadfile" },
-    { 0, "luaopen_base" },
+    { 0, "_Z12luaopen_baseP9lua_State" },
     { 0, "luaopen_package" },
     { 0, "luaopen_table" },
     { 0, "luaopen_io" },
     { 0, "luaopen_os" },
-    { 0, "luaopen_string" },
+    { 0, "_Z14luaopen_stringP9lua_State" },
     { 0, "luaopen_math" },
     { 0, "luaopen_debug" },
     { 0, "luaL_openlibs" },
@@ -456,4 +574,28 @@ void sre_PVRTTextureLoadFromPVRBuffer_hook(
 ) {
     sre_PVRTTextureLoadFromPVRBuffer(param_1, param_2, param_3, param_4, param_5, param_6, param_7, param_8);
 }
+
+/* Module-scoped VTable validator.
+ * Vtable arrays in libswordigo.so live in .data.rel.ro:
+ *   VMA 0x6b6a80–0x6DBFxx  → guest addr 0x16b6a80–0x16DBFxx (at load_base 0x1000000)
+ * Also accept SRE's vtables (libsre.so loaded at 0x2000000):
+ *   Roughly 0x2000000–0x2300000
+ *
+ * Rejects pointers into .text (0x1203e90–0x1584000) and .dynstr
+ * (0x1077168–0x1162a8c) which would indicate a corrupted/stale vtable ptr.
+ */
+int sre_is_valid_vtable_ptr(uint64_t vtable) {
+    if (!vtable) return 0;
+    if ((vtable & 7) != 0) return 0;  /* vtable arrays are pointer-aligned */
+
+    /* libswordigo.so .data.rel.ro: 0x16b6a80 – 0x16DC000 */
+    if (vtable >= 0x16b6a80ULL && vtable < 0x16DC000ULL) return 1;
+    /* libswordigo.so .rodata (some vtables spill into here): 0x1583480 – 0x15A2000 */
+    if (vtable >= 0x1583480ULL && vtable < 0x15A2000ULL) return 1;
+    /* libsre.so data sections (loaded at ~0x2000000) */
+    if (vtable >= 0x2000000ULL && vtable < 0x2300000ULL) return 1;
+
+    return 0;
+}
+
 

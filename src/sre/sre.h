@@ -91,11 +91,26 @@ typedef struct {
 /* Initialization — called by host after loading */
 void sre_init(uint64_t swordigo_base, uint64_t empty_sentinel_bss_offset);
 
+/* Vtable Validator — verifies if vtable is 8-byte aligned and inside valid module range */
+int sre_is_valid_vtable_ptr(uint64_t vtable);
+
 /* CppString replacements — hooked via trampoline */
 SreString* sre_CppString_from_char_p(SreString* self, const char* src);
 SreString* sre_CppString_assign(SreString* self, const char* src, uint64_t len);
 SreString* sre_CppString_append(SreString* self, const char* src, uint64_t len);
 void sre_CppString_release(SreString* self);
+
+/* C++ exception frame initializer — prevents EHABI abort (sre_effects.c) */
+void sre_ExceptionFrameInit(uint64_t* a1, uint64_t a2, uint64_t a3);
+
+/* C++ unwind dispatcher — returns immediately, drops the broken exception (sre_effects.c) */
+void* sre_UnwindRaiseException(void* a1);
+
+/* AudioSystem::EndAudioInterruptionIfNecessary — no-op on desktop (sre_caver.c) */
+void* sre_AudioSystem_EndAudioInterruptionIfNecessary(void* self);
+
+/* __stack_chk_fail replacement — pure return-to-LR, no longjmp (sre_caver.c) */
+void sre_stack_chk_fail(void);
 
 /* =========================================================================
  * Math types (matching Caver engine)
@@ -105,5 +120,50 @@ void sre_CppString_release(SreString* self);
 typedef struct { float x, y; }       SreVec2;
 typedef struct { float x, y, z; }    SreVec3;
 typedef struct { float r, g, b, a; } SreColor;
+
+/* =========================================================================
+ * Frame Loop — sre_frame_loop.c
+ * =========================================================================
+ * Per-frame update pipeline with time-sliced coroutine scheduling.
+ */
+
+/* Per-frame coroutine time-budget state (volatile, polled by ProgramState_Update) */
+extern volatile int   g_sre_frame_budget_expired;
+extern volatile float g_sre_frame_budget_ms_remaining;
+
+/* Called at the start of each host frame to reset the time budget */
+void sre_frame_budget_start(void);
+
+/* Returns 1 if this frame's coroutine time budget is exhausted */
+int sre_frame_budget_check(void);
+
+/* Main frame tick: called from sre_updateApplication instead of original relay */
+void sre_frame_update(void* env, void* obj, float dt);
+
+/* PC-safe CaverShell::Update replacement (trampoline target) */
+void sre_CaverShell_Update_trampoline(void* self, float dt);
+
+/* Scene::Update hook (call-through, allows ProgramState budget to work) */
+void sre_Scene_Update(void* self, float dt);
+
+/* GameSceneController::Update hook (call-through) */
+void sre_GameSceneController_Update(void* self, float dt);
+
+/* GUIApplication::DispatchEvents PC no-op */
+void sre_GUIApplication_DispatchEvents(void* self);
+
+/* Relay pointers set by trampoline installer */
+typedef void (*pfn_CaverShell_Update)(void* self, float dt);
+extern pfn_CaverShell_Update g_orig_CaverShell_Update;
+
+typedef void (*pfn_orig_GSC_Update)(void* self, float dt);
+extern pfn_orig_GSC_Update g_orig_GameSceneController_Update;
+
+typedef void (*pfn_orig_Scene_Update)(void* self, float dt);
+extern pfn_orig_Scene_Update g_orig_Scene_Update_fn;
+
+/* GameData::Clear crash guard (sre_scene_update.c) */
+void sre_GameData_Clear(void* this_);
+extern uint64_t g_orig_GameData_Clear;
 
 #endif /* SRE_H */

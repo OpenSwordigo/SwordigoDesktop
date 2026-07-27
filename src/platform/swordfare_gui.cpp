@@ -18,21 +18,28 @@
 #include "imgui/backends/imgui_impl_sdl3.h"
 #include "imgui/backends/imgui_impl_opengl3.h"
 #ifdef VULKAN_BACKEND
+#define VK_NO_PROTOTYPES
+#include "volk.h"
 #include "platform/vulkan_backend.h"
 #include "imgui/backends/imgui_impl_vulkan.h"
 #endif
 #include "platform/rgc.h"
 
 #include <cstring>
-#include <cmath>
-#include <algorithm>
-#include <cstdio>
-#include <filesystem>
+#include "display.h"
+#include "input_config.h"
+#include "data_path.h"
+#include "save_editor.h"
+
 #include <iostream>
 #include <fstream>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <cmath>
+#include <algorithm>
+#include <cstdio>
+#include <filesystem>
 #include <fcntl.h>
 #include <arpa/inet.h>
 
@@ -439,6 +446,11 @@ void SwordfareGUI::init_vulkan(SDL_Window* window, VulkanBackend* vk_backend) {
 
     // SDL3 Vulkan platform layer
     ImGui_ImplSDL3_InitForVulkan(window);
+
+    // Initialize ImGui Vulkan functions with volk
+    ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_0, [](const char* function_name, void* user_data) {
+        return vkGetInstanceProcAddr((VkInstance)user_data, function_name);
+    }, vk_backend->get_instance());
 
     // Create ImGui-specific descriptor pool
     VkDescriptorPoolSize pool_sizes[] = {

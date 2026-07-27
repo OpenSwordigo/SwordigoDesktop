@@ -32,6 +32,7 @@ public:
     // Integer registers X0-X30
     void set_reg(int reg, uint64_t value) override;
     uint64_t get_reg(int reg) override;
+    void set_tpidr_el0(uint64_t val) override;
     
     // SIMD/FP registers D0-D31 (double) and S0-S31 (float)
     void set_dreg(int reg, double value) override;

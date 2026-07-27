@@ -15,8 +15,35 @@
 #include "sre.h"
 #include "sre_caver.h"
 
-/* Swordigo base address — defined in sre_init.c */
+/* =========================================================================
+ * Scene Loading State — guards coroutine execution during level transitions
+ *
+ * During Scene::FinishLoad / SceneLoadingView::InitWithGameState, hundreds
+ * of SceneObjects run FinishLoad which starts Lua scripts. Any Lua error
+ * during this phase causes sre_cxa_throw → longjmp which can escape a
+ * pthread_mutex_lock that a parent ProgramState::Update holds, leaving
+ * the mutex permanently locked → game deadlocks on next frame.
+ *
+ * Fix: set g_sre_scene_loading=1 while loading. sre_ProgramState_Update
+ * checks this and skips lua_resume entirely when set, preventing the
+ * mutex from ever being taken during scene load.
+ * ========================================================================= */
+volatile int g_sre_scene_loading = 0;  /* 1 = scene load in progress */
+
+/* Extern for force-unlocking the Lua mutex after a scene load completes.
+ * The mutex may have been left locked by a longjmp escape during loading.
+ * We always unlock once after FinishLoad regardless of lock count. */
+extern int pthread_mutex_unlock(void *mutex);
+extern void *g_lua_mutex_ptr;
+
+/* Swordigo base address & Lua recovery externs */
 extern uint64_t g_swordigo_base;
+extern lua_State* g_sre_last_lua_state;
+extern int recovery_push(lua_State* L);
+extern void recovery_pop(int depth);
+typedef struct { unsigned long buf[22]; } SreJmpBufRec;
+extern SreJmpBufRec g_sre_recovery_stack[];
+extern int sre_setjmp(void* env);
 
 /* =========================================================================
  * sre_GUIView_Update — safe no-op
@@ -164,11 +191,13 @@ volatile float g_sre_hero_pos_z = 0.0f;
 /* Relay pointer to original RenderingContext constructor */
 uint64_t g_orig_RenderingContext_C1 = 0;
 
-/* Hook: Force GLES 2.0 API Mode */
+/* Hook: Pass through original RenderingContext API mode */
 void* sre_RenderingContext_C1(void* self, int api_mode) {
-    // Call the original constructor through relay stub forcing GLES 2.0 (api_mode = 1)
     typedef void* (*fn_Ctor)(void*, int);
-    return ((fn_Ctor)g_orig_RenderingContext_C1)(self, 1);
+    if (g_orig_RenderingContext_C1) {
+        return ((fn_Ctor)g_orig_RenderingContext_C1)(self, api_mode);
+    }
+    return self;
 }
 
 /* Scene state flags */
@@ -559,3 +588,274 @@ do_effects:
     /* GUIView::Update (animation system) is now hooked as sre_GUIView_Update
      * (safe no-op) — no direct call needed here. */
 }
+
+/* =========================================================================
+ * Scene Loading Pipeline Safety Wrappers & Error Recovery
+ * ========================================================================= */
+
+typedef void (*pfn_orig_SceneLoadingView_InitWithGameState)(void* self, void* state_ptr, void* map_node_ptr);
+pfn_orig_SceneLoadingView_InitWithGameState g_orig_SceneLoadingView_InitWithGameState = 0;
+
+void sre_SceneLoadingView_InitWithGameState(void* self, void* state_ptr, void* map_node_ptr) {
+    fprintf(stderr, "[SRE/Scene] SceneLoadingView::InitWithGameState starting (view=%p)...\n", self);
+
+    /* CRITICAL: raise scene loading flag BEFORE calling original.
+     * This suppresses all lua_resume calls in ProgramState::Update for the
+     * entire duration of scene loading, preventing mutex-under-longjmp deadlock. */
+    g_sre_scene_loading = 1;
+
+    if (g_orig_SceneLoadingView_InitWithGameState) {
+        g_orig_SceneLoadingView_InitWithGameState(self, state_ptr, map_node_ptr);
+    }
+    fprintf(stderr, "[SRE/Scene] SceneLoadingView::InitWithGameState finished successfully.\n");
+}
+
+typedef void (*pfn_orig_GameSceneController_InitWithScene)(void* self, void* scene_ptr);
+pfn_orig_GameSceneController_InitWithScene g_orig_GameSceneController_InitWithScene = 0;
+
+void sre_GameSceneController_InitWithScene(void* self, void* scene_ptr) {
+    fprintf(stderr, "[SRE/Scene] GameSceneController::InitWithScene starting (ctrl=%p, scene=%p)...\n", self, scene_ptr);
+    if (g_orig_GameSceneController_InitWithScene) {
+        g_orig_GameSceneController_InitWithScene(self, scene_ptr);
+    }
+    fprintf(stderr, "[SRE/Scene] GameSceneController::InitWithScene finished successfully.\n");
+}
+
+typedef void (*pfn_orig_Scene_FinishLoad)(void* self);
+pfn_orig_Scene_FinishLoad g_orig_Scene_FinishLoad = 0;
+
+void sre_Scene_FinishLoad(void* self) {
+    if (!self) return;
+    fprintf(stderr, "[SRE/Scene] Scene::FinishLoad starting (scene=%p)...\n", self);
+
+    /* CRITICAL: raise scene loading flag BEFORE calling original.
+     * This suppresses all lua_resume calls in ProgramState::Update for the
+     * entire duration of scene loading, preventing mutex-under-longjmp deadlock. */
+    g_sre_scene_loading = 1;
+
+    /* NOTE: Scene's object iteration uses a doubly-linked list, NOT a begin/end vector.
+     * Layout (from Ghidra):
+     *   this+0x28  = ProgramState embedded object (NOT a vector!)
+     *   this+0xb8  = SceneObject linked-list sentinel
+     *   this+0xC8  = SceneObject linked-list head (this+200)
+     *   this+0xe8  = SceneObjectGroup linked-list sentinel
+     *   this+0xf8  = SceneObjectGroup linked-list head
+     * DO NOT sanitize any of these — they are traversed by the original FinishLoad. */
+
+    if (g_orig_Scene_FinishLoad) {
+        lua_State* L = g_sre_last_lua_state;
+        if (L != NULL) {
+            int my_depth = recovery_push(L);
+            if (my_depth >= 0 && sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
+                recovery_pop(my_depth);
+                fprintf(stderr, "[SRE/Scene] Recovered exception during Scene::FinishLoad! Scene load continuing.\n");
+                /* MUTEX SAFETY: force unlock — a longjmp may have escaped a locked section */
+                pthread_mutex_unlock(g_lua_mutex_ptr);
+                goto finish_load_done;
+            }
+            g_orig_Scene_FinishLoad(self);
+            if (my_depth >= 0) recovery_pop(my_depth);
+        } else {
+            g_orig_Scene_FinishLoad(self);
+        }
+    }
+
+finish_load_done:
+    /* CRITICAL: scene load is complete — clear flag and force-unlock the Lua mutex.
+     * A longjmp during FinishLoad may have left the mutex locked. Unlocking once
+     * extra is safe (on Linux POSIX mutexes, unlock of an already-unlocked mutex
+     * returns EPERM which we ignore) — but it un-sticks a deadlocked next frame. */
+    g_sre_scene_loading = 0;
+    pthread_mutex_unlock(g_lua_mutex_ptr);  /* Force-unlock: safe even if already unlocked */
+    fprintf(stderr, "[SRE/Scene] Scene::FinishLoad finished. Loading flag cleared, mutex released.\n");
+}
+
+typedef void (*pfn_orig_SceneObject_FinishLoad)(void* self);
+pfn_orig_SceneObject_FinishLoad g_orig_SceneObject_FinishLoad = 0;
+
+void sre_SceneObject_FinishLoad(void* self) {
+    if (!self) return;
+
+    /* Guard the component vector (this+0xC0=begin, this+0xC8=end) before calling the
+     * original. IDA decomp shows FinishLoad iterates from end→begin calling vtable[9].
+     * If begin/end are corrupted (too far apart), the loop runs forever → freeze.
+     *
+     * Safe bounds: a single SceneObject should never have more than 256 components.
+     * If the distance exceeds this, zero the end pointer so the loop body is skipped. */
+    {
+        uint64_t* begin_p = (uint64_t*)((char*)self + 0xC0);
+        uint64_t* end_p   = (uint64_t*)((char*)self + 0xC8);
+        uint64_t begin_v  = *begin_p;
+        uint64_t end_v    = *end_p;
+        /* Check if pointers look valid: both non-null, end >= begin, difference ≤ 256 ptrs */
+        if (begin_v && end_v && end_v >= begin_v) {
+            size_t count = (size_t)((end_v - begin_v) / sizeof(uint64_t));
+            if (count > 256) {
+                fprintf(stderr, "[SRE/SceneObject] FinishLoad: corrupt component count=%zu (obj=%p) — clamping to 0\n",
+                        count, self);
+                /* Clamp: set end = begin so the loop body is skipped entirely */
+                *end_p = begin_v;
+            }
+        } else if (end_v && !begin_v) {
+            /* end non-null but begin null — clear end too */
+            fprintf(stderr, "[SRE/SceneObject] FinishLoad: null begin, non-null end=%llx (obj=%p) — clearing end\n",
+                    (unsigned long long)end_v, self);
+            *end_p = 0;
+        }
+    }
+
+    if (g_orig_SceneObject_FinishLoad) {
+        lua_State* L = g_sre_last_lua_state;
+        if (L != NULL) {
+            int my_depth = recovery_push(L);
+            if (my_depth >= 0 && sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
+                recovery_pop(my_depth);
+                fprintf(stderr, "[SRE/SceneObject] Recovered exception in SceneObject::FinishLoad (obj=%p)! Safely skipped object.\n", self);
+                return;
+            }
+            g_orig_SceneObject_FinishLoad(self);
+            if (my_depth >= 0) recovery_pop(my_depth);
+        } else {
+            g_orig_SceneObject_FinishLoad(self);
+        }
+    }
+}
+
+typedef void (*pfn_orig_ReadPODModelFromFile)(void* pod_model, void* filename_cppstr);
+pfn_orig_ReadPODModelFromFile g_orig_ReadPODModelFromFile = 0;
+
+void sre_ReadPODModelFromFile(void* pod_model, void* filename_cppstr) {
+    if (g_orig_ReadPODModelFromFile) {
+        lua_State* L = g_sre_last_lua_state;
+        if (L != NULL) {
+            int my_depth = recovery_push(L);
+            if (my_depth >= 0 && sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
+                recovery_pop(my_depth);
+                fprintf(stderr, "[SRE/POD] Exception recovered during ReadPODModelFromFile! Bypassed invalid POD mesh.\n");
+                return;
+            }
+            g_orig_ReadPODModelFromFile(pod_model, filename_cppstr);
+            if (my_depth >= 0) recovery_pop(my_depth);
+        } else {
+            g_orig_ReadPODModelFromFile(pod_model, filename_cppstr);
+        }
+    }
+}
+
+typedef int (*pfn_orig_CPVRTModelPOD_ReadFromMemory)(void* pod_model, const char* pData, size_t nSize, const char* pszExpOpt, size_t nExpOptSize, const char* pszHistory, size_t nHistorySize);
+pfn_orig_CPVRTModelPOD_ReadFromMemory g_orig_CPVRTModelPOD_ReadFromMemory = 0;
+
+int sre_CPVRTModelPOD_ReadFromMemory(void* pod_model, const char* pData, size_t nSize, const char* pszExpOpt, size_t nExpOptSize, const char* pszHistory, size_t nHistorySize) {
+    if (nSize < 40) {
+        fprintf(stderr, "[SRE/POD] Safety Hook: Bypassing CPVRTModelPOD::ReadFromMemory due to small/dummy buffer size (%zu bytes)\n", nSize);
+        return 0; // return false, parsing failed
+    }
+    if (g_orig_CPVRTModelPOD_ReadFromMemory) {
+        return g_orig_CPVRTModelPOD_ReadFromMemory(pod_model, pData, nSize, pszExpOpt, nExpOptSize, pszHistory, nHistorySize);
+    }
+    return 0;
+}
+
+/* =============================================================================
+ * sre_GameData_Clear — GameData::Clear crash guard
+ * =============================================================================
+ * CRASH (from live dump + IDA decomp at nm 0x2e6d60):
+ *
+ * GameData::Clear iterates 5 repeated protobuf fields calling vtable[0x20]
+ * (the virtual Clear()) on each element:
+ *
+ *   for (v2=0; v2 < *(int*)(this+24); v2++) {
+ *     v3 = *(QWORD*)(*(QWORD*)(this+16) + 8*v2);
+ *     (*(code**)(*(long*)v3 + 32))(v3);   // vtable[0x20]
+ *   }
+ *   ... repeated for +80, +136, +192, +248 ...
+ *
+ * When *(int*)(this+24) == 0x1077 (4215, corrupt), the loop walks 4215
+ * garbage pointers. One has vtable = .dynstr data → PC = 0x10771ac → crash.
+ *
+ * FIX: Cap each count field to 0 if it exceeds 512 (impossible for valid save).
+ *
+ * Field layout (from IDA decomp of Clear + proto field numbers via nm R symbols):
+ *   this+24 / this+16   = item         (kItemFieldNumber)
+ *   this+80 / this+72   = skill        (kSkillFieldNumber)
+ *   this+136 / this+128 = quest        (kQuestFieldNumber)
+ *   this+192 / this+184 = entity_class (kEntityClassFieldNumber)
+ *   this+248 / this+240 = guide_target (kGuideTargetFieldNumber)
+ *
+ * nm -D libswordigo.so v1.4.12 arm64-v8a:  GameData::Clear = 0x2e6d60
+ * =============================================================================
+ */
+uint64_t g_orig_GameData_Clear = 0;
+
+#define GAMEDATA_MAX_VALID_COUNT  512
+
+static void gamedata_cap_count(char* base, int offset) {
+    int* p = (int*)(base + offset);
+    if (*p < 0 || *p > GAMEDATA_MAX_VALID_COUNT) {
+        fprintf(stderr, "[SRE/GameData] Clear: corrupt count at +%d = %d — clamped to 0\n",
+                offset, *p);
+        *p = 0;
+    }
+}
+
+void sre_GameData_Clear(void* this_) {
+    if (!this_) goto call_orig;
+    {
+        char* t = (char*)this_;
+        gamedata_cap_count(t,  24);
+        gamedata_cap_count(t,  80);
+        gamedata_cap_count(t, 136);
+        gamedata_cap_count(t, 192);
+        gamedata_cap_count(t, 248);
+    }
+call_orig:
+    if (g_orig_GameData_Clear)
+        ((void(*)(void*))g_orig_GameData_Clear)(this_);
+}
+
+/* =============================================================================
+ * sre_SceneObject_ComponentWithInterface — Component VTable Safety Guard
+ * =============================================================================
+ * Prevents Dynarmic Halt exceptions when modded / corrupted SceneObjects contain
+ * invalid component pointers or corrupted vtables.
+ * Address: 0x47462c (v1.4.12 ARM64)
+ * =============================================================================
+ */
+extern int sre_is_valid_vtable_ptr(uint64_t vtable);
+
+uint64_t sre_SceneObject_ComponentWithInterface(void* self, int64_t interface_id) {
+    if (!self) return 0;
+
+    uint64_t* begin = *(uint64_t**)((char*)self + 0xC0);  /* this+24 (64-bit) */
+    uint64_t* end   = *(uint64_t**)((char*)self + 0xC8);  /* this+25 (64-bit) */
+
+    if (!begin || !end || begin >= end) return 0;
+
+    /* Safety sanity check on vector bounds pointer distance */
+    size_t count = (size_t)(end - begin);
+    if (count > 256) return 0;  /* max valid components per object */
+
+    for (size_t i = 0; i < count; i++) {
+        uint64_t comp_addr = begin[i];
+        if (!comp_addr || comp_addr < 0x10000 || comp_addr >= 0x0000800000000000ULL) continue;
+
+        /* Validate vtable pointer */
+        uint64_t vtable = *(uint64_t*)comp_addr;
+        if (!sre_is_valid_vtable_ptr(vtable)) continue;
+
+        /* Validate HasInterface function pointer at vtable[20] (offset +160) */
+        uint64_t fn_has_interface = *(uint64_t*)(vtable + 160);
+        if (!fn_has_interface || fn_has_interface < (g_swordigo_base + 0x100000) ||
+            fn_has_interface >= (g_swordigo_base + 0x700000)) continue;
+
+        typedef int (*pfn_HasInterface)(uint64_t self, int64_t id);
+        pfn_HasInterface fn = (pfn_HasInterface)fn_has_interface;
+
+        if (fn(comp_addr, interface_id) & 1) {
+            return comp_addr;
+        }
+    }
+    return 0;
+}
+
+

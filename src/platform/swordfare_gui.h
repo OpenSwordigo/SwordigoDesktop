@@ -29,7 +29,7 @@
 #include "platform/gl_inc.h"
 
 #ifdef VULKAN_BACKEND
-#include <vulkan/vulkan.h>
+#include "volk.h"
 #else
 // Stub so VkDescriptorPool / VK_NULL_HANDLE exist without the full Vulkan SDK
 typedef struct VkDescriptorPool_T* VkDescriptorPool;
@@ -89,6 +89,7 @@ public:
     void init(SDL_Window* window, SDL_GLContext gl_ctx);
     void init_vulkan(SDL_Window* window, class VulkanBackend* vk_backend);
     void shutdown();
+    bool is_initialized() const { return m_initialized; }
 
     // Event pass-through — call before your own SDL event handling
     // Returns true if ImGui consumed the event (caller should not process it).

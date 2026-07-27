@@ -1031,8 +1031,9 @@ void load_and_boot() {
 
     
     // Allocate some strings in guest memory for paths.
-    // Use 0x00F00000 — safely above low memory structure offsets and below binary base address.
-    uint32_t path_ptr = 0x00F00000;
+    // Use 0x10000000 (256 MB) — safely in the 475MB unused memory gap well below guest heap (0x20000000)
+    // and well above loaded modules (0x01000000 - 0x02200000).
+    uint32_t path_ptr = 0x10000000;
     uint32_t files_dir = path_ptr;
     strncpy((char*)(g_guest_memory + files_dir), g_save_dir.c_str(), 255);
     ((char*)(g_guest_memory + files_dir))[255] = '\0';
@@ -1620,7 +1621,7 @@ void load_and_boot() {
             }
             
             // Draw Swordfare GUI F3 Overlay if visible
-            if (g_display_active && g_graphics_api == GraphicsAPI::OPENGL) {
+            if (g_display_active) {
                 g_swordfare_gui.begin_frame();
                 if (g_swordfare_gui.is_visible()) {
                     SwordfareDebugStats st;
@@ -1657,7 +1658,7 @@ void load_and_boot() {
                     else if (g_fbo_mode == FBOScale::FSR) st.scale_mode = "FSR 1.0";
                     st.binary_name    = g_lib_name.c_str();
                     st.speed_label    = mod_speed_label();
-                    st.graphics_api   = "OpenGL";
+                    st.graphics_api   = (g_graphics_api == GraphicsAPI::VULKAN) ? "Vulkan" : "OpenGL";
                     g_swordfare_gui.draw_debug(st);
                 }
                 
@@ -1690,7 +1691,7 @@ void load_and_boot() {
             if (g_display_active && g_display_ptr) {
 #ifdef VULKAN_BACKEND
                 if (g_graphics_api == GraphicsAPI::VULKAN) {
-                    g_vk_backend.end_frame_and_present();
+                    g_vk_backend.end_frame_and_present(&g_postfx, (int)g_fbo_mode);
                 } else
 #endif
                 {
@@ -1711,7 +1712,7 @@ void load_and_boot() {
                 // Poll and process SDL window and input events
                 SDL_Event event;
                 while (SDL_PollEvent(&event)) {
-                    if (g_graphics_api == GraphicsAPI::OPENGL && g_swordfare_gui.process_event(event)) {
+                    if (g_swordfare_gui.process_event(event)) {
                         continue;
                     }
                     switch (event.type) {
@@ -1814,7 +1815,7 @@ void load_and_boot() {
                             }
                             break;
                         case SDL_EVENT_KEY_DOWN:
-                            if (g_graphics_api == GraphicsAPI::OPENGL && g_swordfare_gui.process_event(event)) {
+                            if (g_swordfare_gui.process_event(event)) {
                                 break;
                             }
                             if (should_block_keyboard()) {
@@ -1842,9 +1843,7 @@ void load_and_boot() {
                             }
                             if (event.key.key == SDLK_F3 && !event.key.repeat) {
                                 debug_visible = !debug_visible;
-                                if (g_graphics_api == GraphicsAPI::OPENGL) {
-                                    g_swordfare_gui.toggle_visible();
-                                }
+                                g_swordfare_gui.toggle_visible();
                                 std::cout << "[Debug] " << (debug_visible ? "ON" : "OFF") << std::endl;
                                 break;
                             }
@@ -2546,6 +2545,25 @@ void load_and_boot_arm64() {
     std::cout << "[Engine] Using " << g_emulator_64->engine_name() << " backend" << std::endl;
     g_emulator_64->set_bridge(&g_bridge_64);
 
+    // =========================================================================
+    // Guest TLS (Thread Local Storage) and Stack Canary setup
+    // =========================================================================
+    // EVERY Caver function ends with a canary check:
+    //   if (*(long *)(tpidr_el0 + 0x28) != local_saved_canary) __stack_chk_fail();
+    // If TPIDR_EL0 is 0 or unmapped, all functions will crash instantly.
+    {
+        uint64_t tls_base = 0x20000;
+        uint64_t canary_val = 0xDEADC0DE12345678ULL;
+        
+        // Write the canary to TLS base + 0x28
+        *(uint64_t*)(g_guest_memory + tls_base + 0x28) = canary_val;
+        
+        // Let the emulator know about TPIDR_EL0
+        g_emulator_64->set_tpidr_el0(tls_base);
+        std::cout << "[Engine] Guest TLS initialized at 0x" << std::hex << tls_base
+                  << ", stack canary set to 0x" << canary_val << std::dec << std::endl;
+    }
+
     // --- Runtime binary patches (ARM64) ---
     // NO hardcoded address patches — they break when switching binary versions.
     // Only version-independent patches are applied:
@@ -2559,11 +2577,34 @@ void load_and_boot_arm64() {
     }
 
     // =========================================================================
-    // STXR/STLXR → STR patcher (eliminate atomic CAS spin loops)
+    // [LEGACY] STXR/STLXR → STR binary patcher (atomic CAS spin-loop fix)
     // =========================================================================
-    // ARM64 uses LDXR/STXR for ALL atomics: shared_ptr refcount, mutexes, etc.
-    // In single-threaded Unicorn, STXR may spin (exclusive monitor unreliable).
-    // Fix: replace every STXR with STR (always succeeds) and fix the retry branch.
+    // ORIGINAL PURPOSE: ARM64 uses LDXR/STXR for ALL atomics (boost::shared_ptr
+    // refcount, std::mutex, __cxa_guard, etc.). In Unicorn's single-threaded mode
+    // the exclusive monitor is unreliable — STXR may never succeed, causing the
+    // retry branch to spin forever. Patching every STXR to plain STR forces
+    // success and NOPs the retry branch.
+    //
+    // [YUZU-INSPIRED FIX] DISABLED for Dynarmic backend.
+    // emulator_dynarmic64.cpp now implements MemoryWriteExclusive8/16/32/64 via
+    // std::atomic::compare_exchange_weak — proper CAS semantics. LDXR/STXR
+    // succeeds on the first attempt inside the JIT; no binary patching needed.
+    // Yuzu ref: arm_dynarmic_64.cpp MemoryWriteExclusive* callbacks.
+    //
+    // UNICORN: Patcher still runs unconditionally — exclusive monitor still broken.
+    // =========================================================================
+    // NOTE: Applied for ALL backends.
+    // Unicorn (CORRECTNESS): exclusive monitor unreliable — STXR never succeeds.
+    // Dynarmic (PERFORMANCE): eliminates compare_exchange_weak overhead on every
+    //   boost::shared_ptr refcount op. Root-caused 2026-07-21: GUILabel::~GUILabel()
+    //   at 0x1498658 caused 1045ms stalls because each STXR → CAS requires a
+    //   memory barrier; with STXR→STR the destructor runs ~10× faster.
+    //   MemoryWriteExclusive* CAS callbacks remain as a safety net for any
+    //   STXR the scanner misses (e.g. JIT-generated or dynamically patched code).
+    /* LEGACY_STXR_PATCHER_START
+     * Now runs for both Unicorn (correctness) and Dynarmic (performance).
+     * Do NOT remove.
+     */
     {
         uint32_t NOP = 0xD503201F;
         std::cout << "[Patch64] STXR scan: text_base=0x" << std::hex << g_main_mod_64.text_base
@@ -2616,8 +2657,10 @@ void load_and_boot_arm64() {
             }
         }
         std::cout << "[Patch64] STXR patcher: " << patched << " stores, "
-                  << cbnz_fixed << " CBNZ→NOP, " << cbz_fixed << " CBZ→B" << std::endl;
+                  << cbnz_fixed << " CBNZ\u2192NOP, " << cbz_fixed << " CBZ\u2192B" << std::endl;
     }
+    /* LEGACY_STXR_PATCHER_END */
+
 
     // =========================================================================
     // PROTECT .text section from corruption
@@ -2639,8 +2682,33 @@ void load_and_boot_arm64() {
         }
     }
 
-    // --- Patch __cxa_guard_acquire/release/abort in the binary ---
+    // =========================================================================
+    // [LEGACY] __cxa_guard_acquire / release / abort byte patcher
+    // =========================================================================
+    // ORIGINAL PURPOSE: The NDK's __cxa_guard_acquire uses LDXR/STXR internally
+    // for thread-safe C++ static initialisation. In Unicorn (broken exclusive
+    // monitor), the STXR inside __cxa_guard always fails, causing an infinite
+    // spin on the guard byte. Overwriting the function with LDRB/CBNZ/MOV/RET
+    // bypasses the LDXR/STXR path entirely.
+    //
+    // [YUZU-INSPIRED FIX] DISABLED for Dynarmic backend.
+    // With proper CAS semantics (MemoryWriteExclusive* in emulator_dynarmic64.cpp)
+    // the LDXR/STXR inside __cxa_guard_acquire succeeds immediately. The real
+    // NDK guard logic therefore runs correctly; no byte overwrite is needed.
+    // Yuzu ref: arm_dynarmic_64.cpp MemoryWriteExclusive* callbacks.
+    //
+    // UNICORN: Patcher still runs — guard LDXR/STXR would spin otherwise.
     // Uses symbol lookup — works for any binary version.
+    // =========================================================================
+    // NOTE: Applied for ALL backends.
+    // Unicorn (CORRECTNESS): __cxa_guard_acquire uses LDXR/STXR internally — spins forever.
+    // Dynarmic (PERFORMANCE): simpler LDRB+CBNZ+RET is faster than the NDK
+    //   implementation which adds barrier overhead even with working CAS.
+    // Uses symbol lookup — works for any binary version.
+    /* LEGACY_CXA_GUARD_PATCHER_START
+     * Now runs for both Unicorn (correctness) and Dynarmic (performance).
+     * Do NOT remove.
+     */
     {
         uint64_t guard_acq = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "__cxa_guard_acquire");
         uint64_t guard_rel = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "__cxa_guard_release");
@@ -2665,10 +2733,12 @@ void load_and_boot_arm64() {
         }
         if (guard_abt) {
             *(uint32_t*)(g_guest_memory + guard_abt) = 0xD65F03C0; // RET
-            std::cout << "[Patch64] __cxa_guard_abort at 0x" << std::hex << guard_abt 
-                      << " → RET" << std::dec << std::endl;
+            std::cout << "[Patch64] __cxa_guard_abort at 0x" << std::hex << guard_abt
+                      << " \u2192 RET" << std::dec << std::endl;
         }
     }
+    /* LEGACY_CXA_GUARD_PATCHER_END */
+
 
     // Debug: Check what's at the crash address 0x270
     {
@@ -2953,10 +3023,11 @@ void load_and_boot_arm64() {
                         {"lua_xmove",       "_Z9lua_xmoveP9lua_StateS0_i"},
                         {"lua_newthread",   "_Z13lua_newthreadP9lua_State"},
                         {"lua_pushthread",  "_Z14lua_pushthreadP9lua_State"},
+                        {"lua_sethook",     "_Z11lua_sethookP9lua_StatePFvS0_P9lua_DebugEii"},
                     };
                     const int NUM_LUA_EXT_SYMS = sizeof(lua_ext_syms) / sizeof(lua_ext_syms[0]);
 
-                    // SreLuaExtAddrs: 30 × uint64_t = 240 bytes
+                    // SreLuaExtAddrs: 32 × uint64_t = 256 bytes
                     uint64_t lua_ext_addrs_guest = 0x48200;  // after lua_addrs
                     uint64_t* lua_ext_addrs = (uint64_t*)(g_guest_memory + lua_ext_addrs_guest);
 
@@ -3125,6 +3196,13 @@ void load_and_boot_arm64() {
                     {"lua_status",      "_Z10lua_statusP9lua_State"},
                     {"lua_gc",          "_Z6lua_gcP9lua_Stateii"},
                     {"sre_GameOverlayView_SetControlsHidden", "_ZN5Caver15GameOverlayView17SetControlsHiddenEb"},
+                    // GUINavigationController safety hooks
+                    {"sre_GUINavigationController_Update",           "_ZN5Caver23GUINavigationController6UpdateEf"},
+                    {"sre_GUINavigationController_VCLoaded",         "_ZN5Caver23GUINavigationController24ViewControllerViewLoadedEPNS_20GUIViewControllerE"},
+                    {"sre_GUINavigationController_FinishTransition", "_ZN5Caver23GUINavigationController32FinishTransitionToViewControllerERKN5boost10shared_ptrINS_17GUIViewControllerEEEPvPNS_8GUIEventE"},
+                    {"sre_OrbitControllerComponent_FollowObject",    "_ZN5Caver24OrbitControllerComponent12FollowObjectERKN5boost13intrusive_ptrINS_11SceneObjectEEE"},
+                    {"sre_HeroEquipmentManager_ApplyArmorTrinket",   "_ZN5Caver20HeroEquipmentManager17ApplyArmorTrinketERKN5boost10shared_ptrINS_4ItemEEE"},
+                    {"sre_HeroEquipmentManager_ApplyWeaponTrinket",  "_ZN5Caver20HeroEquipmentManager18ApplyWeaponTrinketERKN5boost10shared_ptrINS_4ItemEEE"},
                 };
                 const int NUM_SYM_HOOKS = sizeof(sym_hooks) / sizeof(sym_hooks[0]);
 
@@ -3249,6 +3327,69 @@ void load_and_boot_arm64() {
                     }
 
 
+
+                    // ─── GUINavigationController relay caves ────────────────────────
+                    // Save original first instructions so our safe hooks can call-through.
+                    // Three functions in the transition chain:
+                    //   Update (0x303099), ViewControllerViewLoaded (0x3030bd), FinishTransition (0x303681)
+                    struct GUINavRelay {
+                        const char* engine_sym;
+                        const char* sre_orig_sym;
+                    };
+                    const GUINavRelay nav_relays[] = {
+                        { "_ZN5Caver23GUINavigationController6UpdateEf",
+                          "g_orig_GUINavigationController_Update" },
+                        { "_ZN5Caver23GUINavigationController24ViewControllerViewLoadedEPNS_17GUIViewControllerE",
+                          "g_orig_GUINavigationController_VCLoaded" },
+                        { "_ZN5Caver23GUINavigationController32FinishTransitionToViewControllerERKN5boost10shared_ptrINS_17GUIViewControllerEEEPvPNS_8GUIEventE",
+                          "g_orig_GUINavigationController_Finish" },
+                        { "_ZN5Caver24OrbitControllerComponent12FollowObjectERKN5boost13intrusive_ptrINS_11SceneObjectEEE",
+                          "g_orig_OrbitController_FollowObject" },
+                        { "_ZN5Caver20HeroEquipmentManager17ApplyArmorTrinketERKN5boost10shared_ptrINS_4ItemEEE",
+                          "g_orig_HeroEquipmentManager_ApplyArmorTrinket" },
+                        { "_ZN5Caver20HeroEquipmentManager18ApplyWeaponTrinketERKN5boost10shared_ptrINS_4ItemEEE",
+                          "g_orig_HeroEquipmentManager_ApplyWeaponTrinket" },
+                        /* GameData::Clear crash guard — nm 0x2e6d60 arm64-v8a */
+                        { "_ZN5Caver5Proto8GameData5ClearEv",
+                          "g_orig_GameData_Clear" },
+                        /* Scene::FinishLoad relay — nm arm64 0x4642a8
+                         * Called by sre_Scene_FinishLoad under setjmp recovery.
+                         * Without this, g_orig_Scene_FinishLoad=0 → silent no-op
+                         * → no SceneObjects initialized → freeze on first frame. */
+                        { "_ZN5Caver5Scene10FinishLoadEv",
+                          "g_orig_Scene_FinishLoad" },
+                        /* SceneObject::FinishLoad relay — nm arm64 0x470ec4
+                         * The primary crash source: vtable[9] dispatch on corrupt
+                         * component ptr → PC=0x10771ac (.dynstr) → Dynarmic halt.
+                         * sre_SceneObject_FinishLoad wraps the call with setjmp so
+                         * the exception is caught before force-returning to raw LR. */
+                        { "_ZN5Caver11SceneObject10FinishLoadEv",
+                          "g_orig_SceneObject_FinishLoad" },
+                        /* NOTE: g_orig_RenderingContext_C1 is NOT in nav_relays.
+                         * It is handled by gui_relays[] below using copy_and_relocate,
+                         * which runs before the hook installer and captures the real
+                         * first instruction before it is patched. */
+                    };
+                    for (const auto& nr : nav_relays) {
+                        uint64_t fn_vaddr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, nr.engine_sym);
+                        if (!fn_vaddr) {
+                            std::cerr << "[SRE] WARNING: GUINav relay not found: " << nr.engine_sym << std::endl;
+                            continue;
+                        }
+                        uint64_t orig_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, nr.sre_orig_sym);
+                        uint64_t cave = TrampolineMgr::instance().reserve_cave(nr.sre_orig_sym);
+                        copy_and_relocate(g_guest_memory + cave,
+                                          g_guest_memory + fn_vaddr,
+                                          cave, fn_vaddr, 1);
+                        uint32_t* tail = (uint32_t*)(g_guest_memory + cave + 4);
+                        int64_t roff = (int64_t)(fn_vaddr + 4) - (int64_t)(cave + 4);
+                        tail[0] = 0x14000000 | ((roff / 4) & 0x3FFFFFF);
+                        if (orig_addr)
+                            *(uint64_t*)(g_guest_memory + orig_addr) = cave;
+                        std::cout << "[SRE] GUINav relay: " << nr.sre_orig_sym
+                                  << " @ 0x" << std::hex << cave << std::dec << std::endl;
+                    }
+
                     // ─── GUI relay stubs (TrampolineMgr — no hard-coded addresses) ──
                     // Each entry gets its own fresh cave slot from the arena.
                     // RenderingContext_C1 is included here; updateApplication gets its
@@ -3267,7 +3408,7 @@ void load_and_boot_arm64() {
                         { 0x49cd40, "g_orig_GUISlider_DrawRect"    },
                         { 0x42bae4, "g_orig_NewMenuView_DrawRect"  },
                         { 0x393094, "g_orig_MainMenuView_ButtonPressed" },
-                        { 0x2fc03c, "g_orig_RenderingContext_C1"   },
+                        { 0x48afb0, "g_orig_RenderingContext_C1"   },  /* nm arm64: 0x48afb0 (was wrong 0x2fc03c) */
                     };
                     for (const auto& r : gui_relays) {
                         uint64_t vaddr = g_main_mod_64.base_addr + r.nm_offset;
@@ -3437,7 +3578,9 @@ void load_and_boot_arm64() {
                     const DynamicFns dynamic_fns[] = {
                         { "g_Camera_SetPerspectiveProjection", "_ZN5Caver6Camera24SetPerspectiveProjectionEffff" },
                         { "g_SceneObject_ComponentWithInterface", "_ZNK5Caver11SceneObject22ComponentWithInterfaceEl" },
+                        { "g_SceneObject_InitWithTemplate", "_ZN5Caver11SceneObject16InitWithTemplateERKN5boost13intrusive_ptrINS_14ObjectTemplateEEE" },
                         { "g_ProgramState_FromLuaState", "_ZN5Caver12ProgramState12FromLuaStateEP9lua_State" },
+                        { "g_sre_CreateHeroObjectAt", "_ZN5Caver19GameSceneController18CreateHeroObjectAtERKNS_7Vector3Eib" },
                         { "g_sre_GameOverVC_DidContinue", "_ZN5Caver22GameOverViewController23GameOverViewDidContinueEPNS_12GameOverViewE" },
                         { "g_sre_TextBubble_SetHandleTouches", "_ZN5Caver19TextBubbleComponent16SetHandleTouchesEb" },
                         { "g_sre_TextBubble_IsTextFinishedShowing", "_ZN5Caver19TextBubbleComponent21IsTextFinishedShowingEv" },
@@ -4270,11 +4413,9 @@ void load_and_boot_arm64() {
     std::cout << "[Debug64] env_ptr = 0x" << std::hex << env_ptr << " vtable_ptr = 0x" << *(uint64_t*)(g_guest_memory + env_ptr) << std::dec << std::endl;
 
     // Allocate some strings in guest memory for paths.
-    // IMPORTANT: Must NOT be in low memory (0x20000 / 0x3F000) — uninitialized
-    // structure offsets can mistakenly read low addresses as vtable pointers,
-    // crashing with PC=0x3F010 (path string bytes).
-    // Use 0x00F00000 — safely above low memory structure offsets and below binary base.
-    uint32_t path_ptr = 0x00F00000;
+    // Use 0x10000000 (256 MB) — safely in the 475MB unused memory gap well below guest heap (0x20000000)
+    // and well above loaded modules (0x01000000 - 0x02200000).
+    uint32_t path_ptr = 0x10000000;
     uint32_t files_dir = path_ptr;
     strncpy((char*)(g_guest_memory + files_dir), g_save_dir.c_str(), 255);
     ((char*)(g_guest_memory + files_dir))[255] = '\0';
@@ -4301,10 +4442,13 @@ void load_and_boot_arm64() {
         std::cout << "[Boot64] Calling setAssetManager" << std::endl;
         g_emulator_64->call(setAssetMgr, {env_ptr, 0, 0x55555555});
     }
-    if (googleSignInCompleted) {
-        std::cout << "[Boot64] Calling googleSignInCompleted(true) — enable snapshots" << std::endl;
-        g_emulator_64->call(googleSignInCompleted, {env_ptr, 0, 1}); // true = signed in
-    }
+    // NOTE: Do NOT call googleSignInCompleted here — it would set byte_6E9C7C=1,
+    // causing setApplicationViewSize to call HandleGoogleSignInCompleted() DURING
+    // CaverShell::Update(0.0f) when main-menu sign-in listeners are still
+    // null-initialized (boost::function at offset+32 == 0). That triggers
+    // boost::throw_exception<bad_function_call> -> sre_cxa_throw with recovery_depth=0
+    // -> returns -> call at address 0x8 -> Dynarmic null-ptr halt -> silent freeze.
+    // The correct call is deferred to after applicationDidBecomeActive (below).
     if (handleAppLaunch) {
         std::cout << "[Boot64] Calling handleApplicationLaunch" << std::endl;
         g_emulator_64->call(handleAppLaunch, {env_ptr, 0});
@@ -4434,7 +4578,11 @@ void load_and_boot_arm64() {
     uint64_t handleTouchEvent = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_handleTouchEvent");
     uint64_t snapshotLoaded = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_snapshotLoaded");
     
-    // Tell the game Google Sign-In succeeded so snapshot system is enabled
+    // Tell the game Google Sign-In succeeded so snapshot system is enabled.
+    // This is called AFTER applicationDidBecomeActive so that the main-menu
+    // sign-in listener (registered during CaverShell::Update(0.0f) inside
+    // setApplicationViewSize) is fully initialized with a valid boost::function
+    // callback before HandleGoogleSignInCompleted fires.
     if (googleSignInCompleted) {
         std::cout << "[Boot64] Calling googleSignInCompleted(true) — enable snapshots" << std::endl;
         std::cout.flush();
@@ -4645,7 +4793,43 @@ void load_and_boot_arm64() {
                     }
 
                     g_emulator_64->set_sreg(0, game_dt);
-                    g_emulator_64->call(updateApp, {env_ptr, 0});
+
+                    // ── Frame Watchdog ──────────────────────────────────────────────────
+                    // If sre_Scene_FinishLoad left the Lua mutex locked (longjmp escape),
+                    // the scene-loading flag stays set. We detect and force-clear it here.
+                    {
+                        // g_sre_scene_loading lives in libsre.so (g_sre_mod), not the game binary.
+                        // Resolve once on first frame, cache for all subsequent frames.
+                        static uint64_t s_scene_loading_addr = 0;
+                        static bool     s_scene_loading_resolved = false;
+                        if (!s_scene_loading_resolved) {
+                            s_scene_loading_addr = g_loader_64->get_symbol_vaddr(
+                                &g_sre_mod, "g_sre_scene_loading");
+                            s_scene_loading_resolved = true;
+                            if (s_scene_loading_addr)
+                                std::cout << "[Watchdog] Scene loading flag @ 0x"
+                                          << std::hex << s_scene_loading_addr << std::dec << std::endl;
+                            else
+                                std::cout << "[Watchdog] WARNING: g_sre_scene_loading not found in libsre.so" << std::endl;
+                        }
+
+                        bool was_scene_loading = s_scene_loading_addr &&
+                            (*(volatile int*)(g_guest_memory + s_scene_loading_addr) != 0);
+
+                        g_emulator_64->call(updateApp, {env_ptr, 0});
+
+                        // After call: if flag is STILL set, FinishLoad's cleanup was
+                        // skipped (exception path). Force-clear so next frame runs clean.
+                        if (was_scene_loading && s_scene_loading_addr) {
+                            int still_loading = *(volatile int*)(g_guest_memory + s_scene_loading_addr);
+                            if (still_loading) {
+                                std::cout << "[Watchdog] Scene load flag stuck after frame — force-clearing." << std::endl;
+                                *(volatile int*)(g_guest_memory + s_scene_loading_addr) = 0;
+                            }
+                        }
+                    }
+
+
 
                     // Run any threads spawned during this frame's updateApplication
                     // (handles the edge case where spin count < 4 and the deadlock
@@ -4654,6 +4838,7 @@ void load_and_boot_arm64() {
                         g_emulator_64->run_pending_threads();
                     }
                 }
+
                 if (g_step_one_frame) {
                     g_step_one_frame = false;
                     mod_toast("Stepped 1 frame", 0.8f);
@@ -5352,7 +5537,7 @@ void load_and_boot_arm64() {
             }
             
             // Draw Swordfare GUI F3 Overlay if visible
-            if (g_display_active && g_graphics_api == GraphicsAPI::OPENGL) {
+            if (g_display_active) {
                 g_swordfare_gui.begin_frame();
                 if (g_swordfare_gui.is_visible()) {
                     SwordfareDebugStats st;
@@ -5389,7 +5574,7 @@ void load_and_boot_arm64() {
                     else if (g_fbo_mode == FBOScale::FSR) st.scale_mode = "FSR 1.0";
                     st.binary_name    = g_lib_name.c_str();
                     st.speed_label    = mod_speed_label();
-                    st.graphics_api   = "OpenGL";
+                    st.graphics_api   = (g_graphics_api == GraphicsAPI::VULKAN) ? "Vulkan" : "OpenGL";
                     g_swordfare_gui.draw_debug(st);
                 }
                 
@@ -5419,7 +5604,7 @@ void load_and_boot_arm64() {
             if (g_display_active && g_display_ptr) {
 #ifdef VULKAN_BACKEND
                 if (g_graphics_api == GraphicsAPI::VULKAN) {
-                    g_vk_backend.end_frame_and_present();
+                    g_vk_backend.end_frame_and_present(&g_postfx, (int)g_fbo_mode);
                 } else
 #endif
                 {
@@ -5509,7 +5694,7 @@ void load_and_boot_arm64() {
 
                 SDL_Event event;
                 while (SDL_PollEvent(&event)) {
-                    if (g_graphics_api == GraphicsAPI::OPENGL && g_swordfare_gui.process_event(event)) {
+                    if (g_swordfare_gui.process_event(event)) {
                         // ImGui consumed the event
                         continue;
                     }
@@ -5594,9 +5779,7 @@ void load_and_boot_arm64() {
                             }
                             if (event.key.key == SDLK_F3 && !event.key.repeat) {
                                 debug_visible = !debug_visible;
-                                if (g_graphics_api == GraphicsAPI::OPENGL) {
-                                    g_swordfare_gui.toggle_visible();
-                                }
+                                g_swordfare_gui.toggle_visible();
                                 break;
                             }
                             if (event.key.key == SDLK_F4 && !event.key.repeat) {
@@ -6567,3 +6750,26 @@ extern "C" const char* sre_resolve_symbol(uint64_t addr) {
     return nullptr;
 }
 
+extern "C" uint64_t sre_resolve_address(const char* symbol) {
+    if (!symbol) return 0;
+    
+    // Search in g_main_mod_64
+    for (int i = 0; i < g_main_mod_64.num_dynsym; i++) {
+        if (g_main_mod_64.dynsym[i].st_name == 0) continue;
+        const char* name = g_main_mod_64.dynstr + g_main_mod_64.dynsym[i].st_name;
+        if (strcmp(name, symbol) == 0) {
+            return g_main_mod_64.base_addr + g_main_mod_64.dynsym[i].st_value;
+        }
+    }
+    
+    // Search in g_sre_mod
+    for (int i = 0; i < g_sre_mod.num_dynsym; i++) {
+        if (g_sre_mod.dynsym[i].st_name == 0) continue;
+        const char* name = g_sre_mod.dynstr + g_sre_mod.dynsym[i].st_name;
+        if (strcmp(name, symbol) == 0) {
+            return g_sre_mod.base_addr + g_sre_mod.dynsym[i].st_value;
+        }
+    }
+    
+    return 0;
+}
