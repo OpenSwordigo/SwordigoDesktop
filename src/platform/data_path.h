@@ -17,6 +17,10 @@ std::string get_user_data_dir();
 // Returns empty string if not found.
 std::string get_system_data_dir();
 
+// Get the VFS save Documents directory (~/.local/share/swordigo-desktop/save/Documents/)
+// Ensures the returned path resolves through VFS / g_save_dir and points to the Documents subfolder.
+std::string get_vfs_save_dir(const std::string& custom_base = "");
+
 // First-run setup: copies game data from system install to user data dir.
 // Returns true if data was copied, false if already exists or no system install.
 bool ensure_user_data();

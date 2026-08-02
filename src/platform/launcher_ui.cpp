@@ -1273,9 +1273,7 @@ static void DrawLibraryPage(BinarySelector& selector, int& selected,
     if (ImGui::Button(ICON_FA_FLOPPY_DISK "  Save Editor", ImVec2(abw, 36))) {
         g_show_save_ed = true;
         g_save_loaded = false; g_save_sel = -1; g_save_status.clear();
-        std::string home = getenv("HOME") ? getenv("HOME") : "/tmp";
-        std::string xdg  = getenv("XDG_DATA_HOME") ? getenv("XDG_DATA_HOME") : (home + "/.local/share");
-        std::string save_dir = xdg + "/swordigo-desktop/save/Documents";
+        std::string save_dir = get_vfs_save_dir();
         g_save_paths = save_list_dir(save_dir);
         g_save_files.clear();
         for (auto& p : g_save_paths) { SaveFile sf; if (save_load(p, sf)) g_save_files.push_back(sf); }
@@ -1951,9 +1949,7 @@ static void DrawSDKToolsPage() {
                 } else if (i == 2) { // Save Editor
                     g_show_save_ed = true;
                     g_save_loaded = false; g_save_sel = -1; g_save_status.clear();
-                    std::string home = getenv("HOME") ? getenv("HOME") : "/tmp";
-                    std::string xdg  = getenv("XDG_DATA_HOME") ? getenv("XDG_DATA_HOME") : (home + "/.local/share");
-                    std::string sd   = xdg + "/swordigo-desktop/save/Documents";
+                    std::string sd   = get_vfs_save_dir();
                     g_save_paths = save_list_dir(sd);
                     g_save_files.clear();
                     for (auto& p : g_save_paths) { SaveFile sf; if (save_load(p, sf)) g_save_files.push_back(sf); }
@@ -1998,7 +1994,7 @@ static void DrawSaveEditor(bool& show_save_editor) {
     if (g_save_files.empty()) {
         ImGui::Spacing();
         ImGui::TextDisabled("No .gplayer save files found.");
-        ImGui::TextDisabled("Save directory: ~/.local/share/swordigo-desktop/save/Documents/");
+        ImGui::TextDisabled("Save directory: %s", get_vfs_save_dir().c_str());
         return;
     }
 

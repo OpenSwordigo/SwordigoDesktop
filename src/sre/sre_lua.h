@@ -186,4 +186,15 @@ void sre_ProgramState_destructor(void* self);
 
 void sre_open_swkiwi_libs(lua_State* L);
 
+/* =========================================================================
+ * Recovery stack — public API for cross-unit use
+ * =========================================================================
+ * Defined (non-static) in sre_lua.c; declared here so any SRE compilation
+ * unit can call them by including sre_lua.h instead of needing bare externs.
+ * Using bare "extern" in sre_scene_update.c caused these to resolve via the
+ * bridge PLT stub (→ UNHANDLED → return 0) since they were previously static.
+ */
+int  recovery_push(lua_State* L);
+void recovery_pop(int depth);
+
 #endif /* SRE_LUA_H */

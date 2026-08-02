@@ -3,6 +3,8 @@
 #include <vector>
 #include <map>
 #include <regex>
+#include <cstdint>
+#include <stack>
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "imgui.h"
 
@@ -35,6 +37,12 @@ struct StyxStyleSheet {
     std::vector<StyxPattern> patterns;
 };
 
+enum class LexState {
+    NORMAL,
+    IN_BLOCK_COMMENT,
+    IN_MULTILINE_STRING
+};
+
 struct EditorToken {
     std::string text;
     StyxColor style;
@@ -45,6 +53,20 @@ struct BracketError {
     int column = -1;
     char bracket = 0;
     std::string message;
+};
+
+struct CachedTokenLine {
+    uint64_t hash = 0;
+    LexState in_state = LexState::NORMAL;
+    LexState out_state = LexState::NORMAL;
+    std::vector<EditorToken> tokens;
+};
+
+struct SwordigoApiSymbol {
+    std::string name;
+    std::string category;
+    std::string signature;
+    std::string doc;
 };
 
 class IntelliJ {
@@ -64,17 +86,26 @@ public:
     // Tokenize a single line based on the currently loaded style sheet
     std::vector<EditorToken> tokenize_line(const std::string& line, bool is_dark_theme);
 
-    // Perform bracket matching and return any mismatch errors
+    // Multiline state-aware tokenization
+    LexState tokenize_line_stateful(const std::string& line, LexState in_state, bool is_dark_theme, std::vector<EditorToken>& out_tokens);
+
+    // Perform bracket matching and return any mismatch errors (string & comment aware)
     std::vector<BracketError> check_syntax_errors(const std::string& text);
+
+    // Retrieve Swordigo SDK Autocomplete suggestions for active editor context
+    std::vector<SwordigoApiSymbol> get_swordigo_autocomplete(const std::string& query);
 
     void draw_editor(const char* label, std::string* buffer, bool& modified, const std::string& filepath, ImFont* mono_font, ImVec4& custom_bg,
                      bool has_compile_result = false, bool compile_success = false, const std::string& compile_error_msg = "", double compile_time_ms = 0.0);
 
     const StyxStyleSheet& get_style() const { return style_; }
 
+    void clear_token_cache() { token_cache_.clear(); }
+
 private:
     StyxStyleSheet style_;
     std::string current_style_path_;
+    std::vector<CachedTokenLine> token_cache_;
 
     // Helper for hex colors (e.g. "#FF5656" -> ImVec4)
     static ImVec4 parse_hex_color(const std::string& hex);

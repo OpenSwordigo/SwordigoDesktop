@@ -100,4 +100,5 @@ else
 fi
 echo "=========================================="
 echo ""
-exec ./swordigo_boot "$@"
+export LD_LIBRARY_PATH="$(dirname "$0")/bin/libs:$LD_LIBRARY_PATH"
+exec ./bin/swordfare "$@"

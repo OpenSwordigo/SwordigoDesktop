@@ -22,6 +22,47 @@
 extern uint8_t* g_guest_memory;
 extern uint64_t MAGIC_LR;
 extern "C" const char* sre_resolve_symbol(uint64_t addr);
+// Render-guard: longjmp symbol from libsre.so (guest-side, also linked into host via libsre stub)
+extern "C" void sre_longjmp(void* buf, int val);
+// Render-guard recovery state (defined in main.cpp, host globals)
+extern int   g_sre_render_recovery_active;
+extern void* g_sre_render_recovery_jmp;
+
+// Text-segment bounds exported from main.cpp (populated after ELF load).
+// Used for render-guard PC validation (crash report 03 fix).
+extern uint64_t g_sre_text_base;  // guest VA of .text start (e.g. 0x1203e90)
+extern uint64_t g_sre_text_end;   // guest VA of .text end   (e.g. 0x1584000)
+
+// ============================================================================
+// is_valid_exec_pc — Crash-Report-03 render-guard PC validator
+//
+// A valid ARM64 guest PC must:
+//   1. Be 4-byte aligned (ARM64 ISA requirement — LSBits must be 00)
+//   2. Lie within the ELF .text segment [g_sre_text_base, g_sre_text_end)
+//      OR in the TrampolineMgr cave arena [0x3000000, 0x3100000)
+//      OR in libsre.so guest range        [0x2000000, 0x2300000)
+//   3. OR be the magic sentinel / bridge region (always valid).
+//
+// Returns false for the corrupted LR pattern from crash-report-03:
+//   0x12fd3d9 — 1 byte into alignment padding, NOT 4-aligned → caught here.
+// ============================================================================
+static inline bool is_valid_exec_pc(uint64_t pc) {
+    // Magic sentinel / bridge regions are always valid
+    if (pc >= 0xE0000000ULL && pc < 0xE0001000ULL) return true;
+    if (pc >= 0xFF000000ULL && pc < 0xFF100000ULL) return true;
+    // 4-byte alignment is a hard ARM64 requirement
+    if (pc & 3u) return false;
+    // libswordigo.so .text
+    if (g_sre_text_base && g_sre_text_end &&
+        pc >= g_sre_text_base && pc < g_sre_text_end) return true;
+    // TrampolineMgr cave arena
+    if (pc >= 0x3000000ULL && pc < 0x3100000ULL) return true;
+    // libsre.so guest range
+    if (pc >= 0x2000000ULL && pc < 0x2300000ULL) return true;
+    // Fallback: old broad range check (for symbols outside .text e.g. PLT stubs)
+    if (pc >= 0x1000000ULL && pc < 0x3000000ULL) return true;
+    return false;
+}
 
 #include "dynarmic/interface/A64/a64.h"
 #include "dynarmic/interface/A64/config.h"
@@ -30,6 +71,90 @@ extern "C" const char* sre_resolve_symbol(uint64_t addr);
 #include "dynarmic/interface/exclusive_monitor.h"
 #include <atomic>    // for MemoryWriteExclusive CAS operations
 #include <cstddef>   // for size_t
+#include <unordered_map>  // PC hook table
+#include <functional>     // std::function for PC hook callbacks
+#include <mutex>          // hook table lock (install/remove can race with JIT)
+#include "srehost/srehost_abi.h"  // ProHook Phase 1: SVC #0x5352 gateway
+
+// ============================================================================
+// Tier-2 PC Hook Table — Dynarmic-Native, Zero Guest Memory Writes
+// ============================================================================
+// Hooks are registered per-PC. When Dynarmic JIT-compiles a block that starts
+// at (or contains) a hooked address, MemoryReadCode returns BRK #0x42 —
+// a sentinel opcode we own exclusively. ExceptionRaised(Breakpoint) catches
+// it, looks up the PC in g_pc_hooks, and calls the registered handler.
+//
+// Callback contract:
+//   bool handler(void* emu_ptr);
+//   - return true  → hook consumed the call (skip original); PC must be set
+//                   by the handler (e.g. emu->redirect_pc = emu->get_lr())
+//   - return false → execute original instruction transparently
+//                   (the emulator restores the saved original opcode,
+//                    executes it, then re-installs the sentinel next JIT)
+//
+// This system never writes anything to guest code pages — the BRK is returned
+// from MemoryReadCode in-flight only when Dynarmic re-fetches the page.
+// Removing a hook + calling InvalidateCache is sufficient to un-install it.
+// ============================================================================
+
+struct PcHookEntry {
+    std::function<bool(void*)> handler;  // true = consumed, false = pass-through
+    uint32_t                   original; // saved original opcode at this PC
+};
+
+static std::unordered_map<uint64_t, PcHookEntry> g_pc_hooks;
+static std::mutex                                 g_pc_hooks_mu;
+
+// BRK immediate used as our private PC-hook sentinel.
+// ARM64 encoding: BRK #imm16 = 0xD4200000 | (imm16 << 5)
+// #0x42 → 0xD4200000 | (0x42 << 5) = 0xD4200840
+// This is distinct from BRK #0 (D4200000), BRK #1 (D4200020), BRK #3 (D4200060)
+// used by Dynarmic/SRE for other purposes.
+static constexpr uint32_t BRK_PC_HOOK = 0xD4200840u;  // BRK #0x42
+
+// Public API — install a PC-intercept hook (no guest writes)
+static void* s_emulator_instance = nullptr;  // set by EmulatorDynarmic64 ctor
+
+extern "C" int sre_emulator_install_pc_hook(
+        uint64_t guest_pc,
+        bool (*handler)(void* emu),
+        uint32_t* orig_opcode_out)
+{
+    std::lock_guard<std::mutex> lk(g_pc_hooks_mu);
+    if (g_pc_hooks.count(guest_pc)) return -1;  // already hooked
+
+    // Read the original instruction from guest memory
+    uint32_t orig = 0;
+    extern uint8_t* g_guest_memory;
+    if (guest_pc + 3 < 0xF0000000ULL)
+        std::memcpy(&orig, g_guest_memory + guest_pc, 4);
+
+    g_pc_hooks[guest_pc] = { handler, orig };
+    if (orig_opcode_out) *orig_opcode_out = orig;
+
+    // Invalidate the JIT block so the next run re-fetches and gets BRK #0x42
+    if (s_emulator_instance) {
+        auto* ed = static_cast<EmulatorDynarmic64*>(s_emulator_instance);
+        if (ed->get_jit())
+            ed->get_jit()->InvalidateCacheRange(guest_pc, 4);
+    }
+    return 0;
+}
+
+extern "C" int sre_emulator_remove_pc_hook(uint64_t guest_pc)
+{
+    std::lock_guard<std::mutex> lk(g_pc_hooks_mu);
+    auto it = g_pc_hooks.find(guest_pc);
+    if (it == g_pc_hooks.end()) return -1;
+    g_pc_hooks.erase(it);
+    // Invalidate so Dynarmic re-fetches the real instruction next run
+    if (s_emulator_instance) {
+        auto* ed = static_cast<EmulatorDynarmic64*>(s_emulator_instance);
+        if (ed->get_jit())
+            ed->get_jit()->InvalidateCacheRange(guest_pc, 4);
+    }
+    return 0;
+}
 
 struct SavedCpuState {
     uint64_t regs[31];
@@ -271,6 +396,51 @@ public:
         if (vaddr >= 0xE0000000 && vaddr < 0xE0001000) {
             return 0xD4400000;  // HLT #0
         }
+
+        // ── Tier-2 PC Hook Sentinel ──────────────────────────────────────────
+        // If this address has a registered PC hook, return BRK #0x42 so
+        // ExceptionRaised() fires for our private hook dispatcher.
+        // We skip this check for bridge/magic regions above.
+        {
+            std::lock_guard<std::mutex> lk(g_pc_hooks_mu);
+            if (g_pc_hooks.count(vaddr))
+                return BRK_PC_HOOK;
+        }
+
+        // =======================================================================
+        // Crash-Report-03 Guard: Misaligned or out-of-segment fetch.
+        //
+        // Root cause: a corrupted LR (e.g. 0x12fd3d9 — 1 byte past end of
+        // Caver::Proto::ObjectLibrary::Clear) causes RET to jump into alignment
+        // padding. Dynarmic then fetches the garbage opcode 0x6854ffff and
+        // generates a JIT decode exception that crashes the frame.
+        //
+        // Fix: instead of returning the garbage bytes, return BRK #3 (0xD4200060).
+        // This fires ExceptionRaised(Breakpoint) which our handler catches — it
+        // logs the bad PC with full register context and triggers the SRE render
+        // recovery longjmp instead of hard-halting Dynarmic.
+        //
+        // We only apply this for addresses inside the loaded ELF range
+        // (1MB–48MB) so we don't interfere with unknown exotic regions.
+        // =======================================================================
+        if (vaddr >= 0x1000000ULL && vaddr < 0x3000000ULL) {
+            bool bad_align = (vaddr & 3u) != 0;
+            bool bad_range = g_sre_text_base && g_sre_text_end &&
+                             (vaddr < g_sre_text_base || vaddr >= g_sre_text_end) &&
+                             // Don't flag TrampolineMgr caves or libsre.so
+                             !(vaddr >= 0x2000000ULL && vaddr < 0x2300000ULL) &&
+                             !(vaddr >= 0x3000000ULL && vaddr < 0x3100000ULL);
+            if (bad_align || bad_range) {
+                static int render_guard_log = 0;
+                if (render_guard_log < 10) {
+                    render_guard_log++;
+                    std::cerr << "[RenderGuard] Bad fetch at 0x" << std::hex << vaddr
+                              << (bad_align ? " (misaligned!)" : " (out-of-.text!)")
+                              << " — returning BRK #3 for recovery" << std::dec << std::endl;
+                }
+                return 0xD4200060u;  // BRK #3 → ExceptionRaised(Breakpoint)
+            }
+        }
         // Regular memory
         if (vaddr + 3 < mem_size) {
             std::uint32_t val;
@@ -317,10 +487,35 @@ public:
     }
 
     void CallSVC(std::uint32_t swi) override {
-        // SVC in our guest code — skip and continue
+        // =================================================================
+        // ProHook Phase 1: SVC #0x5352 ("SR") = SRE Host ABI Gateway
+        // =================================================================
+        // Guest ARM64 libsre.so can call SREHost_* functions by emitting:
+        //   MOV X8, #<syscall_id>   (SRE_SVC_* constant)
+        //   SVC #0x5352             (ASCII "SR" -- SRE marker)
+        // This intercepts those calls and routes to srehost_impl.cpp.
+        // All other SVC numbers (including 0 = Linux syscall) pass through.
+        // =================================================================
+        if (swi == 0x5352) {
+            // Collect current guest registers X0..X7 and X8
+            uint64_t regs[8];
+            for (int i = 0; i < 8; i++) {
+                regs[i] = emu->get_reg(i);
+            }
+            uint64_t x8_id = emu->get_reg(8);
+
+            // Dispatch to SREHost -- may modify regs[0] (return value)
+            SREHost_Dispatch(swi, regs, x8_id);
+
+            // Write back X0 (return value) to the JIT register file
+            emu->get_jit()->SetRegister(0, regs[0]);
+            return;
+        }
+
+        // All other SVC numbers -- skip and continue (original behavior)
         if (!emu->quiet_mode) {
             std::cerr << "[Dynarmic] SVC #" << swi << " at PC=0x" << std::hex
-                      << emu->get_jit()->GetPC() << std::dec << " — skipping" << std::endl;
+                      << emu->get_jit()->GetPC() << std::dec << " -- skipping" << std::endl;
         }
     }
 
@@ -385,7 +580,47 @@ public:
                 emu->get_jit()->HaltExecution(Dynarmic::HaltReason::UserDefined2);
                 return;
             }
+
+            // ── Tier-2 PC Hook Dispatch (BRK #0x42) ─────────────────────────
+            // Our MemoryReadCode returns BRK_PC_HOOK (0xD4200840) for any PC
+            // registered in g_pc_hooks. Dynarmic fires ExceptionRaised(Breakpoint)
+            // here. We dispatch to the registered handler.
+            {
+                PcHookEntry entry;
+                bool found = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_pc_hooks_mu);
+                    auto it = g_pc_hooks.find(pc);
+                    if (it != g_pc_hooks.end()) {
+                        entry = it->second;
+                        found = true;
+                    }
+                }  // lock released here — safe to call handler
+                if (found) {
+                    bool consumed = entry.handler(emu);
+                    if (consumed) {
+                        // Handler set redirect_pc — halt so emulator picks it up
+                        emu->get_jit()->HaltExecution(Dynarmic::HaltReason::UserDefined2);
+                    } else {
+                        // Pass-through: temporarily remove sentinel so the real
+                        // instruction is fetched next JIT cycle.
+                        {
+                            std::lock_guard<std::mutex> lk2(g_pc_hooks_mu);
+                            g_pc_hooks.erase(pc);
+                        }
+                        emu->get_jit()->InvalidateCacheRange(pc, 4);
+                        // Users who need persistent pass-through hooks should call
+                        // sre_emulator_install_pc_hook again from their handler.
+                        emu->redirect_pc = pc;  // re-execute from same address, now real
+                        emu->get_jit()->HaltExecution(Dynarmic::HaltReason::UserDefined2);
+                    }
+                    return;
+                }
+            }
+
+
             // Unknown breakpoint — log and halt
+
             std::cerr << "[Dynarmic] Unknown breakpoint at 0x" << std::hex << pc << std::dec << std::endl;
             emu->get_jit()->HaltExecution(Dynarmic::HaltReason::UserDefined2);
             return;
@@ -558,13 +793,18 @@ EmulatorDynarmic64::EmulatorDynarmic64(uint8_t* guest_mem, uint64_t size)
 
     std::cout << "[Dynarmic] JIT initialized (512MB code cache, Fastmem, Unsafe FMA/NaN/MXCSR fast-paths enabled)"
               << ", stack at 0x" << std::hex << stack_base << std::dec << std::endl;
+
+    // Register this instance for use by PC hook install/remove API
+    s_emulator_instance = this;
 }
 
 EmulatorDynarmic64::~EmulatorDynarmic64() {
+    s_emulator_instance = nullptr;
     jit.reset();
     delete g_dyn_memory;
     g_dyn_memory = nullptr;
 }
+
 
 // --- Register access ---
 
@@ -586,6 +826,15 @@ uint64_t EmulatorDynarmic64::get_reg(int reg) {
     else if (reg == 29)  return jit->GetRegister(29);
     else if (reg == 30)  return jit->GetRegister(30);
     else                 return jit->GetSP();
+}
+
+void EmulatorDynarmic64::invalidate_cache_range(uint64_t guest_vaddr, size_t size) {
+    // Flush Dynarmic's JIT block cache for the modified address range.
+    // Required after any guest memory patch (opcode modification) so the JIT
+    // retranslates the affected code block on next execution.
+    if (jit) {
+        jit->InvalidateCacheRange(guest_vaddr, size);
+    }
 }
 
 void EmulatorDynarmic64::set_dreg(int reg, double value) {
@@ -734,16 +983,27 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
                       << " SP=0x" << jit->GetSP() << std::dec << std::endl;
         }
         */
-        // --- DEFENSIVE GUEST PC VALIDATION ---
+        // --- DEFENSIVE GUEST PC VALIDATION (Crash-Report-03) ---
+        // Validates: 4-byte alignment AND within known executable regions.
+        // Catches the corrupted-LR pattern (e.g. 0x12fd3d9 — 1-byte past end
+        // of an ARM64 function, landing in alignment padding zeros).
         uint64_t pre_pc = jit->GetPC();
-        bool is_valid_pc = (pre_pc == MAGIC_LR) ||
-                           (pre_pc >= 0x1000000 && pre_pc < 0x3000000) ||
-                           (pre_pc >= 0xFF000000 && pre_pc < 0xFF100000);
-        
-        if (!is_valid_pc) {
-            std::cerr << "[Dynarmic] FATAL: Invalid guest PC detected before execution: 0x" 
-                      << std::hex << pre_pc << std::dec << std::endl;
-            std::cerr << "[Dynarmic] This indicates stack or control flow corruption." << std::endl;
+        if (!is_valid_exec_pc(pre_pc)) {
+            static int bad_exec_pc_log = 0;
+            if (bad_exec_pc_log < 20) {
+                bad_exec_pc_log++;
+                uint64_t lr = jit->GetRegister(30);
+                std::cerr << "[RenderGuard] Invalid guest PC 0x" << std::hex << pre_pc
+                          << (pre_pc & 3u ? " (MISALIGNED)" : " (OUT-OF-TEXT)")
+                          << " LR=0x" << lr
+                          << " — aborting JIT chunk to prevent decode crash"
+                          << std::dec << std::endl;
+            }
+            // Try render-frame recovery before hard-faulting
+            if (g_sre_render_recovery_active && g_sre_render_recovery_jmp) {
+                sre_longjmp(g_sre_render_recovery_jmp, 2); // val=2 → render-guard path
+                // never reached if longjmp succeeds
+            }
             set_faulted(true);
             break;
         }

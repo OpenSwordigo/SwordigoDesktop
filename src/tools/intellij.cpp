@@ -33,6 +33,7 @@ const char* FILERIFT_GROOVE_STYX_CONTENT = R"styx(
     "parameter": {"color": "#C6D9FF"},
     "operator": {"color": "#53B68E"},
     "string": {"color": "#A8D1C8"},
+    "number": {"color": "#769794"},
     "tableitem": {"color": "#769794"},
     "defined": {"color": "#A8D1C8", "bold": true},
     "code": {"color": "#A8D1C8"},
@@ -41,7 +42,7 @@ const char* FILERIFT_GROOVE_STYX_CONTENT = R"styx(
     "local": {"color": "#C55890", "bold": true}
   },
   "keywords": {
-    "keyword": ["not in", "if", "then", "else", "elseif", "end", "for", "while", "repeat", "until", "break", "return", "function", "and", "or", "not", "do", "in"],
+    "keyword": ["if", "then", "else", "elseif", "end", "for", "while", "repeat", "until", "break", "return", "function", "and", "or", "not", "do", "in"],
     "local": ["local"],
     "bools": ["nil", "true", "false"],
     "method": ["print", "pairs", "ipairs", "next", "type", "tostring", "tonumber", "error", "pcall", "xpcall", "assert", "collectgarbage", "require"]
@@ -53,7 +54,7 @@ const char* FILERIFT_GROOVE_STYX_CONTENT = R"styx(
     {"style": "method", "regex": "\\b[a-zA-Z_]\\w*(?=\\s*\\()"},
     {"style": "tableitem", "regex": "\\.(\\s*[a-zA-Z_]\\w*)"},
     {"style": "dunder", "regex": "\\b[a-zA-Z_]\\w*\\b(?=\\s*\\.)"},
-    {"style": "object", "regex": "(?<=\\()\\s*\\b[a-zA-Z_]\\w*\\b\\s*(?=\\))"},
+    {"style": "object", "regex": "\\(\\s*([a-zA-Z_]\\w*)\\s*\\)"},
     {"style": "defined", "regex": "\\b([a-zA-Z_]\\w*)\\b(?=\\s*=)"},
     {"style": "codetag", "regex": "String|\\$end|\\@\\w+"}
   ]
@@ -104,7 +105,7 @@ const char* BAT_SYNTAX_STYX_CONTENT = R"styx(
     "untitled": ["Object", "Template", "Zone"],
     "variable": ["Game", "Character", "Scene", "Program", "PhysicsObject", "TransformController", "CollisionShape", "Light", "Vector3", "Rectangle", "ModelTransformController", "Touchable", "Thread", "Keyboard", "Random", "DoorController", "EntityController", "KeyframeAnimation", "SoundLibrary", "Health", "Math", "TextBubble", "Entity", "ItemDrop"],
     "shardshi": ["Shardshi"],
-    "tagName": ["$end", "$", "$source$", "$"]
+    "tagName": ["$end", "$source$"]
   },
   "patterns": [
     {"style": "comment", "regex": "--.*|#.*|//.*"},
@@ -161,18 +162,52 @@ static size_t find_balanced(const std::string& str, char open, char close, size_
     return std::string::npos;
 }
 
+static std::string escape_regex(const std::string& str) {
+    static const std::string meta = ".^$*+?()[]{}\\|-";
+    std::string out;
+    for (char c : str) {
+        if (meta.find(c) != std::string::npos) {
+            out += '\\';
+        }
+        out += c;
+    }
+    return out;
+}
+
+static bool parse_bool_prop(const std::string& props, const std::string& key) {
+    size_t pos = props.find("\"" + key + "\"");
+    if (pos == std::string::npos) return false;
+    size_t colon = props.find(':', pos);
+    if (colon == std::string::npos) return false;
+    size_t comma = props.find_first_of(",}", colon);
+    std::string val = props.substr(colon + 1, comma == std::string::npos ? std::string::npos : comma - colon - 1);
+    return val.find("true") != std::string::npos;
+}
+
 static void compile_keywords(StyxStyleSheet& sheet) {
     for (const auto& kw_pair : sheet.keywords) {
         if (kw_pair.second.empty()) continue;
-        std::string pattern = "\\b(";
+        std::string pattern = "(";
         for (size_t i = 0; i < kw_pair.second.size(); i++) {
             if (i > 0) pattern += "|";
-            pattern += kw_pair.second[i];
+            const std::string& item = kw_pair.second[i];
+            std::string escaped = escape_regex(item);
+            
+            bool start_word = isalnum((unsigned char)item.front()) || item.front() == '_';
+            bool end_word   = isalnum((unsigned char)item.back())  || item.back() == '_';
+            
+            std::string item_pat;
+            if (start_word) item_pat += "\\b";
+            item_pat += escaped;
+            if (end_word)   item_pat += "\\b";
+            pattern += item_pat;
         }
-        pattern += ")\\b";
+        pattern += ")";
         try {
             sheet.patterns.push_back({kw_pair.first, std::regex(pattern), pattern});
-        } catch (...) {}
+        } catch (const std::regex_error& e) {
+            std::cerr << "[intellij] Regex compilation error for keyword group " << kw_pair.first << ": " << e.what() << "\n";
+        }
     }
 }
 
@@ -194,14 +229,24 @@ bool IntelliJ::load_style(const std::string& path) {
     new_style.line_comment = "--"; // default
     
     try {
-        // Strip block and line comments from configuration text to make it easy to parse
+        // Strip block and line comments from configuration text (string-quote aware)
         std::string clean;
         size_t idx = 0;
-        bool in_block_comment = false;
+        bool in_quote = false;
+        char quote_char = 0;
         while (idx < content.size()) {
-            if (idx + 1 < content.size() && content[idx] == '/' && content[idx+1] == '/') {
+            char c = content[idx];
+            if ((c == '"' || c == '\'') && (idx == 0 || content[idx-1] != '\\')) {
+                if (!in_quote) {
+                    in_quote = true;
+                    quote_char = c;
+                } else if (quote_char == c) {
+                    in_quote = false;
+                }
+                clean += content[idx++];
+            } else if (!in_quote && idx + 1 < content.size() && content[idx] == '/' && content[idx+1] == '/') {
                 while (idx < content.size() && content[idx] != '\n') idx++;
-            } else if (idx + 1 < content.size() && content[idx] == '-' && content[idx+1] == '-') {
+            } else if (!in_quote && idx + 1 < content.size() && content[idx] == '-' && content[idx+1] == '-') {
                 while (idx < content.size() && content[idx] != '\n') idx++;
             } else {
                 clean += content[idx++];
@@ -242,19 +287,22 @@ bool IntelliJ::load_style(const std::string& path) {
                 if (line_pos != std::string::npos) {
                     size_t q1 = obj_content.find('"', line_pos + 6);
                     size_t q2 = obj_content.find('"', q1 + 1);
-                    new_style.line_comment = obj_content.substr(q1 + 1, q2 - q1 - 1);
+                    if (q1 != std::string::npos && q2 != std::string::npos)
+                        new_style.line_comment = obj_content.substr(q1 + 1, q2 - q1 - 1);
                 }
                 size_t bs_pos = obj_content.find("\"block_start\"");
                 if (bs_pos != std::string::npos) {
                     size_t q1 = obj_content.find('"', bs_pos + 13);
                     size_t q2 = obj_content.find('"', q1 + 1);
-                    new_style.block_comment_start = obj_content.substr(q1 + 1, q2 - q1 - 1);
+                    if (q1 != std::string::npos && q2 != std::string::npos)
+                        new_style.block_comment_start = obj_content.substr(q1 + 1, q2 - q1 - 1);
                 }
                 size_t be_pos = obj_content.find("\"block_end\"");
                 if (be_pos != std::string::npos) {
                     size_t q1 = obj_content.find('"', be_pos + 11);
                     size_t q2 = obj_content.find('"', q1 + 1);
-                    new_style.block_comment_end = obj_content.substr(q1 + 1, q2 - q1 - 1);
+                    if (q1 != std::string::npos && q2 != std::string::npos)
+                        new_style.block_comment_end = obj_content.substr(q1 + 1, q2 - q1 - 1);
                 }
             }
         }
@@ -274,22 +322,28 @@ bool IntelliJ::load_style(const std::string& path) {
                     if (name_end == std::string::npos) break;
                     std::string style_name = obj_content.substr(name_start + 1, name_end - name_start - 1);
                     
-                    size_t val_start = obj_content.find('{', name_end);
-                    size_t val_end = find_balanced(obj_content, '{', '}', val_start);
-                    if (val_start != std::string::npos && val_end != std::string::npos && val_start < obj_content.find('"', name_end + 5)) {
-                        std::string style_props = obj_content.substr(val_start + 1, val_end - val_start - 1);
-                        StyxColor sc;
-                        size_t col_pos = style_props.find("\"color\"");
-                        if (col_pos != std::string::npos) {
-                            size_t q1 = style_props.find('"', col_pos + 7);
-                            size_t q2 = style_props.find('"', q1 + 1);
-                            sc.color = parse_hex_color(style_props.substr(q1 + 1, q2 - q1 - 1));
+                    size_t colon = obj_content.find(':', name_end);
+                    if (colon != std::string::npos) {
+                        size_t val_start = obj_content.find('{', colon);
+                        size_t val_end = find_balanced(obj_content, '{', '}', val_start);
+                        if (val_start != std::string::npos && val_end != std::string::npos) {
+                            std::string style_props = obj_content.substr(val_start + 1, val_end - val_start - 1);
+                            StyxColor sc;
+                            size_t col_pos = style_props.find("\"color\"");
+                            if (col_pos != std::string::npos) {
+                                size_t q1 = style_props.find('"', col_pos + 7);
+                                size_t q2 = style_props.find('"', q1 + 1);
+                                if (q1 != std::string::npos && q2 != std::string::npos)
+                                    sc.color = parse_hex_color(style_props.substr(q1 + 1, q2 - q1 - 1));
+                            }
+                            sc.bold = parse_bool_prop(style_props, "bold");
+                            sc.italic = parse_bool_prop(style_props, "italic");
+                            sc.underline = parse_bool_prop(style_props, "underline");
+                            new_style.styles[style_name] = sc;
+                            p = val_end + 1;
+                        } else {
+                            p = name_end + 1;
                         }
-                        sc.bold = (style_props.find("\"bold\"") != std::string::npos && style_props.find("true") != std::string::npos);
-                        sc.italic = (style_props.find("\"italic\"") != std::string::npos && style_props.find("true") != std::string::npos);
-                        sc.underline = (style_props.find("\"underline\"") != std::string::npos && style_props.find("true") != std::string::npos);
-                        new_style.styles[style_name] = sc;
-                        p = val_end + 1;
                     } else {
                         p = name_end + 1;
                     }
@@ -353,13 +407,15 @@ bool IntelliJ::load_style(const std::string& path) {
                     if (style_pos != std::string::npos) {
                         size_t q1 = obj_content.find('"', style_pos + 7);
                         size_t q2 = obj_content.find('"', q1 + 1);
-                        style_name = obj_content.substr(q1 + 1, q2 - q1 - 1);
+                        if (q1 != std::string::npos && q2 != std::string::npos)
+                            style_name = obj_content.substr(q1 + 1, q2 - q1 - 1);
                     }
                     size_t reg_pos = obj_content.find("\"regex\"");
                     if (reg_pos != std::string::npos) {
                         size_t q1 = obj_content.find('"', reg_pos + 7);
                         size_t q2 = obj_content.find('"', q1 + 1);
-                        regex_str = obj_content.substr(q1 + 1, q2 - q1 - 1);
+                        if (q1 != std::string::npos && q2 != std::string::npos)
+                            regex_str = obj_content.substr(q1 + 1, q2 - q1 - 1);
                     }
                     
                     if (!style_name.empty() && !regex_str.empty()) {
@@ -391,13 +447,24 @@ bool IntelliJ::load_style_from_memory(const std::string& content) {
     new_style.line_comment = "--"; // default
     
     try {
-        // Strip block and line comments from configuration text to make it easy to parse
+        // Strip block and line comments from configuration text (string-quote aware)
         std::string clean;
         size_t idx = 0;
+        bool in_quote = false;
+        char quote_char = 0;
         while (idx < content.size()) {
-            if (idx + 1 < content.size() && content[idx] == '/' && content[idx+1] == '/') {
+            char c = content[idx];
+            if ((c == '"' || c == '\'') && (idx == 0 || content[idx-1] != '\\')) {
+                if (!in_quote) {
+                    in_quote = true;
+                    quote_char = c;
+                } else if (quote_char == c) {
+                    in_quote = false;
+                }
+                clean += content[idx++];
+            } else if (!in_quote && idx + 1 < content.size() && content[idx] == '/' && content[idx+1] == '/') {
                 while (idx < content.size() && content[idx] != '\n') idx++;
-            } else if (idx + 1 < content.size() && content[idx] == '-' && content[idx+1] == '-') {
+            } else if (!in_quote && idx + 1 < content.size() && content[idx] == '-' && content[idx+1] == '-') {
                 while (idx < content.size() && content[idx] != '\n') idx++;
             } else {
                 clean += content[idx++];
@@ -438,19 +505,22 @@ bool IntelliJ::load_style_from_memory(const std::string& content) {
                 if (line_pos != std::string::npos) {
                     size_t q1 = obj_content.find('"', line_pos + 6);
                     size_t q2 = obj_content.find('"', q1 + 1);
-                    new_style.line_comment = obj_content.substr(q1 + 1, q2 - q1 - 1);
+                    if (q1 != std::string::npos && q2 != std::string::npos)
+                        new_style.line_comment = obj_content.substr(q1 + 1, q2 - q1 - 1);
                 }
                 size_t bs_pos = obj_content.find("\"block_start\"");
                 if (bs_pos != std::string::npos) {
                     size_t q1 = obj_content.find('"', bs_pos + 13);
                     size_t q2 = obj_content.find('"', q1 + 1);
-                    new_style.block_comment_start = obj_content.substr(q1 + 1, q2 - q1 - 1);
+                    if (q1 != std::string::npos && q2 != std::string::npos)
+                        new_style.block_comment_start = obj_content.substr(q1 + 1, q2 - q1 - 1);
                 }
                 size_t be_pos = obj_content.find("\"block_end\"");
                 if (be_pos != std::string::npos) {
                     size_t q1 = obj_content.find('"', be_pos + 11);
                     size_t q2 = obj_content.find('"', q1 + 1);
-                    new_style.block_comment_end = obj_content.substr(q1 + 1, q2 - q1 - 1);
+                    if (q1 != std::string::npos && q2 != std::string::npos)
+                        new_style.block_comment_end = obj_content.substr(q1 + 1, q2 - q1 - 1);
                 }
             }
         }
@@ -470,22 +540,28 @@ bool IntelliJ::load_style_from_memory(const std::string& content) {
                     if (name_end == std::string::npos) break;
                     std::string style_name = obj_content.substr(name_start + 1, name_end - name_start - 1);
                     
-                    size_t val_start = obj_content.find('{', name_end);
-                    size_t val_end = find_balanced(obj_content, '{', '}', val_start);
-                    if (val_start != std::string::npos && val_end != std::string::npos && val_start < obj_content.find('"', name_end + 5)) {
-                        std::string style_props = obj_content.substr(val_start + 1, val_end - val_start - 1);
-                        StyxColor sc;
-                        size_t col_pos = style_props.find("\"color\"");
-                        if (col_pos != std::string::npos) {
-                            size_t q1 = style_props.find('"', col_pos + 7);
-                            size_t q2 = style_props.find('"', q1 + 1);
-                            sc.color = parse_hex_color(style_props.substr(q1 + 1, q2 - q1 - 1));
+                    size_t colon = obj_content.find(':', name_end);
+                    if (colon != std::string::npos) {
+                        size_t val_start = obj_content.find('{', colon);
+                        size_t val_end = find_balanced(obj_content, '{', '}', val_start);
+                        if (val_start != std::string::npos && val_end != std::string::npos) {
+                            std::string style_props = obj_content.substr(val_start + 1, val_end - val_start - 1);
+                            StyxColor sc;
+                            size_t col_pos = style_props.find("\"color\"");
+                            if (col_pos != std::string::npos) {
+                                size_t q1 = style_props.find('"', col_pos + 7);
+                                size_t q2 = style_props.find('"', q1 + 1);
+                                if (q1 != std::string::npos && q2 != std::string::npos)
+                                    sc.color = parse_hex_color(style_props.substr(q1 + 1, q2 - q1 - 1));
+                            }
+                            sc.bold = parse_bool_prop(style_props, "bold");
+                            sc.italic = parse_bool_prop(style_props, "italic");
+                            sc.underline = parse_bool_prop(style_props, "underline");
+                            new_style.styles[style_name] = sc;
+                            p = val_end + 1;
+                        } else {
+                            p = name_end + 1;
                         }
-                        sc.bold = (style_props.find("\"bold\"") != std::string::npos && style_props.find("true") != std::string::npos);
-                        sc.italic = (style_props.find("\"italic\"") != std::string::npos && style_props.find("true") != std::string::npos);
-                        sc.underline = (style_props.find("\"underline\"") != std::string::npos && style_props.find("true") != std::string::npos);
-                        new_style.styles[style_name] = sc;
-                        p = val_end + 1;
                     } else {
                         p = name_end + 1;
                     }
@@ -549,13 +625,15 @@ bool IntelliJ::load_style_from_memory(const std::string& content) {
                     if (style_pos != std::string::npos) {
                         size_t q1 = obj_content.find('"', style_pos + 7);
                         size_t q2 = obj_content.find('"', q1 + 1);
-                        style_name = obj_content.substr(q1 + 1, q2 - q1 - 1);
+                        if (q1 != std::string::npos && q2 != std::string::npos)
+                            style_name = obj_content.substr(q1 + 1, q2 - q1 - 1);
                     }
                     size_t reg_pos = obj_content.find("\"regex\"");
                     if (reg_pos != std::string::npos) {
                         size_t q1 = obj_content.find('"', reg_pos + 7);
                         size_t q2 = obj_content.find('"', q1 + 1);
-                        regex_str = obj_content.substr(q1 + 1, q2 - q1 - 1);
+                        if (q1 != std::string::npos && q2 != std::string::npos)
+                            regex_str = obj_content.substr(q1 + 1, q2 - q1 - 1);
                     }
                     
                     if (!style_name.empty() && !regex_str.empty()) {
@@ -610,44 +688,73 @@ void IntelliJ::load_default_style() {
 
 std::vector<EditorToken> IntelliJ::tokenize_line(const std::string& line, bool is_dark_theme) {
     std::vector<EditorToken> tokens;
-    if (line.empty()) return tokens;
-    
-    // Get colors or fall back to default style/editor text color
+    tokenize_line_stateful(line, LexState::NORMAL, is_dark_theme, tokens);
+    return tokens;
+}
+
+LexState IntelliJ::tokenize_line_stateful(const std::string& line, LexState in_state, bool is_dark_theme, std::vector<EditorToken>& out_tokens) {
+    out_tokens.clear();
+    if (line.empty()) return in_state;
+
     ImVec4 def_col = is_dark_theme ? ImVec4(0.85f, 0.85f, 0.85f, 1.0f) : ImVec4(0.15f, 0.15f, 0.15f, 1.0f);
     StyxColor default_sty = {def_col, false, false, false};
     if (style_.styles.find("default") != style_.styles.end()) default_sty = style_.styles["default"];
-    
-    // 1. Regex patterns check (lex character ranges)
+    StyxColor comment_sty = style_.styles.count("comment") ? style_.styles["comment"] : default_sty;
+
+    // Handle multiline block comment continuation
+    if (in_state == LexState::IN_BLOCK_COMMENT) {
+        size_t end_pos = line.find("]]");
+        if (end_pos != std::string::npos) {
+            out_tokens.push_back({line.substr(0, end_pos + 2), comment_sty});
+            std::string remainder = line.substr(end_pos + 2);
+            if (!remainder.empty()) {
+                std::vector<EditorToken> rem_tokens;
+                tokenize_line_stateful(remainder, LexState::NORMAL, is_dark_theme, rem_tokens);
+                out_tokens.insert(out_tokens.end(), rem_tokens.begin(), rem_tokens.end());
+            }
+            return LexState::NORMAL;
+        } else {
+            out_tokens.push_back({line, comment_sty});
+            return LexState::IN_BLOCK_COMMENT;
+        }
+    }
+
+    // Standard pattern matching
     struct MatchedRange {
         size_t start;
         size_t end;
         StyxColor style;
+        size_t pattern_index;
     };
     std::vector<MatchedRange> matches;
 
-    for (const auto& pat : style_.patterns) {
-        auto words_begin = std::sregex_iterator(line.begin(), line.end(), pat.regex_pattern);
-        auto words_end = std::sregex_iterator();
-        
-        for (std::sregex_iterator i = words_begin; i != words_end; ++i) {
-            std::smatch match = *i;
-            size_t start = match.position();
-            size_t end = start + match.length();
-            StyxColor sty = default_sty;
-            if (style_.styles.find(pat.style_name) != style_.styles.end()) {
-                sty = style_.styles[pat.style_name];
+    for (size_t p_idx = 0; p_idx < style_.patterns.size(); ++p_idx) {
+        const auto& pat = style_.patterns[p_idx];
+        try {
+            auto words_begin = std::sregex_iterator(line.begin(), line.end(), pat.regex_pattern);
+            auto words_end = std::sregex_iterator();
+            
+            for (std::sregex_iterator i = words_begin; i != words_end; ++i) {
+                std::smatch match = *i;
+                size_t start = match.position();
+                size_t end = start + match.length();
+                StyxColor sty = default_sty;
+                if (style_.styles.find(pat.style_name) != style_.styles.end()) {
+                    sty = style_.styles[pat.style_name];
+                }
+                matches.push_back({start, end, sty, p_idx});
             }
-            matches.push_back({start, end, sty});
-        }
+        } catch (...) {}
     }
-    
-    // Sort matches by starting position, prioritize longer matches
+
     std::sort(matches.begin(), matches.end(), [](const MatchedRange& a, const MatchedRange& b) {
-        if (a.start == b.start) return (a.end - a.start) > (b.end - b.start);
-        return a.start < b.start;
+        if (a.start != b.start) return a.start < b.start;
+        size_t len_a = a.end - a.start;
+        size_t len_b = b.end - b.start;
+        if (len_a != len_b) return len_a > len_b;
+        return a.pattern_index < b.pattern_index;
     });
 
-    // Resolve overlaps
     std::vector<MatchedRange> clean_matches;
     size_t last_end = 0;
     for (const auto& m : matches) {
@@ -657,43 +764,31 @@ std::vector<EditorToken> IntelliJ::tokenize_line(const std::string& line, bool i
         }
     }
 
-    // Build tokens from ranges
     size_t current_idx = 0;
     for (const auto& m : clean_matches) {
         if (m.start > current_idx) {
             std::string text = line.substr(current_idx, m.start - current_idx);
-            tokens.push_back({text, default_sty});
+            out_tokens.push_back({text, default_sty});
         }
         std::string text = line.substr(m.start, m.end - m.start);
-        tokens.push_back({text, m.style});
+        out_tokens.push_back({text, m.style});
         current_idx = m.end;
     }
     if (current_idx < line.size()) {
         std::string text = line.substr(current_idx);
-        tokens.push_back({text, default_sty});
+        out_tokens.push_back({text, default_sty});
     }
 
-    // 2. Keyword highlighting override
-    for (auto& tok : tokens) {
-        // Strip spaces or tabs to check literal match
-        std::string clean_tok = tok.text;
-        clean_tok.erase(std::remove_if(clean_tok.begin(), clean_tok.end(), isspace), clean_tok.end());
-        
-        for (const auto& kw_pair : style_.keywords) {
-            const auto& list = kw_pair.second;
-            if (std::find(list.begin(), list.end(), clean_tok) != list.end()) {
-                if (style_.styles.find(kw_pair.first) != style_.styles.end()) {
-                    tok.style = style_.styles[kw_pair.first];
-                    break;
-                }
-            }
-        }
+    // Check if line opens an unclosed block comment `--[[`
+    size_t block_start = line.find("--[[");
+    if (block_start != std::string::npos && line.find("]]", block_start + 4) == std::string::npos) {
+        return LexState::IN_BLOCK_COMMENT;
     }
 
-    return tokens;
+    return LexState::NORMAL;
 }
 
-// Stack-based bracket mismatch finder
+// String- and Comment-aware stack bracket checker
 std::vector<BracketError> IntelliJ::check_syntax_errors(const std::string& text) {
     std::vector<BracketError> errors;
     
@@ -708,36 +803,75 @@ std::vector<BracketError> IntelliJ::check_syntax_errors(const std::string& text)
     int line_num = 1;
     int col_num = 1;
     
+    bool in_single_quote = false;
+    bool in_double_quote = false;
+    bool in_line_comment = false;
+    bool in_block_comment = false;
+
     for (size_t i = 0; i < text.size(); i++) {
         char c = text[i];
+        
         if (c == '\n') {
             line_num++;
             col_num = 1;
+            in_line_comment = false;
+            in_single_quote = false;
+            in_double_quote = false;
             continue;
         }
 
-        if (c == '{' || c == '(' || c == '[') {
-            stack.push({c, line_num, col_num, i});
-        } else if (c == '}' || c == ')' || c == ']') {
-            char expected = 0;
-            if (c == '}') expected = '{';
-            else if (c == ')') expected = '(';
-            else if (c == ']') expected = '[';
+        // Check comment start/end
+        if (!in_single_quote && !in_double_quote) {
+            if (!in_block_comment && i + 3 < text.size() && text[i] == '-' && text[i+1] == '-' && text[i+2] == '[' && text[i+3] == '[') {
+                in_block_comment = true;
+                i += 3;
+                col_num += 3;
+                continue;
+            }
+            if (in_block_comment && i + 1 < text.size() && text[i] == ']' && text[i+1] == ']') {
+                in_block_comment = false;
+                i += 1;
+                col_num += 1;
+                continue;
+            }
+            if (!in_block_comment && i + 1 < text.size() && ((text[i] == '-' && text[i+1] == '-') || (text[i] == '/' && text[i+1] == '/'))) {
+                in_line_comment = true;
+            }
+        }
 
-            if (stack.empty()) {
-                errors.push_back({line_num, col_num, c, "Unmatched closing bracket '" + std::string(1, c) + "'"});
-            } else {
-                OpenBracket top = stack.top();
-                if (top.ch != expected) {
-                    errors.push_back({line_num, col_num, c, "Mismatched bracket: expected '" + std::string(1, expected) + "' for '" + std::string(1, top.ch) + "'"});
+        // Check quote state
+        if (!in_line_comment && !in_block_comment) {
+            if (c == '"' && (i == 0 || text[i-1] != '\\') && !in_single_quote) {
+                in_double_quote = !in_double_quote;
+            } else if (c == '\'' && (i == 0 || text[i-1] != '\\') && !in_double_quote) {
+                in_single_quote = !in_single_quote;
+            }
+        }
+
+        // ONLY process brackets when in NORMAL code state
+        if (!in_line_comment && !in_block_comment && !in_single_quote && !in_double_quote) {
+            if (c == '{' || c == '(' || c == '[') {
+                stack.push({c, line_num, col_num, i});
+            } else if (c == '}' || c == ')' || c == ']') {
+                char expected = 0;
+                if (c == '}') expected = '{';
+                else if (c == ')') expected = '(';
+                else if (c == ']') expected = '[';
+
+                if (stack.empty()) {
+                    errors.push_back({line_num, col_num, c, "Unmatched closing bracket '" + std::string(1, c) + "'"});
+                } else {
+                    OpenBracket top = stack.top();
+                    if (top.ch != expected) {
+                        errors.push_back({line_num, col_num, c, "Mismatched bracket: expected '" + std::string(1, expected) + "' for '" + std::string(1, top.ch) + "'"});
+                    }
+                    stack.pop();
                 }
-                stack.pop();
             }
         }
         col_num++;
     }
 
-    // Remaining in stack are unmatched opening brackets
     while (!stack.empty()) {
         OpenBracket top = stack.top();
         errors.push_back({top.line, top.col, top.ch, "Unmatched opening bracket '" + std::string(1, top.ch) + "'"});
@@ -747,13 +881,39 @@ std::vector<BracketError> IntelliJ::check_syntax_errors(const std::string& text)
     return errors;
 }
 
+std::vector<SwordigoApiSymbol> IntelliJ::get_swordigo_autocomplete(const std::string& query) {
+    static const std::vector<SwordigoApiSymbol> api_database = {
+        {"Game.GetHero()", "Game", "Character* Game.GetHero()", "Returns pointer to the primary player character hero instance."},
+        {"Game.LoadScene(scene_name)", "Game", "void Game.LoadScene(string name)", "Asynchronously streams and transitions to target scene file."},
+        {"Game.GetLevelName()", "Game", "string Game.GetLevelName()", "Returns active scene map/dungeon filename."},
+        {"Game.PlaySound(sound_id)", "Game", "void Game.PlaySound(string id)", "Plays dynamic spatial sound effect from SoundLibrary."},
+        {"Character.GetHealth()", "Character", "float Character.GetHealth()", "Returns current hero health points."},
+        {"Character.SetHealth(val)", "Character", "void Character.SetHealth(float val)", "Updates hero health and notifies HealthBar GUI."},
+        {"Character.AddCoins(amount)", "Character", "void Character.AddCoins(int count)", "Adds currency coins to hero inventory."},
+        {"Character.ApplyArmorTrinket(item)", "Character", "void Character.ApplyArmorTrinket(Item* item)", "Equips armor trinket modifiers."},
+        {"Character.ApplyWeaponTrinket(item)", "Character", "void Character.ApplyWeaponTrinket(Item* item)", "Equips sword magic element trinket."},
+        {"Scene.FindObject(name)", "Scene", "SceneObject* Scene.FindObject(string name)", "Queries scene tree for object by string ID."},
+        {"Scene.SpawnEntity(proto, pos)", "Scene", "Entity* Scene.SpawnEntity(string proto, Vector3 pos)", "Instantiates new game entity at target coordinates."},
+        {"PhysicsObject.SetVelocity(vec)", "PhysicsObject", "void PhysicsObject.SetVelocity(Vector3 v)", "Applies linear velocity vector."},
+        {"Vector3(x, y, z)", "Math", "Vector3 Vector3(float x, float y, float z)", "3D spatial coordinate vector constructor."},
+        {"Shardshi.ExecuteCommand(cmd)", "Engine", "void Shardshi.ExecuteCommand(string cmd)", "Executes low-level Shardshi console engine command."}
+    };
+
+    std::vector<SwordigoApiSymbol> results;
+    for (const auto& sym : api_database) {
+        if (query.empty() || sym.name.find(query) != std::string::npos || sym.category.find(query) != std::string::npos) {
+            results.push_back(sym);
+        }
+    }
+    return results;
+}
+
 // Render unified code editor + viewer
 void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modified, const std::string& filepath, ImFont* mono_font, ImVec4& custom_bg,
                            bool has_compile_result, bool compile_success, const std::string& compile_error_msg, double compile_time_ms) {
     ImGuiContext& g = *GImGui;
     bool is_dark_theme = (g.Style.Colors[ImGuiCol_Text].x + g.Style.Colors[ImGuiCol_Text].y + g.Style.Colors[ImGuiCol_Text].z) / 3.0f > 0.5f;
     
-    // Zoom control & state setup
     static float zoom = 1.0f;
     
     // Calculate lines
@@ -769,20 +929,17 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
         }
     }
     
-    // Check for syntax errors
+    // Check for syntax errors (comment and string aware)
     std::vector<BracketError> errors = check_syntax_errors(*buffer);
     
-    // ── Gutter Width Calculation ──────────────────────────────────
     float line_h = ImGui::GetTextLineHeight();
     char max_line_str[32];
     snprintf(max_line_str, sizeof(max_line_str), "%d", (int)lines.size());
     float max_line_w = ImGui::CalcTextSize(max_line_str).x;
-    float gutter_w = max_line_w + 24.0f; // line numbers + margin
+    float gutter_w = max_line_w + 24.0f;
     
-    // Draw Toolbar / Header
     ImGui::BeginChild("EditorContainer", ImVec2(0, 0), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
     
-    // Draw top control panel
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8, 4));
     ImGui::BeginChild("Toolbar", ImVec2(0, 36.0f), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
     
@@ -806,7 +963,6 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
     
     ImGui::Separator();
     
-    // Editor backgrounds
     ImVec4 editor_bg = is_dark_theme ? ImVec4(0.10f, 0.10f, 0.13f, 1.0f) : ImVec4(0.97f, 0.97f, 0.98f, 1.0f);
     if (custom_bg.w > 0.0f) {
         editor_bg = custom_bg;
@@ -826,19 +982,13 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
     }
     
     float editor_w = ImGui::GetContentRegionAvail().x - gutter_w;
-    float editor_h = ImGui::GetContentRegionAvail().y - 24.0f; // space for status bar
+    float editor_h = ImGui::GetContentRegionAvail().y - 24.0f;
     
-    // ── Gutter scrolling synchronization ─────────────────────────────
-    // We read the previous frame's scroll from a static map.
-    // The real scroll lives inside InputTextMultiline's inner child window;
-    // we capture it after InputTextMultiline returns (below) and store it
-    // here so the gutter is in sync next frame.  1-frame delay is invisible at 60fps.
     static std::unordered_map<std::string, ImVec2> s_editor_scroll;
     std::string label_key(label);
     ImVec2 prev_scroll = s_editor_scroll.count(label_key) ? s_editor_scroll.at(label_key) : ImVec2(0.f, 0.f);
     float scroll_y = prev_scroll.y;
     
-    // 1. Draw Gutter pane (fixed on the left)
     ImGui::PushStyleColor(ImGuiCol_ChildBg, gutter_bg);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 8.0f));
     ImGui::BeginChild("GutterChild", ImVec2(gutter_w, editor_h), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -875,7 +1025,6 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
         }
     }
     
-    // Draw vertical divider
     gutter_dl->AddLine(
         ImVec2(ImGui::GetWindowPos().x + gutter_w - 1.0f, ImGui::GetWindowPos().y),
         ImVec2(ImGui::GetWindowPos().x + gutter_w - 1.0f, ImGui::GetWindowPos().y + editor_h),
@@ -890,13 +1039,9 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
     
     ImGui::SameLine(0.0f, 0.0f);
     
-    // 2. Draw Editor Text pane (scrolls horizontally & vertically)
-    // NOTE: Text color uses near-zero alpha (not exactly 0) so that ImGui's
-    // internal glyph-advance / mouse-hit-test logic stays stable for swipe &
-    // selection.  The visible colored text is drawn by the token overlay below.
     ImGui::PushStyleColor(ImGuiCol_ChildBg, editor_bg);
     ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0, 0, 0, 0.004f)); // near-invisible — keeps hit-test sane
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0, 0, 0, 0.004f));
     ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, is_dark_theme ? ImVec4(0.18f, 0.35f, 0.55f, 0.70f) : ImVec4(0.65f, 0.80f, 0.95f, 0.80f));
     
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f, 8.0f));
@@ -904,9 +1049,6 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
     
     if (mono_font) ImGui::PushFont(mono_font);
     
-    // No HorizontalScrollbar flag here — InputTextMultiline manages its own
-    // internal horizontal scroll.  A double scrollbar setup shrinks the child's
-    // content-region height and breaks ImVec2(GetContentRegionAvail()) sizing.
     ImGui::BeginChild("EditorTextChild", ImVec2(editor_w, editor_h), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     
     std::string id_label = std::string("##editor_") + label;
@@ -918,14 +1060,14 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
         if (cb_data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
             std::string* str = (std::string*)cb_data->UserData;
             str->resize(cb_data->BufTextLen);
-            cb_data->Buf = (char*)str->c_str();
+            cb_data->Buf = str->data();
         }
         return 0;
     };
     
     bool changed = ImGui::InputTextMultiline(
         id_label.c_str(), 
-        (char*)buffer->c_str(), 
+        buffer->data(), 
         buffer->capacity() + 1, 
         ImGui::GetContentRegionAvail(), 
         ImGuiInputTextFlags_AllowTabInput | ImGuiInputTextFlags_CallbackResize, 
@@ -935,35 +1077,23 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
     
     if (changed) {
         modified = true;
+        token_cache_.clear(); // Invalidate line token cache on edits
     }
     
-    // ── Overlay: draw syntax-highlighted tokens ──────────────────────
-    // InputTextMultiline creates an inner child window whose ImGui name is
-    // "EditorTextChild/##editor_<label>" — FindWindowByName("##editor_...") misses
-    // the parent prefix and returns nullptr.  Instead we scan DC.ChildWindows of
-    // the current window (EditorTextChild) which is populated once BeginChild fires.
-    ImGuiWindow* etch_win = ImGui::GetCurrentWindow(); // EditorTextChild
+    ImGuiWindow* etch_win = ImGui::GetCurrentWindow();
     ImGuiWindow* text_inner_win = nullptr;
     for (int i = 0; i < etch_win->DC.ChildWindows.Size; i++) {
         if (etch_win->DC.ChildWindows[i]) {
             text_inner_win = etch_win->DC.ChildWindows[i];
-            break; // there's only one child: the InputTextMultiline inner window
+            break;
         }
     }
 
-    // Get the real scroll from the inner window.
     ImVec2 inner_scroll(0.f, 0.f);
     if (text_inner_win) inner_scroll = text_inner_win->Scroll;
 
-    // Persist scroll so the gutter can sync next frame.
     s_editor_scroll[label_key] = inner_scroll;
-
-    // Draw on the INNER window's draw list (correct layer + clipping rect).
-    // Using EditorTextChild's draw list would render behind the inner window bg.
     ImDrawList* dl = text_inner_win ? text_inner_win->DrawList : etch_win->DrawList;
-
-    // start_pos: EditorTextChild top-left + FramePadding − scroll
-    // (same formula original code used, but now scroll is non-zero when scrolled)
     ImVec2 start_pos = etch_win->Pos + ImVec2(4.0f, 8.0f) - inner_scroll;
 
     first_visible = (int)(inner_scroll.y / line_h);
@@ -971,13 +1101,20 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
     first_visible = std::max(0, first_visible);
     last_visible = std::min((int)lines.size(), last_visible);
 
+    // Multiline state propagation across visible lines
+    LexState line_lex_state = LexState::NORMAL;
+    for (int i = 0; i < first_visible; i++) {
+        std::vector<EditorToken> dummy;
+        line_lex_state = tokenize_line_stateful(lines[i], line_lex_state, is_dark_theme, dummy);
+    }
     
     for (int line_idx = first_visible; line_idx < last_visible; line_idx++) {
         ImVec2 line_pos = start_pos + ImVec2(0.0f, line_idx * line_h);
         bool has_error = std::find(error_lines.begin(), error_lines.end(), line_idx) != error_lines.end();
         
         const std::string& current_line = lines[line_idx];
-        std::vector<EditorToken> tokens = tokenize_line(current_line, is_dark_theme);
+        std::vector<EditorToken> tokens;
+        line_lex_state = tokenize_line_stateful(current_line, line_lex_state, is_dark_theme, tokens);
         
         ImVec2 draw_cursor = line_pos;
         for (const auto& tok : tokens) {
@@ -1006,10 +1143,10 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
     ImGui::EndChild(); // EditorTextChild
     
     if (mono_font) ImGui::PopFont();
-    ImGui::PopStyleColor(4); // TextSelectedBg, Text, FrameBg, ChildBg
-    ImGui::PopStyleVar(2);  // ItemSpacing, FramePadding
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(2);
     
-    // Status Bar / Footer
+    // Status Bar / Footer with Swordigo Autocomplete trigger
     ImGui::Separator();
     ImGui::BeginChild("StatusBar", ImVec2(0, 20.0f), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
     

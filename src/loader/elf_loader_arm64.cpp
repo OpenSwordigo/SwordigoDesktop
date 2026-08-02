@@ -302,3 +302,48 @@ uint64_t ElfLoaderArm64::get_symbol_vaddr(so_module_arm64* mod, const std::strin
     }
     return 0;
 }
+
+// ============================================================================
+// elf_lookup_symbol — real ProHook Phase 2 symbol resolver
+//
+// Exposed as extern "C" so srehost_impl.cpp's weak stub is overridden at
+// link time. Searches both libswordigo.so (g_main_mod_64) and libsre.so
+// (g_sre_mod) dynamic symbol tables.
+//
+// Returns guest virtual address, or 0 if not found.
+// ============================================================================
+#include <stdint.h>
+
+// Defined in main.cpp — the loaded ARM64 ELF module descriptors
+extern so_module_arm64 g_main_mod_64;  // libswordigo.so
+extern so_module_arm64 g_sre_mod;      // libsre.so
+
+extern "C" uint64_t elf_lookup_symbol(const char* name) {
+    if (!name || !*name) return 0;
+
+    // Search libswordigo.so dynamic symbol table
+    if (g_main_mod_64.dynstr && g_main_mod_64.dynsym && g_main_mod_64.num_dynsym > 0) {
+        for (int i = 0; i < g_main_mod_64.num_dynsym; i++) {
+            if (g_main_mod_64.dynsym[i].st_name == 0) continue;
+            if (g_main_mod_64.dynsym[i].st_value == 0) continue;
+            const char* sym = g_main_mod_64.dynstr + g_main_mod_64.dynsym[i].st_name;
+            if (strcmp(sym, name) == 0) {
+                return g_main_mod_64.base_addr + g_main_mod_64.dynsym[i].st_value;
+            }
+        }
+    }
+
+    // Fallback: search libsre.so (e.g. for sre-internal hooks)
+    if (g_sre_mod.dynstr && g_sre_mod.dynsym && g_sre_mod.num_dynsym > 0) {
+        for (int i = 0; i < g_sre_mod.num_dynsym; i++) {
+            if (g_sre_mod.dynsym[i].st_name == 0) continue;
+            if (g_sre_mod.dynsym[i].st_value == 0) continue;
+            const char* sym = g_sre_mod.dynstr + g_sre_mod.dynsym[i].st_name;
+            if (strcmp(sym, name) == 0) {
+                return g_sre_mod.base_addr + g_sre_mod.dynsym[i].st_value;
+            }
+        }
+    }
+
+    return 0;
+}

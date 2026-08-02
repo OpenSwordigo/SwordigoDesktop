@@ -90,4 +90,7 @@
 #define ICON_FA_WAVEFORM         "\xef\x8f\xb6"  // U+F3F6
 #define ICON_FA_PERSON_RUNNING   "\xef\x9c\x8c"  // U+F70C
 #define ICON_FA_WAND_MAGIC_SPARKLES "\xef\x9c\xab" // U+F72B
+#define ICON_FA_MAP              "\xef\x89\xb9"  // U+F279
+#define ICON_FA_LOCATION_DOT     "\xef\x8f\x85"  // U+F3C5
+#define ICON_FA_MAP_LOCATION_DOT "\xef\x96\x9f"  // U+F59F
 

@@ -12,6 +12,13 @@
 #include "sre.h"
 #include "sre_lua.h"
 #include "sre_caver.h"
+#include "sre_setjmp.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+
+/* Forward declaration: defined later in this file, called from sre_init() */
+void sre_install_exception_safeguard(void);
 
 
 /* =========================================================================
@@ -45,21 +52,22 @@ SreHookEntry sre_hook_table[] = {
 
     /* AudioSystem::EndAudioInterruptionIfNecessary — iOS audio session resumption.
      * IDA: _ZN5Caver11AudioSystem31EndAudioInterruptionIfNecessaryEv @ 0x47ED50
-     *   (IDA-verified real entry; confirmed by __stack_chk_fail LR=0x147eebc = 0x47ED50+0x16C)
-     * NOTE: nm -D reports a thunk at 0x47ef50 — that is the non-virtual call path only.
-     *   Vtable dispatch (from setApplicationViewSize→CaverShell::Init vtable[10]) calls
-     *   0x47ED50 directly, bypassing the thunk.  We must hook 0x47ED50 to catch ALL calls.
-     * Calls alcMakeContextCurrent inside a canary frame; TPIDR_EL0 changes on
-     * JNI context switch → canary mismatch → __stack_chk_fail → recovery loop.
-     * On desktop OpenAL, audio session management is irrelevant. No-op it. */
-    // { 0x47ED50, "sre_AudioSystem_EndAudioInterruptionIfNecessary" },
+     *   nm thunk at 0x47ef50 is the non-virtual call path only; vtable dispatch
+     *   (CaverShell::Init vtable[10]) goes directly to 0x47ED50, bypassing the thunk.
+     * Calls alcMakeContextCurrent inside a canary-guarded frame. TPIDR_EL0 changes on
+     * JNI context switch → canary mismatch → __stack_chk_fail on every return.
+     * On desktop OpenAL, iOS audio session management is irrelevant. No-op it.
+     * Re-enabled: without this hook, CaverShell::Init vtable[10] still enters the
+     * canary body and fires __stack_chk_fail every frame. */
+    { 0x47ED50, "sre_AudioSystem_EndAudioInterruptionIfNecessary" },
 
     /* __stack_chk_fail replacement — PLT stub 0x1F62D0.
-     * IDA-verified: 0x1F62D0 = .__stack_chk_fail (EndAudioInterruptionIfNecessary
-     *   callee entry; real sym at 0x6FE6F8).
+     * IDA-verified: 0x1F62D0 = .__stack_chk_fail (real sym at 0x6FE6F8).
      * TPIDR_EL0 drifts on JNI context switch → canary mismatch on every return.
-     * Pure return-to-LR: all callee-saved regs intact, epilogue runs cleanly. */
-    // { 0x1F62D0, "sre_stack_chk_fail" },
+     * Pure return-to-LR: all callee-saved regs intact, epilogue runs cleanly.
+     * Belt-and-suspenders: covers ANY other function whose canary fires due to
+     * the same TPIDR_EL0 drift, not just EndAudioInterruptionIfNecessary. */
+    { 0x1F62D0, "sre_stack_chk_fail" },
 
     /* ProgramState — catch Lua errors instead of aborting */
     { 0, "sre_ProgramState_Execute" },  /* offset resolved dynamically by symbol */
@@ -79,18 +87,43 @@ SreHookEntry sre_hook_table[] = {
 
     /* Scene Loading Pipeline Hooks — Safety Filters & Error Recovery */
     /* SceneLoadingView::InitWithGameState — offset resolved via sym_hooks (not yet wired,
-     * kept as 0 until we add sym_hooks entry). Scene::FinishLoad and SceneObject::FinishLoad
-     * have hardcoded nm offsets so they ARE installed without sym_hooks entries:
-     *   Scene::FinishLoad     nm arm64 v1.4.12: 0x4642a8
-     *   SceneObject::FinishLoad nm arm64 v1.4.12: 0x470ec4
-     * These two are the PRIMARY cause of scene-transition freeze:
+     * kept as 0 until we add sym_hooks entry). Scene::FinishLoad, SceneObject::FinishLoad,
+     * and SceneObjectGroup::FinishLoad have hardcoded nm offsets so they ARE installed
+     * without sym_hooks entries:
+     *   Scene::FinishLoad           nm arm64 v1.4.12: 0x4642a8
+     *   SceneObject::FinishLoad     nm arm64 v1.4.12: 0x470ec4
+     *   SceneObjectGroup::FinishLoad nm arm64 v1.4.12: 0x475498
+     * These are the PRIMARY cause of scene-transition freeze:
      *   without the hook, corrupted component vtable[9] calls jump into .dynstr
      *   (PC=0x10771ac) and Dynarmic force-returns to LR inside the original code
-     *   instead of our setjmp recovery. */
+     *   instead of our setjmp recovery.
+     * SceneObjectGroup::FinishLoad additionally calls ProgramState::Execute on
+     * attached Lua scripts immediately during scene load — any script error in the
+     * original causes ProgramPanic → abort. Our wrapper catches it via setjmp. */
     { 0,        "sre_SceneLoadingView_InitWithGameState" },
     { 0,        "sre_GameSceneController_InitWithScene"  },
+    /* SceneLoadingView::Update AND AnimateIn — NOT hooked.
+     *
+     * Both functions suffer from the same relay-trampoline bug:
+     * the relay's literal-pool continuation slot is filled with
+     * 0xd4400000d4400000 (BRK#0 bridge bytes) instead of the correct
+     * continuation VA.  Calling g_orig_Xxx() therefore jumps to an
+     * invalid address and crashes with Dynarmic NoExecuteFault.
+     *
+     * Root cause (host relay builder): the relay saves bytes at the
+     * patch site AFTER the BRK is installed, capturing bridge bytes.
+     * This cannot be fixed from SRE C code.
+     *
+     * The forced gateway teleports using GotoLevel only; the scene
+     * transition completes via BackgroundLoad → GVC+0xE9=1 →
+     * GameViewController::Update as normal.
+     *
+     * nm arm64 v1.4.12 (for reference):
+     *   SceneLoadingView::Update    0x43650C
+     *   SceneLoadingView::AnimateIn 0x436A54  */
     { 0x4642a8, "sre_Scene_FinishLoad"                   },
     { 0x470ec4, "sre_SceneObject_FinishLoad"             },
+    { 0x475498, "sre_SceneObjectGroup_FinishLoad"        },
     { 0, "sre_ReadPODModelFromFile"               },
     { 0, "sre_CPVRTModelPOD_ReadFromMemory"       },
 
@@ -300,12 +333,48 @@ SreHookEntry sre_hook_table[] = {
      */
     { 0x2e6d60, "sre_GameData_Clear" },
 
+    /* ─── Proto::SceneObject::Clear crash guard ────────────────────────────────
+     * CONFIRMED CRASH (live log, LR=0x12fe290=Proto::SceneObject D1Ev):
+     *   Scene::LoadFromFile → Proto::Scene::~Scene() → ObjectLibrary::Clear()
+     *   → ObjectTemplate::Clear() → SceneObject::Clear()
+     *   → loop over Component[this+40] via this+32 array, calling vtable[+32]
+     *   on each element. If this+40 is corrupt (use-after-free: allocator link
+     *   overwrites freed proto memory), the loop walks garbage → vtable =
+     *   ARM64 STP instruction bytes → PC = 0x47bfda9034ff4 → NoExecuteFault.
+     *
+     * IDA 0x2fc030 = Clear impl (nm-verified via IDA index; IDA addresses ==
+     * nm VAs for this stripped binary — confirmed against GameData::Clear).
+     * Hook the IMPL, not the PLT thunk (0x1fa880), so all callers are covered.
+     */
+    { 0x2fc030, "sre_Proto_SceneObject_Clear" },
+
+    /* ─── Proto::ObjectLibrary::Clear crash guard ──────────────────────────────
+     * One level above SceneObject::Clear in the chain. IDA 0x2fd374 shows 3
+     * vtable-dispatch loops (ObjectTemplate list + 2 unknown repeated fields).
+     * If any count field there is corrupt, the outer loop crashes before even
+     * reaching SceneObject::Clear, bypassing our guard above.
+     * Belt-and-suspenders: guard both layers.
+     */
+    { 0x2fd374, "sre_Proto_ObjectLibrary_Clear" },
+
     /* ─── SceneObject::ComponentWithInterface safety guard ─────────────────────
      * Filters out corrupted component pointers / bad vtables created by mods,
      * preventing Dynarmic Halt exceptions and jumps into .dynstr data.
      * nm -D libswordigo.so v1.4.12 arm64-v8a: 0x47462c
      */
     { 0x47462c, "sre_SceneObject_ComponentWithInterface" },
+
+    /* ─── ComponentOutletBase::Connect vtable safety guard ────────────────────
+     * CRASH (live log): X8 = 0xf9443508d0002308 (corrupted vtable ptr), PC jumps
+     * to non-canonical kernel space → Dynarmic NoExecuteFault.
+     * Decompiled body dereferences *(_QWORD*)this+8 and *(_QWORD*)this+32 with
+     * ZERO validation. When component memory is freed during level unload, `this`
+     * carries garbage vtable bytes from heap allocator free-list links.
+     * Our hook validates the vtable before any virtual dispatch.
+     *
+     * nm -D libswordigo.so v1.4.12 arm64-v8a: 0x247c48 ✓ (confirmed in symbols file)
+     */
+    { 0x247c48, "sre_ComponentOutletBase_Connect" },
 
     /* Force GLES 2.0 Mode — hook RenderingContext::C1.
      * nm arm64 v1.4.12: 0x48afb0. Relay built by gui_relays[] in main.cpp
@@ -557,6 +626,11 @@ void sre_init(uint64_t swordigo_base, uint64_t empty_bss_off) {
         g_sre_game_speed = config.engine_speed;
         g_sre_coin_limit = config.coin_limit;
     }
+
+    /* Install C++ exception terminate handler safeguard.
+     * Prevents the __verbose_terminate_handler -> abort() crash loop
+     * described in crash report 02. Must run after g_swordigo_base is set. */
+    sre_install_exception_safeguard();
 }
 
 // Host-side bridge function import
@@ -573,6 +647,81 @@ void sre_PVRTTextureLoadFromPVRBuffer_hook(
     int *param_7, int *param_8
 ) {
     sre_PVRTTextureLoadFromPVRBuffer(param_1, param_2, param_3, param_4, param_5, param_6, param_7, param_8);
+}
+
+/* =========================================================================
+ * sre_custom_terminate_handler — intercepts ARM64 __verbose_terminate_handler
+ *
+ * Root cause (crash report 02):
+ *   An uncaught C++ exception in a guest CaverShell/SceneObject component
+ *   causes the ARM64 libc++abi unwinder to call
+ *     __gnu_cxx::__verbose_terminate_handler (0x015702A8)
+ *       → __cxxabiv1::__terminate (0x0151DFEC)
+ *       → abort()
+ *   Our abort-recovery interceptor catches abort() but the stack canary
+ *   value in X8 (0xdeadc0de12345678) causes the unwind to fail, leaving
+ *   Dynarmic halted at 0x10771ac.
+ *
+ * Fix: install this function as std::set_terminate (at 0x151E068) so the
+ *   ABI calls US instead of abort(). We longjmp to the nearest SRE recovery
+ *   point, letting the game loop continue without crashing.
+ *
+ * Architecture note: this is a guest ARM64 function pointer — it is called
+ *   BY the guest ABI unwinder, not by the host. The host-side SRE code
+ *   patches the guest's std::terminate_handler pointer via a direct write
+ *   into guest memory (swordigo_base + 0x151E068).
+ * ========================================================================= */
+
+void sre_custom_terminate_handler(void) {
+    printf("[SRE/Exception] Uncaught C++ exception intercepted in guest engine — recovering...\n");
+
+    /* Longjmp to the innermost SRE recovery point.
+     * g_sre_recovery_depth is kept by sre_lua.c's recovery stack. */
+    if (g_sre_recovery_depth > 0) {
+        int target = g_sre_recovery_depth - 1;
+        sre_recovery_entry* entry = &g_sre_recovery_stack[target];
+        sre_longjmp(entry->buf, 1);
+        /* never reached */
+    }
+
+    /* No recovery point — print and soft-exit rather than aborting */
+    printf("[SRE/Exception] No recovery point available — soft-exiting to prevent abort loop.\n");
+    /* Deliberately DO NOT call abort() — just return.
+     * The JIT will see an invalid PC and Dynarmic will halt gracefully. */
+}
+
+/**
+ * sre_install_exception_safeguard — patch the guest std::terminate_handler.
+ *
+ * std::set_terminate is at swordigo_base + 0x151E068 (IDA: _ZSt14set_unexpectedPFvvE).
+ * The terminate handler slot is a function pointer in .bss that std::terminate reads.
+ * We overwrite that pointer with our sre_custom_terminate_handler guest address.
+ *
+ * Called from sre_init() after sre_caver_init(), when g_swordigo_base is valid.
+ */
+void sre_install_exception_safeguard(void) {
+    if (!g_swordigo_base) return;
+
+    /* The terminate handler stored in .data is at offset 0x7EEBD8 in libswordigo.so.
+     * This is the data pointer that __cxxabiv1::__terminate() reads.
+     * From IDA: DAT_007EEBD8 = terminate_handler (function pointer).
+     *
+     * We write our handler's address there directly.
+     * Note: sre_custom_terminate_handler is a GUEST function (compiled into
+     *   libsre.so), so we need its guest virtual address. */
+    extern void sre_custom_terminate_handler(void);
+    uint64_t terminate_slot = g_swordigo_base + 0x7EEBD8ULL;
+    /* Cast via void* to avoid uintptr_t without stdint.h on older toolchains */
+    void* fn_ptr = (void*)sre_custom_terminate_handler;
+    uint64_t handler_guest_vaddr;
+    __builtin_memcpy(&handler_guest_vaddr, &fn_ptr, sizeof(handler_guest_vaddr));
+
+    /* Write the new terminate handler pointer into guest memory */
+    *(uint64_t*)terminate_slot = handler_guest_vaddr;
+
+    printf("[SRE/Exception] Installed custom terminate handler at 0x%llx -> 0x%llx\n",
+           (unsigned long long)terminate_slot,
+           (unsigned long long)handler_guest_vaddr);
 }
 
 /* Module-scoped VTable validator.
@@ -598,4 +747,56 @@ int sre_is_valid_vtable_ptr(uint64_t vtable) {
     return 0;
 }
 
+/* =========================================================================
+ * Render-Frame Recovery Guard  (Crash-Report-03 Fix)
+ *
+ * Root cause: CaverShell::Render calls C_Matrix4Mul. If the matrix helper
+ * returns via a corrupted LR (e.g. 0x12fd3d9 — 1 byte past the end of
+ * Caver::Proto::ObjectLibrary::Clear), Dynarmic tries to decode garbage
+ * opcode 0x6854ffff at that misaligned address and halts the JIT.
+ *
+ * Fix: bracket every CaverShell::Render dispatch with sre_render_guard_begin()
+ * + sre_render_guard_end(). The emulator's is_valid_exec_pc() validator and
+ * the MemoryReadCode BRK-injection path both call:
+ *
+ *     sre_longjmp(g_sre_render_recovery_jmp, 2)
+ *
+ * which unwinds back to the sre_setjmp checkpoint set here, skipping the
+ * broken render frame without crashing the process.
+ *
+ * USAGE (host side, in the render hook):
+ *
+ *     sre_jmp_buf render_buf;
+ *     sre_render_guard_begin(&render_buf);
+ *     if (sre_setjmp(render_buf) == 0) {
+ *         g_emulator_64->call(render_vaddr, {caverShell, renderCtx});
+ *     }
+ *     sre_render_guard_end();
+ *
+ * (The SRE render hook in sre_caver.c calls this.)
+ * ========================================================================= */
 
+/* Host-visible globals — externed in emulator_dynarmic64.cpp */
+int   g_sre_render_recovery_active = 0;
+void* g_sre_render_recovery_jmp    = NULL;
+
+/**
+ * sre_render_guard_begin — install a render-frame recovery envelope.
+ *
+ * @param jmp_buf_ptr  Pointer to the caller's sre_jmp_buf (stack-allocated).
+ *                     The emulator will longjmp into it with val=2 on bad PC.
+ *                     MUST remain on the stack until sre_render_guard_end() is called.
+ */
+void sre_render_guard_begin(void* jmp_buf_ptr) {
+    g_sre_render_recovery_jmp    = jmp_buf_ptr;
+    g_sre_render_recovery_active = 1;
+}
+
+/**
+ * sre_render_guard_end — remove the render-frame recovery envelope.
+ * Must be called after the render call returns (or longjmp fires).
+ */
+void sre_render_guard_end(void) {
+    g_sre_render_recovery_active = 0;
+    g_sre_render_recovery_jmp    = NULL;
+}

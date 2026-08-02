@@ -150,6 +150,23 @@ public:
         uint64_t status_addr,
         uint64_t print_addr);
 
+    // Scene Shifter — guest memory address wiring.
+    // Call once after libsre.so is loaded (same time as init_lua_console).
+    // Pass g_guest_memory as base and each symbol's VA from get_symbol_vaddr().
+    // After this, the GUI reads/writes scene shifter state in guest memory
+    // instead of the (always-empty) host-side weak fallback copies.
+    void init_scene_shifter(
+        uint8_t* guest_memory,
+        uint64_t scene_list_count_va,   // int  g_sre_scene_list_count
+        uint64_t scene_list_va,          // char g_sre_scene_list[256][128]
+        uint64_t shift_pending_va,       // volatile int  g_sre_scene_shift_pending
+        uint64_t shift_target_va,        // char g_sre_scene_shift_target[128]
+        uint64_t shift_spawn_va,         // char g_sre_scene_shift_spawn[64]
+        uint64_t shift_error_va,         // char g_sre_scene_shift_last_error[256]
+        uint64_t shift_active_va,        // int  g_sre_scene_shift_active
+        uint64_t current_scene_va,       // char g_sre_current_scene_name[128]
+        const std::string& assets_dir);  // path for host-side scan fallback
+
     // Returns true if a command was consumed (caller should not re-process key).
     bool lua_console_key(SDL_Keycode key, const std::string& text_input);
     // Append text from SDL_EVENT_TEXT_INPUT
@@ -218,6 +235,20 @@ private:
     uint64_t      m_console_pending_addr = 0;
     uint64_t      m_console_status_addr  = 0;
     uint64_t      m_console_print_addr   = 0;
+
+    // ---- Scene Shifter guest memory pointers ----
+    // All non-zero after init_scene_shifter() succeeds.
+    // Each is a VA in guest address space; add m_guest_memory to get host ptr.
+    bool     m_scene_shifter_ready    = false;
+    uint64_t m_ss_list_count_va       = 0;  // int
+    uint64_t m_ss_list_va             = 0;  // char[256][128]
+    uint64_t m_ss_pending_va          = 0;  // volatile int
+    uint64_t m_ss_target_va           = 0;  // char[128]
+    uint64_t m_ss_spawn_va            = 0;  // char[64]
+    uint64_t m_ss_error_va            = 0;  // char[256]
+    uint64_t m_ss_active_va           = 0;  // int
+    uint64_t m_ss_current_scene_va    = 0;  // char[128]
+    std::string m_ss_assets_dir;            // host path: ~/.../assets/resources
 
     static constexpr int CONSOLE_MAX_HISTORY = 4096;
 

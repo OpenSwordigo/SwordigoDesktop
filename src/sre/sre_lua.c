@@ -240,8 +240,12 @@ void sre_log_lua_error(const char* source, const char* err_msg) {
 sre_recovery_entry g_sre_recovery_stack[SRE_MAX_RECOVERY];
 int g_sre_recovery_depth = 0;
 
-/* Push a recovery entry. Returns the depth index, or -1 if stack full. */
-static int recovery_push(lua_State* L) {
+/* Push a recovery entry. Returns the depth index, or -1 if stack full.
+ * NOT static: sre_scene_update.c and other SRE compilation units call this
+ * via extern declaration. Making it static caused it to go through the PLT
+ * bridge stub → [Bridge64] !! UNHANDLED → return 0 in X0 → recovery stack
+ * grew unbounded across scene transitions → 4.7M bridge calls per load. */
+int recovery_push(lua_State* L) {
     if (g_sre_recovery_depth >= SRE_MAX_RECOVERY) return -1;
     int idx = g_sre_recovery_depth;
     sre_recovery_entry* e = &g_sre_recovery_stack[idx];
@@ -256,8 +260,9 @@ static int recovery_push(lua_State* L) {
     return idx;
 }
 
-/* Pop recovery stack back to a given depth */
-static void recovery_pop(int depth) {
+/* Pop recovery stack back to a given depth.
+ * NOT static: see note on recovery_push above. */
+void recovery_pop(int depth) {
     g_sre_recovery_depth = depth;
 }
 

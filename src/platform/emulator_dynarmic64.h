@@ -80,6 +80,10 @@ public:
     // The Dynarmic Jit instance (public for callbacks to access)
     Dynarmic::A64::Jit* get_jit() { return jit.get(); }
 
+    // ProHook Phase 1: Invalidate the JIT code cache for a guest address range.
+    // Called by srehost_impl.cpp without needing the full Dynarmic::A64::Jit type.
+    void invalidate_cache_range(uint64_t guest_vaddr, size_t size);
+
     // Bridge halt flag — set by memory callback when PC enters bridge region
     bool bridge_halt_requested = false;
     uint64_t bridge_halt_address = 0;

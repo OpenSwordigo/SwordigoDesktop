@@ -414,12 +414,11 @@ bool write(const std::string& path, const InventoryState& inv,
 // SrtOverlay — Constructor
 // ============================================================================
 
+#include "platform/data_path.h"
+
 SrtOverlay::SrtOverlay() {
-    // Default save directory
-    const char* home = getenv("HOME");
-    if (home) {
-        save_dir = std::string(home) + "/.local/share/swordigo-desktop/save/Documents/";
-    }
+    // Dynamic VFS save directory
+    save_dir = get_vfs_save_dir();
 }
 
 
@@ -492,7 +491,8 @@ void SrtOverlay::draw_item_button(GuiRenderer& gui, float x, float y, float w, f
 
 void SrtOverlay::scan_saves() {
     save_files.clear();
-    DIR* dir = opendir(save_dir.c_str());
+    std::string eff_dir = get_vfs_save_dir(save_dir);
+    DIR* dir = opendir(eff_dir.c_str());
     if (!dir) return;
 
     struct dirent* entry;

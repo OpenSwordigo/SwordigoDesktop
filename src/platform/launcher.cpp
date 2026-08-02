@@ -425,10 +425,8 @@ LaunchConfig show_launcher(BinarySelector& selector) {
     std::string ed_coins, ed_health, ed_mana, ed_xp, ed_weapon, ed_keys;
     int se_active_field = -1;  // Which field is being edited (-1=none, 0=coins, 1=health, 2=mana, 3=xp, 4=weapon, 5=keys)
     bool se_status_ok = false;
-    // Save directory path
-    std::string home_dir_str = getenv("HOME") ? getenv("HOME") : "/tmp";
-    std::string xdg_str = getenv("XDG_DATA_HOME") ? getenv("XDG_DATA_HOME") : (home_dir_str + "/.local/share");
-    std::string save_doc_dir = xdg_str + "/swordigo-desktop/save/Documents";
+    #include "platform/data_path.h"
+    std::string save_doc_dir = get_vfs_save_dir();
 
     // Auto-launch countdown
     auto start_time = std::chrono::steady_clock::now();

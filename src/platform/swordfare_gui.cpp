@@ -29,7 +29,7 @@
 #include "display.h"
 #include "input_config.h"
 #include "data_path.h"
-#include "save_editor.h"
+#include "fbo_scaler.h"
 
 #include <iostream>
 #include <fstream>
@@ -48,6 +48,21 @@ bool g_sre_overlay_blocking = false;
 // Guest heap size reporters (defined in jni_bridge_arm64.cpp / jni_bridge.cpp)
 extern "C" uint32_t get_guest_heap_size_64();
 extern "C" uint32_t get_guest_heap_size_32();
+
+// Weak fallback definitions for SRE Scene Shifter symbols (resolved from guest space at runtime)
+extern "C" {
+    __attribute__((weak)) int    g_sre_scene_list_count = 0;
+    __attribute__((weak)) char   g_sre_scene_list[256][128] = {{0}};
+    __attribute__((weak)) volatile int   g_sre_scene_shift_pending = 0;
+    __attribute__((weak)) char   g_sre_scene_shift_target[128] = {0};
+    __attribute__((weak)) char   g_sre_scene_shift_spawn[64] = "start";
+    __attribute__((weak)) char   g_sre_scene_shift_last_error[256] = {0};
+    __attribute__((weak)) volatile int   g_sre_scene_shift_active = 0;
+    __attribute__((weak)) char   g_sre_current_scene_name[128] = {0};
+    __attribute__((weak)) void   sre_scene_shifter_scan_scenes(void) {}
+    // AnimateIn hook trampoline pointer — set by host after relay install
+    __attribute__((weak)) void*  g_orig_SceneLoadingView_AnimateIn = NULL;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers — no stdlib in SRE land, but this is host-side C++ so fine
@@ -1407,116 +1422,6 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
         }
 
         if (ImGui::BeginTabBar("##mod_overlay_tabs")) {
-            if (ImGui::BeginTabItem("Swordiforge (Mod Store)")) {
-                ImGui::Spacing();
-                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.09f, 0.11f, 0.15f, 0.5f));
-                if (ImGui::BeginChild("##swordiforge_child", ImVec2(0, 0), true)) {
-                    ImGui::TextColored(ImVec4(0.00f, 0.85f, 1.00f, 1.0f), "SWORDIFORGE OFFICIAL COMMUNITY MOD STORE");
-                    ImGui::TextDisabled("Browse, enable, and manage SwKiwi and SRE community mods for Swordigo Desktop.");
-                    ImGui::Separator();
-                    ImGui::Spacing();
-
-                    static int selected_store_mod = 0;
-                    struct StoreMod {
-                        const char* name;
-                        const char* author;
-                        const char* version;
-                        const char* tag;
-                        const char* description;
-                        bool installed;
-                        bool active;
-                    };
-
-                    static StoreMod store_mods[] = {
-                        { "RL Swordigo Remaster", "SwKiwi Team", "v2.4", "TOTAL CONVERSION", "Complete gameplay overhaul featuring active weapon trinkets, extended spell damage, custom level design, and new hero models.", true, true },
-                        { "Frozen Caverns Custom Map", "MapMakerX", "v1.1", "CUSTOM MAP", "Explore a completely new frozen tundra area with custom enemies, puzzles, and hidden treasure chests.", true, false },
-                        { "Hero Skin Pack: Magic Armor", "SkinCrafter", "v1.0", "COSMETIC MESH", "Swaps hero base model with high-poly Magic Armor model and custom elemental particle trails.", false, false },
-                        { "Speedrun HUD & Teleporter", "SpeedyDev", "v3.0", "UTILITY", "Adds live split timer, hitboxes display, position saved states, and instant level teleporter to the Raijin console.", true, true },
-                        { "4K HD Texture Pack", "TextureWizard", "v1.5", "GRAPHICS", "Replaces all vanilla PVR textures with uncompressed 4K PVRTC/PNG textures.", false, false }
-                    };
-                    int mod_count = sizeof(store_mods) / sizeof(store_mods[0]);
-
-                    ImGui::BeginGroup();
-                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.08f, 0.11f, 0.6f));
-                    if (ImGui::BeginChild("##mod_list_left", ImVec2(320, 0), true)) {
-                        for (int m = 0; m < mod_count; m++) {
-                            ImGui::PushID(m);
-                            bool is_selected = (selected_store_mod == m);
-                            if (ImGui::Selectable(store_mods[m].name, is_selected, 0, ImVec2(0, 32))) {
-                                selected_store_mod = m;
-                            }
-                            if (store_mods[m].active) {
-                                ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f), "  [ACTIVE]");
-                            } else if (store_mods[m].installed) {
-                                ImGui::TextColored(ImVec4(1.00f, 0.78f, 0.20f, 1.0f), "  [INSTALLED]");
-                            } else {
-                                ImGui::TextColored(ImVec4(0.60f, 0.60f, 0.60f, 1.0f), "  [AVAILABLE]");
-                            }
-                            ImGui::PopID();
-                        }
-                    }
-                    ImGui::EndChild();
-                    ImGui::PopStyleColor();
-                    ImGui::EndGroup();
-
-                    ImGui::SameLine();
-
-                    if (selected_store_mod >= 0 && selected_store_mod < mod_count) {
-                        StoreMod& mod = store_mods[selected_store_mod];
-                        ImGui::BeginGroup();
-                        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.08f, 0.11f, 0.6f));
-                        if (ImGui::BeginChild("##mod_details_right", ImVec2(0, 0), true)) {
-                            ImGui::TextColored(ImVec4(0.00f, 0.85f, 1.00f, 1.0f), "%s", mod.name);
-                            ImGui::TextDisabled("By %s  •  Version %s  •  Tag: %s", mod.author, mod.version, mod.tag);
-                            ImGui::Separator();
-                            ImGui::Spacing();
-
-                            ImGui::PushTextWrapPos(0.0f);
-                            ImGui::Text("%s", mod.description);
-                            ImGui::PopTextWrapPos();
-                            ImGui::Spacing();
-                            ImGui::Separator();
-                            ImGui::Spacing();
-
-                            if (mod.active) {
-                                ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f), "Status: Loaded in SRE 5-Level VFS Hierarchy");
-                                if (ImGui::Button("Disable Mod Profile", ImVec2(180, 36))) {
-                                    mod.active = false;
-                                    m_status_msg = std::string("Disabled mod: ") + mod.name;
-                                    m_status_timer = 3.0f;
-                                }
-                            } else if (mod.installed) {
-                                ImGui::TextColored(ImVec4(1.00f, 0.78f, 0.20f, 1.0f), "Status: Installed in mods/ directory");
-                                if (ImGui::Button("Enable & Mount Mod", ImVec2(180, 36))) {
-                                    mod.active = true;
-                                    m_status_msg = std::string("Mounted mod in SRE VFS: ") + mod.name;
-                                    m_status_timer = 3.0f;
-                                }
-                            } else {
-                                ImGui::TextColored(ImVec4(0.60f, 0.60f, 0.60f, 1.0f), "Status: Available for Download");
-                                if (ImGui::Button("Download & Install", ImVec2(180, 36))) {
-                                    mod.installed = true;
-                                    mod.active = true;
-                                    m_status_msg = std::string("Installed mod to mods/: ") + mod.name;
-                                    m_status_timer = 3.0f;
-                                }
-                            }
-
-                            if (m_status_timer > 0.0f) {
-                                ImGui::Spacing();
-                                ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f), "✨ %s", m_status_msg.c_str());
-                            }
-                        }
-                        ImGui::EndChild();
-                        ImGui::PopStyleColor();
-                        ImGui::EndGroup();
-                    }
-                }
-                ImGui::EndChild();
-                ImGui::PopStyleColor();
-                ImGui::EndTabItem();
-            }
-
             if (ImGui::BeginTabItem("Readme")) {
                 ImGui::Spacing();
                 ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.125f, 0.150f, 0.190f, 0.3f));
@@ -1541,269 +1446,512 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                 ImGui::EndTabItem();
             }
 
-            if (ImGui::BeginTabItem("Save Profile Manager")) {
+            if (ImGui::BeginTabItem(ICON_FA_GEAR " Options")) {
                 ImGui::Spacing();
-                if (m_save_files.empty()) {
-                    scan_saves(save_dir);
-                }
-                
-                if (m_save_files.empty()) {
-                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "No save profiles (.gplayer) found in directory:");
-                    ImGui::TextUnformatted(save_dir.c_str());
-                    if (ImGui::Button("Rescan Profiles")) {
-                        scan_saves(save_dir);
-                    }
-                } else {
-                    ImGui::Text("Select Save Profile:");
+                extern void apply_render_preset(int preset);
+                extern int  g_render_preset;
+                extern int  GAME_W, GAME_H;
+                extern int  g_win_w, g_win_h;
+                extern PostFXState  g_postfx;
+                extern PostFXPreset g_postfx_preset;
+
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.09f, 0.12f, 0.5f));
+                if (ImGui::BeginChild("##options_child", ImVec2(0, 0), true)) {
+
+                    // ── RENDER RESOLUTION ──────────────────────────────────────────────
+                    ImGui::TextColored(ImVec4(0.00f, 0.85f, 1.00f, 1.0f), ICON_FA_DISPLAY "  RENDER RESOLUTION");
+                    ImGui::TextDisabled("Internal FBO resolution the game renders at. Upscaled to output by the active filter.");
+                    ImGui::Separator();
                     ImGui::Spacing();
-                    
-                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.14f, 0.17f, 0.4f));
-                    if (ImGui::BeginChild("##saves_list_child", ImVec2(240, 0), true)) {
-                        for (int s = 0; s < (int)m_save_files.size(); s++) {
-                            bool selected = (m_selected_save == s);
-                            if (ImGui::Selectable(m_save_files[s].c_str(), selected)) {
-                                if (m_selected_save != s) {
-                                    m_selected_save = s;
-                                    load_save(save_dir + "/" + m_save_files[s]);
-                                }
+
+                    ImGui::Text("Active render: "); ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f), "%d x %d", GAME_W, GAME_H);
+                    ImGui::Spacing();
+
+                    struct ResPreset { const char* label; const char* desc; int idx; int w; int h; };
+                    static const ResPreset render_presets[] = {
+                        { "4K      (3840 x 2160)", "Ultra HD — huge GPU cost",                                    10, 3840, 2160 },
+                        { "1440p   (2560 x 1440)", "2K — sharp, moderate GPU cost",                              9,  2560, 1440 },
+                        { "1080p   (1920 x 1080)", "Full HD — best quality/perf tradeoff",                       0,  1920, 1080 },
+                        { "900p    (1600 x  900)", "High — ~30% less GPU than 1080p",                           11,  1600,  900 },
+                        { "768p    (1366 x  768)", "Laptop native — balanced",                                  12,  1366,  768 },
+                        { "720p    (1280 x  720)", "HD — ~44% GPU savings vs 1080p",                             1,  1280,  720 },
+                        { "600p    (1024 x  600)", "Tablet — good for low-end GPU",                             13,  1024,  600 },
+                        { "540p    ( 960 x  544)", "Android native — fastest, ~75% savings",                    2,   960,  544 },
+                        { "480p    ( 854 x  480)", "WVGA — very fast",                                          14,   854,  480 },
+                        { "360p    ( 640 x  360)", "Low — maximum performance",                                 15,   640,  360 },
+                        { "240p    ( 426 x  240)", "Retro-low — extreme performance mode",                     16,   426,  240 },
+                        { "WUXGA   (1920 x 1200)", "16:10 — slightly taller than 1080p",                       17,  1920, 1200 },
+                        { "1440x900 (1440 x  900)", "Older widescreen laptop",                                 18,  1440,  900 },
+                        { "1280x800 (1280 x  800)", "iPad-like — 16:10",                                       19,  1280,  800 },
+                        { "Window  (match output)",  "1:1 pixel mapping — no upscaling",                        3,     0,    0 },
+                    };
+                    static const int render_preset_count = (int)(sizeof(render_presets)/sizeof(render_presets[0]));
+
+                    // 3-column preset grid
+                    for (int pi = 0; pi < render_preset_count; pi++) {
+                        const ResPreset& pr = render_presets[pi];
+                        bool selected = (g_render_preset == pr.idx);
+                        if (pi % 3 != 0) ImGui::SameLine(0, 6);
+                        if (selected) {
+                            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.18f, 0.52f, 0.18f, 1.0f));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.65f, 0.22f, 1.0f));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.14f, 0.42f, 0.14f, 1.0f));
+                        }
+                        ImGui::PushID(100 + pi);
+                        if (ImGui::Button(pr.label, ImVec2(250, 30))) {
+                            apply_render_preset(pr.idx);
+                            m_status_msg = std::string("Render res: ") + pr.label;
+                            m_status_timer = 3.0f;
+                        }
+                        ImGui::PopID();
+                        if (selected) ImGui::PopStyleColor(3);
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", pr.desc);
+                    }
+
+                    // Custom render resolution
+                    ImGui::Spacing();
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Custom render resolution:");
+                    static int custom_rw = 1280, custom_rh = 720;
+                    ImGui::SetNextItemWidth(120); ImGui::InputInt("W##crw", &custom_rw); ImGui::SameLine();
+                    ImGui::SetNextItemWidth(120); ImGui::InputInt("H##crh", &custom_rh); ImGui::SameLine();
+                    if (ImGui::Button("Apply Custom Render Res")) {
+                        custom_rw = std::max(160, std::min(custom_rw, 7680));
+                        custom_rh = std::max(120, std::min(custom_rh, 4320));
+                        GAME_W = custom_rw & ~1; GAME_H = custom_rh & ~1;
+                        extern void fbo_destroy(); extern bool fbo_init(int, int);
+                        fbo_destroy(); fbo_init(GAME_W, GAME_H);
+                        g_render_preset = -1;
+                        m_status_msg = "Custom render res: " + std::to_string(GAME_W) + "x" + std::to_string(GAME_H);
+                        m_status_timer = 3.0f;
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    // ── OUTPUT / WINDOW RESOLUTION ────────────────────────────────────
+                    ImGui::TextColored(ImVec4(0.00f, 0.85f, 1.00f, 1.0f), ICON_FA_IMAGE "  OUTPUT RESOLUTION (WINDOW SIZE)");
+                    ImGui::TextDisabled("OS window size. The render FBO is upscaled to this by the active filter.");
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    ImGui::Text("Current output: "); ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f), "%d x %d", g_win_w, g_win_h);
+                    ImGui::Spacing();
+
+                    struct OutPreset { const char* label; int w; int h; };
+                    static const OutPreset out_presets[] = {
+                        { "3840x2160 (4K)",  3840, 2160 }, { "2560x1440 (2K)",  2560, 1440 },
+                        { "1920x1080",        1920, 1080 }, { "1600x900",         1600,  900 },
+                        { "1280x720",         1280,  720 }, { "960x544 (native)",  960,  544 },
+                    };
+                    for (int oi = 0; oi < 6; oi++) {
+                        if (oi % 3 != 0) ImGui::SameLine(0, 6);
+                        ImGui::PushID(200 + oi);
+                        if (ImGui::Button(out_presets[oi].label, ImVec2(210, 30))) {
+                            if (m_window) {
+                                SDL_SetWindowSize(m_window, out_presets[oi].w, out_presets[oi].h);
+                                m_status_msg = std::string("Output: ") + out_presets[oi].label;
+                                m_status_timer = 3.0f;
                             }
+                        }
+                        ImGui::PopID();
+                    }
+
+                    // Custom output resolution
+                    ImGui::Spacing();
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Custom output size:");
+                    static int custom_ow = 1280, custom_oh = 720;
+                    ImGui::SetNextItemWidth(120); ImGui::InputInt("W##cow", &custom_ow); ImGui::SameLine();
+                    ImGui::SetNextItemWidth(120); ImGui::InputInt("H##coh", &custom_oh); ImGui::SameLine();
+                    if (ImGui::Button("Apply Custom Output")) {
+                        if (m_window) {
+                            SDL_SetWindowSize(m_window,
+                                std::max(320, std::min(custom_ow, 7680)),
+                                std::max(240, std::min(custom_oh, 4320)));
+                            m_status_msg = "Output: " + std::to_string(custom_ow) + "x" + std::to_string(custom_oh);
+                            m_status_timer = 3.0f;
                         }
                     }
-                    ImGui::EndChild();
-                    ImGui::PopStyleColor();
-                    
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    // ── UPSCALE / SCALE FILTER ────────────────────────────────────────
+                    ImGui::TextColored(ImVec4(0.00f, 0.85f, 1.00f, 1.0f), ICON_FA_LAYER_GROUP "  UPSCALE FILTER");
+                    ImGui::TextDisabled("Algorithm used to upscale the render FBO to the output window.");
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    extern FBOScale g_fbo_mode;
+                    const char* scale_labels[] = {
+                        "Sharp Bilinear   (2-pass, anti-alias)",
+                        "Nearest Neighbor (crisp pixel-art)",
+                        "CRT Scanline     (retro CRT effect)",
+                        "FSR 1.0          (AMD FidelityFX EASU)",
+                    };
+                    for (int si = 0; si < 4; si++) {
+                        bool sel = (g_fbo_mode == static_cast<FBOScale>(si));
+                        if (sel) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.5f, 1.0f));
+                        ImGui::PushID(300 + si);
+                        if (ImGui::Selectable(scale_labels[si], sel)) {
+                            g_fbo_mode = static_cast<FBOScale>(si);
+                            m_status_msg = std::string("Scale: ") + scale_labels[si];
+                            m_status_timer = 2.0f;
+                        }
+                        ImGui::PopID();
+                        if (sel) ImGui::PopStyleColor();
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    // ── POST-FX PRESETS ───────────────────────────────────────────────
+                    ImGui::TextColored(ImVec4(0.00f, 0.85f, 1.00f, 1.0f), ICON_FA_WAND_SPARKLES "  POST-PROCESSING (PostFX)");
+                    ImGui::TextDisabled("Visual effects applied after the game renders. Tuned for Swordigo's art style.");
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    // Preset selector
+                    const char* preset_labels[] = {
+                        "Off", "SW+ Medium", "SW+ High (PBR)", "Atmospheric",
+                        "Ethereal", "Cinematic", "Retro", "Fantasy", "Noir", "Custom"
+                    };
+                    ImGui::Text("Preset:"); ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", g_postfx.preset_name);
+                    ImGui::Spacing();
+
+                    for (int pi = 0; pi < (int)PostFXPreset::COUNT; pi++) {
+                        bool sel = ((int)g_postfx_preset == pi);
+                        if (pi % 5 != 0) ImGui::SameLine(0, 6);
+                        if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.18f, 1.0f));
+                        ImGui::PushID(400 + pi);
+                        if (ImGui::Button(preset_labels[pi], ImVec2(138, 30))) {
+                            g_postfx_preset = (PostFXPreset)pi;
+                            postfx_apply_preset(g_postfx, g_postfx_preset);
+                            m_status_msg = std::string("PostFX: ") + g_postfx.preset_name;
+                            m_status_timer = 2.0f;
+                        }
+                        ImGui::PopID();
+                        if (sel) ImGui::PopStyleColor();
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Fine-tune individual effects:");
+                    ImGui::Spacing();
+
+                    // Tier 1: color effects
+                    ImGui::Checkbox("Vignette",    &g_postfx.vignette);
+                    if (g_postfx.vignette) { ImGui::SameLine(); ImGui::SetNextItemWidth(160);
+                        ImGui::SliderFloat("##vig", &g_postfx.vignette_intensity, 0.0f, 1.0f, "Strength %.2f"); }
+
+                    ImGui::Checkbox("Bloom",       &g_postfx.bloom);
+                    if (g_postfx.bloom) {
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(140);
+                        ImGui::SliderFloat("##blmi", &g_postfx.bloom_intensity, 0.0f, 1.0f, "Intensity %.2f");
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(140);
+                        ImGui::SliderFloat("##blmt", &g_postfx.bloom_threshold, 0.0f, 1.0f, "Threshold %.2f");
+                    }
+
+                    ImGui::Checkbox("Film Grain",  &g_postfx.film_grain);
+                    if (g_postfx.film_grain) { ImGui::SameLine(); ImGui::SetNextItemWidth(160);
+                        ImGui::SliderFloat("##grain", &g_postfx.grain_intensity, 0.0f, 0.5f, "Strength %.3f"); }
+
+                    ImGui::Checkbox("Chromatic Aberration", &g_postfx.chromatic_aberration);
+                    if (g_postfx.chromatic_aberration) { ImGui::SameLine(); ImGui::SetNextItemWidth(160);
+                        ImGui::SliderFloat("##ca", &g_postfx.ca_offset, 0.0f, 0.02f, "Offset %.4f"); }
+
+                    ImGui::Checkbox("Sharpen", &g_postfx.sharpen);
+                    if (g_postfx.sharpen) { ImGui::SameLine(); ImGui::SetNextItemWidth(160);
+                        ImGui::SliderFloat("##sharp", &g_postfx.sharpen_strength, 0.0f, 2.0f, "Strength %.2f"); }
+
+                    ImGui::Checkbox("Color Adjust", &g_postfx.color_adjust);
+                    if (g_postfx.color_adjust) {
+                        ImGui::SetNextItemWidth(200); ImGui::SliderFloat("Saturation##sat", &g_postfx.saturation, 0.0f, 3.0f);
+                        ImGui::SetNextItemWidth(200); ImGui::SliderFloat("Contrast##con",   &g_postfx.contrast,   0.0f, 3.0f);
+                        ImGui::SetNextItemWidth(200); ImGui::SliderFloat("Brightness##bri", &g_postfx.brightness,-0.5f, 0.5f);
+                        ImGui::SetNextItemWidth(200); ImGui::SliderFloat("Warmth##warm",    &g_postfx.warmth,    -1.0f, 1.0f);
+                    }
+
+                    ImGui::Spacing();
+                    // Tier 2: advanced effects
+                    ImGui::Checkbox("God Rays",    &g_postfx.god_rays);
+                    if (g_postfx.god_rays) {
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(140);
+                        ImGui::SliderFloat("##gri", &g_postfx.god_rays_intensity, 0.0f, 1.5f, "Inten %.2f");
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(140);
+                        ImGui::SliderFloat("##grd", &g_postfx.god_rays_decay, 0.8f, 1.0f, "Decay %.3f");
+                    }
+
+                    ImGui::Checkbox("SSAO",        &g_postfx.ssao);
+                    if (g_postfx.ssao) {
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(140);
+                        ImGui::SliderFloat("##ssaoi", &g_postfx.ssao_intensity, 0.0f, 3.0f, "Inten %.2f");
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(140);
+                        ImGui::SliderFloat("##ssaor", &g_postfx.ssao_radius, 0.0f, 0.1f, "Radius %.3f");
+                    }
+
+                    ImGui::Checkbox("Shadows",     &g_postfx.shadows);
+                    if (g_postfx.shadows) {
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(140);
+                        ImGui::SliderFloat("##shi", &g_postfx.shadow_intensity, 0.0f, 1.0f, "Dark %.2f");
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(140);
+                        ImGui::SliderFloat("##shs", &g_postfx.shadow_softness, 0.0f, 0.02f, "Soft %.4f");
+                    }
+
+                    ImGui::Checkbox("Outlines",    &g_postfx.outlines);
+                    if (g_postfx.outlines) {
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(140);
+                        ImGui::SliderFloat("##olt", &g_postfx.outline_thickness, 0.5f, 4.0f, "Thick %.1f");
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(140);
+                        ImGui::SliderFloat("##oli", &g_postfx.outline_intensity, 0.0f, 1.0f, "Opac %.2f");
+                    }
+
+                    ImGui::Checkbox("Volumetric Light", &g_postfx.volumetric_light);
+                    if (g_postfx.volumetric_light) { ImGui::SameLine(); ImGui::SetNextItemWidth(160);
+                        ImGui::SliderFloat("##voli", &g_postfx.volumetric_intensity, 0.0f, 1.0f, "Intensity %.2f"); }
+
+                    ImGui::Spacing();
+                    // Tier 3: Remaster
+                    ImGui::Checkbox("PBR Shading",    &g_postfx.pbr_enabled);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cook-Torrance BRDF + LabPBR materials. High GPU cost.");
                     ImGui::SameLine();
-                    
-                    if (m_selected_save >= 0 && m_selected_save < (int)m_save_files.size()) {
-                        ImGui::BeginGroup();
-                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Profile Details: %s", m_save_files[m_selected_save].c_str());
-                        ImGui::Separator();
-                        ImGui::Text("Level: %d", m_inventory.level);
-                        ImGui::Text("Coins: %d", m_inventory.coins);
-                        ImGui::Text("XP: %d", m_inventory.xp);
-                        ImGui::Text("Current HP Hearts: %d", m_inventory.current_health);
-                        ImGui::Text("Current Mana: %d", m_inventory.current_mana);
-                        ImGui::Spacing();
-                        
-                        if (m_inventory_dirty) {
-                            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "⚠️ Profile has unsaved changes!");
-                            if (ImGui::Button("Save Changes", ImVec2(160, 36))) {
-                                if (write_save(save_dir + "/" + m_save_files[m_selected_save])) {
-                                    m_status_msg = "Successfully saved changes!";
-                                    m_status_timer = 3.0f;
-                                } else {
-                                    m_status_msg = "Failed to write save profile!";
-                                    m_status_timer = 3.0f;
-                                }
-                            }
-                        } else {
-                            ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.5f, 1.0f), "✅ Profile is in-sync.");
-                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.2f, 0.2f, 0.5f));
-                            ImGui::Button("No Changes to Save", ImVec2(160, 36));
-                            ImGui::PopStyleColor();
-                        }
-                        
-                        if (m_status_timer > 0.0f) {
-                            ImGui::Spacing();
-                            ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.5f, 1.0f), "%s", m_status_msg.c_str());
-                        }
-                        
-                        ImGui::EndGroup();
-                    } else {
-                        ImGui::Text("Please select a save profile from the list.");
+                    ImGui::Checkbox("Water Reflections", &g_postfx.reflections_enabled);
+                    if (g_postfx.reflections_enabled) { ImGui::SameLine(); ImGui::SetNextItemWidth(160);
+                        ImGui::SliderFloat("##refi", &g_postfx.reflection_intensity, 0.0f, 1.0f, "Blend %.2f"); }
+
+                    // Status line
+                    if (m_status_timer > 0.0f) {
+                        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+                        ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f), "\xE2\x9C\xA8 %s", m_status_msg.c_str());
                     }
                 }
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
                 ImGui::EndTabItem();
             }
 
-            if (ImGui::BeginTabItem("Stats & Inventory Editor")) {
+            // ─────────────────────────────────────────────────────────────────
+            // Scene Shifter tab — ARM64 only feature
+            // Scans mod + vanilla directories for .scene files and provides
+            // Normal (loading screen) and Forced (instant) teleport gateways.
+            // ─────────────────────────────────────────────────────────────────
+            if (ImGui::BeginTabItem(ICON_FA_MAP " Scene Shifter")) {
+                static bool   scene_list_loaded = false;
+                static int    selected_scene     = -1;
+                static char   spawn_buf[64]      = "start";
+                static char   filter_buf[64]     = "";
+
+                // Resolve guest memory pointers if initialized, otherwise fallback to weak globals
+                int*   p_list_count  = (m_scene_shifter_ready && m_guest_memory) ? (int*)(m_guest_memory + m_ss_list_count_va) : &g_sre_scene_list_count;
+                char (*p_list)[128]  = (m_scene_shifter_ready && m_guest_memory) ? (char(*)[128])(m_guest_memory + m_ss_list_va) : g_sre_scene_list;
+                volatile int* p_pending = (m_scene_shifter_ready && m_guest_memory) ? (volatile int*)(m_guest_memory + m_ss_pending_va) : &g_sre_scene_shift_pending;
+                char*  p_target      = (m_scene_shifter_ready && m_guest_memory) ? (char*)(m_guest_memory + m_ss_target_va) : g_sre_scene_shift_target;
+                char*  p_spawn       = (m_scene_shifter_ready && m_guest_memory) ? (char*)(m_guest_memory + m_ss_spawn_va) : g_sre_scene_shift_spawn;
+                char*  p_error       = (m_scene_shifter_ready && m_guest_memory) ? (char*)(m_guest_memory + m_ss_error_va) : g_sre_scene_shift_last_error;
+                int*   p_active      = (m_scene_shifter_ready && m_guest_memory) ? (int*)(m_guest_memory + m_ss_active_va) : (int*)&g_sre_scene_shift_active;
+                char*  p_cur_scene   = (m_scene_shifter_ready && m_guest_memory && m_ss_current_scene_va) ? (char*)(m_guest_memory + m_ss_current_scene_va) : g_sre_current_scene_name;
+
+                auto do_rescan = [&]() {
+                    if (m_scene_shifter_ready && !m_ss_assets_dir.empty()) {
+                        namespace fs = std::filesystem;
+                        *p_list_count = 0;
+                        auto try_scan = [&](const fs::path& dir) {
+                            if (!fs::exists(dir) || !fs::is_directory(dir)) return;
+                            std::error_code ec;
+                            for (auto& ent : fs::recursive_directory_iterator(dir, fs::directory_options::skip_permission_denied, ec)) {
+                                if (*p_list_count >= 256) break;
+                                if (!ent.is_regular_file(ec)) continue;
+                                auto name = ent.path().filename().string();
+                                if (name.size() <= 6 || name.substr(name.size() - 6) != ".scene") continue;
+                                std::string stem = name.substr(0, name.size() - 6);
+                                bool dup = false;
+                                for (int i = 0; i < *p_list_count; i++) {
+                                    if (std::string(p_list[i]) == stem) { dup = true; break; }
+                                }
+                                if (dup) continue;
+                                strncpy(p_list[*p_list_count], stem.c_str(), 127);
+                                p_list[*p_list_count][127] = '\0';
+                                (*p_list_count)++;
+                            }
+                        };
+                        try_scan(fs::path(m_ss_assets_dir) / "resources");
+                        qsort(p_list, *p_list_count, 128, [](const void* a, const void* b) -> int {
+                            return strcmp((const char*)a, (const char*)b);
+                        });
+                    } else {
+                        sre_scene_shifter_scan_scenes();
+                    }
+                };
+
+                if (!scene_list_loaded) {
+                    do_rescan();
+                    scene_list_loaded = true;
+                }
+
                 ImGui::Spacing();
-                if (m_selected_save < 0 || m_selected_save >= (int)m_save_files.size()) {
-                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Please load a save profile in the 'Save Profile Manager' tab first.");
-                } else {
-                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.14f, 0.17f, 0.3f));
-                    if (ImGui::BeginChild("##editor_scrollable", ImVec2(0, 0), true)) {
-                        
-                        ImGui::TextColored(ImVec4(0.914f, 0.271f, 0.376f, 1.0f), "Character Attributes");
-                        ImGui::Separator();
-                        ImGui::Spacing();
-                        
-                        if (ImGui::InputInt("Coins", &m_inventory.coins)) m_inventory_dirty = true;
-                        if (ImGui::InputInt("Level", &m_inventory.level)) m_inventory_dirty = true;
-                        if (ImGui::InputInt("XP", &m_inventory.xp)) m_inventory_dirty = true;
-                        if (ImGui::InputInt("HP / Heart Container Attribute", &m_inventory.health_attr)) m_inventory_dirty = true;
-                        if (ImGui::InputInt("Attack Power Attribute", &m_inventory.attack_attr)) m_inventory_dirty = true;
-                        if (ImGui::InputInt("Magic Power Attribute", &m_inventory.magic_attr)) m_inventory_dirty = true;
-                        if (ImGui::InputInt("Current HP Hearts", &m_inventory.current_health)) m_inventory_dirty = true;
-                        if (ImGui::InputInt("Current Mana", &m_inventory.current_mana)) m_inventory_dirty = true;
-                        
-                        ImGui::Spacing();
-                        ImGui::TextColored(ImVec4(0.914f, 0.271f, 0.376f, 1.0f), "Equipment & Spells");
-                        ImGui::Separator();
-                        ImGui::Spacing();
-                        
-                        const char* weapon_names[] = { "None", "Brass Sword", "Iron Sword", "The Needle", "Broad Sword", "The Thorn", "Magic Sword", "The Mageblade" };
-                        const char* weapon_ids[] = { "", "brasssword", "ironsword", "needle", "broadsword", "thorn", "magicsword", "legendsword" };
-                        int current_weapon_idx = 0;
-                        for (int w = 0; w < 8; w++) {
-                            if (m_inventory.equipped_weapon == weapon_ids[w]) { current_weapon_idx = w; break; }
-                        }
-                        if (ImGui::Combo("Equipped Weapon", &current_weapon_idx, weapon_names, IM_ARRAYSIZE(weapon_names))) {
-                            m_inventory.equipped_weapon = weapon_ids[current_weapon_idx];
-                            if (current_weapon_idx > 0) {
-                                m_inventory.add_item(weapon_ids[current_weapon_idx], 1);
+
+                // ── Header row: current scene + controls ──────────────────
+                ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
+                                   ICON_FA_LOCATION_DOT " Current scene:");
+                ImGui::SameLine();
+                ImGui::TextUnformatted(p_cur_scene[0]
+                                       ? p_cur_scene
+                                       : "(unknown)");
+
+                ImGui::SameLine(0, 20.0f);
+                if (ImGui::SmallButton(ICON_FA_ARROWS_ROTATE " Refresh")) {
+                    do_rescan();
+                    scene_list_loaded = true;
+                    selected_scene = -1;
+                }
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+                                   "%d scenes", *p_list_count);
+
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // ── Filter + scene list ───────────────────────────────────
+                ImGui::SetNextItemWidth(-1);
+                ImGui::InputTextWithHint("##ss_filter", ICON_FA_MAGNIFYING_GLASS " Filter scenes...",
+                                         filter_buf, sizeof(filter_buf));
+
+                float list_h = ImGui::GetContentRegionAvail().y - 130.0f;
+                if (list_h < 120.0f) list_h = 120.0f;
+
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.06f, 0.06f, 0.6f));
+                ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0.15f, 0.45f, 0.85f, 0.7f));
+                ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.2f, 0.55f, 1.0f,  0.7f));
+                ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0.3f, 0.65f, 1.0f,  0.9f));
+
+                if (ImGui::BeginChild("##scene_list", ImVec2(0, list_h), true)) {
+                    if (*p_list_count == 0) {
+                        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                            "No scenes found.\nMake sure a mod is active or vanilla assets are accessible.\n"
+                            "Press Refresh to scan again.");
+                    } else {
+                        for (int i = 0; i < *p_list_count; i++) {
+                            const char* name = p_list[i];
+                            // Apply filter
+                            if (filter_buf[0] && !strstr(name, filter_buf)) continue;
+
+                            // Highlight current scene
+                            bool is_current = (p_cur_scene[0] &&
+                                               strcmp(name, p_cur_scene) == 0);
+
+                            if (is_current) {
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.5f, 1.0f));
                             }
-                            m_inventory_dirty = true;
-                        }
-                        
-                        const char* armor_names[] = { "None", "Plate Armor", "Magic Armor" };
-                        const char* armor_ids[] = { "", "platearmor", "magicarmor" };
-                        int current_armor_idx = 0;
-                        for (int a = 0; a < 3; a++) {
-                            if (m_inventory.equipped_armor == armor_ids[a]) { current_armor_idx = a; break; }
-                        }
-                        if (ImGui::Combo("Equipped Armor", &current_armor_idx, armor_names, IM_ARRAYSIZE(armor_names))) {
-                            m_inventory.equipped_armor = armor_ids[current_armor_idx];
-                            if (current_armor_idx > 0) {
-                                m_inventory.add_item(armor_ids[current_armor_idx], 1);
+
+                            char label[160];
+                            snprintf(label, sizeof(label), "%s %s",
+                                     is_current ? ICON_FA_LOCATION_DOT : "   ", name);
+
+                            bool sel = (selected_scene == i);
+                            if (ImGui::Selectable(label, sel,
+                                    ImGuiSelectableFlags_AllowDoubleClick)) {
+                                selected_scene = i;
+                                // Double-click → fill spawn and set as target
+                                if (ImGui::IsMouseDoubleClicked(0)) {
+                                    strncpy(p_target, name, 127);
+                                    p_target[127] = '\0';
+                                }
                             }
-                            m_inventory_dirty = true;
-                        }
-                        
-                        ImGui::Spacing();
-                        ImGui::Text("Spells:");
-                        bool has_bolt = m_inventory.has_skill("bolt");
-                        if (ImGui::Checkbox("Magic Bolt", &has_bolt)) {
-                            if (has_bolt) m_inventory.add_skill("bolt");
-                            else m_inventory.remove_skill("bolt");
-                            m_inventory_dirty = true;
-                        }
-                        ImGui::SameLine();
-                        bool has_bomb = m_inventory.has_skill("bomb");
-                        if (ImGui::Checkbox("Magic Bomb", &has_bomb)) {
-                            if (has_bomb) m_inventory.add_skill("bomb");
-                            else m_inventory.remove_skill("bomb");
-                            m_inventory_dirty = true;
-                        }
-                        ImGui::SameLine();
-                        bool has_hook = m_inventory.has_skill("hookshot");
-                        if (ImGui::Checkbox("Dragon's Grasp (Hookshot)", &has_hook)) {
-                            if (has_hook) m_inventory.add_skill("hookshot");
-                            else m_inventory.remove_skill("hookshot");
-                            m_inventory_dirty = true;
-                        }
-                        ImGui::SameLine();
-                        bool has_dim = m_inventory.has_skill("dimension");
-                        if (ImGui::Checkbox("Dimension Rift", &has_dim)) {
-                            if (has_dim) m_inventory.add_skill("dimension");
-                            else m_inventory.remove_skill("dimension");
-                            m_inventory_dirty = true;
-                        }
-                        
-                        ImGui::Spacing();
-                        ImGui::TextColored(ImVec4(0.914f, 0.271f, 0.376f, 1.0f), "Consumables & Trinkets");
-                        ImGui::Separator();
-                        ImGui::Spacing();
-                        
-                        int potion_count = 0;
-                        for (auto& item : m_inventory.items) {
-                            if (item.name == "healingpotion") potion_count = item.count;
-                        }
-                        if (ImGui::InputInt("Healing Potions", &potion_count)) {
-                            if (potion_count < 0) potion_count = 0;
-                            m_inventory.remove_item("healingpotion");
-                            if (potion_count > 0) m_inventory.add_item("healingpotion", potion_count);
-                            m_inventory_dirty = true;
-                        }
-                        
-                        int xp_sack_count = 0;
-                        for (auto& item : m_inventory.items) {
-                            if (item.name == "experiencesack") xp_sack_count = item.count;
-                        }
-                        if (ImGui::InputInt("Sacks of Experience", &xp_sack_count)) {
-                            if (xp_sack_count < 0) xp_sack_count = 0;
-                            m_inventory.remove_item("experiencesack");
-                            if (xp_sack_count > 0) m_inventory.add_item("experiencesack", xp_sack_count);
-                            m_inventory_dirty = true;
-                        }
-                        
-                        int ankh_count = 0;
-                        for (auto& item : m_inventory.items) {
-                            if (item.name == "ankh") ankh_count = item.count;
-                        }
-                        if (ImGui::InputInt("Ankhs of Resurrection", &ankh_count)) {
-                            if (ankh_count < 0) ankh_count = 0;
-                            m_inventory.remove_item("ankh");
-                            if (ankh_count > 0) m_inventory.add_item("ankh", ankh_count);
-                            m_inventory_dirty = true;
-                        }
-                        
-                        ImGui::Spacing();
-                        ImGui::Text("Equipped Trinkets:");
-                        bool fire_t = m_inventory.has_item("firetrinket");
-                        if (ImGui::Checkbox("Trinket of Fire", &fire_t)) {
-                            if (fire_t) m_inventory.add_item("firetrinket", 1);
-                            else m_inventory.remove_item("firetrinket");
-                            m_inventory_dirty = true;
-                        }
-                        ImGui::SameLine();
-                        bool ice_t = m_inventory.has_item("icetrinket");
-                        if (ImGui::Checkbox("Trinket of Ice", &ice_t)) {
-                            if (ice_t) m_inventory.add_item("icetrinket", 1);
-                            else m_inventory.remove_item("icetrinket");
-                            m_inventory_dirty = true;
-                        }
-                        ImGui::SameLine();
-                        bool shadow_t = m_inventory.has_item("shadowtrinket");
-                        if (ImGui::Checkbox("Trinket of Shadow", &shadow_t)) {
-                            if (shadow_t) m_inventory.add_item("shadowtrinket", 1);
-                            else m_inventory.remove_item("shadowtrinket");
-                            m_inventory_dirty = true;
-                        }
-                        
-                        ImGui::Spacing();
-                        ImGui::TextColored(ImVec4(0.914f, 0.271f, 0.376f, 1.0f), "Quest Items");
-                        ImGui::Separator();
-                        ImGui::Spacing();
-                        
-                        bool has_key = m_inventory.has_item("key_yellow");
-                        if (ImGui::Checkbox("A Yellow Key", &has_key)) {
-                            if (has_key) m_inventory.add_item("key_yellow", 1);
-                            else m_inventory.remove_item("key_yellow");
-                            m_inventory_dirty = true;
-                        }
-                        
-                        bool shard1 = m_inventory.has_item("iselon_shard_1");
-                        if (ImGui::Checkbox("Mageblade Shard 1", &shard1)) {
-                            if (shard1) m_inventory.add_item("iselon_shard_1", 1);
-                            else m_inventory.remove_item("iselon_shard_1");
-                            m_inventory_dirty = true;
-                        }
-                        ImGui::SameLine();
-                        bool shard2 = m_inventory.has_item("iselon_shard_2");
-                        if (ImGui::Checkbox("Mageblade Shard 2", &shard2)) {
-                            if (shard2) m_inventory.add_item("iselon_shard_2", 1);
-                            else m_inventory.remove_item("iselon_shard_2");
-                            m_inventory_dirty = true;
-                        }
-                        ImGui::SameLine();
-                        bool shard3 = m_inventory.has_item("iselon_shard_3");
-                        if (ImGui::Checkbox("Mageblade Shard 3", &shard3)) {
-                            if (shard3) m_inventory.add_item("iselon_shard_3", 1);
-                            else m_inventory.remove_item("iselon_shard_3");
-                            m_inventory_dirty = true;
-                        }
-                        ImGui::SameLine();
-                        bool shard4 = m_inventory.has_item("iselon_shard_4");
-                        if (ImGui::Checkbox("Mageblade Shard 4", &shard4)) {
-                            if (shard4) m_inventory.add_item("iselon_shard_4", 1);
-                            else m_inventory.remove_item("iselon_shard_4");
-                            m_inventory_dirty = true;
+
+                            if (is_current) ImGui::PopStyleColor();
                         }
                     }
-                    ImGui::EndChild();
-                    ImGui::PopStyleColor();
                 }
+                ImGui::EndChild();
+                ImGui::PopStyleColor(4);
+
+                ImGui::Spacing();
+
+                // ── Spawn point input ─────────────────────────────────────
+                ImGui::SetNextItemWidth(180.0f);
+                ImGui::InputTextWithHint("##ss_spawn", "Spawn point (e.g. start)",
+                                         spawn_buf, sizeof(spawn_buf));
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), " \u2190 spawn");
+
+                ImGui::Spacing();
+
+                // ── Target display & teleport buttons ─────────────────────
+                const char* target_name = (selected_scene >= 0 &&
+                                           selected_scene < *p_list_count)
+                                          ? p_list[selected_scene]
+                                          : nullptr;
+
+                bool can_tp = (target_name != nullptr &&
+                               *p_pending == 0 &&
+                               *p_active  == 0);
+
+                if (target_name) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                                       ICON_FA_MAP_LOCATION_DOT " Target: %s", target_name);
+                } else {
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                                       "(select a scene above)");
+                }
+
+                if (*p_active) {
+                    ImGui::SameLine(0, 16.0f);
+                    ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.0f, 1.0f),
+                                       ICON_FA_SPINNER " Loading...");
+                }
+
+                ImGui::Spacing();
+
+                if (!can_tp) ImGui::BeginDisabled();
+
+                // Normal Gateway — standard loading screen transition
+                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.15f, 0.45f, 0.15f, 0.85f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.6f,  0.2f,  1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.3f, 0.75f, 0.3f,  1.0f));
+                bool do_normal = ImGui::Button(ICON_FA_PLAY " Normal Gateway", ImVec2(220.0f, 0));
+                ImGui::PopStyleColor(3);
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Calls GotoLevel() \u2192 shows loading screen.\n"
+                                      "Standard transition, identical to entering a portal.");
+
+                ImGui::SameLine(0, 12.0f);
+
+                // Forced Gateway — instant 0-frame load
+                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.5f, 0.15f, 0.15f, 0.85f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.2f,  0.2f,  1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.9f, 0.3f,  0.3f,  1.0f));
+                bool do_forced = ImGui::Button(ICON_FA_BOLT " Forced Gateway", ImVec2(220.0f, 0));
+                ImGui::PopStyleColor(3);
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Calls GotoLevel() for instant scene transition.\n"
+                                      "Fast teleport gateway.");
+
+                if (!can_tp) ImGui::EndDisabled();
+
+                // Dispatch requests — set pending for sre_scene_shifter_tick()
+                if (can_tp && target_name) {
+                    if (do_normal || do_forced) {
+                        strncpy(p_target, target_name, 127);
+                        p_target[127] = '\0';
+                        strncpy(p_spawn, spawn_buf, 63);
+                        p_spawn[63] = '\0';
+                        // Mode: 1=normal, 2=forced
+                        *p_pending = do_forced ? 2 : 1;
+                    }
+                }
+
+                // Status / last error
+                if (p_error[0] && strcmp(p_error, "OK") != 0) {
+                    ImGui::Spacing();
+                    ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                                       ICON_FA_TRIANGLE_EXCLAMATION " %s",
+                                       p_error);
+                }
+
                 ImGui::EndTabItem();
             }
 
@@ -1953,7 +2101,7 @@ bool SwordfareGUI::is_input_blocked(float mx, float my) {
 extern SrtOverlay g_srt_overlay;
 
 void SwordfareGUI::scan_saves(const std::string& save_dir) {
-    g_srt_overlay.save_dir = save_dir;
+    g_srt_overlay.save_dir = get_vfs_save_dir(save_dir);
     g_srt_overlay.scan_saves();
     m_save_files = g_srt_overlay.save_files;
 }
@@ -2851,6 +2999,99 @@ void SwordfareGUI::init_lua_console(
         m_console_history.push_back({"Raijin  •  World's first Swordigo Lua console  •  Swordfare subsystem", false, false});
         m_console_history.push_back({"Type Lua and press Enter. Up/Down for history. Backtick (`) to close.", false, false});
     }
+}
+
+// ---------------------------------------------------------------------------
+// SwordfareGUI::init_scene_shifter
+// ---------------------------------------------------------------------------
+// Wires up all scene shifter globals in guest memory.  After this call the
+// GUI reads/writes those globals directly via (m_guest_memory + VA) instead
+// of the always-zero host-side weak fallback copies.
+//
+// Also runs an initial host-side filesystem scan (std::filesystem) of
+//   assets_dir/resources/  and, if present,  data_dir/mods/<mod>/resources/
+// to populate g_sre_scene_list in guest memory so the panel shows scenes
+// immediately without needing the guest scan function.
+// ---------------------------------------------------------------------------
+#include <filesystem>
+void SwordfareGUI::init_scene_shifter(
+    uint8_t* guest_memory,
+    uint64_t scene_list_count_va,
+    uint64_t scene_list_va,
+    uint64_t shift_pending_va,
+    uint64_t shift_target_va,
+    uint64_t shift_spawn_va,
+    uint64_t shift_error_va,
+    uint64_t shift_active_va,
+    uint64_t current_scene_va,
+    const std::string& assets_dir)
+{
+    namespace fs = std::filesystem;
+
+    // Store guest memory base (may already be set by init_lua_console)
+    if (!m_guest_memory) m_guest_memory = guest_memory;
+
+    m_ss_list_count_va    = scene_list_count_va;
+    m_ss_list_va          = scene_list_va;
+    m_ss_pending_va       = shift_pending_va;
+    m_ss_target_va        = shift_target_va;
+    m_ss_spawn_va         = shift_spawn_va;
+    m_ss_error_va         = shift_error_va;
+    m_ss_active_va        = shift_active_va;
+    m_ss_current_scene_va = current_scene_va;
+    m_ss_assets_dir       = assets_dir;  // e.g. ~/.local/share/swordigo-desktop/assets
+
+    m_scene_shifter_ready = (guest_memory &&
+                             scene_list_count_va &&
+                             scene_list_va &&
+                             shift_pending_va &&
+                             shift_target_va);
+
+    if (!m_scene_shifter_ready) {
+        fprintf(stderr, "[SwordfareGUI] init_scene_shifter: missing VAs — scene shifter disabled\n");
+        return;
+    }
+
+    // Run host-side scan immediately so the list is populated on first open.
+    // We write directly into guest memory (g_sre_scene_list / g_sre_scene_list_count).
+    int*  g_count = (int*)(guest_memory + scene_list_count_va);
+    char (*g_list)[128] = (char(*)[128])(guest_memory + scene_list_va);
+    *g_count = 0;
+
+    auto try_scan = [&](const fs::path& dir) {
+        if (!fs::exists(dir) || !fs::is_directory(dir)) return;
+        std::error_code ec;
+        for (auto& ent : fs::recursive_directory_iterator(dir,
+                fs::directory_options::skip_permission_denied, ec)) {
+            if (*g_count >= 256) break;
+            if (!ent.is_regular_file(ec)) continue;
+            auto name = ent.path().filename().string();
+            if (name.size() <= 6) continue;
+            if (name.substr(name.size() - 6) != ".scene") continue;
+            // strip extension
+            std::string stem = name.substr(0, name.size() - 6);
+            // deduplicate
+            bool dup = false;
+            for (int i = 0; i < *g_count; i++) {
+                if (std::string(g_list[i]) == stem) { dup = true; break; }
+            }
+            if (dup) continue;
+            strncpy(g_list[*g_count], stem.c_str(), 127);
+            g_list[*g_count][127] = '\0';
+            (*g_count)++;
+        }
+    };
+
+    // 1. Vanilla assets/resources/
+    try_scan(fs::path(assets_dir) / "resources");
+
+    // 2. Sort alphabetically for readability
+    qsort(g_list, *g_count, 128, [](const void* a, const void* b) -> int {
+        return strcmp((const char*)a, (const char*)b);
+    });
+
+    fprintf(stderr, "[SwordfareGUI] Scene Shifter ready — %d scenes found in %s/resources\n",
+            *g_count, assets_dir.c_str());
 }
 
 void SwordfareGUI::toggle_lua_console() {

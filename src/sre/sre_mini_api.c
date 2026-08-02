@@ -1905,27 +1905,34 @@ static int l_mini_toggle_debug(lua_State* L) {
     return 0;
 }
 
-/* Mini.RecreateHero() — dynamically recreates hero object at current location (matching SwKiwi recreate_hero.c) */
+/* Mini.RecreateHero() — dynamically recreates hero object at current location.
+ * Matches libneedlewarfare/cpp/lua_libs/mini/recreate_hero.c exactly:
+ *   - GameSceneController::HeroObject  = sc + 0x8  (raw ptr, ARM64)
+ *   - HeroReference::Position          = hero + 0x70 (Vector3, ARM64)
+ *   - EntityComponent::FacingDirection = component + 0x70 (int, ARM64)
+ *     (NOT TransformComponent — that offset holds a matrix float, not facing int)
+ */
 static int l_mini_recreate_hero(lua_State* L) {
-    g_sre_recreate_hero_pending = 1;
-
     SceneController* sc = sre_scene_controller_from_L(L);
     if (!sc) return 0;
 
     SceneObject* hero = sre_hero_object_from_sc(sc);
     if (!hero) return 0;
 
-    /* Hero position is at hero + 0x70 (Vector3) */
+    /* Hero position Vector3 at hero + 0x70 (ARM64, confirmed from controllers.h SOFF_HeroReference_Position) */
     void* pos = (char*)hero + 0x70;
 
-    /* Facing direction from TransformComponent (0x70) */
+    /* Facing direction from EntityComponent at component + 0x70 (ARM64).
+     * libneedlewarfare/cpp/offsets/controllers.h: SOFF_EntityComponent_FacingDirection = offset_(0x3c, 0x70)
+     * NOTE: TransformComponent + 0x70 is a rotation matrix element, NOT the facing int. */
     int facing_dir = 1;
-    if (g_SceneObject_ComponentWithInterface && TransformComponent_Interface) {
-        void* comp = g_SceneObject_ComponentWithInterface(hero, TransformComponent_Interface);
+    if (g_SceneObject_ComponentWithInterface && EntityComponent_Interface) {
+        void* comp = g_SceneObject_ComponentWithInterface(hero, EntityComponent_Interface);
         if (comp) facing_dir = *(int*)((char*)comp + 0x70);
     }
 
     if (g_sre_CreateHeroObjectAt) {
+        /* addToScene=0 matches libneedlewarfare: CreateHeroObjectAt(sc, pos, dir, false) */
         g_sre_CreateHeroObjectAt(sc, pos, facing_dir, 0);
     }
     return 0;
@@ -3920,6 +3927,10 @@ void sre_register_mini_api(lua_State* L) {
     g_lua_setfield(L, -2, "ResetAll");
     g_lua_setfield(L, -2, "Achievement");
 
+    /* Scene Shifter API — GotoLevel, SetInstantLoad, ListScenes, ScanScenes */
+    extern void sre_scene_shifter_register_lua(lua_State* L);
+    sre_scene_shifter_register_lua(L);
+
     g_lua_setfield(L, LUA_GLOBALSINDEX, "Mini");  /* _G.Mini = table */
 
     /* ---- LNI table ---- */
@@ -5715,6 +5726,12 @@ void sre_mini_ensure_injected(lua_State* L) {
     sre_register_mini_api(L);
     extern void sre_open_swkiwi_libs(lua_State* L);
     sre_open_swkiwi_libs(L);
+    extern void sre_register_expanded_namespaces(lua_State* L);
+    sre_register_expanded_namespaces(L);
+    extern void sre_register_pack_lib(lua_State* L);
+    sre_register_pack_lib(L);
+    extern void sre_register_raknet_lib(lua_State* L);
+    sre_register_raknet_lib(L);
 
     /* Register luasocket, luamime, luafilesystem, and toml in package.preload */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "package");

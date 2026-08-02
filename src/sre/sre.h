@@ -166,4 +166,8 @@ extern pfn_orig_Scene_Update g_orig_Scene_Update_fn;
 void sre_GameData_Clear(void* this_);
 extern uint64_t g_orig_GameData_Clear;
 
+/* ComponentOutletBase::Connect vtable safety guard (sre_scene_update.c) */
+uint64_t sre_ComponentOutletBase_Connect(void* this_, void* a2);
+extern uint64_t g_orig_ComponentOutletBase_Connect;
+
 #endif /* SRE_H */

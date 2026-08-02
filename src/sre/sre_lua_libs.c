@@ -1981,6 +1981,39 @@ static int l_caver_setPosition(lua_State* L) {
     return 0;
 }
 
+/* C impl helper functions for sre_raknet_c.c */
+extern lua_State* g_sre_last_lua_state;
+
+void* caver_getHero_impl(void) {
+    if (!g_sre_last_lua_state) return (void*)0;
+    return sre_hero_object_from_L(g_sre_last_lua_state);
+}
+
+void* caver_getHero_from_view(void* view) {
+    if (!view) return (void*)0;
+    uint64_t gc = *(uint64_t*)((char*)view + 0xF8);
+    if (!gc) return (void*)0;
+    uint64_t sc = *(uint64_t*)((char*)gc + 0xC8); /* 0xC8 = GameSceneController* */
+    if (!sc) return (void*)0;
+    return (void*)*(uint64_t*)((char*)sc + 0x8);  /* 0x8 = Hero SceneObject* */
+}
+
+void caver_getPosition_impl(void* obj, float* x, float* y, float* z) {
+    if (!obj || !x || !y || !z) return;
+    void* tc = 0;
+    if (g_SceneObject_ComponentWithInterface && TransformComponent_Interface)
+        tc = g_SceneObject_ComponentWithInterface(obj, TransformComponent_Interface);
+    if (tc) sre_transform_get_position(tc, x, y, z);
+}
+
+void caver_setPosition_impl(void* obj, float x, float y, float z) {
+    if (!obj) return;
+    void* tc = 0;
+    if (g_SceneObject_ComponentWithInterface && TransformComponent_Interface)
+        tc = g_SceneObject_ComponentWithInterface(obj, TransformComponent_Interface);
+    if (tc) sre_transform_set_position(tc, x, y, z);
+}
+
 /* caver.getHp(obj) → number */
 static int l_caver_getHp(lua_State* L) {
     void* obj = check_ptr(L, 1);
@@ -2458,4 +2491,189 @@ void sre_open_swkiwi_libs(lua_State* L) {
     g_luaL_register(L, "components", (const void*)componentslib);
     lua_pop(L, 1);
 }
+
+/* =========================================================================
+ * Host ImGui Bridge Stubs (Forwarding guest Lua ImGui calls to Host C++ ImGui)
+ * ========================================================================= */
+extern int g_sre_imgui_active;
+
+static int l_sre_imgui_begin(lua_State* L) {
+    const char* title = g_lua_tolstring ? g_lua_tolstring(L, 1, NULL) : "Window";
+    if (g_lua_pushboolean) g_lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_sre_imgui_end(lua_State* L) {
+    (void)L;
+    return 0;
+}
+
+static int l_sre_imgui_text(lua_State* L) {
+    (void)L;
+    return 0;
+}
+
+static int l_sre_imgui_button(lua_State* L) {
+    (void)L;
+    if (g_lua_pushboolean) g_lua_pushboolean(L, 0);
+    return 1;
+}
+
+static const void* sre_imgui_bridgelib[] = {
+    (const void*)"Begin",   (const void*)l_sre_imgui_begin,
+    (const void*)"End",     (const void*)l_sre_imgui_end,
+    (const void*)"Text",    (const void*)l_sre_imgui_text,
+    (const void*)"Button",  (const void*)l_sre_imgui_button,
+    (const void*)0,         (const void*)0
+};
+
+/* =========================================================================
+ * ProgramState Modding Extensions
+ * ========================================================================= */
+extern float g_sre_global_time_multiplier;
+
+static int l_programstate_set_global_speed(lua_State* L) {
+    if (g_lua_isnumber && g_lua_isnumber(L, 1)) {
+        double spd = g_lua_tonumber(L, 1);
+        if (spd <= 0.0) spd = 0.001;
+        g_sre_global_time_multiplier = (float)spd;
+    }
+    if (g_lua_pushboolean) g_lua_pushboolean(L, 1);
+    return 1;
+}
+
+static const void* sre_programstatelib[] = {
+    (const void*)"SetGlobalSpeed", (const void*)l_programstate_set_global_speed,
+    (const void*)0,                (const void*)0
+};
+
+/* =========================================================================
+ * Swd.* Engine Core & Telemetry Library
+ * ========================================================================= */
+extern uint32_t g_sre_draws_per_frame;
+extern uint32_t g_sre_verts_per_frame;
+extern uint32_t g_sre_tex_binds_per_frame;
+
+static int l_swd_system_get_perf_metrics(lua_State* L) {
+    if (!g_lua_createtable || !g_lua_pushinteger || !g_lua_setfield) return 0;
+    g_lua_createtable(L, 0, 4);
+    g_lua_pushinteger(L, (int)g_sre_draws_per_frame);    g_lua_setfield(L, -2, "draws");
+    g_lua_pushinteger(L, (int)g_sre_verts_per_frame);    g_lua_setfield(L, -2, "verts");
+    g_lua_pushinteger(L, (int)g_sre_tex_binds_per_frame);g_lua_setfield(L, -2, "tex_binds");
+    return 1;
+}
+
+static int l_swd_spawn_dummy_hero(lua_State* L) {
+    float offset_x = (g_lua_isnumber && g_lua_isnumber(L, 1)) ? (float)g_lua_tonumber(L, 1) : 3.0f;
+    void* hero = caver_getHero_impl();
+    if (!hero) {
+        if (g_lua_pushnil) g_lua_pushnil(L);
+        return 1;
+    }
+    float x = 0, y = 0, z = 0;
+    caver_getPosition_impl(hero, &x, &y, &z);
+
+    extern void (*g_sre_CreateHeroObjectAt)(void* sc, void* pos, int facing_dir, int add_to_scene);
+    extern void* g_remote_hero_ghost;
+
+    void* sc = sre_scene_controller_from_L(L);
+    if (!sc || !g_sre_CreateHeroObjectAt) {
+        if (g_lua_pushnil) g_lua_pushnil(L);
+        return 1;
+    }
+
+    float spawn_pos[3] = { x + offset_x, y, z };
+    void* main_hero = *(void**)((char*)sc + 0x8); /* Save main hero pointer */
+    g_sre_CreateHeroObjectAt(sc, spawn_pos, 1, 1);
+    void* dummy_hero = *(void**)((char*)sc + 0x8); /* Capture 2nd hero clone pointer */
+
+    *(void**)((char*)sc + 0x8) = main_hero; /* 1. Restore main hero pointer! */
+
+    /* 2. Re-bind CameraController to main_hero via UpdateTarget (0x0034A6BC) */
+    extern uint64_t g_swordigo_base;
+    typedef void (*pfn_UpdateTarget)(void* sc);
+    pfn_UpdateTarget fn_UpdateTarget = (pfn_UpdateTarget)(g_swordigo_base + 0x34A6BC);
+    if (fn_UpdateTarget) fn_UpdateTarget(sc);
+
+    if (dummy_hero) {
+        g_remote_hero_ghost = dummy_hero;
+        caver_setPosition_impl(dummy_hero, x + offset_x, y, z);
+    }
+
+    push_ptr(L, dummy_hero);
+    return 1;
+}
+
+static const void* swd_systemlib[] = {
+    (const void*)"GetPerfMetrics", (const void*)l_swd_system_get_perf_metrics,
+    (const void*)"SpawnDummyHero", (const void*)l_swd_spawn_dummy_hero,
+    (const void*)0,                (const void*)0
+};
+
+/* =========================================================================
+ * Swd.Net.* Desktop Engine Multiplayer API
+ *
+ * Delegates to the 60Hz UDP LAN sync engine in sre_raknet_c.c.
+ * Swd.Net.Host(port?)        — start UDP server (host mode)
+ * Swd.Net.Join(ip, port?)    — connect to host (client mode)
+ * Swd.Net.IsConnected()      — true if peer is connected
+ * Swd.Net.Disconnect()       — shut down peer socket
+ * ========================================================================= */
+
+/* Forward declarations from sre_raknet_c.c */
+extern int   sre_raknet_startup_impl(uint16_t port);
+extern int   sre_raknet_connect_impl(const char* host, uint16_t port);
+extern void  sre_raknet_shutdown_impl(void);
+extern int   g_sre_lan_sync_active;
+extern int   g_sre_lan_is_host;
+
+static int l_swd_net_host(lua_State* L) {
+    int port = (g_lua_isnumber && g_lua_isnumber(L, 1)) ? (int)g_lua_tointeger(L, 1) : 12345;
+    int result = sre_raknet_startup_impl((uint16_t)port);
+    if (g_lua_pushboolean) g_lua_pushboolean(L, result == 0 ? 1 : 0);
+    return 1;
+}
+
+static int l_swd_net_join(lua_State* L) {
+    const char* ip   = (g_lua_tolstring) ? g_lua_tolstring(L, 1, NULL) : "127.0.0.1";
+    int port = (g_lua_isnumber && g_lua_isnumber(L, 2)) ? (int)g_lua_tointeger(L, 2) : 12345;
+    if (!ip) ip = "127.0.0.1";
+    int result = sre_raknet_connect_impl(ip, (uint16_t)port);
+    if (g_lua_pushboolean) g_lua_pushboolean(L, result == 0 ? 1 : 0);
+    return 1;
+}
+
+static int l_swd_net_is_connected(lua_State* L) {
+    /* g_sre_lan_sync_active is 1 once either Host or Join succeeds */
+    if (g_lua_pushboolean) g_lua_pushboolean(L, g_sre_lan_sync_active ? 1 : 0);
+    return 1;
+}
+
+static int l_swd_net_disconnect(lua_State* L) {
+    (void)L;
+    /* Shut down the UDP socket and reset LAN sync state */
+    sre_raknet_shutdown_impl();
+    return 0;
+}
+
+static const void* swd_netlib[] = {
+    (const void*)"Host",        (const void*)l_swd_net_host,
+    (const void*)"Join",        (const void*)l_swd_net_join,
+    (const void*)"IsConnected", (const void*)l_swd_net_is_connected,
+    (const void*)"Disconnect",  (const void*)l_swd_net_disconnect,
+    (const void*)0,             (const void*)0
+};
+
+void sre_register_expanded_namespaces(lua_State* L) {
+    if (!g_luaL_register) return;
+    g_luaL_register(L, "ImGui", (const void*)sre_imgui_bridgelib);
+    if (g_lua_settop) g_lua_settop(L, -2);
+    g_luaL_register(L, "ProgramState", (const void*)sre_programstatelib);
+    if (g_lua_settop) g_lua_settop(L, -2);
+    g_luaL_register(L, "Swd.System", (const void*)swd_systemlib);
+    if (g_lua_settop) g_lua_settop(L, -2);
+    g_luaL_register(L, "Swd.Net", (const void*)swd_netlib);
+    if (g_lua_settop) g_lua_settop(L, -2);
+}
+
 

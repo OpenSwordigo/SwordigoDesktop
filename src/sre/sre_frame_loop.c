@@ -287,6 +287,11 @@ void sre_CaverShell_Update(void* self, float dt) {
                 if (root_update) {
                     root_update(root_view, dt);
                 }
+                /* 6b. Run 60 Hz RakNet LAN Sync Engine */
+                {
+                    extern void sre_raknet_lan_sync_update(void* view);
+                    sre_raknet_lan_sync_update(root_view);
+                }
             }
         }
     }
@@ -330,6 +335,13 @@ void sre_frame_update(void* env, void* obj, float dt) {
      * and ProgramState::Update (hooked via trampoline), both of which are
      * safe to call here. */
     sre_CaverShell_Update(shell, dt);
+
+    /* Scene Shifter — consume pending teleport requests from the host GUI.
+     * Called after CaverShell::Update so we never interrupt an in-flight scene
+     * load. Sets g_sre_instant_scene_load_enabled before calling GotoLevel
+     * for the forced gateway, or calls GotoLevel directly for the normal one. */
+    extern void sre_scene_shifter_tick(void);
+    sre_scene_shifter_tick();
 }
 
 /* ──────────────────────────────────────────────────────────────────────────

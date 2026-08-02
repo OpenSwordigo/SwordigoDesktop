@@ -24,6 +24,7 @@ namespace fs = std::filesystem;
 #include "platform/emulator_arm64.h"
 #include "platform/i_emulator_arm64.h"
 #include "platform/emulator_dynarmic64.h"
+#include "srehost/srehost_abi.h"   // ProHook Phase 1: SVC #0x5352 gateway
 #include "platform/display.h"
 #include "android/asset_manager.h"
 extern "C" void asset_manager_init_arm32(const char* base_path);
@@ -75,6 +76,65 @@ std::string g_assets_dir = "assets";  // "assets" for vanilla, "rl_assets" for R
 std::string g_instance_assets_dir = "assets";
 static float TOUCH_SCALE_Y = (float)GAME_H / 544.0f;   // ~1.985
 
+// =========================================================================
+// Render Resolution Preset System
+// =========================================================================
+// The game renders to an internal FBO at GAME_W×GAME_H, then blits it to the
+// window. Reducing GAME_W×GAME_H cuts GPU fragment load proportionally.
+// setApplicationViewSize must be re-called to tell the game engine the new
+// viewport so its camera and UI layout update correctly.
+// =========================================================================
+
+// These are stored after boot so apply_render_preset() can re-call the JNI fn.
+uint64_t g_setApplicationViewSize_addr = 0;
+uint64_t g_apply_viewsize_env_ptr = 0;
+int      g_render_preset = 0; // 0=1080p, 1=720p, 2=540p, 3=Window
+
+// Call after changing g_render_preset to rebuild the FBO and notify the engine.
+// Safe to call from the frame loop (between drawApp calls).
+void apply_render_preset(int preset) {
+    struct Preset { int w, h; const char* label; };
+    // Preset 3 uses current window size — filled in below.
+    static const Preset presets[4] = {
+        { 1920, 1080, "1080p" },
+        { 1280,  720, "720p"  },
+        {  960,  544, "540p"  },
+        {    0,    0, "Window" },
+    };
+    extern int g_win_w, g_win_h;
+    extern void fbo_destroy();
+    extern bool fbo_init(int game_w, int game_h);
+    extern IEmulatorArm64* g_emulator_64;
+
+    int new_w = presets[preset].w;
+    int new_h = presets[preset].h;
+    if (preset == 3) { new_w = g_win_w; new_h = g_win_h; }
+    if (new_w < 320) new_w = 320;
+    if (new_h < 180) new_h = 180;
+    // Align to even dimensions (required by some FBO formats)
+    new_w &= ~1;
+    new_h &= ~1;
+
+    GAME_W = new_w;
+    GAME_H = new_h;
+    TOUCH_SCALE_X = (float)GAME_W / 960.0f;
+    TOUCH_SCALE_Y = (float)GAME_H / 544.0f;
+    g_render_preset = preset;
+
+    // Rebuild FBO at new resolution
+    fbo_destroy();
+    fbo_init(GAME_W, GAME_H);
+
+    // Notify game engine of new viewport
+    if (g_setApplicationViewSize_addr && g_apply_viewsize_env_ptr && g_emulator_64) {
+        g_emulator_64->call(g_setApplicationViewSize_addr,
+                            {g_apply_viewsize_env_ptr, 0,
+                             (uint64_t)GAME_W, (uint64_t)GAME_H, 1});
+    }
+    std::cout << "[RenderPreset] Changed to " << presets[preset].label
+              << " (" << GAME_W << "x" << GAME_H << ")" << std::endl;
+}
+
 // Add a specific area for guest-side global variables (libc stuff)
 const uint32_t GUEST_GLOBALS_BASE = 0x50000; 
 const uint32_t GUEST_GLOBALS_SIZE = 0x1000; 
@@ -98,6 +158,28 @@ bool g_use_dynarmic = false;  // Set via --engine=dynarmic
 bool g_use_sre = true;        // Set via launcher or --no-sre
 bool g_advanced_redstell_opts = false; // Advanced Redstell Optimisations (off by default)
 uint64_t g_sre_profile_addr = 0;
+
+// =========================================================================
+// Crash-Report-03 Render-Guard Globals
+//
+// g_sre_text_base / g_sre_text_end:
+//   Guest VA bounds of libswordigo.so's .text section.
+//   Populated from g_main_mod_64.text_base + text_size after ELF load.
+//   Used by is_valid_exec_pc() in emulator_dynarmic64.cpp to detect corrupted
+//   link-register returns that land in alignment padding (non-4-byte-aligned
+//   addresses or addresses between functions).
+//
+// g_sre_render_recovery_active / g_sre_render_recovery_jmp:
+//   Set by sre_render_guard_begin() in sre_init.c before CaverShell::Render.
+//   Cleared by sre_render_guard_end() after Render returns.
+//   When the emulator detects a bad PC during a render frame, it calls
+//   sre_longjmp(g_sre_render_recovery_jmp, 2) to skip the broken frame and
+//   return control to the game loop cleanly.
+// =========================================================================
+uint64_t g_sre_text_base = 0;   // guest VA of .text start
+uint64_t g_sre_text_end  = 0;   // guest VA of .text end
+int      g_sre_render_recovery_active = 0;
+void*    g_sre_render_recovery_jmp    = nullptr;
 uint64_t g_sre_vfs_profile_addr = 0;
 GuiRenderer g_gui;
 SrtOverlay g_srt_overlay;
@@ -1360,21 +1442,29 @@ void load_and_boot() {
             while (g_snapshot_load_pending_count > 0 && snapshotLoaded) {
                 g_snapshot_load_pending_count--;
                 if (g_snapshot_has_data && !g_snapshot_data.empty()) {
-                    // Allocate byte array in guest memory: [length(4)] [data(N)]
-                    static uint32_t save_buf_addr = 0x40000000; // high address for save buffer
-                    uint32_t array_len = g_snapshot_data.size();
-                    if (save_buf_addr + 4 + array_len > 0xE0000000ULL) {
-                        std::cerr << "[SAVE] Save data too large (" << array_len << " bytes), skipping" << std::endl;
-                        continue;
+                    // Bump-allocate save buffer in guest high-memory so a second load
+                    // doesn't clobber the previous one. Aligned to 64 bytes for safety.
+                    // Region: 0x40000000 – 0xDFFFFFFF (well below the 0xE0000000 magic LR page).
+                    static uint32_t save_buf_addr = 0x40000000;
+                    uint32_t array_len = (uint32_t)g_snapshot_data.size();
+                    uint32_t needed    = 4 + array_len;
+                    uint32_t aligned   = (needed + 63u) & ~63u; // round up to 64-byte boundary
+                    if ((uint64_t)save_buf_addr + aligned > 0xE0000000ULL) {
+                        // Out of high-memory — wrap back to base (rare: only if many saves loaded)
+                        std::cerr << "[SAVE] Save buffer region exhausted, resetting to base" << std::endl;
+                        save_buf_addr = 0x40000000;
                     }
                     *(uint32_t*)(g_guest_memory + save_buf_addr) = array_len;
                     memcpy(g_guest_memory + save_buf_addr + 4, g_snapshot_data.data(), array_len);
-                    std::cout << "[Callback] snapshotLoaded with " << array_len << " bytes of save data" << std::endl;
+                    std::cout << "[Callback] snapshotLoaded with " << array_len
+                              << " bytes of save data @ guest:0x" << std::hex << save_buf_addr << std::dec << std::endl;
                     g_emulator->call(snapshotLoaded, {env_ptr, 0, 0, save_buf_addr}); // (env, this, name=null, data=array)
-                    g_snapshot_has_data = false;
+                    save_buf_addr += aligned; // advance past this allocation
+                    g_snapshot_has_data = false; // always reset to avoid double-delivery
                 } else {
                     std::cout << "[Callback] snapshotLoaded(null, null) — no saved game" << std::endl;
                     g_emulator->call(snapshotLoaded, {env_ptr, 0, 0, 0}); // (env, this, name=null, data=null)
+                    g_snapshot_has_data = false; // reset unconditionally (prevents stale replay on next poll)
                 }
             }
             
@@ -1420,7 +1510,9 @@ void load_and_boot() {
             if (g_display_active && g_input_config.is_editing()) {
                 g_input_config.render_editor(g_win_w, g_win_h, mouse_x, mouse_y, mouse_pressed);
                 // Draw instruction text on top (uses GUI font renderer)
-                glPushAttrib(GL_ALL_ATTRIB_BITS);
+                /* GL_ALL_ATTRIB_BITS causes a full pipeline flush on Mesa/NVIDIA.
+                 * We only change blend, depth, texture — save just those bits. */
+                glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
                 glViewport(0, 0, g_draw_w, g_draw_h);
                 glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
                 glOrtho(0, g_win_w, 0, g_win_h, -1, 1);
@@ -1471,7 +1563,7 @@ void load_and_boot() {
             
             // Render F3 debug overlay
             if (g_display_active && debug_visible && g_graphics_api != GraphicsAPI::OPENGL) {
-                glPushAttrib(GL_ALL_ATTRIB_BITS);
+                glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
                 glViewport(0, 0, g_draw_w, g_draw_h);
                 glMatrixMode(GL_PROJECTION);
                 glPushMatrix();
@@ -1562,7 +1654,7 @@ void load_and_boot() {
             
             // Render mod tools overlay (speed indicator, toasts, pause screen)
             if (g_display_active) {
-                glPushAttrib(GL_ALL_ATTRIB_BITS);
+                glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
                 glViewport(0, 0, g_draw_w, g_draw_h);
                 glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
                 glOrtho(0, g_win_w, 0, g_win_h, -1, 1);
@@ -1576,7 +1668,7 @@ void load_and_boot() {
 
             // Render SRT overlay (inventory editor, etc.) — F11 toggle
             if (g_display_active && g_srt_overlay.is_visible()) {
-                glPushAttrib(GL_ALL_ATTRIB_BITS);
+                glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
                 glViewport(0, 0, g_draw_w, g_draw_h);
                 glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
                 glOrtho(0, g_win_w, 0, g_win_h, -1, 1);
@@ -1592,7 +1684,7 @@ void load_and_boot() {
 
             // Show hint for first 5 seconds
             if (g_display_active && !gui_visible && (SDL_GetTicks() - hint_start_time) < 5000) {
-                glPushAttrib(GL_ALL_ATTRIB_BITS);
+                glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
                 glViewport(0, 0, g_draw_w, g_draw_h);
                 glMatrixMode(GL_PROJECTION);
                 glPushMatrix();
@@ -2491,6 +2583,17 @@ void load_and_boot_arm64() {
     // Initialize TrampolineMgr before symbol resolution
     TrampolineMgr::instance().init(g_guest_memory, load_addr);
 
+    // Populate render-guard text-segment bounds (Crash-Report-03 fix).
+    // g_sre_text_base / g_sre_text_end are read by is_valid_exec_pc() in the
+    // Dynarmic run loop to detect corrupted LR returns into alignment padding.
+    if (g_main_mod_64.text_base && g_main_mod_64.text_size) {
+        g_sre_text_base = g_main_mod_64.text_base;
+        g_sre_text_end  = g_main_mod_64.text_base + g_main_mod_64.text_size;
+        std::cout << "[RenderGuard] Text bounds: 0x" << std::hex
+                  << g_sre_text_base << " – 0x" << g_sre_text_end
+                  << std::dec << std::endl;
+    }
+
     // 3. External Symbol Resolution (to Bridge addresses)
     g_loader_64->resolve_all_to_bridge(&g_main_mod_64, &g_bridge_64, GUEST_GLOBALS_BASE);
     
@@ -2539,6 +2642,8 @@ void load_and_boot_arm64() {
     // Multi-engine backend selection
     if (g_use_dynarmic) {
         g_emulator_64 = new EmulatorDynarmic64(g_guest_memory, GUEST_MEM_SIZE);
+        // ProHook Phase 1: Register Dynarmic emulator for JIT cache invalidation
+        SREHost_RegisterEmulator(static_cast<EmulatorDynarmic64*>(g_emulator_64));
     } else {
         g_emulator_64 = new EmulatorArm64(g_guest_memory, GUEST_MEM_SIZE);
     }
@@ -3352,6 +3457,29 @@ void load_and_boot_arm64() {
                         /* GameData::Clear crash guard — nm 0x2e6d60 arm64-v8a */
                         { "_ZN5Caver5Proto8GameData5ClearEv",
                           "g_orig_GameData_Clear" },
+                        /* Proto::SceneObject::Clear crash guard — nm 0x2fc030
+                         * Confirmed crash path (live log LR=0x12fe290):
+                         *   Scene::LoadFromFile → Proto::Scene::~Scene()
+                         *   → ObjectLibrary → ObjectTemplate → SceneObject::Clear()
+                         *   → vtable[+32] on corrupted Component ptr
+                         *   → PC = 0x47bfda9034ff4 (ARM64 STP instruction bytes)
+                         *   → Dynarmic NoExecuteFault → game freeze.
+                         * Our hook caps this+40 (count) before delegating. */
+                        { "_ZN5Caver5Proto11SceneObject5ClearEv",
+                          "g_orig_Proto_SceneObject_Clear" },
+                        /* ComponentOutletBase::Connect vtable safety guard
+                         * nm arm64-v8a 0x247c48: _ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE
+                         * Crash: freed component's 'this' carries garbage vtable (0xf9443508d0002308)
+                         * from heap allocator free-list link → PC jumps to kernel space →
+                         * Dynarmic NoExecuteFault. Our hook validates vtable[1] and vtable[4]
+                         * before dispatching. Bail = return 0 (same as 'no identifier' path). */
+                        { "_ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE",
+                          "g_orig_ComponentOutletBase_Connect" },
+                        /* Proto::ObjectLibrary::Clear crash guard — nm 0x2fd374
+                         * Belt-and-suspenders: guards 3 vtable-dispatch loops
+                         * one level above SceneObject::Clear in the chain. */
+                        { "_ZN5Caver5Proto13ObjectLibrary5ClearEv",
+                          "g_orig_Proto_ObjectLibrary_Clear" },
                         /* Scene::FinishLoad relay — nm arm64 0x4642a8
                          * Called by sre_Scene_FinishLoad under setjmp recovery.
                          * Without this, g_orig_Scene_FinishLoad=0 → silent no-op
@@ -3365,6 +3493,20 @@ void load_and_boot_arm64() {
                          * the exception is caught before force-returning to raw LR. */
                         { "_ZN5Caver11SceneObject10FinishLoadEv",
                           "g_orig_SceneObject_FinishLoad" },
+                        /* SceneObjectGroup::FinishLoad relay — nm arm64 0x475498
+                         * IDA at 0x475498: calls ProgramState::Execute on attached
+                         * Lua scripts immediately during scene load. Without the relay,
+                         * g_orig_SceneObjectGroup_FinishLoad=0 → silent no-op → group
+                         * scripts never run → objects in scripted groups never initialize. */
+                        { "_ZN5Caver16SceneObjectGroup10FinishLoadEv",
+                          "g_orig_SceneObjectGroup_FinishLoad" },
+                        /* RegisterProgramLibrary relay — nm arm64 0x4c0f18
+                         * sre_RegisterProgramLibrary wraps this to intercept mod
+                         * library registrations. Without the relay, g_orig=0 and
+                         * vanilla Lua library registration is silently skipped:
+                         * all built-in Caver Lua APIs (DB, Scene, etc.) never load. */
+                        { "_ZN5Caver21RegisterProgramLibraryERKSsPFvPNS_12ProgramStateEE",
+                          "g_orig_RegisterProgramLibrary" },
                         /* NOTE: g_orig_RenderingContext_C1 is NOT in nav_relays.
                          * It is handled by gui_relays[] below using copy_and_relocate,
                          * which runs before the hook installer and captures the real
@@ -3737,6 +3879,26 @@ void load_and_boot_arm64() {
                         g_lua_console_status_addr,
                         g_lua_console_print_addr);
                     std::cout << "[SRE] Lua console ready — backtick (`) to open ImGui terminal" << std::endl;
+                }
+
+                // Wire Scene Shifter into SwordfareGUI
+                uint64_t ss_count_va   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_list_count");
+                uint64_t ss_list_va    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_list");
+                uint64_t ss_pend_va    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_pending");
+                uint64_t ss_targ_va    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_target");
+                uint64_t ss_spwn_va    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_spawn");
+                uint64_t ss_err_va     = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_last_error");
+                uint64_t ss_act_va     = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_active");
+                uint64_t ss_cur_va     = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_current_scene_name");
+
+                if (ss_count_va && ss_list_va && ss_pend_va && ss_targ_va) {
+                    std::string assets_dir_path = get_data_path(g_assets_dir);
+                    g_swordfare_gui.init_scene_shifter(
+                        g_guest_memory,
+                        ss_count_va, ss_list_va, ss_pend_va, ss_targ_va,
+                        ss_spwn_va, ss_err_va, ss_act_va, ss_cur_va,
+                        assets_dir_path);
+                    std::cout << "[SRE] Scene Shifter initialized in GUI" << std::endl;
                 }
 
                 // Resolve lua_resume error monitoring symbols
@@ -4468,6 +4630,10 @@ void load_and_boot_arm64() {
     if (setApplicationViewSize) {
         std::cout << "[Boot64] Calling setApplicationViewSize" << std::endl;
         g_emulator_64->call(setApplicationViewSize, {env_ptr, 0, (uint64_t)GAME_W, (uint64_t)GAME_H, 1});
+        /* Store for apply_render_preset() so the preset system can re-call without
+         * going through a full re-boot sequence. */
+        g_setApplicationViewSize_addr = setApplicationViewSize;
+        g_apply_viewsize_env_ptr      = env_ptr;
     }
     if (applicationDidBecomeActive) {
         std::cout << "[Boot64] Calling applicationDidBecomeActive" << std::endl;
@@ -4801,10 +4967,13 @@ void load_and_boot_arm64() {
                         // g_sre_scene_loading lives in libsre.so (g_sre_mod), not the game binary.
                         // Resolve once on first frame, cache for all subsequent frames.
                         static uint64_t s_scene_loading_addr = 0;
+                        static uint64_t s_suppress_hud_addr  = 0;
                         static bool     s_scene_loading_resolved = false;
                         if (!s_scene_loading_resolved) {
                             s_scene_loading_addr = g_loader_64->get_symbol_vaddr(
                                 &g_sre_mod, "g_sre_scene_loading");
+                            s_suppress_hud_addr  = g_loader_64->get_symbol_vaddr(
+                                &g_sre_mod, "g_sre_suppress_hud_frames");
                             s_scene_loading_resolved = true;
                             if (s_scene_loading_addr)
                                 std::cout << "[Watchdog] Scene loading flag @ 0x"
@@ -4820,14 +4989,20 @@ void load_and_boot_arm64() {
 
                         // After call: if flag is STILL set, FinishLoad's cleanup was
                         // skipped (exception path). Force-clear so next frame runs clean.
+                        // Also suppress HUD data reads for 2 frames so we don't spam
+                        // stale game-state pointers while the new scene is activating.
                         if (was_scene_loading && s_scene_loading_addr) {
                             int still_loading = *(volatile int*)(g_guest_memory + s_scene_loading_addr);
                             if (still_loading) {
                                 std::cout << "[Watchdog] Scene load flag stuck after frame — force-clearing." << std::endl;
                                 *(volatile int*)(g_guest_memory + s_scene_loading_addr) = 0;
+                                // Suppress HUD spam for 2 frames
+                                if (s_suppress_hud_addr)
+                                    *(volatile int*)(g_guest_memory + s_suppress_hud_addr) = 2;
                             }
                         }
                     }
+
 
 
 

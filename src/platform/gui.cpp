@@ -8,6 +8,8 @@
 
 namespace fs = std::filesystem;
 
+#include "platform/data_path.h"
+
 // External save directory
 extern std::string g_save_dir;
 
@@ -915,8 +917,8 @@ GuiAction GuiRenderer::handle_click(int mouse_x, int mouse_y, int win_w, int win
                     }
                     if (action == GUI_OPEN_SAVE_EDITOR) {
                         show_save_editor = true;
-                        // Find first .gplayer file in save/Documents/
-                        std::string docs_path = g_save_dir + "/Documents";
+                        // Find first .gplayer file in VFS save Documents/
+                        std::string docs_path = get_vfs_save_dir();
                         std::string save_path = "";
                         
                         if (fs::exists(docs_path) && fs::is_directory(docs_path)) {
@@ -1560,8 +1562,8 @@ GuiAction GuiRenderer::handle_save_editor_click(int mouse_x, int mouse_y, int wi
     float sv_w = 100.0f * s;
     float sv_x = spx + mg;
     if (mouse_x >= (int)sv_x && mouse_x < (int)(sv_x+sv_w) && mouse_y >= (int)btn_y && mouse_y < (int)(btn_y+btn_h)) {
-        // Find first .gplayer file in save/Documents/
-        std::string docs_path = g_save_dir + "/Documents";
+        // Find first .gplayer file in VFS save Documents/
+        std::string docs_path = get_vfs_save_dir();
         std::string save_path = "";
         if (fs::exists(docs_path) && fs::is_directory(docs_path)) {
             for (const auto& entry : fs::directory_iterator(docs_path)) {

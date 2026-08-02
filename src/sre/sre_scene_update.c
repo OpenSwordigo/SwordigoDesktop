@@ -29,6 +29,11 @@
  * mutex from ever being taken during scene load.
  * ========================================================================= */
 volatile int g_sre_scene_loading = 0;  /* 1 = scene load in progress */
+/* Watchdog suppressor: when set > 0, sre_GameSceneView_Update skips its HUD
+ * data export for that many frames. The scene-load watchdog (main.cpp) sets
+ * this to 2 whenever it force-clears g_sre_scene_loading so that we don't
+ * spam stale game-state reads during the frame where the new scene is activating. */
+volatile int g_sre_suppress_hud_frames = 0;
 
 /* Extern for force-unlocking the Lua mutex after a scene load completes.
  * The mutex may have been left locked by a longjmp escape during loading.
@@ -39,8 +44,11 @@ extern void *g_lua_mutex_ptr;
 /* Swordigo base address & Lua recovery externs */
 extern uint64_t g_swordigo_base;
 extern lua_State* g_sre_last_lua_state;
-extern int recovery_push(lua_State* L);
-extern void recovery_pop(int depth);
+/* recovery_push / recovery_pop / g_sre_recovery_stack / sre_setjmp:
+ * declared in sre_lua.h and defined (non-static) in sre_lua.c.
+ * Using sre_lua.h instead of bare externs ensures the linker resolves these
+ * symbols within libsre.so rather than falling back to the bridge PLT stub. */
+#include "sre_lua.h"
 typedef struct { unsigned long buf[22]; } SreJmpBufRec;
 extern SreJmpBufRec g_sre_recovery_stack[];
 extern int sre_setjmp(void* env);
@@ -265,7 +273,14 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
     g_sre_gui_scene_view_ptr = (uint64_t)self;
     g_sre_gamesceneview_ptr = self;
     g_sre_gui_scene_active = 1;
-    
+
+    /* Watchdog suppressor: skip game-state reads for N frames after a forced
+     * scene-load flag clear (avoids spamming stale HUD data during transition). */
+    if (g_sre_suppress_hud_frames > 0) {
+        g_sre_suppress_hud_frames--;
+        goto do_effects;
+    }
+
     /* ---- Read core pointers ---- */
     uint64_t overlay_ptr = *(uint64_t*)(this_ + 0x100);  /* GameOverlayView* */
     uint64_t ctrl_ptr    = *(uint64_t*)(this_ + 0xF0);   /* GameSceneController* */
@@ -519,6 +534,12 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
                 *(uint8_t*)(spell_picker + 0xE4) = has_spells ? 0 : 1;
             }
 
+            /* ---- 5. AUTOMATIC 60 HZ RAKNET LAN MULTIPLAYER SYNC ENGINE ---- */
+            {
+                extern void sre_raknet_lan_sync_update(void* sc);
+                sre_raknet_lan_sync_update((void*)this_);
+            }
+
             // Force the mana bar to remain visible if the player has at least one spell
             if (mana_bar) {
                 int has_spells = 0;
@@ -687,20 +708,125 @@ void sre_SceneObject_FinishLoad(void* self) {
         uint64_t* end_p   = (uint64_t*)((char*)self + 0xC8);
         uint64_t begin_v  = *begin_p;
         uint64_t end_v    = *end_p;
-        /* Check if pointers look valid: both non-null, end >= begin, difference ≤ 256 ptrs */
+        size_t count = 0;
+        /* Check if pointers look valid: both non-null, end >= begin, difference <= 256 ptrs */
         if (begin_v && end_v && end_v >= begin_v) {
-            size_t count = (size_t)((end_v - begin_v) / sizeof(uint64_t));
+            count = (size_t)((end_v - begin_v) / sizeof(uint64_t));
             if (count > 256) {
                 fprintf(stderr, "[SRE/SceneObject] FinishLoad: corrupt component count=%zu (obj=%p) — clamping to 0\n",
                         count, self);
                 /* Clamp: set end = begin so the loop body is skipped entirely */
                 *end_p = begin_v;
+                count = 0;
             }
         } else if (end_v && !begin_v) {
             /* end non-null but begin null — clear end too */
             fprintf(stderr, "[SRE/SceneObject] FinishLoad: null begin, non-null end=%llx (obj=%p) — clearing end\n",
                     (unsigned long long)end_v, self);
             *end_p = 0;
+            count = 0;
+        }
+
+        /* ── Per-component vtable safety (Purplemoor Crypt crash fix) ──────────────
+         * Crash: PC=0x10771ac = g_swordigo_base+0x77168 (.dynstr section).
+         * Occurs when a corrupted component pointer (e.g. unaligned 0x17cc002)
+         * or a component with a invalid parent/vtable is passed to FinishLoad.
+         * When FinishLoad calls vtable[9], Dynarmic executes string bytes as ARM64
+         * instructions → UnallocatedEncoding (type=0) which bypasses setjmp.
+         *
+         * Fix: Strict 5-point validation on every component before calling original:
+         * 1. 8-byte pointer alignment ((comp & 7) == 0)
+         * 2. Valid vtable location (.data.rel.ro / .rodata [0x583480, 0x6e8000))
+         * 3. 4-byte fn9 instruction alignment ((fn9 & 3) == 0)
+         * 4. Valid fn9 code location (.text [0x1f33d0, 0x583480))
+         * 5. Parent SceneObject pointer validation (at comp+0x28 if non-null)
+         * Invalid components are zeroed out so original's loop skips them safely. */
+        if (count > 0 && begin_v && g_swordigo_base) {
+            const uint64_t text_lo = g_swordigo_base + 0x1f33d0ULL; /* .plt start */
+            const uint64_t text_hi = g_swordigo_base + 0x583480ULL; /* .rodata start */
+            const uint64_t ro_lo   = g_swordigo_base + 0x583480ULL; /* .rodata start */
+            const uint64_t ro_hi   = g_swordigo_base + 0x6e8000ULL; /* .bss start */
+
+            uint64_t* arr = (uint64_t*)begin_v;
+            for (size_t ci = 0; ci < count; ci++) {
+                uint64_t comp = arr[ci];
+                if (!comp) continue;
+
+                /* 1. Alignment check: C++ component pointers MUST be 8-byte aligned */
+                if ((comp & 7) != 0 || comp < 0x10000ULL || comp >= 0x800000000000ULL) {
+                    fprintf(stderr, "[SRE/SceneObject] FinishLoad guard: "
+                            "comp[%zu]=0x%llx is misaligned or invalid range — zeroing\n",
+                            ci, (unsigned long long)comp);
+                    arr[ci] = 0;
+                    continue;
+                }
+
+                /* 2. Read vtable pointer */
+                uint64_t vtable = *(uint64_t*)comp;
+                if (!vtable || (vtable & 7) != 0) {
+                    fprintf(stderr, "[SRE/SceneObject] FinishLoad guard: "
+                            "comp[%zu]=%p vtable=0x%llx is null or misaligned — zeroing\n",
+                            ci, (void*)comp, (unsigned long long)vtable);
+                    arr[ci] = 0;
+                    continue;
+                }
+
+                /* Vtable must be in .data.rel.ro / .rodata, libsre, or trampoline caves */
+                bool vtable_ok = (vtable >= ro_lo && vtable < ro_hi) ||
+                                 (vtable >= 0x2000000ULL && vtable < 0x2300000ULL) ||
+                                 (vtable >= 0x3000000ULL && vtable < 0x3100000ULL);
+                if (!vtable_ok) {
+                    fprintf(stderr, "[SRE/SceneObject] FinishLoad guard: "
+                            "comp[%zu]=%p vtable=0x%llx not in .rodata range — zeroing\n",
+                            ci, (void*)comp, (unsigned long long)vtable);
+                    arr[ci] = 0;
+                    continue;
+                }
+
+                /* 3 & 4. Validate vtable[9] — FinishLoad call target */
+                uint64_t fn9 = ((uint64_t*)vtable)[9];
+                if (!fn9 || (fn9 & 3) != 0) {
+                    fprintf(stderr, "[SRE/SceneObject] FinishLoad guard: "
+                            "comp[%zu]=%p vtable[9]=0x%llx is null or misaligned — zeroing\n",
+                            ci, (void*)comp, (unsigned long long)fn9);
+                    arr[ci] = 0;
+                    continue;
+                }
+
+                bool fn9_ok = (fn9 >= text_lo && fn9 < text_hi) ||
+                              (fn9 >= 0x2000000ULL && fn9 < 0x2300000ULL) ||
+                              (fn9 >= 0x3000000ULL && fn9 < 0x3100000ULL);
+                if (!fn9_ok) {
+                    fprintf(stderr, "[SRE/SceneObject] FinishLoad guard: "
+                            "comp[%zu]=%p vtable[9]=0x%llx not in .text range — zeroing\n",
+                            ci, (void*)comp, (unsigned long long)fn9);
+                    arr[ci] = 0;
+                    continue;
+                }
+
+                /* 5. Check parent pointer at comp+0x28 (accessed by BackgroundComponent::Prepare) */
+                uint64_t parent = *(uint64_t*)(comp + 0x28);
+                if (parent) {
+                    if ((parent & 7) != 0 || parent < 0x10000ULL || parent >= 0x800000000000ULL) {
+                        fprintf(stderr, "[SRE/SceneObject] FinishLoad guard: "
+                                "comp[%zu]=%p parent=0x%llx misaligned — zeroing\n",
+                                ci, (void*)comp, (unsigned long long)parent);
+                        arr[ci] = 0;
+                        continue;
+                    }
+                    uint64_t parent_vt = *(uint64_t*)parent;
+                    if (!parent_vt || (parent_vt & 7) != 0 ||
+                        !((parent_vt >= ro_lo && parent_vt < ro_hi) ||
+                          (parent_vt >= 0x2000000ULL && parent_vt < 0x2300000ULL) ||
+                          (parent_vt >= 0x3000000ULL && parent_vt < 0x3100000ULL))) {
+                        fprintf(stderr, "[SRE/SceneObject] FinishLoad guard: "
+                                "comp[%zu]=%p parent=0x%llx has bad vtable=0x%llx — zeroing\n",
+                                ci, (void*)comp, (unsigned long long)parent, (unsigned long long)parent_vt);
+                        arr[ci] = 0;
+                        continue;
+                    }
+                }
+            }
         }
     }
 
@@ -717,6 +843,44 @@ void sre_SceneObject_FinishLoad(void* self) {
             if (my_depth >= 0) recovery_pop(my_depth);
         } else {
             g_orig_SceneObject_FinishLoad(self);
+        }
+    }
+}
+
+/* =============================================================================
+ * sre_SceneObjectGroup_FinishLoad — SceneObjectGroup::FinishLoad safety wrap
+ * =============================================================================
+ * IDA at nm 0x475498:
+ *   Caver::SceneObjectGroup::FinishLoad reads this->program (offset +40)
+ *   and calls ProgramState::Execute on it immediately during scene loading.
+ *   If the attached Lua script throws (error, stack overflow, bad access),
+ *   the original calls ProgramPanic → abort. This hook intercepts via setjmp
+ *   so the error is recoverable.
+ *
+ * Unlike SceneObject::FinishLoad (which iterates a component vector), the
+ * SceneObjectGroup variant does NOT have a loop that can run forever — the
+ * only danger is an unrecovered Lua exception from Execute(). So we do NOT
+ * apply a component bounds guard here; only the setjmp wrapper is needed.
+ * ============================================================================= */
+typedef void (*pfn_orig_SceneObjectGroup_FinishLoad)(void* self);
+pfn_orig_SceneObjectGroup_FinishLoad g_orig_SceneObjectGroup_FinishLoad = 0;
+
+void sre_SceneObjectGroup_FinishLoad(void* self) {
+    if (!self) return;
+    if (g_orig_SceneObjectGroup_FinishLoad) {
+        lua_State* L = g_sre_last_lua_state;
+        if (L != NULL) {
+            int my_depth = recovery_push(L);
+            if (my_depth >= 0 && sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
+                recovery_pop(my_depth);
+                fprintf(stderr, "[SRE/SceneGroup] Recovered exception in SceneObjectGroup::FinishLoad (obj=%p)! "
+                        "Skipped group script execution safely.\n", self);
+                return;
+            }
+            g_orig_SceneObjectGroup_FinishLoad(self);
+            if (my_depth >= 0) recovery_pop(my_depth);
+        } else {
+            g_orig_SceneObjectGroup_FinishLoad(self);
         }
     }
 }
@@ -858,4 +1022,189 @@ uint64_t sre_SceneObject_ComponentWithInterface(void* self, int64_t interface_id
     return 0;
 }
 
+/* =============================================================================
+ * sre_Proto_SceneObject_Clear — Proto::SceneObject::Clear crash guard
+ * =============================================================================
+ * CRASH (IDA decomp at nm 0x2fc030, confirmed in live log LR=0x12fe290):
+ *
+ *   Crash path: Scene::LoadFromFile (nm 0x463780)
+ *     -> Proto::Scene::~Scene()   -> ObjectLibrary::Clear()
+ *     -> ObjectTemplate::Clear()  -> Proto::SceneObject::Clear()
+ *     -> do { v4 = *(QWORD*)(array + 8*i);
+ *            (*(*v4 + 32))(v4);   // vtable[+32] = Clear()
+ *       } while (i < *(int*)(this+40));
+ *
+ * Root cause: this+40 (Component count) is corrupted — allocator "next free"
+ * link written to freed SceneObject memory -> large integer -> OOB walk ->
+ * element vtable = ARM64 STP instruction bytes -> PC = 0x47bfda9034ff4.
+ *
+ * FIX: Cap this+40 to 0 if > MAX_PROTO_COMPONENT_COUNT before calling original.
+ * Also null-guard the array pointer at this+32 (belt-and-suspenders).
+ *
+ * nm v1.4.12 arm64-v8a: 0x2fc030 (impl)   0x1fa880 (PLT thunk)
+ * We hook the IMPL so callers through both paths are intercepted.
+ * =============================================================================
+ */
+uint64_t g_orig_Proto_SceneObject_Clear = 0;
 
+#define MAX_PROTO_COMPONENT_COUNT 512
+
+void sre_Proto_SceneObject_Clear(void* this_) {
+    if (this_) {
+        char* t = (char*)this_;
+        int* comp_count = (int*)(t + 40);
+        if (*comp_count < 0 || *comp_count > MAX_PROTO_COMPONENT_COUNT) {
+            fprintf(stderr,
+                    "[SRE/Proto] SceneObject::Clear: corrupt component count "
+                    "at +40 = %d (obj=%p) — clamped to 0\n",
+                    *comp_count, this_);
+            *comp_count = 0;
+        }
+        /* Belt-and-suspenders: if array pointer at +32 is outside guest heap,
+         * null both pointer and count so original's loop guard can't fire. */
+        uint64_t* arr_ptr = (uint64_t*)(t + 32);
+        if (*arr_ptr != 0 &&
+            (*arr_ptr < 0x10000000ULL || *arr_ptr > 0xE0000000ULL)) {
+            fprintf(stderr,
+                    "[SRE/Proto] SceneObject::Clear: corrupt array ptr "
+                    "+32 = 0x%lx (obj=%p) — zeroed\n",
+                    (unsigned long)*arr_ptr, this_);
+            *arr_ptr = 0;
+            *comp_count = 0;
+        }
+    }
+    if (g_orig_Proto_SceneObject_Clear)
+        ((void(*)(void*))g_orig_Proto_SceneObject_Clear)(this_);
+}
+
+/* =============================================================================
+ * sre_Proto_ObjectLibrary_Clear — Proto::ObjectLibrary::Clear crash guard
+ * =============================================================================
+ * Sits ONE level above SceneObject::Clear in the destructor chain.
+ * IDA decomp at nm 0x2fd374: iterates THREE repeated-field vtable loops:
+ *
+ *   loop1: array=this+24, count=this+32  (ObjectTemplate list, calls Clear)
+ *   loop3: array=this+136, count=this+144 (unknown, vtable[+32])
+ *   loop4: array=this+192, count=this+200 (unknown, vtable[+32])
+ *
+ * (Loop2 at this+80/+88 uses sub_568CB8 = string release — no vtable, safe.)
+ *
+ * Same corrupt-count risk. We cap all three before calling through.
+ *
+ * nm v1.4.12 arm64-v8a: 0x2fd374 (impl)
+ * =============================================================================
+ */
+uint64_t g_orig_Proto_ObjectLibrary_Clear = 0;
+
+#define MAX_PROTO_OBJECTLIB_COUNT 1024
+
+static void objlib_cap_count(char* base, int offset, const char* tag) {
+    int* p = (int*)(base + offset);
+    if (*p < 0 || *p > MAX_PROTO_OBJECTLIB_COUNT) {
+        fprintf(stderr,
+                "[SRE/Proto] ObjectLibrary::Clear: corrupt %s count at +%d = %d "
+                "— clamped to 0\n", tag, offset, *p);
+        *p = 0;
+    }
+}
+
+void sre_Proto_ObjectLibrary_Clear(void* this_) {
+    if (this_) {
+        char* t = (char*)this_;
+        objlib_cap_count(t,  32, "ObjectTemplate");
+        objlib_cap_count(t, 144, "field3");
+        objlib_cap_count(t, 200, "field4");
+    }
+    if (g_orig_Proto_ObjectLibrary_Clear)
+        ((void(*)(void*))g_orig_Proto_ObjectLibrary_Clear)(this_);
+}
+
+/* =============================================================================
+ * sre_ComponentOutletBase_Connect — vtable safety guard
+ * =============================================================================
+ * CRASH (live log, Dynarmic NoExecuteFault):
+ *   X17 = 0x1247c48 [ComponentOutletBase::Connect]
+ *   X30 = 0x12824d4 [FireBreathComponent::FireBreathComponent]
+ *   X8  = 0xf9443508d0002308  ← CORRUPTED vtable ptr
+ *   PC  = 0x443508d0002308    ← jumps into kernel-space non-canonical addr
+ *
+ * IDA decompiled body at nm 0x247c48:
+ *   result = (*(*(_QWORD*)this + 8))(this);  // vtable[1] = identifier getter
+ *   if (result) {
+ *     v5 = *((_QWORD*)a2 + 5);               // a2 = Component*
+ *     v7 = *(*(_QWORD*)this + 32);           // vtable[4] = connect fn
+ *     (*(*(_QWORD*)this + 8))(this);         // vtable[1] again
+ *     SceneObject::ComponentWithIdentifier(v5);
+ *     return v7(this, v6);
+ *   }
+ *   return result;
+ *
+ * Root cause: when a component is destroyed during level unload, its 'this'
+ * pointer carried by the outlet struct still references freed memory.
+ * The allocator has written a free-list link word over the vtable slot.
+ * Calling vtable[1] launches into garbage memory → NoExecuteFault / PC far.
+ *
+ * Fix: validate vtable BEFORE any dispatch. If invalid — bail with 0 (same
+ * as the "no identifier" early-exit path in the original). This silently
+ * skips the binding which is fine: the component being bound no longer
+ * exists anyway.
+ *
+ * nm -D libswordigo.so v1.4.12 arm64-v8a: 0x247c48 (confirmed via swordigo_symbols_demangled.txt)
+ * =============================================================================
+ */
+uint64_t g_orig_ComponentOutletBase_Connect = 0;
+
+uint64_t sre_ComponentOutletBase_Connect(void* this_, void* a2) {
+    /* Null-guard 'this' (the outlet object) */
+    if (!this_) {
+        fprintf(stderr, "[SRE/Outlet] Connect: null this_ — skipped\n");
+        return 0;
+    }
+
+    /* Guard the outlet object's vtable pointer at *this */
+    uint64_t vtable = *(uint64_t*)this_;
+    if (!sre_is_valid_vtable_ptr(vtable)) {
+        fprintf(stderr,
+                "[SRE/Outlet] Connect: corrupt outlet vtable=0x%llx (this=%p) — blocked\n",
+                (unsigned long long)vtable, this_);
+        return 0;
+    }
+
+    /* Validate vtable slot 1 (byte offset +8): the identifier-getter function.
+     * Must be within libswordigo.so .text range (0x1203e90 – 0x1584000). */
+    uint64_t fn_slot1 = *(uint64_t*)(vtable + 8);
+    if (fn_slot1 < (g_swordigo_base + 0x203e90) ||
+        fn_slot1 >= (g_swordigo_base + 0x584000)) {
+        fprintf(stderr,
+                "[SRE/Outlet] Connect: vtable[1]=0x%llx out of .text (this=%p) — blocked\n",
+                (unsigned long long)fn_slot1, this_);
+        return 0;
+    }
+
+    /* Validate vtable slot 4 (byte offset +32): the connect-setter function. */
+    uint64_t fn_slot4 = *(uint64_t*)(vtable + 32);
+    if (fn_slot4 < (g_swordigo_base + 0x203e90) ||
+        fn_slot4 >= (g_swordigo_base + 0x584000)) {
+        fprintf(stderr,
+                "[SRE/Outlet] Connect: vtable[4]=0x%llx out of .text (this=%p) — blocked\n",
+                (unsigned long long)fn_slot4, this_);
+        return 0;
+    }
+
+    /* Validate Component* a2 if non-null (IDA: *(QWORD*)(a2+5*8) = sceneObject ptr) */
+    if (a2) {
+        uint64_t a2_addr = (uint64_t)a2;
+        if (a2_addr < 0x10000 || a2_addr >= 0x0000800000000000ULL) {
+            fprintf(stderr,
+                    "[SRE/Outlet] Connect: Component* a2=0x%llx out of heap range — blocked\n",
+                    (unsigned long long)a2_addr);
+            return 0;
+        }
+    }
+
+    /* All guards passed — call through to original implementation */
+    if (g_orig_ComponentOutletBase_Connect) {
+        return ((uint64_t(*)(void*, void*))g_orig_ComponentOutletBase_Connect)(this_, a2);
+    }
+    return 0;
+}

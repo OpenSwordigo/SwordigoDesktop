@@ -58,6 +58,11 @@ int g_sre_vfs_active = 0;
 /* Flag: 1 = search hierarchy enabled, 0 = simple prefix rewrite only */
 int g_sre_vfs_hierarchy_enabled = 0;
 
+/* Cache generation counter — incremented each time the VFS is (re)configured
+ * (i.e. each sre_vfs_init call). The FileExistsAtPath cache compares its
+ * local copy against this value and flushes when they differ. */
+int g_sre_vfs_cache_gen = 0;
+
 /* Original function pointers — set by host after trampoline install */
 uint64_t g_orig_FileExistsAtPath = 0;
 uint64_t g_orig_NewByteBuffer = 0;
@@ -171,6 +176,7 @@ void sre_vfs_init(const char* mod_prefix) {
         g_sre_vfs_mod_prefix[0] = '\0';
         g_sre_vfs_active = 0;
     }
+    g_sre_vfs_cache_gen++; /* flush FileExistsAtPath cache */
 }
 
 /*
@@ -217,6 +223,7 @@ void sre_vfs_init_full(const char* data_dir, const char* mod_name, const char* p
     /* Enable VFS if we have a data directory */
     g_sre_vfs_active = (data_dir && data_dir[0]) ? 1 : 0;
     g_sre_vfs_hierarchy_enabled = (mod_name && mod_name[0]) ? 1 : 0;
+    g_sre_vfs_cache_gen++; /* flush FileExistsAtPath cache */
 }
 
 /*
@@ -484,20 +491,58 @@ int sre_FileExistsAtPath(SreString* path_str) {
     /* Mod hierarchy — do a real multi-level search */
     if (g_sre_vfs_active && g_sre_vfs_hierarchy_enabled) {
         if (sre_vfs_rewrite_path(path, rewritten, 512) && g_sre_vfs_search_list[0]) {
-            const char* p = g_sre_vfs_search_list;
+            /* ---------------------------------------------------------------
+             * Fast path: 64-slot direct-mapped string cache.
+             * During a scene load the same 10-20 resource paths are checked
+             * dozens of times (FileExistsAtPath precedes NewByteBuffer for
+             * every asset). Each cache hit skips up to 5 fopen() calls.
+             * Cache is reset when the active mod or profile changes (handled
+             * by the host calling sre_vfs_init, which clears these statics).
+             * --------------------------------------------------------------- */
+            #define VFS_EXIST_CACHE_SLOTS 64
+            static char  vfs_cache_keys[VFS_EXIST_CACHE_SLOTS][512];
+            static int   vfs_cache_vals[VFS_EXIST_CACHE_SLOTS];
+            static int   vfs_cache_gen = 0; /* incremented on each sre_vfs_init */
+            static int   vfs_cache_mod_gen = -1; /* tracks g_sre_vfs_active generation */
+
+            /* Invalidate entire cache when mod config changes */
+            extern int g_sre_vfs_cache_gen; /* written by sre_vfs_init */
+            if (vfs_cache_mod_gen != g_sre_vfs_cache_gen) {
+                vfs_cache_mod_gen = g_sre_vfs_cache_gen;
+                memset(vfs_cache_keys, 0, sizeof(vfs_cache_keys));
+            }
+
+            /* Hash: simple djb2 mod slot count */
+            unsigned int h = 5381;
+            const char* p = path;
+            while (*p) h = ((h << 5) + h) ^ (unsigned char)*p++;
+            int slot = (int)(h % VFS_EXIST_CACHE_SLOTS);
+
+            if (vfs_cache_keys[slot][0] && strcmp(vfs_cache_keys[slot], path) == 0) {
+                return vfs_cache_vals[slot]; /* cache hit */
+            }
+
+            /* Cache miss — do the real fopen search */
+            const char* sp = g_sre_vfs_search_list;
             char candidate[512];
-            while (*p) {
+            int found = 0;
+            while (*sp && !found) {
                 int ci = 0;
-                while (*p && *p != '|' && ci < 511)
-                    candidate[ci++] = *p++;
+                while (*sp && *sp != '|' && ci < 511)
+                    candidate[ci++] = *sp++;
                 candidate[ci] = '\0';
-                if (*p == '|') p++;
+                if (*sp == '|') sp++;
                 if (ci > 0) {
                     FILE* f = fopen(candidate, "rb");
-                    if (f) { fclose(f); return 1; }
+                    if (f) { fclose(f); found = 1; }
                 }
             }
-            return 0;  /* not found in any of the 5 levels */
+
+            /* Store result in cache */
+            strncpy(vfs_cache_keys[slot], path, 511);
+            vfs_cache_keys[slot][511] = '\0';
+            vfs_cache_vals[slot] = found;
+            return found;
         }
     }
 

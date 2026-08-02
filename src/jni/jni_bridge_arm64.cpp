@@ -3712,11 +3712,24 @@ static void bridge_unlink(void* emu_ptr) {
 static int g_abort_count = 0;
 static uint64_t g_last_abort_lr = 0;
 static int g_same_lr_count = 0;
+static int g_abort_reentry_depth = 0;  /* re-entrancy guard: how deep we are in abort recovery */
+static uint64_t g_abort_last_target = 0;  /* last PC we redirected to — detect redirect loops */
+static int g_abort_same_target_count = 0;
+
+/* Validate a return address for use as an abort-recovery redirect target.
+ * Must be 4-byte aligned, in .text [0x1000000, 0x3000000) not in bridge/cave.
+ * This prevents redirecting into destructors that call abort() again. */
+static bool abort_lr_valid(uint64_t lr) {
+    return ((lr & 3) == 0) &&
+           lr >= 0x1000000ULL &&
+           lr < 0x3000000ULL;
+}
 
 static void bridge_abort(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
     g_abort_count++;
+    g_abort_reentry_depth++;
 
     uint64_t lr = emu->get_lr();
     uint64_t sp = emu->get_reg(31);
@@ -3729,17 +3742,33 @@ static void bridge_abort(void* emu_ptr) {
         g_last_abort_lr = lr;
     }
 
+    // ── RE-ENTRANCY GUARD ─────────────────────────────────────────────────
+    // If abort fires WHILE we are already handling a previous abort, the
+    // frame-walker landed in code that called abort() again (destructor loop,
+    // e.g. ObjectLibrary::~ObjectLibrary → vtable dispatch → abort()).
+    // Do NOT walk frames again — that will only deepen the loop.
+    // Instead, redirect straight to MAGIC_LR and let the host recover.
+    if (g_abort_reentry_depth > 1 || g_same_lr_count > 2) {
+        std::cerr << "[SRE/Abort-Recovery] Re-entrant abort #" << g_abort_reentry_depth
+                  << " (same_lr=" << g_same_lr_count << ") — escaping to MAGIC_LR\n";
+        g_abort_reentry_depth = 0;
+        g_same_lr_count = 0;
+        emu->redirect_pc = 0xE0000000ULL;  // MAGIC_LR — host detects and recovers
+        emu->set_reg(0, 0);
+        return;
+    }
+
     if (g_abort_count <= 3) {
         std::cerr << "[WARN] abort() #" << g_abort_count
                   << " PC=0x" << std::hex << emu->get_pc()
                   << " LR=0x" << lr
-                  << " SP=0x" << sp << std::dec << std::endl;
+                  << " SP=0x" << sp << std::dec << "\n";
 
         // Dump registers for debugging
         std::cerr << "  X0=0x" << std::hex << emu->get_reg(0)
                   << " X1=0x" << emu->get_reg(1)
                   << " X19=0x" << emu->get_reg(19)
-                  << " X20=0x" << emu->get_reg(20) << std::dec << std::endl;
+                  << " X20=0x" << emu->get_reg(20) << std::dec << "\n";
 
         // If called from the parser assert (LR near 0x15812e4), dump the object
         uint64_t x19 = emu->get_reg(19);
@@ -3747,18 +3776,19 @@ static void bridge_abort(void* emu_ptr) {
             uint64_t val792 = *(uint64_t*)(memory + (uint32_t)x19 + 792);
             uint64_t val832 = *(uint64_t*)(memory + (uint32_t)x19 + 832);
             std::cerr << "  object[792]=0x" << std::hex << val792
-                      << " object[832]=0x" << val832 << std::dec << std::endl;
-            // Try to read what's at the code address in object[792]
+                      << " object[832]=0x" << val832 << std::dec << "\n";
             if (val792 > 0x1000000 && val792 < 0x2000000) {
                 uint32_t code1 = *(uint32_t*)(memory + (uint32_t)val792);
                 uint32_t code2 = *(uint32_t*)(memory + (uint32_t)val792 + 4);
                 std::cerr << "  code@[792]: 0x" << std::hex << code1
-                          << " 0x" << code2 << std::dec << std::endl;
+                          << " 0x" << code2 << std::dec << "\n";
             }
         }
     }
 
-    // ABORT RECOVERY: Immediately unwind stack frame to skip past the aborting exception/assert
+    // ABORT RECOVERY: Walk up to 2 stack frames looking for a valid return address.
+    // Critically: validate that the target is 4-byte aligned and NOT in a region
+    // that will call abort() itself (i.e. not a destructor body).
     uint64_t fp = emu->get_reg(29);  // current frame pointer
     if (fp > 0x1000 && fp < 0xF0000000) {
         uint64_t fp1 = *(uint64_t*)(memory + (uint32_t)fp);
@@ -3769,35 +3799,71 @@ static void bridge_abort(void* emu_ptr) {
             lr2 = *(uint64_t*)(memory + (uint32_t)fp1 + 8);
         }
 
-        if (lr2 > 0x1000000 && lr2 < 0x3000000) {
+        // Prefer lr2 (2 frames up) — it's further from the abort callsite
+        if (abort_lr_valid(lr2)) {
+            // Extra guard: if we already redirected here and got another abort,
+            // the target itself is bad — try lr1 instead
+            if (lr2 == g_abort_last_target) {
+                g_abort_same_target_count++;
+                if (g_abort_same_target_count > 1) {
+                    std::cerr << "[SRE/Abort-Recovery] Target 0x" << std::hex << lr2
+                              << " triggered abort again — escaping to MAGIC_LR\n" << std::dec;
+                    g_abort_reentry_depth = 0;
+                    g_abort_same_target_count = 0;
+                    emu->redirect_pc = 0xE0000000ULL;
+                    emu->set_reg(0, 0);
+                    return;
+                }
+            } else {
+                g_abort_same_target_count = 1;
+                g_abort_last_target = lr2;
+            }
             std::cerr << "[SRE/Abort-Recovery] Intercepted abort() — unwinding 2 frames to 0x"
-                      << std::hex << lr2 << std::dec << std::endl;
+                      << std::hex << lr2 << std::dec << "\n";
             emu->set_reg(29, fp2);
             emu->set_reg(31, fp1 + 16);
             emu->set_reg(0, 0);
             emu->redirect_pc = lr2;
+            g_abort_reentry_depth = 0;
             return;
-        } else if (lr1 > 0x1000000 && lr1 < 0x3000000) {
+        } else if (abort_lr_valid(lr1)) {
+            if (lr1 == g_abort_last_target) {
+                g_abort_same_target_count++;
+                if (g_abort_same_target_count > 1) {
+                    std::cerr << "[SRE/Abort-Recovery] Target 0x" << std::hex << lr1
+                              << " triggered abort again — escaping to MAGIC_LR\n" << std::dec;
+                    g_abort_reentry_depth = 0;
+                    g_abort_same_target_count = 0;
+                    emu->redirect_pc = 0xE0000000ULL;
+                    emu->set_reg(0, 0);
+                    return;
+                }
+            } else {
+                g_abort_same_target_count = 1;
+                g_abort_last_target = lr1;
+            }
             std::cerr << "[SRE/Abort-Recovery] Intercepted abort() — unwinding 1 frame to 0x"
-                      << std::hex << lr1 << std::dec << std::endl;
+                      << std::hex << lr1 << std::dec << "\n";
             emu->set_reg(29, fp1);
             emu->set_reg(31, fp + 16);
             emu->set_reg(0, 0);
             emu->redirect_pc = lr1;
+            g_abort_reentry_depth = 0;
             return;
         }
     }
 
     // Fallback: redirect directly to LR or MAGIC_LR
-    if (lr >= 0x1000000ULL && lr < 0x3000000ULL) {
+    if (abort_lr_valid(lr)) {
         std::cerr << "[SRE/Abort-Recovery] Intercepted abort() — returning to LR=0x"
-                  << std::hex << lr << std::dec << std::endl;
+                  << std::hex << lr << std::dec << "\n";
         emu->redirect_pc = lr;
         emu->set_reg(0, 0);
     } else {
-        std::cerr << "[SRE/Abort-Recovery] Intercepted abort() — returning to MAGIC_LR" << std::endl;
+        std::cerr << "[SRE/Abort-Recovery] Intercepted abort() — escaping to MAGIC_LR\n";
         emu->redirect_pc = 0xE0000000ULL;  // MAGIC_LR
     }
+    g_abort_reentry_depth = 0;
 }
 
 

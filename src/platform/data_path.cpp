@@ -83,6 +83,25 @@ std::string get_system_data_dir() {
     return s_system_data_dir_cache;
 }
 
+__attribute__((weak)) std::string g_save_dir;
+
+std::string get_vfs_save_dir(const std::string& custom_base) {
+    std::string base = custom_base;
+    if (base.empty()) {
+        base = g_save_dir;
+    }
+    if (base.empty()) {
+        base = get_user_data_dir() + "save";
+    }
+    while (!base.empty() && (base.back() == '/' || base.back() == '\\')) {
+        base.pop_back();
+    }
+    if (base.length() >= 10 && base.substr(base.length() - 10) == "/Documents") {
+        return base;
+    }
+    return base + "/Documents";
+}
+
 // ============================================================
 //  First-run setup: copy from /usr/share/swordigo/ → ~/.local/share/swordigo-desktop/
 // ============================================================
