@@ -1,0 +1,26 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "github-actions",
+      "displayName": "GitHub Actions",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/github-actions",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "SWORDIGO_USE_DYNARMIC": "OFF",
+        "SWORDIGO_BUILD_SRE": "OFF",
+        "SWORDIGO_BUILD_RUBY": "OFF",
+        "SWORDIGO_BUILD_OPENSWORDIGO": "OFF",
+        "SWORDIGO_USE_BUNDLED_FFMPEG": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "github-actions",
+      "configurePreset": "github-actions"
+    }
+  ]
+}

@@ -81,6 +81,16 @@ Cross-compiles the Swordigo Runtime Engine for ARM64 using `aarch64-linux-gnu-gc
 make asset_viewer
 ```
 
+## GitHub Actions
+
+The repository includes a CMake preset and a GitHub Actions workflow for CI builds. To trigger the workflow manually from the GitHub CLI, use:
+
+```bash
+gh workflow run cmake.yml --ref main
+```
+
+`gh run` only manages existing runs, so it will not start a new workflow dispatch.
+
 ---
 
 ## Build Targets

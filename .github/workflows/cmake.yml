@@ -1,0 +1,43 @@
+name: CMake
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            libsdl3-dev \
+            libsdl3-image-dev \
+            libopenal-dev \
+            libgl1-mesa-dev \
+            libunicorn-dev \
+            libvorbis-dev \
+            libmpg123-dev \
+            zlib1g-dev \
+            libavformat-dev \
+            libavcodec-dev \
+            libswscale-dev \
+            libavutil-dev
+
+      - name: Configure CMake
+        run: cmake --preset github-actions
+
+      - name: Build
+        run: cmake --build --preset github-actions --parallel

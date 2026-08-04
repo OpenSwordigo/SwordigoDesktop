@@ -10,6 +10,7 @@ option(SWORDIGO_USE_DYNARMIC "Build and link the Dynarmic ARM64 JIT" ON)
 option(SWORDIGO_BUILD_SRE "Build the ARM64 guest libsre.so" ON)
 option(SWORDIGO_BUILD_RUBY "Build the asset viewer" ON)
 option(SWORDIGO_BUILD_OPENSWORDIGO "Build the optional native OpenSwordigo runtime" OFF)
+option(SWORDIGO_USE_BUNDLED_FFMPEG "Link against the bundled static FFmpeg build" ON)
 set(SWORDIGO_FFMPEG_ROOT "${CMAKE_SOURCE_DIR}/src/tools/ffmpeg/build" CACHE PATH "Local static FFmpeg prefix")
 set(SWORDIGO_DYNARMIC_ROOT "${CMAKE_SOURCE_DIR}/deps/dynarmic/build" CACHE PATH "Dynarmic build directory")
 
@@ -32,6 +33,25 @@ pkg_check_modules(VORBISFILE REQUIRED vorbisfile)
 pkg_check_modules(MPG123 REQUIRED libmpg123)
 find_library(UNICORN_LIBRARY NAMES unicorn REQUIRED)
 
+if (SWORDIGO_USE_BUNDLED_FFMPEG)
+    set(FFMPEG_LIB_DIR "${SWORDIGO_FFMPEG_ROOT}/lib")
+    set(FFMPEG_LINK_LIBS
+        -Wl,--whole-archive
+        "${FFMPEG_LIB_DIR}/libavformat.a" "${FFMPEG_LIB_DIR}/libavcodec.a"
+        "${FFMPEG_LIB_DIR}/libswscale.a" "${FFMPEG_LIB_DIR}/libavutil.a"
+        -Wl,--no-whole-archive)
+else()
+    pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
+    pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec)
+    pkg_check_modules(SWSCALE REQUIRED IMPORTED_TARGET libswscale)
+    pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil)
+    set(FFMPEG_LINK_LIBS
+        PkgConfig::AVFORMAT
+        PkgConfig::AVCODEC
+        PkgConfig::SWSCALE
+        PkgConfig::AVUTIL)
+endif()
+
 set(SRC_DIR "${CMAKE_SOURCE_DIR}/src")
 set(INCLUDE_DIR "${CMAKE_SOURCE_DIR}/include")
 set(COMMON_INCLUDES
@@ -46,8 +66,6 @@ if (SWORDIGO_USE_DYNARMIC)
     list(APPEND COMMON_DEFINITIONS USE_DYNARMIC SWORDIGO_HAS_DYNARMIC)
 endif()
 set(SWORDIGO_RPATH "$ORIGIN/libs;$ORIGIN;$ORIGIN/../libs;$ORIGIN/../share/swordigo-desktop/libs;/usr/share/swordigo-desktop/libs;/usr/share/swordigo-desktop")
-set(FFMPEG_LIB_DIR "${SWORDIGO_FFMPEG_ROOT}/lib")
-
 function(swordigo_target target)
     target_include_directories(${target} PRIVATE ${COMMON_INCLUDES} ${SDL3_IMAGE_INCLUDE_DIRS})
     target_compile_definitions(${target} PRIVATE ${COMMON_DEFINITIONS})
@@ -101,9 +119,7 @@ add_executable(swordfare_boot ${SRC_DIR}/main.cpp ${SRC_DIR}/platform/display.cp
 set_target_properties(swordfare_boot PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin" OUTPUT_NAME swordfare)
 swordigo_target(swordfare_boot)
 target_link_libraries(swordfare_boot PRIVATE swcore swgui swfmt swpod filerift swgfx swemu swordfare
-    -Wl,--whole-archive
-    ${FFMPEG_LIB_DIR}/libavformat.a ${FFMPEG_LIB_DIR}/libavcodec.a ${FFMPEG_LIB_DIR}/libswscale.a ${FFMPEG_LIB_DIR}/libavutil.a
-    -Wl,--no-whole-archive
+    ${FFMPEG_LINK_LIBS}
     SDL3::SDL3 ${SDL3_IMAGE_LINK} ${VORBISFILE_LIBRARIES} ${MPG123_LIBRARIES} ZLIB::ZLIB OpenAL::OpenAL OpenGL::GL Threads::Threads ${CMAKE_DL_LIBS} m)
 if (SWORDIGO_USE_DYNARMIC)
     target_link_libraries(swordfare_boot PRIVATE
