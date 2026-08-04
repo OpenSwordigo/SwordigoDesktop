@@ -1242,6 +1242,7 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
                     // If updateApplication (0x1478ccc) or handleTouchEvent (0x1478f84) is spinning at the exact same PC
                     // with zero pending threads and zero bridge calls made during this chunk loop, break out cleanly
                     // so the host main loop can poll SDL events and render without hanging!
+                    //
                     if (start_pc == 0x1478cccULL || start_pc == 0x1478f84ULL) {
                         break;
                     }

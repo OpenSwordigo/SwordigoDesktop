@@ -1291,6 +1291,33 @@ static void pref_set(const std::string& key, const std::string& val) {
 }
 
 // Resolve a jstring handle (from g_jstrings map) or a raw guest C-string pointer
+// ── Per-slot snapshot naming ──────────────────────────────────────────────
+// Each save slot is identified by the snapshot "name" the guest passes to
+// saveSnapshot/loadSnapshot/deleteSnapshot. The name was ignored before, so
+// every slot collapsed into a single snapshot.bin and new save slots lost
+// their identity. Keep files under g_save_dir so old paths keep working.
+static std::string snapshot_sanitize_name(const std::string& name) {
+    std::string out;
+    out.reserve(name.size());
+    for (char c : name) {
+        if (c == '/' || c == '\\' || c == ':' || c == '\0' || (unsigned char)c < 0x20)
+            out += '_';
+        else
+            out += c;
+    }
+    if (out.empty()) return "snapshot";
+    if (out.size() > 120) out = out.substr(0, 120);
+    return out;
+}
+
+static std::string snapshot_path_for_name(const std::string& name) {
+    return g_save_dir + "/snapshots/" + snapshot_sanitize_name(name) + ".bin";
+}
+
+static std::string snapshot_documents_path_for_name(const std::string& name) {
+    return g_save_dir + "/Documents/" + snapshot_sanitize_name(name) + ".gplayer";
+}
+
 static std::string resolve_jstring(uint32_t handle, uint8_t* memory) {
     auto it = g_jstrings.find(handle);
     if (it != g_jstrings.end()) return it->second;
@@ -1684,9 +1711,19 @@ void bridge_CallStaticVoidMethodV(void* emu_ptr) {
     } else if (mid == 0x13170007) { // receivedPrivacyConsent
         std::cout << "[JNI] receivedPrivacyConsent() -> Stubbed!" << std::endl;
     } else if (mid == 0x13250001) { // loadSnapshot
-        std::string snap_path = g_save_dir + "/snapshot.bin";
-        std::cout << "[SAVE] loadSnapshot() -> Posting async load for " << snap_path << std::endl;
-        io_thread_post_load(snap_path, [](bool ok, std::vector<uint8_t> data) {
+        uint8_t* memory = emu->get_memory_base();
+        uint32_t va_list_ptr = emu->get_reg(3);
+        uint32_t name_ref_load = *(uint32_t*)(memory + va_list_ptr);
+        std::string snap_name = resolve_jstring(name_ref_load, memory);
+        std::string snap_path = snapshot_path_for_name(snap_name);
+        std::string snap_path_legacy = g_save_dir + "/snapshot.bin";
+        std::string snap_path_doc = snapshot_documents_path_for_name(snap_name);
+        std::string actual_path = snap_path;
+        if (!fs::exists(actual_path) && !snap_name.empty() && fs::exists(snap_path_doc))
+            actual_path = snap_path_doc;           // .gplayer mirror written by saveSnapshot
+        if (!fs::exists(actual_path)) actual_path = snap_path_legacy; // legacy boot resume
+        std::cout << "[SAVE] loadSnapshot(name=\"" << snap_name << "\") -> Posting async load for " << actual_path << std::endl;
+        io_thread_post_load(actual_path, [](bool ok, std::vector<uint8_t> data) {
             g_snapshot_load_pending_count++;
             g_snapshot_has_data = ok;
             if (ok) {
@@ -1703,8 +1740,9 @@ void bridge_CallStaticVoidMethodV(void* emu_ptr) {
         uint32_t va_list_ptr = emu->get_reg(3);
         uint32_t name_ref = *(uint32_t*)(memory + va_list_ptr);
         uint32_t data_ref = *(uint32_t*)(memory + va_list_ptr + 4);
-        std::cout << "[SAVE] saveSnapshot(name=0x" << std::hex << name_ref 
-                  << ", data=0x" << data_ref << ")" << std::dec << std::endl;
+        std::string snap_name = resolve_jstring(name_ref, memory);
+        std::cout << "[SAVE] saveSnapshot(name=\"" << snap_name << "\""
+                  << ", data=0x" << std::hex << data_ref << ")" << std::dec << std::endl;
         
         if (data_ref != 0) {
             uint32_t array_len = *(uint32_t*)(memory + data_ref);
@@ -1712,14 +1750,34 @@ void bridge_CallStaticVoidMethodV(void* emu_ptr) {
             
             if (array_len > 0 && array_len < 0x1000000) {
                 std::vector<uint8_t> data_to_save(array_data, array_data + array_len);
-                std::string snap_path = g_save_dir + "/snapshot.bin";
-                io_thread_post_save(snap_path, std::move(data_to_save));
+                // Persist the slot under its NAME (not just the shared snapshot.bin) so
+                // a newly created save slot keeps its identity and survives a menu return.
+                std::string snap_path = snapshot_path_for_name(snap_name);
+                io_thread_post_save(snap_path, data_to_save);
+                if (!snap_name.empty()) {
+                    std::string doc_path = snapshot_documents_path_for_name(snap_name);
+                    try { fs::create_directories(fs::path(doc_path).parent_path()); } catch (...) {}
+                    std::vector<uint8_t> doc_copy = data_to_save;
+                    io_thread_post_save(doc_path, std::move(doc_copy));
+                }
+                std::string snap_legacy = g_save_dir + "/snapshot.bin";
+                std::vector<uint8_t> legacy_copy = data_to_save;
+                io_thread_post_save(snap_legacy, std::move(legacy_copy));
                 std::cout << "[SAVE] Wrote " << array_len << " bytes asynchronously via IO thread" << std::endl;
             }
         }
     } else if (mid == 0x13250003) { // deleteSnapshot
-        remove((g_save_dir + "/snapshot.bin").c_str());
-        std::cout << "[SAVE] Deleted snapshot" << std::endl;
+        uint8_t* memory = emu->get_memory_base();
+        uint32_t va_list_ptr = emu->get_reg(3);
+        uint32_t name_ref_del = *(uint32_t*)(memory + va_list_ptr);
+        std::string snap_name_del = resolve_jstring(name_ref_del, memory);
+        if (snap_name_del.empty()) {
+            remove((g_save_dir + "/snapshot.bin").c_str());
+        } else {
+            remove(snapshot_path_for_name(snap_name_del).c_str());
+            remove(snapshot_documents_path_for_name(snap_name_del).c_str());
+        }
+        std::cout << "[SAVE] Deleted snapshot \"" << snap_name_del << "\"" << std::endl;
     } else if (mid == 0x13270001) { // startAdsAndAnalytics
         std::cout << "[JNI] startAdsAndAnalytics() -> Stubbed!" << std::endl;
     } else if (mid == 0x13280002) { // saveBooleanInSP(String key, boolean val)

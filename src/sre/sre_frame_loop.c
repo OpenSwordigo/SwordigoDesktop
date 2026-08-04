@@ -35,18 +35,18 @@
  *       Strips Android-specific calls (Achievements, GUIApplication::DispatchEvents)
  *       Routes AudioSystem::Update, then dispatches GameSceneView vtable
  *
- *   Level 3 — ProgramState::Update  (0x3198bd)
+ *   Level 3 — ProgramState::Update  (0x4c15fc)
  *     → sre_ProgramState_Update  (in sre_lua.c, already hooked)
  *       Time-sliced: caps at FRAME_COROUTINE_BUDGET_MS per host frame
  *
  * OFFSETS (v1.4.12 ARM64, from nm -D libswordigo.so + Ghidra)
  * ──────────────────────────────────────────────────────────────
  *   Java_..._updateApplication     0x1478ccc  (JNI stub, 7 insns)
- *   CaverShell::Update              0x1ce38d   (vtable slot 13)
- *   GameSceneView::Update           0x27a89d   (vtable slot @ this+0x48)
- *   GameSceneController::Update     0x278739
- *   Scene::Update                   0x2ea411
- *   ProgramState::Update            0x3198bd
+ *   CaverShell::Update              0x210efc   (vtable slot 13)
+ *   GameSceneView::Update           0x34ed2c   (vtable slot @ this+0x48)
+ *   GameSceneController::Update     0x349d84
+ *   Scene::Update                   0x465968
+ *   ProgramState::Update            0x4c15fc
  *   AudioSystem::Update             (called from CaverShell at runtime via singleton)
  *   AchievementsManager::Update     (no-op replacement)
  *   GUIApplication::DispatchEvents  (no-op replacement)
@@ -82,7 +82,6 @@ extern lua_State* g_sre_last_lua_state;
 extern int        g_lua_console_pending;
 extern void       sre_run_console(lua_State* L);
 extern void       sre_mini_ensure_injected(lua_State* L);
-extern void       sre_tick_console_coroutines(lua_State* L);
 
 /* From sre_scene_update.c */
 extern void sre_GameSceneView_Update(void* self, float deltaTime);
@@ -108,6 +107,11 @@ volatile float g_sre_frame_budget_ms_remaining = FRAME_COROUTINE_BUDGET_MS;
 /* Frame timing state */
 static struct timespec s_frame_start;
 static int             s_frame_timing_init = 0;
+
+/* Host-visible diagnostics. These counters make it possible to distinguish a
+ * dead JNI hook from a live frame loop whose scene poll simply saw no work. */
+volatile uint64_t g_sre_frame_update_ticks = 0;
+volatile uint64_t g_sre_frame_shell_ticks  = 0;
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Game speed multiplier (from sre_lua.c)
@@ -193,7 +197,7 @@ void sre_GUIApplication_DispatchEvents(void* self) {
 /* ──────────────────────────────────────────────────────────────────────────
  * sre_CaverShell_Update — full PC-safe reimplementation
  *
- * Replaces Caver::CaverShell::Update(float) at 0x1ce38d.
+ * Replaces Caver::CaverShell::Update(float) at 0x210efc.
  *
  * Original execution in CaverShell::Update(float):
  *   1. if (this[0xa8]) param_1 = 0.0;              // paused check
@@ -206,6 +210,7 @@ void sre_GUIApplication_DispatchEvents(void* self) {
  * ARM64 ABI: X0 = this (CaverShell*), S0 = float dt
  * ────────────────────────────────────────────────────────────────────────── */
 void sre_CaverShell_Update(void* self, float dt) {
+    if (!self) return;
     char* shell = (char*)self;
 
     /* 1. Paused check (offset +0xa8): zero-out dt when engine is paused */
@@ -223,9 +228,9 @@ void sre_CaverShell_Update(void* self, float dt) {
 
     /* 4. AudioSystem::Update — find singleton via sharedSystem() and call */
     {
-        /* AudioSystem::sharedSystem() → 0x47ee38 (from nm -D libswordigo.so v1.4.12 ARM64) */
-        #define OFF_AudioSystem_sharedSystem  0x47ee38
-        #define OFF_AudioSystem_Update        0x47ef10
+        /* Offsets verified with nm -D -C libswordigo.so. */
+        #define OFF_AudioSystem_sharedSystem  0x47e32c
+        #define OFF_AudioSystem_Update        0x47fb9c
 
         typedef void* (*pfn_sharedSystem)(void);
         typedef void  (*pfn_audioUpdate)(void* self, float dt);
@@ -245,7 +250,7 @@ void sre_CaverShell_Update(void* self, float dt) {
     {
         /* FWShellPreferences::Get(pref, 2) = screen width (int)  */
         /* FWShellPreferences::Get(pref, 3) = screen height (int) */
-        #define OFF_FWShellPreferences_Get  0x2f5d8c
+        #define OFF_FWShellPreferences_Get  0x47e2d0
 
         typedef int (*pfn_PrefGet)(void* self, int field);
         pfn_PrefGet prefGet = (pfn_PrefGet)(g_swordigo_base + OFF_FWShellPreferences_Get);
@@ -268,7 +273,7 @@ void sre_CaverShell_Update(void* self, float dt) {
             if ((cur_w < fw - eps || cur_w > fw + eps) ||
                 (cur_h < fh - eps || cur_h > fh + eps)) {
                 /* GUIView::SetFrame(this, rect) — rect is a {float x, y, w, h} struct */
-                #define OFF_GUIView_SetFrame  0x49e228
+                #define OFF_GUIView_SetFrame  0x49f5c8
                 typedef void (*pfn_SetFrame)(void* self, void* rect);
                 pfn_SetFrame setFrame = (pfn_SetFrame)(g_swordigo_base + OFF_GUIView_SetFrame);
                 float rect[4] = { 0.0f, 0.0f, fw, fh };
@@ -278,7 +283,7 @@ void sre_CaverShell_Update(void* self, float dt) {
             }
 
             /* 6. Dispatch via vtable[+0x48] = GameSceneView::Update (or whatever the root view is).
-             *    Our sre_GameSceneView_Update is already installed via trampoline at 0x27a89d,
+             *    Our sre_GameSceneView_Update is already installed via trampoline at 0x34ed2c,
              *    so calling through the vtable naturally lands in our reimplementation. */
             if (root_view) {
                 void**  vtable = *(void***)root_view;
@@ -287,7 +292,9 @@ void sre_CaverShell_Update(void* self, float dt) {
                 if (root_update) {
                     root_update(root_view, dt);
                 }
-                /* 6b. Run 60 Hz RakNet LAN Sync Engine */
+                /* Network polling belongs to the frame owner, once per frame.
+                 * Keeping it here avoids competing consumers draining the same
+                 * non-blocking UDP socket from both HUD and shell updates. */
                 {
                     extern void sre_raknet_lan_sync_update(void* view);
                     sre_raknet_lan_sync_update(root_view);
@@ -316,25 +323,27 @@ void sre_CaverShell_Update(void* self, float dt) {
 void sre_frame_update(void* env, void* obj, float dt) {
     (void)env; (void)obj;
 
+    g_sre_frame_update_ticks++;
+
     /* Reset per-frame coroutine time budget */
     sre_frame_budget_start();
 
-    /* Fetch CaverShell* singleton from DAT_007f3c20 (runtime global pointer) */
-    #define OFF_CaverShell_globalptr  0x7f3c20  /* g_caverShell global in BSS */
+    /* IDA: Native_updateApplication loads qword_6E9C20, then dispatches
+     * vtable+0x68. This is the runtime CaverShell singleton for v1.4.12. */
+    #define OFF_CaverShell_globalptr  0x6e9c20
 
     void** caverShell_ptr_addr = (void**)(g_swordigo_base + OFF_CaverShell_globalptr);
     void* shell = *caverShell_ptr_addr;
 
-    if (!shell) {
-        /* Engine not yet initialized — skip tick */
-        return;
-    }
+    if (shell) {
+        g_sre_frame_shell_ticks++;
 
-    /* Call our PC-safe CaverShell::Update.
+        /* Call our PC-safe CaverShell::Update.
      * This will cascade into GameSceneView::Update (hooked via trampoline)
      * and ProgramState::Update (hooked via trampoline), both of which are
      * safe to call here. */
-    sre_CaverShell_Update(shell, dt);
+        sre_CaverShell_Update(shell, dt);
+    }
 
     /* Scene Shifter — consume pending teleport requests from the host GUI.
      * Called after CaverShell::Update so we never interrupt an in-flight scene
@@ -349,7 +358,7 @@ void sre_frame_update(void* env, void* obj, float dt) {
  *
  * This is the symbol registered in sre_hook_table (sre_init.c) under
  * "sre_CaverShell_Update". The trampoline installer patches
- * CaverShell::Update at 0x1ce38d to jump here.
+ * CaverShell::Update at 0x210efc to jump here.
  *
  * The relay cave saves the original first instruction so callers that
  * go through the vtable normally also land here.
@@ -361,7 +370,7 @@ void sre_CaverShell_Update_trampoline(void* self, float dt) {
 /* ──────────────────────────────────────────────────────────────────────────
  * Scene::Update hook  (sre_Scene_Update)
  *
- * Installed via hook table on Scene::Update at 0x2ea411.
+ * Installed via hook table on Scene::Update at 0x465968.
  *
  * The full Scene::Update does:
  *   1. ProgramState::Update(this+0x28, dt)  ← hooked via sre_ProgramState_Update
@@ -380,6 +389,7 @@ typedef void (*pfn_orig_Scene_Update)(void* self, float dt);
 pfn_orig_Scene_Update g_orig_Scene_Update_fn = NULL;
 
 void sre_Scene_Update(void* self, float dt) {
+    if (!self) return;
     if (g_orig_Scene_Update_fn) {
         g_orig_Scene_Update_fn(self, dt);
     }
@@ -388,7 +398,7 @@ void sre_Scene_Update(void* self, float dt) {
 /* ──────────────────────────────────────────────────────────────────────────
  * sre_GameSceneController_Update — interception hook
  *
- * Installed at GameSceneController::Update (0x278739).
+ * Installed at GameSceneController::Update (0x349d84).
  *
  * Original calls:
  *   - Hero existence check / AddHeroObjectToScene
@@ -406,6 +416,7 @@ typedef void (*pfn_orig_GSC_Update)(void* self, float dt);
 pfn_orig_GSC_Update g_orig_GameSceneController_Update = NULL;
 
 void sre_GameSceneController_Update(void* self, float dt) {
+    if (!self) return;
     if (g_orig_GameSceneController_Update) {
         g_orig_GameSceneController_Update(self, dt);
     }

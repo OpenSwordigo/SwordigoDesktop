@@ -8,6 +8,7 @@
 #endif
 #include <iostream>
 #include <iomanip>
+#include <cstdlib>
 #include <vector>
 #include <stdint.h>
 #include <filesystem>
@@ -23,9 +24,12 @@ namespace fs = std::filesystem;
 #include "platform/emulator.h"
 #include "platform/emulator_arm64.h"
 #include "platform/i_emulator_arm64.h"
+#ifdef SWORDIGO_HAS_DYNARMIC
 #include "platform/emulator_dynarmic64.h"
+#endif
 #include "srehost/srehost_abi.h"   // ProHook Phase 1: SVC #0x5352 gateway
 #include "platform/display.h"
+#include "platform/openswordigo_host.h"
 #include "android/asset_manager.h"
 extern "C" void asset_manager_init_arm32(const char* base_path);
 #include "game/camera_override.h"
@@ -2641,9 +2645,15 @@ void load_and_boot_arm64() {
     // Initialize ARM64 Emulator AFTER memory is prepared
     // Multi-engine backend selection
     if (g_use_dynarmic) {
+#ifdef SWORDIGO_HAS_DYNARMIC
         g_emulator_64 = new EmulatorDynarmic64(g_guest_memory, GUEST_MEM_SIZE);
         // ProHook Phase 1: Register Dynarmic emulator for JIT cache invalidation
         SREHost_RegisterEmulator(static_cast<EmulatorDynarmic64*>(g_emulator_64));
+#else
+        std::cerr << "[Main] Dynarmic was not built; falling back to Unicorn\n";
+        g_use_dynarmic = false;
+        g_emulator_64 = new EmulatorArm64(g_guest_memory, GUEST_MEM_SIZE);
+#endif
     } else {
         g_emulator_64 = new EmulatorArm64(g_guest_memory, GUEST_MEM_SIZE);
     }
@@ -3467,6 +3477,11 @@ void load_and_boot_arm64() {
                          * Our hook caps this+40 (count) before delegating. */
                         { "_ZN5Caver5Proto11SceneObject5ClearEv",
                           "g_orig_Proto_SceneObject_Clear" },
+                        /* Proto::SceneObject D1/D2 destructor — nm 0x2fe23c.
+                         * Separate from Clear(): it directly dispatches component
+                         * vtable[1] during scene teardown and needs its own guard. */
+                        { "_ZN5Caver5Proto11SceneObjectD1Ev",
+                          "g_orig_Proto_SceneObject_Destroy" },
                         /* ComponentOutletBase::Connect vtable safety guard
                          * nm arm64-v8a 0x247c48: _ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE
                          * Crash: freed component's 'this' carries garbage vtable (0xf9443508d0002308)
@@ -3836,10 +3851,9 @@ void load_and_boot_arm64() {
                     }
                     std::cout << "[SRE-Resolver] Dynamically resolved " << iface_resolved << " component interfaces." << std::endl;
 
-                    // updateApplication hook completely removed. The CBZ instruction inside the 7-instruction
-                    // updateApplication wrapper has an offset limit of +-1MB. Relocating it to our cave region
-                    // (which is 29MB away) causes the offset to overflow/wrap, sending PC to 0x20010.
-                    // Since the original wrapper is safe, we don't hook it at all and run it natively.
+                    // updateApplication is a full replacement, not a relay. Its
+                    // original CBZ is therefore never relocated; the hook table
+                    // installs a single direct B to sre_updateApplication.
 
                     // ─── Final diagnostics ───────────────────────────────────────
                     TrampolineMgr::instance().check_conflicts();
@@ -4743,6 +4757,16 @@ void load_and_boot_arm64() {
     uint64_t drawApp = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_drawApplication");
     uint64_t handleTouchEvent = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_handleTouchEvent");
     uint64_t snapshotLoaded = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_snapshotLoaded");
+    uint64_t sre_scene_shifter_tick_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_scene_shifter_tick") : 0;
+    uint64_t sre_update_ticks_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_update_application_ticks") : 0;
+    uint64_t sre_frame_ticks_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_frame_update_ticks") : 0;
+    uint64_t sre_shell_ticks_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_frame_shell_ticks") : 0;
+    uint64_t sre_scene_poll_ticks_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shifter_poll_ticks") : 0;
     
     // Tell the game Google Sign-In succeeded so snapshot system is enabled.
     // This is called AFTER applicationDidBecomeActive so that the main-menu
@@ -4784,6 +4808,7 @@ void load_and_boot_arm64() {
         uint32_t total_matrix_ops = 0;
         uint32_t total_state_changes = 0;
         uint32_t total_asset_opens = 0;
+        uint64_t host_scene_poll_calls = 0;
 
         std::cout << "\n========================================" << std::endl;
         if (g_display_active) {
@@ -4959,6 +4984,8 @@ void load_and_boot_arm64() {
                     }
 
                     g_emulator_64->set_sreg(0, game_dt);
+                    uint64_t update_ticks_before = 0;
+                    uint64_t update_ticks_after = 0;
 
                     // ── Frame Watchdog ──────────────────────────────────────────────────
                     // If sre_Scene_FinishLoad left the Lua mutex locked (longjmp escape),
@@ -4985,7 +5012,43 @@ void load_and_boot_arm64() {
                         bool was_scene_loading = s_scene_loading_addr &&
                             (*(volatile int*)(g_guest_memory + s_scene_loading_addr) != 0);
 
+                        update_ticks_before = sre_update_ticks_addr
+                            ? *(volatile uint64_t*)(g_guest_memory + sre_update_ticks_addr) : 0;
                         g_emulator_64->call(updateApp, {env_ptr, 0});
+                        update_ticks_after = sre_update_ticks_addr
+                            ? *(volatile uint64_t*)(g_guest_memory + sre_update_ticks_addr) : 0;
+
+                        /* Keep this independent of the guest hook.  A single
+                         * first-frame sample was insufficient: zero-valued or
+                         * unresolved symbols silently suppressed the diagnosis. */
+                        static uint64_t s_diag_frame = 0;
+                        if ((completed_frames == 0 || completed_frames - s_diag_frame >= 60) &&
+                            sre_update_ticks_addr && sre_frame_ticks_addr &&
+                            sre_shell_ticks_addr && sre_scene_poll_ticks_addr) {
+                            uint64_t update_ticks = *(volatile uint64_t*)(g_guest_memory + sre_update_ticks_addr);
+                            uint64_t frame_ticks = *(volatile uint64_t*)(g_guest_memory + sre_frame_ticks_addr);
+                            uint64_t shell_ticks = *(volatile uint64_t*)(g_guest_memory + sre_shell_ticks_addr);
+                            uint64_t poll_ticks = *(volatile uint64_t*)(g_guest_memory + sre_scene_poll_ticks_addr);
+                            uint64_t guest_poll_ticks = poll_ticks >= host_scene_poll_calls
+                                ? poll_ticks - host_scene_poll_calls : 0;
+                            std::cout << "[SRE/FrameDiag] host_frame=" << completed_frames
+                                      << " JNI=" << update_ticks
+                                      << " frame=" << frame_ticks
+                                      << " shell=" << shell_ticks
+                                      << " scene_poll_total=" << poll_ticks
+                                      << " scene_poll_guest=" << guest_poll_ticks
+                                      << " scene_poll_fallback=" << host_scene_poll_calls
+                                      << std::endl;
+                            s_diag_frame = completed_frames;
+                        } else if (completed_frames == 0 &&
+                                   (!sre_update_ticks_addr || !sre_frame_ticks_addr ||
+                                    !sre_shell_ticks_addr || !sre_scene_poll_ticks_addr)) {
+                            std::cerr << "[SRE/FrameDiag] WARNING: unresolved counter(s): JNI=0x"
+                                      << std::hex << sre_update_ticks_addr << " frame=0x"
+                                      << sre_frame_ticks_addr << " shell=0x" << sre_shell_ticks_addr
+                                      << " scene_poll=0x" << sre_scene_poll_ticks_addr << std::dec
+                                      << std::endl;
+                        }
 
                         // After call: if flag is STILL set, FinishLoad's cleanup was
                         // skipped (exception path). Force-clear so next frame runs clean.
@@ -5001,6 +5064,17 @@ void load_and_boot_arm64() {
                                     *(volatile int*)(g_guest_memory + s_suppress_hud_addr) = 2;
                             }
                         }
+                    }
+
+                    /* Recover only a missed JNI hook.  The guest frame is the
+                     * primary poll owner; an unconditional host call doubled
+                     * the poll count on every frame. */
+                    if (sre_scene_shifter_tick_addr && sre_update_ticks_addr &&
+                        update_ticks_after == update_ticks_before) {
+                        g_emulator_64->call(sre_scene_shifter_tick_addr, {});
+                        host_scene_poll_calls++;
+                        std::cerr << "[SRE/FrameDiag] JNI hook missed; host poll fallback used at host_frame="
+                                  << completed_frames << std::endl;
                     }
 
 
@@ -6604,11 +6678,21 @@ int main(int argc, char* argv[]) {
     g_saved_argv = argv;
     // Check for --headless flag
     bool headless = false;
+    bool use_openswordigo = false;
+    std::string openswordigo_scene = "menu.scene";
+    std::string openswordigo_library;
 #ifdef HEADLESS_DEFAULT
     headless = true;
 #endif
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--headless") == 0) headless = true;
+        if (strcmp(argv[i], "--openswordigo") == 0) use_openswordigo = true;
+        if (strcmp(argv[i], "--openswordigo-scene") == 0 && i + 1 < argc) {
+            openswordigo_scene = argv[++i];
+        }
+        if (strcmp(argv[i], "--openswordigo-lib") == 0 && i + 1 < argc) {
+            openswordigo_library = argv[++i];
+        }
 #ifdef VULKAN_BACKEND
         if (strcmp(argv[i], "--vulkan") == 0) g_graphics_api = GraphicsAPI::VULKAN;
 #endif
@@ -6728,7 +6812,7 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Show unified launcher GUI (graphics API + binary selection)
     // ========================================================================
-    if (!headless) {
+    if (!headless && !use_openswordigo) {
         bool skip_launcher = false;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--vulkan") == 0 || strcmp(argv[i], "--no-launcher") == 0 ||
@@ -6844,7 +6928,38 @@ int main(int argc, char* argv[]) {
             std::cerr << "[Main] Display init failed, falling back to headless" << std::endl;
         }
     } else {
-        std::cout << "[Main] Running in headless mode" << std::endl;
+        if (headless) std::cout << "[Main] Running in headless mode" << std::endl;
+    }
+
+    if (use_openswordigo) {
+        if (headless) {
+            std::cerr << "[OpenSwordigo/Host] --headless is not supported yet" << std::endl;
+            return 2;
+        }
+        if (!g_display_active) {
+            std::cerr << "[OpenSwordigo/Host] Display initialization failed" << std::endl;
+            return 1;
+        }
+
+        if (openswordigo_library.empty()) {
+            const std::string installed = get_data_path("OpenSwordigo/libopenswordigo.so");
+            if (fs::exists(installed)) {
+                openswordigo_library = installed;
+            } else if (fs::exists("./OpenSwordigo/build/bin/libopenswordigo.so")) {
+                openswordigo_library = "./OpenSwordigo/build/bin/libopenswordigo.so";
+            } else {
+                openswordigo_library = "./bin/libs/libopenswordigo.so";
+            }
+        }
+
+        OpenSwordigoLaunchOptions options;
+        options.library_path = openswordigo_library;
+        options.assets_root = get_data_path(g_instance_assets_dir + "/resources");
+        options.scene = openswordigo_scene;
+        const int result = run_openswordigo(display, options);
+        std::cout.flush();
+        std::cerr.flush();
+        std::quick_exit(result);
     }
 
     // ========================================================================
@@ -6897,8 +7012,18 @@ int main(int argc, char* argv[]) {
     RedstellGC::instance().shutdown();
     
     std::cout << "[Main] Swordigo — session complete." << std::endl;
-    
-    return 0;
+
+    /*
+     * The guest loader owns a large amount of state whose lifetime extends
+     * beyond the host frame loop.  Running C++ static destructors here is not
+     * safe: the selector teardown currently walks BinaryInfo strings after
+     * the guest/loader teardown has invalidated process-wide state.  All
+     * owned runtime resources have been explicitly stopped above; terminate
+     * without re-entering unordered static destruction.
+     */
+    std::cout.flush();
+    std::cerr.flush();
+    std::quick_exit(0);
 }
 
 extern "C" const char* sre_resolve_symbol(uint64_t addr) {

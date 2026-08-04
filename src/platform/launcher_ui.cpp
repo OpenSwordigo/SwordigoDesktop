@@ -30,8 +30,35 @@
 #include <cstring>
 #include <unistd.h>
 #include <cmath>
+#include <future>
 
 namespace fs = std::filesystem;
+
+// Resolve the ruby asset viewer and launch it as a separate process.
+// Prefers a ruby binary next to the running executable so the viewer works
+// regardless of the current working directory.
+static void launch_ruby_viewer() {
+    std::string path = "./ruby";
+    if (!fs::exists(path)) {
+        char exe_buf[4096];
+        ssize_t len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+        if (len > 0) {
+            exe_buf[len] = '\0';
+            path = fs::path(exe_buf).parent_path() / "ruby";
+        }
+    }
+    if (fs::exists(path)) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            execlp(path.c_str(), path.c_str(), (char*)NULL);
+            _exit(1);
+        }
+    } else {
+        pid_t pid = fork();
+        if (pid == 0) { execlp("ruby", "ruby", (char*)NULL); _exit(1); }
+        std::cerr << "[Launcher] ruby not found next to binary — tried PATH" << std::endl;
+    }
+}
 
 // =============================================================================
 // Forward declarations (internal helpers)
@@ -136,6 +163,24 @@ static char  g_add_game_type[64]  = "Swordigo";
 static std::string g_add_status;
 static bool  g_add_copying        = false;
 static float g_add_copy_progress  = 0.0f;
+static char  g_add_apk_path[1024] = "";
+static bool  g_add_apk_dialog_pending = false;
+
+struct ApkImportResult {
+    bool success = false;
+    std::string error;
+};
+static std::future<ApkImportResult> g_apk_import_future;
+
+static void SDLCALL apk_dialog_callback(void*, const char* const* files, int) {
+    g_add_apk_dialog_pending = false;
+    if (!files || !files[0]) return;
+    std::snprintf(g_add_apk_path, sizeof(g_add_apk_path), "%s", files[0]);
+    if (g_add_name[0] == '\0') {
+        std::string stem = fs::path(files[0]).stem().string();
+        std::snprintf(g_add_name, sizeof(g_add_name), "%s", stem.c_str());
+    }
+}
 
 static float g_anim_time = 0.0f;
 
@@ -1016,14 +1061,29 @@ static void DrawLibraryPage(BinarySelector& selector, int& selected,
         return false;
     });
 
-    // Auto-select ARM64 v1.4.12 on first frame
+    // Auto-select on first frame: prefer the persisted default binary, then
+    // the newest ARM64, then the newest ARM32. Never hardcode a version.
     static bool first_frame = true;
     if (first_frame && !bins.empty()) {
         first_frame = false;
-        for (int i = 0; i < (int)bins.size(); i++) {
-            if (bins[i].arch == BinaryArch::ARM64 && bins[i].version.find("1.4.12") != std::string::npos) {
-                selected = i; break;
+        const std::string default_filepath = selector.get_default();
+        if (!default_filepath.empty()) {
+            for (int i = 0; i < (int)bins.size(); i++) {
+                if (bins[i].filepath == default_filepath) { selected = i; break; }
             }
+        }
+        if (selected < 0 || selected >= (int)bins.size()) {
+            int best = -1;
+            for (int i = 0; i < (int)bins.size(); i++) {
+                if (bins[i].arch == BinaryArch::ARM64) {
+                    if (best < 0 || bins[i].version > bins[best].version) best = i;
+                }
+            }
+            if (best < 0) {
+                for (int i = 0; i < (int)bins.size(); i++)
+                    if (best < 0 || bins[i].version > bins[best].version) best = i;
+            }
+            if (best >= 0) selected = best;
         }
     }
 
@@ -1292,8 +1352,7 @@ static void DrawLibraryPage(BinarySelector& selector, int& selected,
 
     ImGui::SameLine();
     if (ImGui::Button(ICON_FA_EYE "  Ruby Viewer", ImVec2(abw, 36))) {
-        pid_t pid = fork();
-        if (pid == 0) { execlp("./ruby", "ruby", nullptr); execlp("ruby", "ruby", nullptr); _exit(1); }
+        launch_ruby_viewer();
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Browse game assets");
     PopSecondaryBtn();
@@ -1944,8 +2003,7 @@ static void DrawSDKToolsPage() {
             PopSecondaryBtn();
             if (clicked) {
                 if (i == 0) { // Ruby Viewer
-                    pid_t pid = fork();
-                    if (pid == 0) { execlp("./ruby", "ruby", nullptr); execlp("ruby","ruby",nullptr); _exit(1); }
+                    launch_ruby_viewer();
                 } else if (i == 2) { // Save Editor
                     g_show_save_ed = true;
                     g_save_loaded = false; g_save_sel = -1; g_save_status.clear();
@@ -2463,6 +2521,70 @@ LaunchConfig show_launcher(BinarySelector& selector) {
         if (ImGui::BeginPopupModal("Add Instance", &g_show_add_instance, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8, 6));
 
+            if (g_add_copying && g_apk_import_future.valid() &&
+                g_apk_import_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                const ApkImportResult result = g_apk_import_future.get();
+                g_add_copying = false;
+                if (result.success) {
+                    selector.reload_instances();
+                    bin_sel = static_cast<int>(selector.get_binaries().size()) - 1;
+                    g_add_apk_path[0] = '\0';
+                    g_show_add_instance = false;
+                    ImGui::CloseCurrentPopup();
+                } else {
+                    g_add_status = "APK import failed: " + result.error;
+                }
+            }
+
+            ImGui::TextDisabled("Create from installed assets, a custom folder, or a complete Android APK.");
+            ImGui::Spacing();
+
+            // -- APK IMPORT --
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.345f, 0.651f, 1.000f, 1.0f));
+            ImGui::Text(ICON_FA_FILE "  IMPORT FROM APK");
+            ImGui::PopStyleColor();
+            ImGui::Separator();
+            ImGui::SetNextItemWidth(-112);
+            ImGui::InputTextWithHint("##apk_path", "Swordigo APK path", g_add_apk_path, sizeof(g_add_apk_path));
+            ImGui::SameLine();
+            ImGui::BeginDisabled(g_add_apk_dialog_pending);
+            if (ImGui::Button(ICON_FA_FOLDER_OPEN " Browse", ImVec2(104, 0))) {
+                static const SDL_DialogFileFilter filters[] = {{"Android packages", "apk"}};
+                g_add_apk_dialog_pending = true;
+                SDL_ShowOpenFileDialog(apk_dialog_callback, nullptr, g_sdl_window,
+                                       filters, 1, nullptr, false);
+            }
+            ImGui::EndDisabled();
+            if (g_add_apk_path[0] || g_add_copying) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.52f, 0.78f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.27f, 0.63f, 0.92f, 1.0f));
+                ImGui::BeginDisabled(g_add_copying);
+                if (ImGui::Button(g_add_copying ? "Importing APK..."
+                                                : ICON_FA_BOX_OPEN "  Import APK as Instance", ImVec2(-1, 38))) {
+                    g_add_status.clear();
+                    if (g_add_name[0] == '\0') {
+                        g_add_status = "Enter an instance name before importing.";
+                    } else {
+                        const std::string apk = g_add_apk_path;
+                        const std::string instance_name = g_add_name;
+                        const std::string data_root = get_user_data_dir();
+                        g_add_copying = true;
+                        g_apk_import_future = std::async(std::launch::async,
+                            [apk, instance_name, data_root]() {
+                                BinarySelector importer;
+                                importer.set_data_dir(data_root);
+                                ApkImportResult result;
+                                result.success = importer.import_apk_instance(apk, instance_name, &result.error);
+                                return result;
+                            });
+                    }
+                }
+                ImGui::EndDisabled();
+                ImGui::PopStyleColor(2);
+            }
+            ImGui::Spacing();
+            ImGui::Spacing();
+
             // -- INSTANCE DETAILS --
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.345f, 0.651f, 1.000f, 1.0f));
             ImGui::Text(ICON_FA_CUBE "  INSTANCE DETAILS");
@@ -2603,35 +2725,52 @@ LaunchConfig show_launcher(BinarySelector& selector) {
 
                     if (g_add_status.empty()) {
                         std::string user_data = get_user_data_dir();
-                        std::string base_so = user_data + "/engine/v1.4.12/arm64-v8a/libswordigo.so";
 
-                        // Set data_dir on selector before adding custom instance
-                        selector.set_data_dir(user_data);
-
-                        if (selector.add_custom_instance(base_so, g_add_name, assets_dir_name)) {
-                            if (g_add_use_sre) {
-                                std::string sre_src = user_data + "/engine/v1.4.12/arm64-v8a/libsre.so";
-                                std::string arch_dir = user_data + "/engine/custom-" + std::string(g_add_name) + "/arm64-v8a";
-                                if (fs::exists(sre_src)) {
-                                    try {
-                                        fs::copy_file(sre_src, arch_dir + "/libsre.so", fs::copy_options::overwrite_existing);
-                                    } catch (...) {}
-                                }
-
-                                auto& bins_mut = const_cast<std::vector<BinaryInfo>&>(selector.get_binaries());
-                                if (!bins_mut.empty()) {
-                                    auto& last = bins_mut.back();
-                                    auto& deps = last.dependencies;
-                                    deps.erase(std::remove_if(deps.begin(), deps.end(), [](const std::string& d) {
-                                        return d == "libmini.so" || d == "libGlossHook.so";
-                                    }), deps.end());
-                                    auto& dpaths = last.dep_paths;
-                                    dpaths.erase(std::remove_if(dpaths.begin(), dpaths.end(), [](const std::string& p) {
-                                        return p.find("libmini.so") != std::string::npos ||
-                                               p.find("libGlossHook.so") != std::string::npos;
-                                    }), dpaths.end());
+                        // Base engine: prefer the default binary, then the
+                        // newest ARM64, then the newest ARM32. Never hardcode.
+                        std::string base_so;
+                        std::string base_arch_dir;
+                        const std::string default_filepath = selector.get_default();
+                        const auto& available = selector.get_binaries();
+                        const BinaryInfo* source = nullptr;
+                        if (!default_filepath.empty()) {
+                            for (const auto& b : available) {
+                                if (b.filepath == default_filepath) { source = &b; break; }
+                            }
+                        }
+                        if (!source) {
+                            for (const auto& b : available) {
+                                if (b.arch == BinaryArch::ARM64) {
+                                    if (!source || b.version > source->version) source = &b;
                                 }
                             }
+                        }
+                        if (!source) {
+                            for (const auto& b : available) {
+                                if (!source || b.version > source->version) source = &b;
+                            }
+                        }
+                        if (!source) {
+                            g_add_status = "No engine installed. Import an APK first.";
+                        } else {
+                            base_so = (fs::path(user_data) / source->filepath).string();
+                            base_arch_dir = source->arch == BinaryArch::ARM64 ? "arm64-v8a" : "armeabi-v7a";
+
+                            // Set data_dir on selector before adding custom instance
+                            selector.set_data_dir(user_data);
+
+                            if (selector.add_custom_instance(base_so, g_add_name, assets_dir_name)) {
+                                if (g_add_use_sre) {
+                                    std::string sre_src = (fs::path(user_data) / "engine" / source->version_dir / base_arch_dir / "libsre.so").string();
+                                    std::string arch_dir = user_data + "/engine/custom-" + std::string(g_add_name) + "/" + base_arch_dir;
+                                    if (fs::exists(sre_src)) {
+                                        try {
+                                            fs::copy_file(sre_src, arch_dir + "/libsre.so", fs::copy_options::overwrite_existing);
+                                        } catch (...) {}
+                                    }
+
+                                    selector.strip_sre_conflicts_from_last();
+                                }
 
                             std::string config_dir;
                             const char* xdg_config = getenv("XDG_CONFIG_HOME");
@@ -2645,8 +2784,9 @@ LaunchConfig show_launcher(BinarySelector& selector) {
 
                             g_show_add_instance = false;
                             ImGui::CloseCurrentPopup();
-                        } else {
-                            g_add_status = "Failed to create instance.";
+                            } else {
+                                g_add_status = "Failed to create instance.";
+                            }
                         }
                     }
                 }
@@ -2656,10 +2796,12 @@ LaunchConfig show_launcher(BinarySelector& selector) {
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.110f, 0.137f, 0.200f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.180f, 0.210f, 0.300f, 1.0f));
+            ImGui::BeginDisabled(g_add_copying);
             if (ImGui::Button("Cancel", ImVec2(btn_w, 36))) {
                 g_show_add_instance = false;
                 ImGui::CloseCurrentPopup();
             }
+            ImGui::EndDisabled();
             ImGui::PopStyleColor(2);
 
             ImGui::PopStyleVar();

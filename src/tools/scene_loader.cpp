@@ -31,6 +31,7 @@
  */
 
 #include "scene_loader.h"
+#include "scene_schemas.h"
 #include "platform/protobuf_reader.h"
 
 #include <fstream>
@@ -39,6 +40,8 @@
 #include <cstring>
 #include <iostream>
 #include <filesystem>
+#include <system_error>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 
@@ -87,6 +90,67 @@ static void scan_for_asset_refs(const std::string& raw,
     } catch (...) {}
 }
 
+static std::string first_printable_len_field(const std::string& raw, int field_number) {
+    try {
+        proto::Reader reader(raw);
+        proto::Field field;
+        while (reader.read_field(field)) {
+            if (field.field_number == field_number && field.wire_type == proto::WIRE_LEN &&
+                is_printable(field.bytes_val))
+                return field.bytes_val;
+        }
+    } catch (...) {}
+    return {};
+}
+
+static int component_payload_field(const SceneComponent& component) {
+    if (component.payload_field >= 50) return component.payload_field;
+    // main.js::Ot dispatches the first nested message at field >= 50. This is
+    // authoritative even when ClassName uses the short form ("Model") while
+    // generated schemas use "ModelComponent".
+    try {
+        proto::Reader reader(component.raw_data);
+        proto::Field field;
+        while (reader.read_field(field)) {
+            if (field.field_number >= 50 && field.wire_type == proto::WIRE_LEN)
+                return static_cast<int>(field.field_number);
+        }
+    } catch (...) {}
+
+    const auto schema = g_schemas.find("Component");
+    if (schema == g_schemas.end()) return 0;
+    for (const auto& entry : schema->second.fields) {
+        if (entry.second.class_name == component.type_name || entry.second.name == component.type_name)
+            return static_cast<int>(entry.first >> 3);
+    }
+    return 0;
+}
+
+static std::string component_schema_name(const SceneComponent& component) {
+    const int payload = component_payload_field(component);
+    const auto schema = g_schemas.find("Component");
+    if (schema != g_schemas.end() && payload > 0) {
+        const auto field = schema->second.fields.find((static_cast<uint32_t>(payload) << 3) | proto::WIRE_LEN);
+        if (field != schema->second.fields.end()) return field->second.class_name;
+    }
+    return component.type_name;
+}
+
+static std::string component_string_field(const SceneComponent& component, int field_number) {
+    const int payload_field = component_payload_field(component);
+    if (payload_field == 0) return {};
+    try {
+        proto::Reader wrapper(component.raw_data);
+        proto::Field field;
+        while (wrapper.read_field(field)) {
+            if (field.field_number != payload_field || field.wire_type != proto::WIRE_LEN)
+                continue;
+            return first_printable_len_field(field.bytes_val, field_number);
+        }
+    } catch (...) {}
+    return {};
+}
+
 // ============================================================
 // Component parse (raw_data stores entire message bytes so we
 // can write it back verbatim on scene_save)
@@ -109,6 +173,8 @@ static SceneComponent parse_component(const std::string& bytes) {
                         comp.type_id = static_cast<int>(f.varint_val);
                     break;
                 default:
+                    if (f.field_number >= 50 && f.wire_type == proto::WIRE_LEN && comp.payload_field == 0)
+                        comp.payload_field = static_cast<int>(f.field_number);
                     break;
             }
         }
@@ -119,27 +185,8 @@ static SceneComponent parse_component(const std::string& bytes) {
 }
 
 // ============================================================
-// GroundMesh parsing (unchanged from previous implementation)
+// GroundMesh parsing
 // ============================================================
-struct MeshData_t {
-    int data_type  = 0;
-    int components = 0;
-    int offset     = 0;
-    int stride     = 0;
-};
-
-static MeshData_t parse_mesh_data(const std::string& bytes) {
-    MeshData_t md;
-    proto::Reader reader(bytes);
-    proto::Field f;
-    while (reader.read_field(f)) {
-        if      (f.field_number == 1 && f.wire_type == proto::WIRE_VARINT) md.data_type  = static_cast<int>(f.varint_val) + 0x13ff;
-        else if (f.field_number == 2 && f.wire_type == proto::WIRE_VARINT) md.components = static_cast<int>(f.varint_val);
-        else if (f.field_number == 3 && f.wire_type == proto::WIRE_VARINT) md.offset     = static_cast<int>(f.varint_val);
-        else if (f.field_number == 4 && f.wire_type == proto::WIRE_VARINT) md.stride     = static_cast<int>(f.varint_val);
-    }
-    return md;
-}
 
 static std::string parse_mesh_texture_name(const std::string& bytes) {
     proto::Reader reader(bytes);
@@ -161,83 +208,43 @@ static void parse_single_mesh(SceneObject& obj, const std::string& bytes) {
     proto::Reader reader(bytes);
     proto::Field f;
 
-    int index_count = 0;
-    MeshData_t indices_meta, positions_meta, normals_meta;
-    std::vector<MeshData_t> texcoords_meta;
+    int num_vertices = 0;
     std::string texture_name, vertex_data, index_data;
-    bool has_indices_meta = false, has_positions_meta = false, has_normals_meta = false;
 
     while (reader.read_field(f)) {
-        if      (f.field_number == 2  && f.wire_type == proto::WIRE_VARINT) { index_count = static_cast<int>(f.varint_val); }
-        else if (f.field_number == 3  && f.wire_type == proto::WIRE_LEN)    { indices_meta   = parse_mesh_data(f.bytes_val); has_indices_meta   = true; }
-        else if (f.field_number == 4  && f.wire_type == proto::WIRE_LEN)    { positions_meta = parse_mesh_data(f.bytes_val); has_positions_meta = true; }
-        else if (f.field_number == 5  && f.wire_type == proto::WIRE_LEN)    { normals_meta   = parse_mesh_data(f.bytes_val); has_normals_meta   = true; }
-        else if (f.field_number == 6  && f.wire_type == proto::WIRE_LEN)    { texcoords_meta.push_back(parse_mesh_data(f.bytes_val)); }
-        else if (f.field_number == 16 && f.wire_type == proto::WIRE_LEN)    { texture_name   = parse_mesh_material(f.bytes_val); }
+        if      (f.field_number == 1  && f.wire_type == proto::WIRE_VARINT) { num_vertices = static_cast<int>(f.varint_val); }
+        else if (f.field_number == 10 && f.wire_type == proto::WIRE_LEN)    { texture_name   = parse_mesh_material(f.bytes_val); }
         else if (f.field_number == 50 && f.wire_type == proto::WIRE_LEN)    { vertex_data    = f.bytes_val; }
         else if (f.field_number == 51 && f.wire_type == proto::WIRE_LEN)    { index_data     = f.bytes_val; }
     }
 
-    if (!has_positions_meta || vertex_data.empty()) return;
+    // main.js::addGroundMesh ignores MeshData metadata and treats field 50 as
+    // a packed position3/normal3/uv2 stream. Follow it exactly: metadata in
+    // shipped scenes is often stale and was producing exploded geometry.
+    if (vertex_data.empty()) return;
+    if (num_vertices <= 0) num_vertices = static_cast<int>(vertex_data.size() / 32);
+    if (num_vertices <= 0 || static_cast<size_t>(num_vertices) * 32 > vertex_data.size()) return;
 
     PODMesh pm;
-    int v_stride = positions_meta.stride > 0 ? positions_meta.stride : positions_meta.components * 4;
-    int num_vertices = (int)(vertex_data.size() - positions_meta.offset) / v_stride;
-    if (num_vertices <= 0) return;
     pm.num_vertices = num_vertices;
-
     pm.positions.resize(num_vertices * 3, 0.0f);
+    pm.normals.resize(num_vertices * 3, 0.0f);
+    pm.uvs.resize(num_vertices * 2, 0.0f);
     for (int i = 0; i < num_vertices; ++i) {
-        const char* ptr = vertex_data.data() + positions_meta.offset + i * v_stride;
-        if (positions_meta.components >= 3) {
-            pm.positions[i*3+0] = *(const float*)(ptr);
-            pm.positions[i*3+1] = *(const float*)(ptr+4);
-            pm.positions[i*3+2] = *(const float*)(ptr+8);
-        } else if (positions_meta.components == 2) {
-            pm.positions[i*3+0] = *(const float*)(ptr);
-            pm.positions[i*3+1] = *(const float*)(ptr+4);
-            pm.positions[i*3+2] = 0.0f;
-        }
+        const char* ptr = vertex_data.data() + static_cast<size_t>(i) * 32;
+        std::memcpy(&pm.positions[i*3], ptr, 12);
+        std::memcpy(&pm.normals[i*3], ptr + 12, 12);
+        std::memcpy(&pm.uvs[i*2], ptr + 24, 8);
     }
 
-    if (has_normals_meta && normals_meta.stride > 0) {
-        pm.normals.resize(num_vertices * 3, 0.0f);
-        for (int i = 0; i < num_vertices; ++i) {
-            const char* ptr = vertex_data.data() + normals_meta.offset + i * normals_meta.stride;
-            if (normals_meta.components >= 3) {
-                pm.normals[i*3+0] = *(const float*)(ptr);
-                pm.normals[i*3+1] = *(const float*)(ptr+4);
-                pm.normals[i*3+2] = *(const float*)(ptr+8);
-            }
-        }
-    }
-
-    if (!texcoords_meta.empty() && texcoords_meta[0].stride > 0) {
-        const auto& uv = texcoords_meta[0];
-        pm.uvs.resize(num_vertices * 2, 0.0f);
-        for (int i = 0; i < num_vertices; ++i) {
-            const char* ptr = vertex_data.data() + uv.offset + i * uv.stride;
-            if (uv.components >= 2) {
-                pm.uvs[i*2+0] = *(const float*)(ptr);
-                pm.uvs[i*2+1] = *(const float*)(ptr+4);
-            }
-        }
-    }
-
-    if (has_indices_meta && !index_data.empty() && index_count > 0) {
+    // main.js always creates Uint16Array from field 51 for GroundMesh.
+    const int index_count = static_cast<int>(index_data.size() / 2);
+    if (index_count > 0) {
         pm.indices.resize(index_count);
-        if (indices_meta.data_type == 0x1403) {
-            for (int i = 0; i < index_count; ++i)
-                if (indices_meta.offset + i*2+2 <= (int)index_data.size())
-                    pm.indices[i] = *(const uint16_t*)(index_data.data() + indices_meta.offset + i*2);
-        } else if (indices_meta.data_type == 0x1401) {
-            for (int i = 0; i < index_count; ++i)
-                if (indices_meta.offset + i < (int)index_data.size())
-                    pm.indices[i] = *(const uint8_t*)(index_data.data() + indices_meta.offset + i);
-        } else if (indices_meta.data_type == 0x1405) {
-            for (int i = 0; i < index_count; ++i)
-                if (indices_meta.offset + i*4+4 <= (int)index_data.size())
-                    pm.indices[i] = (uint16_t)(*(const uint32_t*)(index_data.data() + indices_meta.offset + i*4));
+        for (int i = 0; i < index_count; ++i) {
+            uint16_t index;
+            std::memcpy(&index, index_data.data() + static_cast<size_t>(i) * 2, 2);
+            pm.indices[i] = index;
         }
         pm.num_faces = index_count / 3;
     }
@@ -257,19 +264,29 @@ static void parse_single_mesh(SceneObject& obj, const std::string& bytes) {
     obj.ground_mesh_textures.push_back(texture_name);
 }
 
-static void parse_ground_mesh_component(SceneObject& obj, const std::string& component_bytes) {
-    proto::Reader reader(component_bytes);
+static void parse_ground_mesh_component(SceneObject& obj, const SceneComponent& component) {
+    const int payload_field = component_payload_field(component);
+    if (payload_field == 0) return;
+    proto::Reader reader(component.raw_data);
     proto::Field f;
     while (reader.read_field(f)) {
-        if (f.field_number == 111 && f.wire_type == proto::WIRE_LEN) {
+        if (f.field_number == payload_field && f.wire_type == proto::WIRE_LEN) {
             proto::Reader gm_reader(f.bytes_val);
             proto::Field gm_f;
+            std::vector<std::string> front_meshes;
+            std::vector<std::string> surface_meshes;
+            std::vector<std::string> base_meshes;
             while (gm_reader.read_field(gm_f)) {
-                if (gm_f.field_number == 8 && gm_f.wire_type == proto::WIRE_LEN)
-                    parse_single_mesh(obj, gm_f.bytes_val);
-                else if (gm_f.field_number == 9 && gm_f.wire_type == proto::WIRE_LEN)
-                    parse_single_mesh(obj, gm_f.bytes_val);
+                if (gm_f.wire_type == proto::WIRE_LEN) {
+                    // main.js order: FrontMesh(8), SurfaceMesh(9), Mesh(6).
+                    if (gm_f.field_number == 8) front_meshes.push_back(gm_f.bytes_val);
+                    else if (gm_f.field_number == 9) surface_meshes.push_back(gm_f.bytes_val);
+                    else if (gm_f.field_number == 6) base_meshes.push_back(gm_f.bytes_val);
+                }
             }
+            for (const auto& mesh : front_meshes) parse_single_mesh(obj, mesh);
+            for (const auto& mesh : surface_meshes) parse_single_mesh(obj, mesh);
+            for (const auto& mesh : base_meshes) parse_single_mesh(obj, mesh);
         }
     }
 }
@@ -368,13 +385,29 @@ static SceneObject parse_object(const std::string& bytes) {
         std::cerr << "[scene_loader] warning: object parse error: " << e.what() << "\n";
     }
 
-    // Post-process: scan components for asset references
-    for (const auto& comp : obj.components) {
-        if (comp.type_name == "GroundMeshComponent")
-            parse_ground_mesh_component(obj, comp.raw_data);
+    obj.resolved_components = obj.components;
+    return obj;
+}
+
+static void resolve_object_render_data(SceneObject& obj) {
+    obj.mesh_name.clear();
+    obj.texture_name.clear();
+    obj.background_name.clear();
+    obj.ground_meshes.clear();
+    obj.ground_mesh_textures.clear();
+    const auto& components = obj.resolved_components.empty() ? obj.components : obj.resolved_components;
+    for (const auto& comp : components) {
+        const std::string schema_name = component_schema_name(comp);
+        if (schema_name == "GroundMeshComponent")
+            parse_ground_mesh_component(obj, comp);
 
         if (comp.type_name == "MeshRenderer" || comp.type_name == "SkinnedMeshRenderer")
             scan_for_asset_refs(comp.raw_data, obj.mesh_name, obj.texture_name);
+
+        // Ruby's schema stores ModelComponent.Name as field 1 without a .pod
+        // suffix. Resolve this form as well as the older filename form.
+        if (schema_name == "ModelComponent" && obj.mesh_name.empty())
+            obj.mesh_name = component_string_field(comp, 1);
 
         if (comp.type_name == "Background") {
             std::string dummy_tex;
@@ -387,7 +420,66 @@ static SceneObject parse_object(const std::string& bytes) {
             scan_for_asset_refs(comp.raw_data, obj.mesh_name, obj.texture_name);
     }
 
-    return obj;
+}
+
+struct SceneTemplate {
+    std::string name;
+    float scaling = 1.0f;
+    std::vector<SceneComponent> components;
+};
+
+static std::vector<SceneTemplate> parse_object_library(const std::string& bytes) {
+    std::vector<SceneTemplate> templates;
+    try {
+        proto::Reader library(bytes);
+        proto::Field field;
+        while (library.read_field(field)) {
+            if (field.field_number != 2 || field.wire_type != proto::WIRE_LEN) continue;
+            SceneTemplate item;
+            proto::Reader object_template(field.bytes_val);
+            proto::Field template_field;
+            while (object_template.read_field(template_field)) {
+                if (template_field.field_number == 1 && template_field.wire_type == proto::WIRE_LEN) {
+                    SceneObject object = parse_object(template_field.bytes_val);
+                    item.name = object.name;
+                    item.components = std::move(object.components);
+                } else if (template_field.field_number == 2 && template_field.wire_type == proto::WIRE_I32) {
+                    item.scaling = template_field.float_val;
+                }
+            }
+            if (!item.name.empty()) templates.push_back(std::move(item));
+        }
+    } catch (...) {}
+    return templates;
+}
+
+static void resolve_scene_templates(SceneData& scene) {
+    std::unordered_map<std::string, SceneTemplate> templates;
+    for (const auto& library : scene.object_libraries) {
+        for (auto& item : parse_object_library(library))
+            templates[item.name] = std::move(item);
+    }
+
+    for (auto& object : scene.objects) {
+        object.resolved_components = object.components;
+        const auto item = templates.find(object.template_name);
+        if (item != templates.end()) {
+            if (object.components.empty()) {
+                object.resolved_components = item->second.components;
+            } else {
+                std::unordered_set<int> overridden;
+                for (const auto& component : object.components) overridden.insert(component.type_id);
+                std::vector<SceneComponent> merged;
+                for (const auto& component : item->second.components) {
+                    if (overridden.find(component.type_id) == overridden.end()) merged.push_back(component);
+                }
+                merged.insert(merged.end(), object.components.begin(), object.components.end());
+                object.resolved_components = std::move(merged);
+            }
+            object.template_scaling = item->second.scaling;
+        }
+        resolve_object_render_data(object);
+    }
 }
 
 // ============================================================
@@ -445,7 +537,11 @@ static std::string serialize_object(const SceneObject& obj) {
 // Compute AABB from all object positions
 // ============================================================
 static void compute_bounds(SceneData& scene) {
-    if (scene.objects.empty()) return;
+    if (scene.objects.empty()) {
+        std::fill(std::begin(scene.bounds_min), std::end(scene.bounds_min), 0.0f);
+        std::fill(std::begin(scene.bounds_max), std::end(scene.bounds_max), 0.0f);
+        return;
+    }
 
     float min_x = scene.objects[0].pos_x;
     float min_y = scene.objects[0].pos_y;
@@ -462,12 +558,12 @@ static void compute_bounds(SceneData& scene) {
 
         for (const auto& gm : obj.ground_meshes) {
             if (gm.num_vertices > 0) {
-                min_x = std::min(min_x, obj.pos_x + gm.min_x * obj.scale_x);
-                min_y = std::min(min_y, obj.pos_y + gm.min_y * obj.scale_y);
-                min_z = std::min(min_z, obj.pos_z + gm.min_z * obj.scale_z);
-                max_x = std::max(max_x, obj.pos_x + gm.max_x * obj.scale_x);
-                max_y = std::max(max_y, obj.pos_y + gm.max_y * obj.scale_y);
-                max_z = std::max(max_z, obj.pos_z + gm.max_z * obj.scale_z);
+                min_x = std::min(min_x, obj.pos_x + gm.min_x * obj.scale_x * obj.template_scaling);
+                min_y = std::min(min_y, obj.pos_y + gm.min_y * obj.scale_y * obj.template_scaling);
+                min_z = std::min(min_z, obj.pos_z + gm.min_z * obj.scale_z * obj.template_scaling);
+                max_x = std::max(max_x, obj.pos_x + gm.max_x * obj.scale_x * obj.template_scaling);
+                max_y = std::max(max_y, obj.pos_y + gm.max_y * obj.scale_y * obj.template_scaling);
+                max_z = std::max(max_z, obj.pos_z + gm.max_z * obj.scale_z * obj.template_scaling);
             }
         }
     }
@@ -478,6 +574,285 @@ static void compute_bounds(SceneData& scene) {
     scene.bounds_max[0] = max_x;
     scene.bounds_max[1] = max_y;
     scene.bounds_max[2] = max_z;
+}
+
+void scene_refresh(SceneData& scene) {
+    resolve_scene_templates(scene);
+    scene.object_count = static_cast<int>(scene.objects.size());
+    compute_bounds(scene);
+}
+
+std::string scene_fresh_identifier(const SceneData& scene) {
+    std::unordered_set<std::string> names;
+    names.reserve(scene.objects.size());
+    for (const auto& object : scene.objects)
+        names.insert(object.name);
+
+    for (size_t suffix = 1;; ++suffix) {
+        const std::string candidate = "obj" + std::to_string(suffix);
+        if (names.find(candidate) == names.end())
+            return candidate;
+    }
+}
+
+size_t scene_create_object(SceneData& scene, const std::string& template_name) {
+    SceneObject object;
+    object.template_name = template_name;
+    object.name = scene_fresh_identifier(scene);
+    scene.objects.push_back(std::move(object));
+    scene_refresh(scene);
+    return scene.objects.size() - 1;
+}
+
+bool scene_duplicate_object(SceneData& scene, size_t index, size_t* new_index) {
+    if (index >= scene.objects.size())
+        return false;
+
+    SceneObject duplicate = scene.objects[index];
+    duplicate.name = scene_fresh_identifier(scene);
+    const auto insertion = scene.objects.begin() + static_cast<std::ptrdiff_t>(index + 1);
+    scene.objects.insert(insertion, std::move(duplicate));
+    scene_refresh(scene);
+    if (new_index)
+        *new_index = index + 1;
+    return true;
+}
+
+size_t scene_paste_object(SceneData& scene, const SceneObject& object) {
+    SceneObject pasted = object;
+    pasted.name = scene_fresh_identifier(scene);
+    scene.objects.push_back(std::move(pasted));
+    scene_refresh(scene);
+    return scene.objects.size() - 1;
+}
+
+bool scene_delete_object(SceneData& scene, size_t index) {
+    if (index >= scene.objects.size())
+        return false;
+    scene.objects.erase(scene.objects.begin() + static_cast<std::ptrdiff_t>(index));
+    scene_refresh(scene);
+    return true;
+}
+
+bool scene_move_object(SceneData& scene, size_t from_index, size_t to_index) {
+    if (from_index >= scene.objects.size() || to_index >= scene.objects.size())
+        return false;
+    if (from_index == to_index)
+        return true;
+
+    SceneObject object = std::move(scene.objects[from_index]);
+    scene.objects.erase(scene.objects.begin() + static_cast<std::ptrdiff_t>(from_index));
+    scene.objects.insert(scene.objects.begin() + static_cast<std::ptrdiff_t>(to_index),
+                         std::move(object));
+    scene_refresh(scene);
+    return true;
+}
+
+std::vector<std::string> scene_component_types() {
+    std::vector<std::string> types;
+    const auto component_schema = g_schemas.find("Component");
+    if (component_schema == g_schemas.end()) return types;
+    for (const auto& entry : component_schema->second.fields) {
+        if (entry.second.is_message && !entry.second.class_name.empty())
+            types.push_back(entry.second.class_name);
+    }
+    std::sort(types.begin(), types.end());
+    types.erase(std::unique(types.begin(), types.end()), types.end());
+    return types;
+}
+
+bool scene_add_component(SceneData& scene, size_t object_index,
+                         const std::string& type_name, size_t* new_index) {
+    if (object_index >= scene.objects.size()) return false;
+    SceneObject& object = scene.objects[object_index];
+
+    const auto component_schema = g_schemas.find("Component");
+    if (component_schema == g_schemas.end()) return false;
+    int payload_field = 0;
+    for (const auto& entry : component_schema->second.fields) {
+        if (entry.second.is_message && entry.second.class_name == type_name) {
+            payload_field = static_cast<int>(entry.first >> 3);
+            break;
+        }
+    }
+    if (payload_field == 0) return false;
+
+    int instance_id = 1;
+    for (const auto& component : object.components)
+        instance_id = std::max(instance_id, component.type_id + 1);
+
+    proto::Writer wrapper;
+    wrapper.write_string_field(1, type_name);
+    wrapper.write_varint_field(2, static_cast<uint64_t>(instance_id));
+    proto::Writer payload;
+    wrapper.write_nested_field(payload_field, payload);
+
+    SceneComponent component;
+    component.type_name = type_name;
+    component.type_id = instance_id;
+    component.raw_data = wrapper.to_string();
+    object.components.push_back(std::move(component));
+    if (new_index) *new_index = object.components.size() - 1;
+    return true;
+}
+
+bool scene_remove_component(SceneData& scene, size_t object_index, size_t component_index) {
+    if (object_index >= scene.objects.size()) return false;
+    auto& components = scene.objects[object_index].components;
+    if (component_index >= components.size()) return false;
+    components.erase(components.begin() + static_cast<std::ptrdiff_t>(component_index));
+    return true;
+}
+
+bool scene_paste_component(SceneData& scene, size_t object_index,
+                           const SceneComponent& source, size_t* new_index) {
+    if (object_index >= scene.objects.size()) return false;
+    auto& components = scene.objects[object_index].components;
+    int instance_id = 1;
+    for (const auto& component : components)
+        instance_id = std::max(instance_id, component.type_id + 1);
+
+    SceneComponent pasted = source;
+    try {
+        proto::Reader reader(pasted.raw_data);
+        std::vector<proto::Field> fields = reader.read_all();
+        for (auto& field : fields) {
+            if (field.field_number == 2 && field.wire_type == proto::WIRE_VARINT) {
+                field.varint_val = static_cast<uint64_t>(instance_id);
+                break;
+            }
+        }
+        proto::Writer writer;
+        for (const auto& field : fields) writer.write_field(field);
+        pasted.raw_data = writer.to_string();
+    } catch (...) {
+        return false;
+    }
+    pasted.type_id = instance_id;
+    components.push_back(std::move(pasted));
+    if (new_index) *new_index = components.size() - 1;
+    return true;
+}
+
+std::vector<SceneComponentField> scene_component_fields(const SceneComponent& component) {
+    std::vector<SceneComponentField> result;
+    const int payload_field = component_payload_field(component);
+    if (payload_field == 0) return result;
+
+    const auto schema_it = g_schemas.find(component_schema_name(component));
+    std::unordered_map<uint32_t, size_t> occurrences;
+    try {
+        proto::Reader wrapper(component.raw_data);
+        proto::Field wrapper_field;
+        while (wrapper.read_field(wrapper_field)) {
+            if (wrapper_field.field_number != static_cast<uint32_t>(payload_field) ||
+                wrapper_field.wire_type != proto::WIRE_LEN)
+                continue;
+            proto::Reader payload(wrapper_field.bytes_val);
+            proto::Field field;
+            while (payload.read_field(field)) {
+                SceneComponentField value;
+                value.field_number = field.field_number;
+                value.wire_type = field.wire_type;
+                value.occurrence = occurrences[field.field_number]++;
+                value.varint_value = field.varint_val;
+                value.double_value = field.double_val;
+                value.float_value = field.float_val;
+                value.bytes_value = field.bytes_val;
+                if (schema_it != g_schemas.end()) {
+                    const uint32_t wire_key = (field.field_number << 3) | field.wire_type;
+                    const auto schema_field = schema_it->second.fields.find(wire_key);
+                    if (schema_field != schema_it->second.fields.end()) {
+                        value.name = schema_field->second.name;
+                        value.class_name = schema_field->second.class_name;
+                        value.is_message = schema_field->second.is_message;
+                    }
+                }
+                if (value.name.empty()) value.name = "Field " + std::to_string(field.field_number);
+                result.push_back(std::move(value));
+            }
+            break;
+        }
+    } catch (...) {}
+    return result;
+}
+
+bool scene_set_component_field(SceneComponent& component, const SceneComponentField& value) {
+    const int payload_field = component_payload_field(component);
+    if (payload_field == 0 || value.is_message) return false;
+    try {
+        proto::Reader wrapper_reader(component.raw_data);
+        std::vector<proto::Field> wrapper_fields = wrapper_reader.read_all();
+        bool changed = false;
+        for (auto& wrapper_field : wrapper_fields) {
+            if (wrapper_field.field_number != static_cast<uint32_t>(payload_field) ||
+                wrapper_field.wire_type != proto::WIRE_LEN)
+                continue;
+            proto::Reader payload_reader(wrapper_field.bytes_val);
+            std::vector<proto::Field> payload_fields = payload_reader.read_all();
+            size_t occurrence = 0;
+            for (auto& field : payload_fields) {
+                if (field.field_number != value.field_number) continue;
+                if (occurrence++ != value.occurrence) continue;
+                if (field.wire_type != value.wire_type) return false;
+                field.varint_val = value.varint_value;
+                field.double_val = value.double_value;
+                field.float_val = value.float_value;
+                field.bytes_val = value.bytes_value;
+                changed = true;
+                break;
+            }
+            if (!changed) return false;
+            proto::Writer payload_writer;
+            for (const auto& field : payload_fields) payload_writer.write_field(field);
+            wrapper_field.bytes_val = payload_writer.to_string();
+            break;
+        }
+        if (!changed) return false;
+        proto::Writer wrapper_writer;
+        for (const auto& field : wrapper_fields) wrapper_writer.write_field(field);
+        component.raw_data = wrapper_writer.to_string();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string scene_program_source(const std::string& program_data) {
+    try {
+        proto::Reader reader(program_data);
+        proto::Field field;
+        while (reader.read_field(field)) {
+            if (field.field_number == 1 && field.wire_type == proto::WIRE_LEN)
+                return field.bytes_val;
+        }
+    } catch (...) {}
+    return {};
+}
+
+bool scene_set_program_source(std::string& program_data, const std::string& source) {
+    try {
+        std::vector<proto::Field> fields;
+        if (!program_data.empty()) {
+            proto::Reader reader(program_data);
+            fields = reader.read_all();
+        }
+        bool found = false;
+        for (auto& field : fields) {
+            if (field.field_number == 1 && field.wire_type == proto::WIRE_LEN) {
+                field.bytes_val = source;
+                found = true;
+                break;
+            }
+        }
+        proto::Writer writer;
+        if (!found && !source.empty()) writer.write_string_field(1, source);
+        for (const auto& field : fields) writer.write_field(field);
+        program_data = writer.to_string();
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 // ============================================================
@@ -539,8 +914,7 @@ SceneData scene_load(const std::string& path) {
         std::cerr << "[scene_loader] error: top-level parse failed: " << e.what() << "\n";
     }
 
-    scene.object_count = static_cast<int>(scene.objects.size());
-    compute_bounds(scene);
+    scene_refresh(scene);
 
     std::cout << "[scene_loader] loaded " << scene.filename
               << ": " << scene.object_count << " objects"
@@ -558,7 +932,7 @@ SceneData scene_load(const std::string& path) {
 // Field order matches the load order: objects first, then
 // libraries, bounds, groups, onload scripts, then any unknown.
 // ============================================================
-void scene_save(const std::string& path, const SceneData& scene) {
+std::string scene_serialize(const SceneData& scene) {
     proto::Writer w;
 
     // Tag 1: SceneObject[] — re-serialise every object
@@ -585,17 +959,46 @@ void scene_save(const std::string& path, const SceneData& scene) {
     for (const auto& f : scene.other_fields)
         w.write_field(f);
 
-    std::ofstream out(path, std::ios::binary);
+    return w.to_string();
+}
+
+bool scene_save(const std::string& path, const SceneData& scene, std::string* error_message) {
+    const std::string data = scene_serialize(scene);
+
+    const fs::path destination(path);
+    const fs::path temporary = destination.string() + ".ruby.tmp";
+    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
-        std::cerr << "[scene_loader] error: cannot write " << path << "\n";
-        return;
+        const std::string error = "cannot write temporary file " + temporary.string();
+        if (error_message) *error_message = error;
+        std::cerr << "[scene_loader] error: " << error << "\n";
+        return false;
     }
-    const std::string data = w.to_string();
     out.write(data.data(), static_cast<std::streamsize>(data.size()));
     out.close();
+    if (!out) {
+        const std::string error = "failed while writing temporary file " + temporary.string();
+        if (error_message) *error_message = error;
+        std::error_code remove_error;
+        fs::remove(temporary, remove_error);
+        std::cerr << "[scene_loader] error: " << error << "\n";
+        return false;
+    }
+
+    std::error_code rename_error;
+    fs::rename(temporary, destination, rename_error);
+    if (rename_error) {
+        const std::string error = "cannot replace " + destination.string() + ": " + rename_error.message();
+        if (error_message) *error_message = error;
+        std::error_code remove_error;
+        fs::remove(temporary, remove_error);
+        std::cerr << "[scene_loader] error: " << error << "\n";
+        return false;
+    }
 
     std::cout << "[scene_loader] saved " << fs::path(path).filename().string()
               << " (" << data.size() << " bytes, " << scene.objects.size() << " objects)\n";
+    return true;
 }
 
 } // namespace av

@@ -95,49 +95,6 @@ typedef int  (*fn_int_self)(void* self);
 typedef int  (*fn_int_self_ptr)(void* self, void* shared_ptr_ref);
 
 /* =========================================================================
- * Function offsets — from nm (v1.4.12 ARM64)
- * ========================================================================= */
-
-/* HealthBar */
-#define OFF_HealthBar_SetMaxHealth       0x3d9b74
-#define OFF_HealthBar_SetCurrentHealth   0x3d9b9c
-
-/* ManaBar */
-#define OFF_ManaBar_SetMaxMana           0x3df0a4
-#define OFF_ManaBar_SetCurrentMana       0x3df178
-
-/* CoinBar */
-#define OFF_CoinBar_SetCurrentCoins      0x3c3acc
-
-/* GameOverlayView */
-#define OFF_GameOverlayView_SetControlsHidden      0x3d5394
-#define OFF_GameOverlayView_SetShowsUseButton      0x3d56ac
-#define OFF_GameOverlayView_SetSkillButtonDisabled  0x3d57c4
-
-/* GUIEffect */
-#define OFF_GUIEffect_FadeOut            0x4a6f54
-#define OFF_GUIEffect_FadeIn             0x4a709c
-#define OFF_GUIEffect_Update             0x4a6f88
-
-/* GUIView */
-#define OFF_GUIView_Update               0x49e33c
-
-/* CharControllerComponent */
-#define OFF_CharController_CanUse        0x25c950
-#define OFF_CharController_CanPickup     0x25ca68
-
-/* GameSceneController */
-#define OFF_GameSceneController_CanCastSkill  0x34c2fc
-
-/* GameSceneView (own methods we call on self) */
-#define OFF_GameSceneView_HideCinematicSkipButton  0x34def4
-
-/* =========================================================================
- * Helper: compute function pointer from offset
- * ========================================================================= */
-#define FN(type, offset)  ((type)(g_swordigo_base + (offset)))
-
-/* =========================================================================
  * GameSceneView object layout (from decompiled source)
  * =========================================================================
  *   +0x00   vtable pointer (GUIView base)
@@ -267,6 +224,7 @@ static void sp_release(void* pn) {
  * ARM64 ABI: X0 = this, S0 = float deltaTime
  */
 void sre_GameSceneView_Update(void* self, float deltaTime) {
+    if (!self) return;
     char* this_ = (char*)self;
     
     /* Store scene view pointer for host */
@@ -534,12 +492,6 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
                 *(uint8_t*)(spell_picker + 0xE4) = has_spells ? 0 : 1;
             }
 
-            /* ---- 5. AUTOMATIC 60 HZ RAKNET LAN MULTIPLAYER SYNC ENGINE ---- */
-            {
-                extern void sre_raknet_lan_sync_update(void* sc);
-                sre_raknet_lan_sync_update((void*)this_);
-            }
-
             // Force the mana bar to remain visible if the player has at least one spell
             if (mana_bar) {
                 int has_spells = 0;
@@ -671,7 +623,7 @@ void sre_Scene_FinishLoad(void* self) {
                 recovery_pop(my_depth);
                 fprintf(stderr, "[SRE/Scene] Recovered exception during Scene::FinishLoad! Scene load continuing.\n");
                 /* MUTEX SAFETY: force unlock — a longjmp may have escaped a locked section */
-                pthread_mutex_unlock(g_lua_mutex_ptr);
+                if (g_lua_mutex_ptr) pthread_mutex_unlock(g_lua_mutex_ptr);
                 goto finish_load_done;
             }
             g_orig_Scene_FinishLoad(self);
@@ -682,13 +634,10 @@ void sre_Scene_FinishLoad(void* self) {
     }
 
 finish_load_done:
-    /* CRITICAL: scene load is complete — clear flag and force-unlock the Lua mutex.
-     * A longjmp during FinishLoad may have left the mutex locked. Unlocking once
-     * extra is safe (on Linux POSIX mutexes, unlock of an already-unlocked mutex
-     * returns EPERM which we ignore) — but it un-sticks a deadlocked next frame. */
+    /* Scene load is complete. ProgramState owns its mutex; this wrapper never
+     * locks it, so unlocking here would violate mutex ownership and is undefined. */
     g_sre_scene_loading = 0;
-    pthread_mutex_unlock(g_lua_mutex_ptr);  /* Force-unlock: safe even if already unlocked */
-    fprintf(stderr, "[SRE/Scene] Scene::FinishLoad finished. Loading flag cleared, mutex released.\n");
+    fprintf(stderr, "[SRE/Scene] Scene::FinishLoad finished. Loading flag cleared.\n");
 }
 
 typedef void (*pfn_orig_SceneObject_FinishLoad)(void* self);
@@ -837,6 +786,7 @@ void sre_SceneObject_FinishLoad(void* self) {
             if (my_depth >= 0 && sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
                 recovery_pop(my_depth);
                 fprintf(stderr, "[SRE/SceneObject] Recovered exception in SceneObject::FinishLoad (obj=%p)! Safely skipped object.\n", self);
+                if (g_lua_mutex_ptr) pthread_mutex_unlock(g_lua_mutex_ptr);
                 return;
             }
             g_orig_SceneObject_FinishLoad(self);
@@ -1117,6 +1067,81 @@ void sre_Proto_ObjectLibrary_Clear(void* this_) {
     }
     if (g_orig_Proto_ObjectLibrary_Clear)
         ((void(*)(void*))g_orig_Proto_ObjectLibrary_Clear)(this_);
+}
+
+/* =============================================================================
+ * Proto::SceneObject::~SceneObject — teardown lifetime guard
+ * =============================================================================
+ * IDA v1.4.12 ARM64 (0x2fe23c) shows the destructor iterating:
+ *   component array: this + 0x20
+ *   component count: this + 0x2c
+ * and calling each component's vtable[1] destructor.  During a scene swap a
+ * deferred guest free can leave the array/count pair pointing at reclaimed
+ * memory.  The native destructor has no bounds or vtable validation, so a
+ * stale component can branch into .dynstr and halt Dynarmic.
+ */
+uint64_t g_orig_Proto_SceneObject_Destroy = 0;
+
+void sre_Proto_SceneObject_Destroy(void* this_) {
+    if (!this_) return;
+
+    char* base = (char*)this_;
+    uint64_t array_addr = *(uint64_t*)(base + 0x20);
+    int count = *(int*)(base + 0x2c);
+    bool bad = count < 0 || count > MAX_PROTO_COMPONENT_COUNT;
+
+    /* Proto objects and their repeated-field arrays are guest heap objects. */
+    if (count > 0 && (!array_addr || (array_addr & 7) != 0 ||
+                      array_addr < 0x20000000ULL || array_addr >= 0xe0000000ULL))
+        bad = true;
+
+    if (!bad && array_addr && count > 0 && g_swordigo_base) {
+        uint64_t* components = (uint64_t*)array_addr;
+        const uint64_t text_lo = g_swordigo_base + 0x203e90ULL;
+        const uint64_t text_hi = g_swordigo_base + 0x583480ULL;
+        const uint64_t ro_lo = g_swordigo_base + 0x583480ULL;
+        const uint64_t ro_hi = g_swordigo_base + 0x6e8000ULL;
+
+        for (int i = 0; i < count; ++i) {
+            uint64_t component = components[i];
+            if (!component || (component & 7) != 0 ||
+                component < 0x20000000ULL || component >= 0xe0000000ULL) {
+                bad = true;
+                break;
+            }
+
+            uint64_t vtable = *(uint64_t*)component;
+            bool vtable_ok = vtable && (vtable & 7) == 0 &&
+                ((vtable >= ro_lo && vtable < ro_hi) ||
+                 (vtable >= 0x2000000ULL && vtable < 0x2300000ULL) ||
+                 (vtable >= 0x3000000ULL && vtable < 0x3100000ULL));
+            if (!vtable_ok) {
+                bad = true;
+                break;
+            }
+
+            uint64_t destructor = ((uint64_t*)vtable)[1];
+            bool destructor_ok = destructor && (destructor & 3) == 0 &&
+                ((destructor >= text_lo && destructor < text_hi) ||
+                 (destructor >= 0x2000000ULL && destructor < 0x2300000ULL) ||
+                 (destructor >= 0x3000000ULL && destructor < 0x3100000ULL));
+            if (!destructor_ok) {
+                bad = true;
+                break;
+            }
+        }
+    }
+
+    if (bad) {
+        fprintf(stderr, "[SRE/Proto] SceneObject::~SceneObject: invalid component array/count "
+                        "array=0x%llx count=%d (obj=%p) — skipping component teardown\n",
+                (unsigned long long)array_addr, count, this_);
+        *(uint64_t*)(base + 0x20) = 0;
+        *(int*)(base + 0x2c) = 0;
+    }
+
+    if (g_orig_Proto_SceneObject_Destroy)
+        ((void(*)(void*))g_orig_Proto_SceneObject_Destroy)(this_);
 }
 
 /* =============================================================================

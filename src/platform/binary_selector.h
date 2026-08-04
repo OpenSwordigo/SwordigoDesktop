@@ -51,6 +51,9 @@ public:
     
     // Load user-added instances (writable, from user config dir)
     void load_user_instances(const std::string& json_path);
+
+    // Rebuild the runtime list from engine/*/*/instance.ini metadata.
+    void reload_instances();
     
     // Save user instances (only custom ones, not system ones)
     void save_user_instances(const std::string& json_path) const;
@@ -85,9 +88,18 @@ public:
     const BinaryInfo* get_loaded_info() const;
     void set_loaded(const std::string& filepath);
 
+    // Remove SRE-conflicting dependencies from a newly-created instance.
+    void strip_sre_conflicts_from_last();
+
     // Add a custom binary instance from a .so file
     // Copies the .so into engine/custom-NAME/<arch>/ and registers it
     bool add_custom_instance(const std::string& so_filepath, const std::string& name, const std::string& assets_dir);
+
+    // Import an Android APK as a complete self-contained instance. Extracts
+    // game assets and every native ABI, registers each libswordigo.so, copies
+    // companion libraries, and writes instance.ini metadata.
+    bool import_apk_instance(const std::string& apk_path, const std::string& name,
+                             std::string* error_message = nullptr);
 
     // Remove an instance by index from the in-memory list
     void remove_instance(int index) {

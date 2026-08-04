@@ -64,11 +64,15 @@ void renderer_shutdown();
 /// @param normals     Flat float array [nx,ny,nz] * num_verts (may be null)
 /// @param uvs         Flat float array [u,v] * num_verts      (may be null)
 /// @param num_verts   Number of vertices
-/// @param indices     Index array (uint16), may be null for non-indexed
+/// @param indices     Index array (uint32), may be null for non-indexed
 /// @param num_indices Number of indices (0 if non-indexed)
 /// @return GPUMesh ready for rendering (vao == 0 on failure)
 GPUMesh upload_mesh(const float* positions, const float* normals, const float* uvs,
-                    int num_verts, const uint16_t* indices, int num_indices);
+                    int num_verts, const uint32_t* indices, int num_indices);
+
+/// Replace an uploaded mesh's dynamic position/normal data in-place.
+void update_mesh_vertices(const GPUMesh& mesh, const float* positions,
+                          const float* normals, const float* uvs, int num_verts);
 
 /// Delete GPU resources for a mesh.  Zeros the handle fields.
 void free_mesh(GPUMesh& mesh);
@@ -105,10 +109,15 @@ void begin_3d(unsigned int fbo, int w, int h, const Camera& cam);
 void render_mesh(const GPUMesh& mesh, const float* model_matrix,
                  const float color[4], bool wireframe);
 
+/// Render debug line segments, two xyz points per segment.
+void render_lines(const float* positions, int vertex_count, const float color[4],
+                  const float* model_matrix = nullptr, float width = 1.0f);
+
 /// Render the XZ grid plane centered at origin.
 /// @param size     Total grid extent (e.g. 20 = ±10 units)
 /// @param y_level  Y height of the grid plane
 void render_grid(float size, float y_level);
+void render_grid_xy(float size, float z_level);
 
 /// End the 3D render pass (unbind FBO, restore viewport).
 void end_3d();

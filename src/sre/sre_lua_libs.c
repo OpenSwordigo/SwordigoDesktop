@@ -1995,7 +1995,7 @@ void* caver_getHero_from_view(void* view) {
     if (!gc) return (void*)0;
     uint64_t sc = *(uint64_t*)((char*)gc + 0xC8); /* 0xC8 = GameSceneController* */
     if (!sc) return (void*)0;
-    return (void*)*(uint64_t*)((char*)sc + 0x8);  /* 0x8 = Hero SceneObject* */
+    return (void*)*(uint64_t*)((char*)sc + 0xd8); /* active hero SceneObject* */
 }
 
 void caver_getPosition_impl(void* obj, float* x, float* y, float* z) {
@@ -2583,17 +2583,17 @@ static int l_swd_spawn_dummy_hero(lua_State* L) {
     }
 
     float spawn_pos[3] = { x + offset_x, y, z };
-    void* main_hero = *(void**)((char*)sc + 0x8); /* Save main hero pointer */
+    void* main_hero = *(void**)((char*)sc + 0xd8); /* Save active hero pointer */
     g_sre_CreateHeroObjectAt(sc, spawn_pos, 1, 1);
-    void* dummy_hero = *(void**)((char*)sc + 0x8); /* Capture 2nd hero clone pointer */
+    void* dummy_hero = *(void**)((char*)sc + 0xd8); /* Capture created hero */
 
-    *(void**)((char*)sc + 0x8) = main_hero; /* 1. Restore main hero pointer! */
+    *(void**)((char*)sc + 0xd8) = main_hero; /* Restore the local hero pointer. */
 
-    /* 2. Re-bind CameraController to main_hero via UpdateTarget (0x0034A6BC) */
+    /* Re-bind to the restored local hero. Address verified by nm -D -C. */
     extern uint64_t g_swordigo_base;
     typedef void (*pfn_UpdateTarget)(void* sc);
-    pfn_UpdateTarget fn_UpdateTarget = (pfn_UpdateTarget)(g_swordigo_base + 0x34A6BC);
-    if (fn_UpdateTarget) fn_UpdateTarget(sc);
+    pfn_UpdateTarget fn_UpdateTarget = (pfn_UpdateTarget)(g_swordigo_base + 0x34a6bc);
+    fn_UpdateTarget(sc);
 
     if (dummy_hero) {
         g_remote_hero_ghost = dummy_hero;
@@ -2624,9 +2624,6 @@ static const void* swd_systemlib[] = {
 extern int   sre_raknet_startup_impl(uint16_t port);
 extern int   sre_raknet_connect_impl(const char* host, uint16_t port);
 extern void  sre_raknet_shutdown_impl(void);
-extern int   g_sre_lan_sync_active;
-extern int   g_sre_lan_is_host;
-
 static int l_swd_net_host(lua_State* L) {
     int port = (g_lua_isnumber && g_lua_isnumber(L, 1)) ? (int)g_lua_tointeger(L, 1) : 12345;
     int result = sre_raknet_startup_impl((uint16_t)port);
@@ -2643,9 +2640,19 @@ static int l_swd_net_join(lua_State* L) {
     return 1;
 }
 
+/* Compatibility names used by the Open-to-LAN design/API. Discovery is not
+ * implemented yet, so JoinLAN accepts the same explicit IP as Join. */
+static int l_swd_net_open_to_lan(lua_State* L) {
+    return l_swd_net_host(L);
+}
+
+static int l_swd_net_join_lan(lua_State* L) {
+    return l_swd_net_join(L);
+}
+
 static int l_swd_net_is_connected(lua_State* L) {
-    /* g_sre_lan_sync_active is 1 once either Host or Join succeeds */
-    if (g_lua_pushboolean) g_lua_pushboolean(L, g_sre_lan_sync_active ? 1 : 0);
+    extern int sre_raknet_is_connected_impl(void);
+    if (g_lua_pushboolean) g_lua_pushboolean(L, sre_raknet_is_connected_impl());
     return 1;
 }
 
@@ -2656,11 +2663,25 @@ static int l_swd_net_disconnect(lua_State* L) {
     return 0;
 }
 
+static int l_swd_net_set_scene(lua_State* L) {
+    const char* scene = luaL_checkstring(L, 1);
+    extern char g_sre_current_scene_name[128];
+    if (scene) {
+        strncpy(g_sre_current_scene_name, scene, 127);
+        g_sre_current_scene_name[127] = '\0';
+        printf("[SRE-Net] Forced current scene to: %s\n", g_sre_current_scene_name);
+    }
+    return 0;
+}
+
 static const void* swd_netlib[] = {
     (const void*)"Host",        (const void*)l_swd_net_host,
     (const void*)"Join",        (const void*)l_swd_net_join,
+    (const void*)"OpenToLAN",   (const void*)l_swd_net_open_to_lan,
+    (const void*)"JoinLAN",     (const void*)l_swd_net_join_lan,
     (const void*)"IsConnected", (const void*)l_swd_net_is_connected,
     (const void*)"Disconnect",  (const void*)l_swd_net_disconnect,
+    (const void*)"SetScene",    (const void*)l_swd_net_set_scene,
     (const void*)0,             (const void*)0
 };
 
@@ -2675,5 +2696,3 @@ void sre_register_expanded_namespaces(lua_State* L) {
     g_luaL_register(L, "Swd.Net", (const void*)swd_netlib);
     if (g_lua_settop) g_lua_settop(L, -2);
 }
-
-

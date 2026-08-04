@@ -2046,19 +2046,7 @@ LaunchConfig show_launcher(BinarySelector& selector) {
                                     } catch (...) {}
                                 }
 
-                                auto& bins_mut = const_cast<std::vector<BinaryInfo>&>(selector.get_binaries());
-                                if (!bins_mut.empty()) {
-                                    auto& last = bins_mut.back();
-                                    auto& deps = last.dependencies;
-                                    deps.erase(std::remove_if(deps.begin(), deps.end(), [](const std::string& d) {
-                                        return d == "libmini.so" || d == "libGlossHook.so";
-                                    }), deps.end());
-                                    auto& dpaths = last.dep_paths;
-                                    dpaths.erase(std::remove_if(dpaths.begin(), dpaths.end(), [](const std::string& p) {
-                                        return p.find("libmini.so") != std::string::npos ||
-                                               p.find("libGlossHook.so") != std::string::npos;
-                                    }), dpaths.end());
-                                }
+                                selector.strip_sre_conflicts_from_last();
                             }
 
                             std::string config_dir;

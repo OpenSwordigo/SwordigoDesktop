@@ -37,6 +37,7 @@
 #include "tools/av_renderer.h"
 #include "tools/av_audio.h"
 #include "tools/scene_loader.h"
+#include "tools/scene_schemas.h"
 #include "tools/intellij.h"
 #include "tools/boulder.h"
 #include "tools/filerift.h"
@@ -150,6 +151,8 @@ struct ViewerState {
     std::vector<FileEntry> filtered_files; // after search + type filter
     int                    selected_idx = -1;
     char                   search_buf[256] = {};
+    char                   browser_path_buf[1024] = {};
+    std::string            browser_path_source;
     int                    type_filter = 0; // 0=all, 1-4=specific
 
     // Preview
@@ -172,18 +175,33 @@ struct ViewerState {
     int                      fbo_w = 0, fbo_h = 0;
     bool                     show_wireframe = false;
     bool                     show_textured  = true;
+    bool                     show_skeleton  = false;
     GLuint                   model_texture  = 0;
     int                      highlighted_mesh = -1;
 
     // Scene preview
     av::SceneData scene;
-    int           scene_preview_tab = 0; // 0 = Swordfare Editor, 1 = 3D Visualizer, 2 = Tree Inspector
+    int           scene_preview_tab = 1; // 0 = Editor, 1 = 3D Visualizer, 2 = Tree Inspector
+    bool          scene_text_dirty = false;
     int           selected_object = -1;
     std::map<std::string, av::PODModel> scene_model_cache;
     std::map<std::string, std::vector<av::GPUMesh>> scene_gpu_mesh_cache;
     std::map<std::string, std::vector<GLuint>> scene_texture_cache;
     std::vector<std::vector<av::GPUMesh>> scene_ground_gpu_meshes;
     std::vector<std::vector<GLuint>> scene_ground_textures;
+    av::GPUMesh scene_proxy_mesh;
+    bool       scene_show_hidden = true;
+    int        scene_transform_mode = 0; // 0 navigate, 1 move, 2 rotate, 3 scale
+    bool       scene_pointer_active = false;
+    bool       scene_transform_drag = false;
+    ImVec2     scene_pointer_start = ImVec2(0, 0);
+    int        scene_component_type = 0;
+    bool       scene_has_object_clipboard = false;
+    av::SceneObject scene_object_clipboard;
+    bool       scene_has_component_clipboard = false;
+    av::SceneComponent scene_component_clipboard;
+    int        scene_script_index = -1;
+    char       scene_script_buf[16384] = {};
 
     // Checkerboard texture (for transparency)
     GLuint checker_tex = 0;
@@ -196,10 +214,11 @@ struct ViewerState {
     // Multi-texture & Animation Support
     std::vector<GLuint>      model_textures;
     std::vector<std::string> missing_textures;
-    int                      current_frame = 0;
+    float                    current_frame = 0.0f;
     bool                     anim_playing = false;
     float                    anim_timer = 0.0f;
     float                    anim_fps = 30.0f;
+    float                    uploaded_skin_frame = -1.0f;
 
     // Settings / Preferences
     bool        show_settings = false;
@@ -256,6 +275,8 @@ struct ViewerState {
     bool        scene_onload_modified = false; // true if user edited the script
     char        scene_obj_name_buf[256]    = {}; // editable name field
     char        scene_obj_template_buf[256]= {}; // editable template field
+    std::vector<av::SceneData> scene_undo_stack;
+    std::vector<av::SceneData> scene_redo_stack;
     
     // --- IntelliJ Text Editor state ---
     intel::IntelliJ intellij_editor;
@@ -277,6 +298,66 @@ struct ViewerState {
 static ViewerState g_state;
 
 static bool load_scene_model_to_cache(ViewerState& st, const std::string& mesh_name, const std::string& scene_dir_path);
+static void upload_scene_ground_meshes(ViewerState& st, const std::string& scene_dir_path);
+static void frame_scene_camera(ViewerState& st);
+
+static void flush_scene_onload_editor(ViewerState& st) {
+    if (!st.scene_onload_modified || st.selected_object < 0 ||
+        st.selected_object >= static_cast<int>(st.scene.objects.size()))
+        return;
+    proto::Writer program;
+    program.write_string_field(1, std::string(st.scene_onload_buf));
+    st.scene.objects[st.selected_object].onload = program.to_string();
+    st.scene_onload_modified = false;
+}
+
+static void sync_scene_object_editor(ViewerState& st) {
+    st.scene_onload_buf[0] = '\0';
+    st.scene_onload_modified = false;
+    st.scene_obj_name_buf[0] = '\0';
+    st.scene_obj_template_buf[0] = '\0';
+    if (st.selected_object < 0 || st.selected_object >= static_cast<int>(st.scene.objects.size()))
+        return;
+
+    const auto& object = st.scene.objects[st.selected_object];
+    snprintf(st.scene_obj_name_buf, sizeof(st.scene_obj_name_buf), "%s", object.name.c_str());
+    snprintf(st.scene_obj_template_buf, sizeof(st.scene_obj_template_buf), "%s", object.template_name.c_str());
+}
+
+static void select_scene_object(ViewerState& st, int index) {
+    flush_scene_onload_editor(st);
+    st.selected_object = index;
+    sync_scene_object_editor(st);
+}
+
+static void snapshot_scene(ViewerState& st) {
+    flush_scene_onload_editor(st);
+    st.scene_undo_stack.push_back(st.scene);
+    if (st.scene_undo_stack.size() > 64)
+        st.scene_undo_stack.erase(st.scene_undo_stack.begin());
+    st.scene_redo_stack.clear();
+}
+
+static bool restore_scene_history(ViewerState& st, bool redo) {
+    auto& source = redo ? st.scene_redo_stack : st.scene_undo_stack;
+    auto& destination = redo ? st.scene_undo_stack : st.scene_redo_stack;
+    if (source.empty())
+        return false;
+
+    flush_scene_onload_editor(st);
+    destination.push_back(st.scene);
+    if (destination.size() > 64)
+        destination.erase(destination.begin());
+    st.scene = std::move(source.back());
+    source.pop_back();
+    if (st.scene.objects.empty())
+        st.selected_object = -1;
+    else
+        st.selected_object = std::clamp(st.selected_object, 0, static_cast<int>(st.scene.objects.size()) - 1);
+    sync_scene_object_editor(st);
+    st.scene_dirty = true;
+    return true;
+}
 
 // ============================================================================
 // Helpers
@@ -303,6 +384,31 @@ static std::string expand_home(const std::string& p) {
         if (home) return std::string(home) + p.substr(1);
     }
     return p;
+}
+
+static fs::path find_pod_resource(const fs::path& root, const std::string& resource) {
+    if (root.empty() || resource.empty()) return {};
+    auto lowercase = [](std::string value) {
+        for (char& ch : value) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+        return value;
+    };
+    std::error_code ec;
+    const fs::path direct = root / resource;
+    if (fs::is_regular_file(direct, ec)) return direct;
+    const std::string wanted_name = lowercase(fs::path(resource).filename().string());
+    const std::string wanted_stem = lowercase(fs::path(resource).stem().string());
+    for (fs::recursive_directory_iterator iterator(root,
+             fs::directory_options::skip_permission_denied, ec), end;
+         iterator != end && !ec; iterator.increment(ec)) {
+        if (iterator.depth() > 6) { iterator.disable_recursion_pending(); continue; }
+        if (!iterator->is_regular_file(ec)) continue;
+        const fs::path candidate = iterator->path();
+        if (lowercase(candidate.extension().string()) != ".pod") continue;
+        if (lowercase(candidate.filename().string()) == wanted_name ||
+            lowercase(candidate.stem().string()) == wanted_stem)
+            return candidate;
+    }
+    return {};
 }
 
 static std::string format_size(size_t bytes) {
@@ -475,7 +581,7 @@ static void free_preview_resources(ViewerState& st) {
     }
     st.model_textures.clear();
     st.missing_textures.clear();
-    st.current_frame = 0;
+    st.current_frame = 0.0f;
     st.anim_playing = false;
     st.anim_timer = 0.0f;
 
@@ -497,6 +603,8 @@ static void free_preview_resources(ViewerState& st) {
     }
     st.scene_ground_textures.clear();
 
+    av::free_mesh(st.scene_proxy_mesh);
+
     for (auto& pair : st.scene_gpu_mesh_cache) {
         for (auto& m : pair.second) {
             av::free_mesh(m);
@@ -511,7 +619,8 @@ static void free_preview_resources(ViewerState& st) {
     }
     st.scene_texture_cache.clear();
     st.scene_model_cache.clear();
-    st.scene_preview_tab = 0;
+    st.scene_preview_tab = 1;
+    st.scene_text_dirty = false;
 
     // Reset transformations
     st.texture_rotation = 0;
@@ -695,12 +804,13 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
             st.preview_type = PREVIEW_NONE;
             break;
         }
+        st.anim_fps = st.model.fps;
 
         for (auto& mesh : st.model.meshes) {
             const float*    pos = mesh.positions.empty()  ? nullptr : mesh.positions.data();
             const float*    nrm = mesh.normals.empty()    ? nullptr : mesh.normals.data();
             const float*    uv  = mesh.uvs.empty()        ? nullptr : mesh.uvs.data();
-            const uint16_t* idx = mesh.indices.empty()    ? nullptr : mesh.indices.data();
+            const uint32_t* idx = mesh.indices.empty()    ? nullptr : mesh.indices.data();
             av::GPUMesh gm = av::upload_mesh(pos, nrm, uv, mesh.num_vertices,
                                               idx, (int)mesh.indices.size());
             st.gpu_meshes.push_back(gm);
@@ -787,6 +897,10 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
         st.scene_onload_modified = false;
         st.scene_obj_name_buf[0]     = '\0';
         st.scene_obj_template_buf[0] = '\0';
+        st.scene_script_index = -1;
+        st.scene_script_buf[0] = '\0';
+        st.scene_undo_stack.clear();
+        st.scene_redo_stack.clear();
 
         if (st.scene.objects.empty()) {
             st.status_msg = "Failed to parse " + fe.name;
@@ -795,7 +909,8 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
             st.scene_model_cache.clear();
             st.scene_gpu_mesh_cache.clear();
             st.scene_texture_cache.clear();
-            st.scene_preview_tab = 0; // Default to Swordfare Editor
+            st.scene_preview_tab = 1; // Scenes open directly in the visual editor.
+            st.scene_text_dirty = false;
 
             // Read scene binary bytes and decode to text markup
             {
@@ -815,26 +930,28 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
                 if (!obj.background_name.empty())
                     load_scene_model_to_cache(st, obj.background_name, scene_dir.string());
             }
+            upload_scene_ground_meshes(st, scene_dir.string());
 
             st.camera = av::Camera{};
-            float bounds_center_x = (st.scene.bounds_min[0] + st.scene.bounds_max[0]) * 0.5f;
-            float bounds_center_y = (st.scene.bounds_min[1] + st.scene.bounds_max[1]) * 0.5f;
-            float bounds_center_z = (st.scene.bounds_min[2] + st.scene.bounds_max[2]) * 0.5f;
-            st.camera.target[0] = bounds_center_x;
-            st.camera.target[1] = bounds_center_y;
-            st.camera.target[2] = bounds_center_z;
+            frame_scene_camera(st);
 
-            float dx = st.scene.bounds_max[0] - st.scene.bounds_min[0];
-            float dy = st.scene.bounds_max[1] - st.scene.bounds_min[1];
-            float dz = st.scene.bounds_max[2] - st.scene.bounds_min[2];
-            st.camera.distance = std::sqrt(dx*dx + dy*dy + dz*dz) * 1.2f;
-            if (st.camera.distance < 5.0f) st.camera.distance = 25.0f;
+            size_t resolved_models = 0;
+            size_t ground_meshes = 0;
+            size_t inherited_objects = 0;
+            for (const auto& object : st.scene.objects) {
+                if (!object.mesh_name.empty() || !object.background_name.empty()) ++resolved_models;
+                ground_meshes += object.ground_meshes.size();
+                if (object.components.empty() && !object.resolved_components.empty()) ++inherited_objects;
+            }
 
             char buf[256];
-            snprintf(buf, sizeof(buf), "Loaded %s — %d objects",
-                     fe.name.c_str(), (int)st.scene.objects.size());
+            snprintf(buf, sizeof(buf), "Loaded %s - %d objects, %zu models, %zu ground meshes",
+                     fe.name.c_str(), (int)st.scene.objects.size(), resolved_models, ground_meshes);
             st.status_msg = buf;
             log_file_event("SceneRead", "Loaded scene: " + fe.name + " (" + std::to_string(st.scene.objects.size()) + " objects, " + format_size(fe.size) + ")");
+            log_file_event("SceneRender", "Resolved " + std::to_string(resolved_models) +
+                " model objects, " + std::to_string(ground_meshes) + " ground meshes, " +
+                std::to_string(inherited_objects) + " inherited template objects");
         }
     } break;
 
@@ -1029,17 +1146,24 @@ static void draw_file_browser(ViewerState& st) {
     ImGui::BeginChild("FileBrowser", ImVec2(LEFT_PANEL_W, 0), ImGuiChildFlags_Borders);
 
     // Absolute Path Input Bar
-    char path_buf[512];
-    strncpy(path_buf, st.current_dir.c_str(), sizeof(path_buf) - 1);
-    path_buf[sizeof(path_buf) - 1] = '\0';
+    if (!ImGui::IsAnyItemActive() && st.browser_path_source != st.current_dir) {
+        snprintf(st.browser_path_buf, sizeof(st.browser_path_buf), "%s", st.current_dir.c_str());
+        st.browser_path_source = st.current_dir;
+    }
     
     ImGui::PushItemWidth(-1);
-    if (ImGui::InputText("##folder_path", path_buf, sizeof(path_buf), ImGuiInputTextFlags_EnterReturnsTrue)) {
+    if (ImGui::InputText("##folder_path", st.browser_path_buf, sizeof(st.browser_path_buf),
+                         ImGuiInputTextFlags_EnterReturnsTrue)) {
         std::error_code ec;
-        if (fs::is_directory(path_buf, ec)) {
-            st.current_dir = path_buf;
+        const std::string requested = expand_home(st.browser_path_buf);
+        if (fs::is_directory(requested, ec)) {
+            st.current_dir = fs::weakly_canonical(requested, ec).string();
+            if (ec) st.current_dir = requested;
+            st.browser_path_source = st.current_dir;
             refresh_directory(st);
             apply_filters(st);
+        } else {
+            st.status_msg = "Folder not found: " + requested;
         }
     }
     ImGui::PopItemWidth();
@@ -1196,15 +1320,60 @@ static void draw_model_viewport(ViewerState& st) {
             av::get_node_matrix(st.model, i, st.current_frame, node_matrix);
 
             float final_matrix[16];
-            av::mat4_multiply(final_matrix, global_model_matrix, node_matrix);
+            float centered_global[16];
+            if (st.model.has_center_point) {
+                float center_offset[16];
+                av::mat4_translate(center_offset, -st.model.center_point[0],
+                                   -st.model.center_point[1], -st.model.center_point[2]);
+                av::mat4_multiply(centered_global, global_model_matrix, center_offset);
+            } else {
+                std::memcpy(centered_global, global_model_matrix, sizeof(centered_global));
+            }
+            av::mat4_multiply(final_matrix, centered_global, node_matrix);
 
-            float* col = (node.object_index == st.highlighted_mesh) ? highlight : white;
+            // POD skin streams are CPU-deformed here so the viewer follows the
+            // same bone-matrix path as the ARM32 ModelInstance renderer.
+            if (node.object_index < static_cast<int>(st.model.meshes.size()) &&
+                st.model.meshes[node.object_index].bones_per_vertex > 0) {
+                std::vector<float> skinned_positions, skinned_normals;
+                if (av::skin_mesh(st.model, i, st.current_frame, skinned_positions, skinned_normals)) {
+                    const auto& source_mesh = st.model.meshes[node.object_index];
+                    av::update_mesh_vertices(gm, skinned_positions.data(),
+                                             skinned_normals.empty() ? nullptr : skinned_normals.data(),
+                                             source_mesh.uvs.empty() ? nullptr : source_mesh.uvs.data(),
+                                             source_mesh.num_vertices);
+                }
+            }
+
+            float mat_color[4] = {1, 1, 1, 1};
+            int mat_idx = node.material_index;
+            if (mat_idx >= 0 && mat_idx < (int)st.model.materials.size()) {
+                const auto& m = st.model.materials[mat_idx];
+                mat_color[0] = m.diffuse[0]; mat_color[1] = m.diffuse[1]; mat_color[2] = m.diffuse[2];
+                mat_color[3] = m.opacity;
+            }
+            float* col = (node.object_index == st.highlighted_mesh) ? highlight : mat_color;
             av::render_mesh(gm, final_matrix, col, false);
 
             if (st.show_wireframe) {
                 float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
                 av::render_mesh(gm, final_matrix, wire_col, true);
             }
+        }
+        if (st.show_skeleton) {
+            std::vector<float> lines;
+            for (int i = 0; i < static_cast<int>(st.model.nodes.size()); ++i) {
+                const int parent = st.model.nodes[i].parent_index;
+                if (parent < 0 || parent >= static_cast<int>(st.model.nodes.size())) continue;
+                float child[16], parent_matrix[16];
+                av::get_node_matrix(st.model, i, st.current_frame, child);
+                av::get_node_matrix(st.model, parent, st.current_frame, parent_matrix);
+                lines.insert(lines.end(), {parent_matrix[12], parent_matrix[13], parent_matrix[14],
+                                           child[12], child[13], child[14]});
+            }
+            float skeleton_color[4] = {1.0f, 0.45f, 0.08f, 1.0f};
+            av::render_lines(lines.data(), static_cast<int>(lines.size() / 3),
+                             skeleton_color, global_model_matrix, 2.0f);
         }
     } else {
         // Fallback for models without nodes
@@ -1216,12 +1385,21 @@ static void draw_model_viewport(ViewerState& st) {
                 gm.texture_id = 0;
             }
 
+            float centered_model[16];
+            if (st.model.has_center_point) {
+                float center_offset[16];
+                av::mat4_translate(center_offset, -st.model.center_point[0],
+                                   -st.model.center_point[1], -st.model.center_point[2]);
+                av::mat4_multiply(centered_model, global_model_matrix, center_offset);
+            } else {
+                std::memcpy(centered_model, global_model_matrix, sizeof(centered_model));
+            }
             float* col = (i == st.highlighted_mesh) ? highlight : white;
-            av::render_mesh(gm, global_model_matrix, col, false);
+            av::render_mesh(gm, centered_model, col, false);
 
             if (st.show_wireframe) {
                 float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
-                av::render_mesh(gm, global_model_matrix, wire_col, true);
+                av::render_mesh(gm, centered_model, wire_col, true);
             }
         }
     }
@@ -1445,17 +1623,7 @@ static void draw_scene_inspector(ViewerState& st) {
 
         bool open = ImGui::TreeNodeEx((void*)(intptr_t)i, flags, "%s", obj.name.c_str());
         if (ImGui::IsItemClicked()) {
-            if (st.selected_object != i) {
-                st.selected_object = i;
-                // Populate editor input buffers
-                snprintf(st.scene_obj_name_buf, sizeof(st.scene_obj_name_buf),
-                         "%s", obj.name.c_str());
-                snprintf(st.scene_obj_template_buf, sizeof(st.scene_obj_template_buf),
-                         "%s", obj.template_name.c_str());
-                // Reset script editor so it re-reads from the new object
-                st.scene_onload_buf[0] = '\0';
-                st.scene_onload_modified = false;
-            }
+            if (st.selected_object != i) select_scene_object(st, i);
         }
 
 
@@ -1557,11 +1725,17 @@ static bool load_scene_model_to_cache(ViewerState& st, const std::string& mesh_n
     fs::path scene_dir(scene_dir_path);
     std::vector<fs::path> search_paths = {
         scene_dir / mesh_name,
+        scene_dir / (mesh_name + ".pod"),
         scene_dir.parent_path() / mesh_name,
+        scene_dir.parent_path() / (mesh_name + ".pod"),
         scene_dir.parent_path() / "models" / mesh_name,
+        scene_dir.parent_path() / "models" / (mesh_name + ".pod"),
         scene_dir.parent_path() / "resources" / mesh_name,
+        scene_dir.parent_path() / "resources" / (mesh_name + ".pod"),
         fs::path(g_assets_dir) / "resources" / mesh_name,
-        fs::path(g_assets_dir) / "resources" / "models" / mesh_name
+        fs::path(g_assets_dir) / "resources" / (mesh_name + ".pod"),
+        fs::path(g_assets_dir) / "resources" / "models" / mesh_name,
+        fs::path(g_assets_dir) / "resources" / "models" / (mesh_name + ".pod")
     };
 
     fs::path resolved_path;
@@ -1569,6 +1743,14 @@ static bool load_scene_model_to_cache(ViewerState& st, const std::string& mesh_n
         if (fs::exists(path)) {
             resolved_path = path;
             break;
+        }
+    }
+
+    if (resolved_path.empty()) {
+        for (const fs::path& root : {scene_dir, scene_dir.parent_path(),
+                                    fs::path(g_assets_dir) / "resources"}) {
+            resolved_path = find_pod_resource(root, mesh_name);
+            if (!resolved_path.empty()) break;
         }
     }
 
@@ -1584,7 +1766,7 @@ static bool load_scene_model_to_cache(ViewerState& st, const std::string& mesh_n
         const float*    pos = mesh.positions.empty()  ? nullptr : mesh.positions.data();
         const float*    nrm = mesh.normals.empty()    ? nullptr : mesh.normals.data();
         const float*    uv  = mesh.uvs.empty()        ? nullptr : mesh.uvs.data();
-        const uint16_t* idx = mesh.indices.empty()    ? nullptr : mesh.indices.data();
+        const uint32_t* idx = mesh.indices.empty()    ? nullptr : mesh.indices.data();
         av::GPUMesh gm = av::upload_mesh(pos, nrm, uv, mesh.num_vertices,
                                           idx, (int)mesh.indices.size());
         gpu_meshes.push_back(gm);
@@ -1684,7 +1866,7 @@ static void upload_scene_ground_meshes(ViewerState& st, const std::string& scene
             const float*    pos = mesh.positions.empty()  ? nullptr : mesh.positions.data();
             const float*    nrm = mesh.normals.empty()    ? nullptr : mesh.normals.data();
             const float*    uv  = mesh.uvs.empty()        ? nullptr : mesh.uvs.data();
-            const uint16_t* idx_ptr = mesh.indices.empty() ? nullptr : mesh.indices.data();
+            const uint32_t* idx_ptr = mesh.indices.empty() ? nullptr : mesh.indices.data();
             av::GPUMesh gm = av::upload_mesh(pos, nrm, uv, mesh.num_vertices,
                                               idx_ptr, (int)mesh.indices.size());
             st.scene_ground_gpu_meshes[idx].push_back(gm);
@@ -1727,7 +1909,147 @@ static void upload_scene_ground_meshes(ViewerState& st, const std::string& scene
     }
 }
 
+static void ensure_scene_proxy_mesh(ViewerState& st) {
+    if (st.scene_proxy_mesh.vao)
+        return;
+    static const float positions[] = {
+        -0.5f,-0.5f,-0.5f,  0.5f,-0.5f,-0.5f,  0.5f, 0.5f,-0.5f, -0.5f, 0.5f,-0.5f,
+        -0.5f,-0.5f, 0.5f,  0.5f,-0.5f, 0.5f,  0.5f, 0.5f, 0.5f, -0.5f, 0.5f, 0.5f
+    };
+    static const uint32_t indices[] = {
+        0,2,1, 0,3,2, 4,5,6, 4,6,7, 0,1,5, 0,5,4,
+        3,7,6, 3,6,2, 0,4,7, 0,7,3, 1,2,6, 1,6,5
+    };
+    st.scene_proxy_mesh = av::upload_mesh(positions, nullptr, nullptr, 8, indices, 36);
+}
+
+static void frame_scene_camera(ViewerState& st) {
+    const float cx = (st.scene.bounds_min[0] + st.scene.bounds_max[0]) * 0.5f;
+    const float cy = (st.scene.bounds_min[1] + st.scene.bounds_max[1]) * 0.5f;
+    const float cz = (st.scene.bounds_min[2] + st.scene.bounds_max[2]) * 0.5f;
+    const float dx = st.scene.bounds_max[0] - st.scene.bounds_min[0];
+    const float dy = st.scene.bounds_max[1] - st.scene.bounds_min[1];
+    const float dz = st.scene.bounds_max[2] - st.scene.bounds_min[2];
+    const float radius = std::max(1.0f, std::sqrt(dx*dx + dy*dy + dz*dz) * 0.5f);
+    st.camera.target[0] = cx;
+    st.camera.target[1] = cy;
+    st.camera.target[2] = cz;
+    st.camera.distance = std::max(4.0f, radius * 2.6f);
+    st.camera.near_plane = std::max(0.01f, st.camera.distance / 10000.0f);
+    st.camera.far_plane = std::max(1000.0f, st.camera.distance + radius * 8.0f);
+    // main.js uses a Z-forward scene with objects rotating around Z.
+    st.camera.yaw = 0.0f;
+    st.camera.pitch = 0.0f;
+}
+
+static void scene_camera_basis(const av::Camera& camera, float right[3], float up[3], float forward[3]) {
+    const float yaw = camera.yaw * 3.14159265358979323846f / 180.0f;
+    const float pitch = camera.pitch * 3.14159265358979323846f / 180.0f;
+    const float cp = cosf(pitch);
+    const float eye[3] = {
+        camera.target[0] + camera.distance * cp * sinf(yaw),
+        camera.target[1] + camera.distance * sinf(pitch),
+        camera.target[2] + camera.distance * cp * cosf(yaw)
+    };
+    forward[0] = camera.target[0] - eye[0];
+    forward[1] = camera.target[1] - eye[1];
+    forward[2] = camera.target[2] - eye[2];
+    const float fl = std::sqrt(forward[0]*forward[0] + forward[1]*forward[1] + forward[2]*forward[2]);
+    if (fl > 0.0f) for (int i = 0; i < 3; ++i) forward[i] /= fl;
+    right[0] = forward[2];
+    right[1] = 0.0f;
+    right[2] = -forward[0];
+    const float rl = std::sqrt(right[0]*right[0] + right[2]*right[2]);
+    if (rl > 0.0f) { right[0] /= rl; right[2] /= rl; }
+    up[0] = right[1]*forward[2] - right[2]*forward[1];
+    up[1] = right[2]*forward[0] - right[0]*forward[2];
+    up[2] = right[0]*forward[1] - right[1]*forward[0];
+}
+
+static int pick_scene_object(const ViewerState& st, const ImVec2& viewport_pos,
+                             int width, int height, const ImVec2& mouse) {
+    float right[3], up[3], forward[3];
+    scene_camera_basis(st.camera, right, up, forward);
+    const float yaw = st.camera.yaw * 3.14159265358979323846f / 180.0f;
+    const float pitch = st.camera.pitch * 3.14159265358979323846f / 180.0f;
+    const float cp = cosf(pitch);
+    const float eye[3] = {
+        st.camera.target[0] + st.camera.distance * cp * sinf(yaw),
+        st.camera.target[1] + st.camera.distance * sinf(pitch),
+        st.camera.target[2] + st.camera.distance * cp * cosf(yaw)
+    };
+    const float tan_half_fov = tanf(st.camera.fov * 3.14159265358979323846f / 360.0f);
+    const float aspect = height > 0 ? static_cast<float>(width) / height : 1.0f;
+    const float ndc_x = ((mouse.x - viewport_pos.x) / std::max(1, width)) * 2.0f - 1.0f;
+    const float ndc_y = 1.0f - ((mouse.y - viewport_pos.y) / std::max(1, height)) * 2.0f;
+    float ray[3] = {
+        forward[0] + right[0] * ndc_x * tan_half_fov * aspect + up[0] * ndc_y * tan_half_fov,
+        forward[1] + right[1] * ndc_x * tan_half_fov * aspect + up[1] * ndc_y * tan_half_fov,
+        forward[2] + right[2] * ndc_x * tan_half_fov * aspect + up[2] * ndc_y * tan_half_fov
+    };
+    const float ray_length = std::sqrt(ray[0]*ray[0] + ray[1]*ray[1] + ray[2]*ray[2]);
+    if (ray_length > 0.0f) for (float& value : ray) value /= ray_length;
+
+    int best = -1;
+    float best_distance = 1e30f;
+    for (int index = 0; index < static_cast<int>(st.scene.objects.size()); ++index) {
+        const auto& object = st.scene.objects[index];
+        if (object.hidden && !st.scene_show_hidden) continue;
+        float center[3] = {object.pos_x, object.pos_y, object.pos_z};
+        float radius = std::max(0.35f, st.camera.distance * 0.008f);
+        const std::string model_name = object.mesh_name.empty() ? object.background_name : object.mesh_name;
+        const auto model = st.scene_model_cache.find(model_name);
+        if (model != st.scene_model_cache.end()) {
+            const float scale = std::abs(object.scale_x * object.template_scaling);
+            center[0] += model->second.center_x * scale;
+            center[1] += model->second.center_y * scale;
+            center[2] += model->second.center_z * scale;
+            radius = std::max(radius, model->second.radius * scale);
+        }
+        for (const auto& mesh : object.ground_meshes) {
+            const float scale = std::abs(object.scale_x * object.template_scaling);
+            const float cx = (mesh.min_x + mesh.max_x) * 0.5f * scale + object.pos_x;
+            const float cy = (mesh.min_y + mesh.max_y) * 0.5f * scale + object.pos_y;
+            const float cz = (mesh.min_z + mesh.max_z) * 0.5f * scale + object.pos_z;
+            const float dx = (mesh.max_x - mesh.min_x) * 0.5f * scale;
+            const float dy = (mesh.max_y - mesh.min_y) * 0.5f * scale;
+            const float dz = (mesh.max_z - mesh.min_z) * 0.5f * scale;
+            const float mesh_radius = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (mesh_radius > radius) {
+                center[0] = cx; center[1] = cy; center[2] = cz;
+                radius = mesh_radius;
+            }
+        }
+
+        const float oc[3] = {eye[0]-center[0], eye[1]-center[1], eye[2]-center[2]};
+        const float b = oc[0]*ray[0] + oc[1]*ray[1] + oc[2]*ray[2];
+        const float c = oc[0]*oc[0] + oc[1]*oc[1] + oc[2]*oc[2] - radius*radius;
+        const float discriminant = b*b - c;
+        if (discriminant < 0.0f) continue;
+        const float distance = -b - std::sqrt(discriminant);
+        if (distance >= 0.0f && distance < best_distance) {
+            best = index;
+            best_distance = distance;
+        }
+    }
+    return best;
+}
+
 static void draw_scene_visualizer(ViewerState& st) {
+    ensure_scene_proxy_mesh(st);
+    const char* transform_modes[] = {"Navigate", "Move", "Rotate", "Scale"};
+    for (int mode = 0; mode < 4; ++mode) {
+        if (mode > 0) ImGui::SameLine();
+        const bool active = st.scene_transform_mode == mode;
+        if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.48f, 0.78f, 1.0f));
+        if (ImGui::Button(transform_modes[mode])) st.scene_transform_mode = mode;
+        if (active) ImGui::PopStyleColor();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Frame")) frame_scene_camera(st);
+    ImGui::SameLine();
+    ImGui::TextDisabled("1 Navigate  2 Move  3 Rotate  4 Scale");
+
     ImVec2 avail = ImGui::GetContentRegionAvail();
     int w = (int)avail.x;
     int h = (int)avail.y;
@@ -1744,23 +2066,28 @@ static void draw_scene_visualizer(ViewerState& st) {
 
     av::begin_3d(st.fbo, w, h, st.camera);
     if (st.show_grid) {
-        av::render_grid(st.grid_size * 5.0f, st.scene.bounds_min[1]);
+        av::render_grid_xy(st.grid_size * 5.0f, st.scene.bounds_min[2]);
     }
 
     float white[4] = {1, 1, 1, 1};
     float highlight[4] = {0.4f, 0.7f, 1.0f, 1.0f};
+    int rendered_objects = 0;
+    int proxy_objects = 0;
 
     for (int idx = 0; idx < (int)st.scene.objects.size(); ++idx) {
         const auto& obj = st.scene.objects[idx];
+        if (obj.hidden && !st.scene_show_hidden)
+            continue;
+        bool rendered = false;
 
         float T[16], R[16], S[16], temp[16], obj_mat[16];
         av::mat4_translate(T, obj.pos_x, obj.pos_y, obj.pos_z);
-        av::mat4_rotate_y(R, obj.rot_y);
+        av::mat4_rotate_z(R, obj.rot_y * 180.0f / 3.14159265358979323846f);
         
         av::mat4_identity(S);
-        S[0] = obj.scale_x;
-        S[5] = obj.scale_y;
-        S[10] = obj.scale_z;
+        S[0] = obj.scale_x * obj.template_scaling;
+        S[5] = obj.scale_y * obj.template_scaling;
+        S[10] = obj.scale_z * obj.template_scaling;
 
         av::mat4_multiply(temp, T, R);
         av::mat4_multiply(obj_mat, temp, S);
@@ -1779,6 +2106,7 @@ static void draw_scene_visualizer(ViewerState& st) {
 
                 float* col = (idx == st.selected_object) ? highlight : white;
                 av::render_mesh(gm, obj_mat, col, false);
+                rendered = true;
 
                 if (st.show_wireframe) {
                     float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
@@ -1788,16 +2116,13 @@ static void draw_scene_visualizer(ViewerState& st) {
         }
 
         std::string mname = obj.mesh_name.empty() ? obj.background_name : obj.mesh_name;
-        if (mname.empty()) continue;
+        if (!mname.empty() && st.scene_model_cache.count(mname)) {
+            const auto& model = st.scene_model_cache[mname];
+            const auto& gpu_meshes = st.scene_gpu_mesh_cache[mname];
+            const auto& textures = st.scene_texture_cache[mname];
 
-        if (!st.scene_model_cache.count(mname)) continue;
-
-        const auto& model = st.scene_model_cache[mname];
-        const auto& gpu_meshes = st.scene_gpu_mesh_cache[mname];
-        const auto& textures = st.scene_texture_cache[mname];
-
-        if (!model.nodes.empty()) {
-            for (int ni = 0; ni < (int)model.nodes.size(); ni++) {
+            if (!model.nodes.empty()) {
+                for (int ni = 0; ni < (int)model.nodes.size(); ni++) {
                 const auto& node = model.nodes[ni];
                 if (node.object_index < 0 || node.object_index >= (int)gpu_meshes.size()) continue;
 
@@ -1820,19 +2145,47 @@ static void draw_scene_visualizer(ViewerState& st) {
                 }
 
                 float node_matrix[16], final_matrix[16];
-                av::get_node_matrix(model, ni, 0, node_matrix);
-                av::mat4_multiply(final_matrix, obj_mat, node_matrix);
+                av::get_node_matrix(model, ni, st.current_frame, node_matrix);
+                float centered_node[16];
+                if (model.has_center_point) {
+                    float center_offset[16];
+                    av::mat4_translate(center_offset, -model.center_point[0],
+                                       -model.center_point[1], -model.center_point[2]);
+                    av::mat4_multiply(centered_node, center_offset, node_matrix);
+                } else {
+                    std::memcpy(centered_node, node_matrix, sizeof(centered_node));
+                }
+                av::mat4_multiply(final_matrix, obj_mat, centered_node);
 
-                float* col = (idx == st.selected_object) ? highlight : white;
+                if (node.object_index < static_cast<int>(model.meshes.size()) &&
+                    model.meshes[node.object_index].bones_per_vertex > 0) {
+                    std::vector<float> skinned_positions, skinned_normals;
+                    if (av::skin_mesh(model, ni, st.current_frame, skinned_positions, skinned_normals)) {
+                        const auto& source_mesh = model.meshes[node.object_index];
+                        av::update_mesh_vertices(gm, skinned_positions.data(),
+                                                 skinned_normals.empty() ? nullptr : skinned_normals.data(),
+                                                 source_mesh.uvs.empty() ? nullptr : source_mesh.uvs.data(),
+                                                 source_mesh.num_vertices);
+                    }
+                }
+
+                float mat_color[4] = {1, 1, 1, 1};
+                if (node.material_index >= 0 && node.material_index < (int)model.materials.size()) {
+                    const auto& m = model.materials[node.material_index];
+                    mat_color[0] = m.diffuse[0]; mat_color[1] = m.diffuse[1]; mat_color[2] = m.diffuse[2];
+                    mat_color[3] = m.opacity;
+                }
+                float* col = (idx == st.selected_object) ? highlight : mat_color;
                 av::render_mesh(gm, final_matrix, col, false);
+                rendered = true;
 
                 if (st.show_wireframe) {
                     float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
                     av::render_mesh(gm, final_matrix, wire_col, true);
                 }
-            }
-        } else {
-            for (int mi = 0; mi < (int)gpu_meshes.size(); mi++) {
+                }
+            } else {
+                for (int mi = 0; mi < (int)gpu_meshes.size(); mi++) {
                 auto& gm = const_cast<av::GPUMesh&>(gpu_meshes[mi]);
                 if (st.show_textured && !textures.empty()) {
                     gm.texture_id = textures[0];
@@ -1842,21 +2195,103 @@ static void draw_scene_visualizer(ViewerState& st) {
 
                 float* col = (idx == st.selected_object) ? highlight : white;
                 av::render_mesh(gm, obj_mat, col, false);
+                rendered = true;
 
                 if (st.show_wireframe) {
                     float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
                     av::render_mesh(gm, obj_mat, wire_col, true);
                 }
+                }
             }
         }
+
+        if (!rendered && st.scene_proxy_mesh.vao) {
+            float marker_scale = std::max(0.2f, st.camera.distance * 0.012f);
+            float marker_s[16], marker_t[16], marker_matrix[16];
+            av::mat4_identity(marker_s);
+            marker_s[0] = marker_s[5] = marker_s[10] = marker_scale;
+            av::mat4_translate(marker_t, obj.pos_x, obj.pos_y, obj.pos_z);
+            av::mat4_multiply(marker_matrix, marker_t, marker_s);
+            float proxy_color[4] = {0.95f, 0.48f, 0.16f, obj.hidden ? 0.28f : 0.75f};
+            if (idx == st.selected_object) {
+                proxy_color[0] = 0.25f; proxy_color[1] = 0.72f; proxy_color[2] = 1.0f;
+                proxy_color[3] = 1.0f;
+            }
+            av::render_mesh(st.scene_proxy_mesh, marker_matrix, proxy_color, false);
+            rendered = true;
+            ++proxy_objects;
+        }
+        if (rendered)
+            ++rendered_objects;
     }
     av::end_3d();
 
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImGui::Image((ImTextureID)(intptr_t)st.fbo_tex, ImVec2((float)w, (float)h), ImVec2(0, 1), ImVec2(1, 0));
 
+    ImDrawList* overlay = ImGui::GetWindowDrawList();
+    overlay->AddRectFilled(ImVec2(pos.x + 10.0f, pos.y + 10.0f),
+                           ImVec2(pos.x + 250.0f, pos.y + 52.0f), IM_COL32(20, 24, 31, 210), 5.0f);
+    char stats[128];
+    snprintf(stats, sizeof(stats), "%d/%zu visible  |  %d proxies",
+             rendered_objects, st.scene.objects.size(), proxy_objects);
+    overlay->AddText(ImVec2(pos.x + 20.0f, pos.y + 18.0f), IM_COL32(225, 232, 240, 255), stats);
+    overlay->AddText(ImVec2(pos.x + 20.0f, pos.y + 34.0f), IM_COL32(145, 160, 178, 255),
+                     st.scene_transform_mode == 0 ? "Click select  LMB orbit  RMB pan  F frame"
+                                                  : "Click select  LMB drag transform  Esc navigate");
+
     if (ImGui::IsItemHovered()) {
         ImGuiIO& io = ImGui::GetIO();
+
+        if (ImGui::IsKeyPressed(ImGuiKey_F))
+            frame_scene_camera(st);
+        if (ImGui::IsKeyPressed(ImGuiKey_1)) st.scene_transform_mode = 0;
+        if (ImGui::IsKeyPressed(ImGuiKey_2)) st.scene_transform_mode = 1;
+        if (ImGui::IsKeyPressed(ImGuiKey_3)) st.scene_transform_mode = 2;
+        if (ImGui::IsKeyPressed(ImGuiKey_4)) st.scene_transform_mode = 3;
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) st.scene_transform_mode = 0;
+
+        if (ImGui::IsMouseClicked(0)) {
+            st.scene_pointer_active = true;
+            st.scene_pointer_start = io.MousePos;
+            const int hit = pick_scene_object(st, pos, w, h, io.MousePos);
+            st.scene_transform_drag = st.scene_transform_mode != 0 && hit >= 0 && hit == st.selected_object;
+            if (hit != st.selected_object) select_scene_object(st, hit);
+            if (st.scene_transform_drag) snapshot_scene(st);
+        }
+
+        if (st.scene_pointer_active && st.scene_transform_drag && ImGui::IsMouseDragging(0) &&
+            st.selected_object >= 0 && st.selected_object < static_cast<int>(st.scene.objects.size())) {
+            auto& object = st.scene.objects[st.selected_object];
+            if (st.scene_transform_mode == 1) {
+                float right[3], up[3], forward[3];
+                scene_camera_basis(st.camera, right, up, forward);
+                const float units = 2.0f * st.camera.distance *
+                    tanf(st.camera.fov * 3.14159265358979323846f / 360.0f) / std::max(1, h);
+                for (int axis = 0; axis < 3; ++axis) {
+                    const float delta = right[axis] * io.MouseDelta.x * units - up[axis] * io.MouseDelta.y * units;
+                    if (axis == 0) object.pos_x += delta;
+                    else if (axis == 1) object.pos_y += delta;
+                    else object.pos_z += delta;
+                }
+            } else if (st.scene_transform_mode == 2) {
+                object.rot_y += io.MouseDelta.x * 0.01f;
+            } else if (st.scene_transform_mode == 3) {
+                object.scale_x = std::clamp(object.scale_x * expf(io.MouseDelta.x * 0.01f), 0.001f, 100.0f);
+                object.scale_y = object.scale_z = object.scale_x;
+            }
+            av::scene_refresh(st.scene);
+            st.scene_dirty = true;
+        }
+
+        if (st.scene_pointer_active && ImGui::IsMouseReleased(0)) {
+            const float dx = io.MousePos.x - st.scene_pointer_start.x;
+            const float dy = io.MousePos.y - st.scene_pointer_start.y;
+            if (dx*dx + dy*dy <= 16.0f && !st.scene_transform_drag)
+                select_scene_object(st, pick_scene_object(st, pos, w, h, io.MousePos));
+            st.scene_pointer_active = false;
+            st.scene_transform_drag = false;
+        }
 
         if (io.MouseWheel != 0.0f) {
             float zoom_speed = 0.1f * st.cam_zoom_speed;
@@ -1865,7 +2300,7 @@ static void draw_scene_visualizer(ViewerState& st) {
             if (st.camera.distance > 2000.0f) st.camera.distance = 2000.0f;
         }
 
-        if (ImGui::IsMouseDragging(0)) {
+        if (st.scene_transform_mode == 0 && ImGui::IsMouseDragging(0)) {
             ImVec2 delta = io.MouseDelta;
             float sign_x = st.cam_invert_x ? -1.0f : 1.0f;
             float sign_y = st.cam_invert_y ? -1.0f : 1.0f;
@@ -2725,17 +3160,51 @@ static void draw_bottom_panel(ViewerState& st) {
 // ============================================================================
 
 static void draw_center_panel(ViewerState& st) {
+    if (st.preview_type == PREVIEW_SCENE) {
+        static const char* labels[] = {
+            ICON_FA_CODE " Source",
+            ICON_FA_CUBE " Visual",
+            ICON_FA_LAYER_GROUP " Tree"
+        };
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        const float button_width = std::max(80.0f,
+            (ImGui::GetContentRegionAvail().x - spacing * 2.0f) / 3.0f);
+        for (int mode = 0; mode < 3; ++mode) {
+            if (mode > 0) ImGui::SameLine();
+            const bool active = st.scene_preview_tab == mode;
+            if (active) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.46f, 0.76f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.54f, 0.86f, 1.0f));
+            }
+            if (ImGui::Button(labels[mode], ImVec2(button_width, 30.0f))) {
+                if (mode == 0 && st.scene_preview_tab != 0 && !st.scene_text_dirty) {
+                    const std::string binary = av::scene_serialize(st.scene);
+                    st.text_edit_buffer = filerift::decode_protobuf(binary, "scene");
+                    st.text_preview_content = st.text_edit_buffer;
+                }
+                st.scene_preview_tab = mode;
+            }
+            if (active) ImGui::PopStyleColor(2);
+        }
+        if (st.scene_text_dirty && st.scene_preview_tab != 0) {
+            ImGui::TextColored(ImVec4(0.95f, 0.62f, 0.20f, 1.0f),
+                ICON_FA_TRIANGLE_EXCLAMATION " Source changes are not reflected in Visual/Tree until compiled with Save.");
+        }
+        ImGui::Separator();
+    }
+
     switch (st.preview_type) {
         case PREVIEW_MODEL:   draw_model_viewport(st);  break;
         case PREVIEW_TEXTURE: draw_texture_preview(st);  break;
         case PREVIEW_TEXT:    draw_text_preview(st);     break;
         case PREVIEW_SCENE:
             if (st.scene_preview_tab == 0) {
-                bool scene_text_modified = st.scene_dirty;
+                bool scene_text_modified = st.scene_text_dirty;
                 st.intellij_editor.draw_editor("scene_text", &st.text_edit_buffer, scene_text_modified, st.sel_path, st.mono_font, st.editor_custom_bg,
                                                st.has_compile_result, st.compile_success, st.compile_error_msg, st.compile_time_ms);
-                if (scene_text_modified != st.scene_dirty) {
-                    st.scene_dirty = scene_text_modified;
+                if (scene_text_modified != st.scene_text_dirty) {
+                    st.scene_text_dirty = scene_text_modified;
+                    st.scene_dirty = st.scene_dirty || scene_text_modified;
                 }
             } else if (st.scene_preview_tab == 1) {
                 draw_scene_visualizer(st);
@@ -2752,6 +3221,58 @@ static void draw_center_panel(ViewerState& st) {
                 ImGui::GetCursorPosY() + (avail.y - text_size.y) * 0.5f));
             ImGui::TextDisabled("Select a file on the left to preview");
         } break;
+    }
+}
+
+static bool compile_scene_source(ViewerState& st, std::string* error_message = nullptr) {
+    try {
+        const std::string binary = filerift::recode_markup(st.text_edit_buffer, "scene");
+        const fs::path destination(st.scene.filepath);
+        const fs::path temporary = destination.string() + ".ruby-source.tmp";
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        if (!out) throw std::runtime_error("cannot create temporary scene file");
+        out.write(binary.data(), static_cast<std::streamsize>(binary.size()));
+        out.close();
+        if (!out) throw std::runtime_error("failed while writing temporary scene file");
+        std::error_code rename_error;
+        fs::rename(temporary, destination, rename_error);
+        if (rename_error) {
+            std::error_code remove_error;
+            fs::remove(temporary, remove_error);
+            throw std::runtime_error(rename_error.message());
+        }
+
+        st.scene = av::scene_load(st.scene.filepath);
+        st.selected_object = -1;
+        sync_scene_object_editor(st);
+        st.scene_undo_stack.clear();
+        st.scene_redo_stack.clear();
+        st.scene_dirty = false;
+        st.scene_text_dirty = false;
+
+        for (auto& entry : st.scene_gpu_mesh_cache)
+            for (auto& mesh : entry.second) av::free_mesh(mesh);
+        st.scene_gpu_mesh_cache.clear();
+        for (auto& entry : st.scene_texture_cache)
+            for (GLuint texture : entry.second) if (texture) glDeleteTextures(1, &texture);
+        st.scene_texture_cache.clear();
+        st.scene_model_cache.clear();
+        for (auto& meshes : st.scene_ground_gpu_meshes)
+            for (auto& mesh : meshes) av::free_mesh(mesh);
+        for (auto& textures : st.scene_ground_textures)
+            for (GLuint texture : textures) if (texture) glDeleteTextures(1, &texture);
+
+        const fs::path scene_dir = destination.parent_path();
+        for (const auto& object : st.scene.objects) {
+            if (!object.mesh_name.empty()) load_scene_model_to_cache(st, object.mesh_name, scene_dir.string());
+            if (!object.background_name.empty()) load_scene_model_to_cache(st, object.background_name, scene_dir.string());
+        }
+        upload_scene_ground_meshes(st, scene_dir.string());
+        frame_scene_camera(st);
+        return true;
+    } catch (const std::exception& error) {
+        if (error_message) *error_message = error.what();
+        return false;
     }
 }
 
@@ -2830,14 +3351,16 @@ static void draw_properties_panel(ViewerState& st) {
             }
             ImGui::SameLine();
             if (ImGui::Button("Next")) {
-                st.current_frame = (st.current_frame + 1) % st.model.num_frames;
+                st.current_frame = std::fmod(st.current_frame + 1.0f, (float)st.model.num_frames);
             }
             ImGui::SameLine();
             if (ImGui::Button("Prev")) {
-                st.current_frame = (st.current_frame - 1 + st.model.num_frames) % st.model.num_frames;
+                st.current_frame = std::fmod(st.current_frame - 1.0f + st.model.num_frames,
+                                             (float)st.model.num_frames);
             }
 
-            ImGui::SliderInt("Frame", &st.current_frame, 0, st.model.num_frames - 1);
+            ImGui::SliderFloat("Frame", &st.current_frame, 0.0f,
+                               (float)st.model.num_frames - 1.0f, "%.2f");
             ImGui::SliderFloat("FPS", &st.anim_fps, 1.0f, 120.0f, "%.0f");
             ImGui::Separator();
         }
@@ -2904,6 +3427,7 @@ static void draw_properties_panel(ViewerState& st) {
         ImGui::TextColored(ImVec4(0.40f, 0.60f, 0.88f, 1.0f), "Render Settings");
         ImGui::Checkbox("Textured Mode", &st.show_textured);
         ImGui::Checkbox("Wireframe Mode", &st.show_wireframe);
+        ImGui::Checkbox("Show Skeleton", &st.show_skeleton);
 
         if (ImGui::TreeNode("Texture Dependencies")) {
             for (size_t k = 0; k < st.model.texture_filenames.size(); k++) {
@@ -3016,45 +3540,21 @@ static void draw_properties_panel(ViewerState& st) {
                     // Save by compiling the text editor markup back to binary
                     st.has_compile_result = false;
                     auto start = std::chrono::high_resolution_clock::now();
-                    try {
-                        std::string binary_data = filerift::recode_markup(st.text_edit_buffer, "scene");
-                        std::ofstream out(st.scene.filepath, std::ios::binary);
-                        if (out) {
-                            out.write(binary_data.data(), binary_data.size());
-                            st.scene = av::scene_load(st.scene.filepath);
-                            st.scene_dirty = false;
-                            st.scene_save_msg = "Compiled and Saved scene!";
-                            st.scene_save_msg_timer = 4.0f;
-                            log_file_event("SceneSave", "Compiled and saved scene: " + st.scene.filename);
-                            
-                            // Reload cached assets
-                            st.scene_model_cache.clear();
-                            st.scene_gpu_mesh_cache.clear();
-                            st.scene_texture_cache.clear();
-                            fs::path scene_dir = fs::path(st.scene.filepath).parent_path();
-                            for (const auto& obj : st.scene.objects) {
-                                if (!obj.mesh_name.empty())
-                                    load_scene_model_to_cache(st, obj.mesh_name, scene_dir.string());
-                                if (!obj.background_name.empty())
-                                    load_scene_model_to_cache(st, obj.background_name, scene_dir.string());
-                            }
-                            
-                            auto end = std::chrono::high_resolution_clock::now();
-                            st.compile_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-                            st.compile_success = true;
-                            st.has_compile_result = true;
-                        }
-                    } catch (const std::exception& e) {
-                        st.status_msg = "Compile Error: " + std::string(e.what());
+                    std::string compile_error;
+                    if (compile_scene_source(st, &compile_error)) {
+                        st.scene_save_msg = "Compiled and saved scene!";
+                        log_file_event("SceneSave", "Compiled and saved scene: " + st.scene.filename);
+                        st.compile_success = true;
+                    } else {
+                        st.status_msg = "Compile Error: " + compile_error;
                         st.scene_save_msg = "Compile Error!";
-                        st.scene_save_msg_timer = 4.0f;
-                        
-                        auto end = std::chrono::high_resolution_clock::now();
-                        st.compile_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
                         st.compile_success = false;
-                        st.compile_error_msg = e.what();
-                        st.has_compile_result = true;
+                        st.compile_error_msg = compile_error;
                     }
+                    st.scene_save_msg_timer = 4.0f;
+                    st.compile_time_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - start).count();
+                    st.has_compile_result = true;
                 } else {
                     // Flush any pending OnLoad script edit back to object
                     if (st.scene_onload_modified &&
@@ -3066,11 +3566,13 @@ static void draw_properties_panel(ViewerState& st) {
                         obj.onload = prog.to_string();
                         st.scene_onload_modified = false;
                     }
-                    av::scene_save(st.scene.filepath, st.scene);
-                    st.scene_dirty = false;
-                    st.scene_save_msg = "Saved " + st.scene.filename;
+                    std::string save_error;
+                    const bool saved = av::scene_save(st.scene.filepath, st.scene, &save_error);
+                    if (saved) st.scene_dirty = false;
+                    st.scene_save_msg = saved ? "Saved " + st.scene.filename : "Save failed: " + save_error;
                     st.scene_save_msg_timer = 4.0f;
-                    log_file_event("SceneSave", "Saved scene: " + st.scene.filename);
+                    log_file_event("SceneSave", saved ? "Saved scene: " + st.scene.filename
+                                                       : "ERROR: " + save_error);
                 }
             }
             ImGui::PopStyleColor(2);
@@ -3083,32 +3585,137 @@ static void draw_properties_panel(ViewerState& st) {
             ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.20f, 1.0f),
                                ICON_FA_TRIANGLE_EXCLAMATION " Unsaved changes");
 
-        // ── View mode selection (Tab Bar) ───────────────────────────
-        ImGui::Spacing();
-        if (ImGui::BeginTabBar("##SceneTabBar", ImGuiTabBarFlags_NoTooltip)) {
-            bool tab_editor = (st.scene_preview_tab == 0);
-            bool tab_visual = (st.scene_preview_tab == 1);
-            bool tab_tree = (st.scene_preview_tab == 2);
-            
-            ImGuiTabItemFlags f_editor = tab_editor ? ImGuiTabItemFlags_SetSelected : 0;
-            ImGuiTabItemFlags f_visual = tab_visual ? ImGuiTabItemFlags_SetSelected : 0;
-            ImGuiTabItemFlags f_tree = tab_tree ? ImGuiTabItemFlags_SetSelected : 0;
-            
-            if (ImGui::BeginTabItem(ICON_FA_CODE " Editor", nullptr, f_editor)) {
-                st.scene_preview_tab = 0;
-                ImGui::EndTabItem();
+        if (ImGui::CollapsingHeader("Scene Data", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Text("Object libraries: %zu", st.scene.object_libraries.size());
+            ImGui::Text("Bounds records: %zu", st.scene.bounds.size());
+            ImGui::Text("Groups: %zu", st.scene.groups.size());
+            ImGui::Text("Unknown fields: %zu", st.scene.other_fields.size());
+            ImGui::Text("Scene OnLoad scripts: %zu", st.scene.onload_scripts.size());
+
+            if (ImGui::Button(ICON_FA_PLUS " Scene OnLoad")) {
+                snapshot_scene(st);
+                std::string program;
+                av::scene_set_program_source(program, "-- Scene OnLoad\n");
+                st.scene.onload_scripts.push_back(std::move(program));
+                st.scene_script_index = static_cast<int>(st.scene.onload_scripts.size()) - 1;
+                snprintf(st.scene_script_buf, sizeof(st.scene_script_buf), "%s",
+                         av::scene_program_source(st.scene.onload_scripts.back()).c_str());
+                st.scene_dirty = true;
             }
-            if (ImGui::BeginTabItem(ICON_FA_CUBE " 3D View", nullptr, f_visual)) {
-                st.scene_preview_tab = 1;
-                ImGui::EndTabItem();
+            if (!st.scene.onload_scripts.empty()) {
+                ImGui::SameLine();
+                const char* preview = st.scene_script_index >= 0 ? "Selected script" : "Choose script";
+                if (ImGui::BeginCombo("##scene_script", preview)) {
+                    for (int script = 0; script < static_cast<int>(st.scene.onload_scripts.size()); ++script) {
+                        const std::string label = "OnLoad #" + std::to_string(script + 1);
+                        if (ImGui::Selectable(label.c_str(), st.scene_script_index == script)) {
+                            st.scene_script_index = script;
+                            snprintf(st.scene_script_buf, sizeof(st.scene_script_buf), "%s",
+                                av::scene_program_source(st.scene.onload_scripts[script]).c_str());
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
             }
-            if (ImGui::BeginTabItem(ICON_FA_LAYER_GROUP " Inspector", nullptr, f_tree)) {
-                st.scene_preview_tab = 2;
-                ImGui::EndTabItem();
+            if (st.scene_script_index >= 0 &&
+                st.scene_script_index < static_cast<int>(st.scene.onload_scripts.size())) {
+                if (ImGui::InputTextMultiline("##scene_onload", st.scene_script_buf,
+                        sizeof(st.scene_script_buf), ImVec2(-1, 130), ImGuiInputTextFlags_AllowTabInput)) {
+                    snapshot_scene(st);
+                    av::scene_set_program_source(st.scene.onload_scripts[st.scene_script_index],
+                                                 st.scene_script_buf);
+                    st.scene_dirty = true;
+                }
+                if (ImGui::Button("Remove Scene OnLoad")) {
+                    snapshot_scene(st);
+                    st.scene.onload_scripts.erase(st.scene.onload_scripts.begin() + st.scene_script_index);
+                    st.scene_script_index = -1;
+                    st.scene_script_buf[0] = '\0';
+                    st.scene_dirty = true;
+                }
             }
-            ImGui::EndTabBar();
         }
-        ImGui::Spacing();
+        ImGui::Separator();
+
+        ImGui::TextColored(ImVec4(0.45f, 0.72f, 1.0f, 1.0f), "Scene Selection");
+        if (st.selected_object >= 0 && st.selected_object < static_cast<int>(st.scene.objects.size())) {
+            const auto& selected = st.scene.objects[st.selected_object];
+            ImGui::TextWrapped("%s", selected.name.empty() ? "(unnamed object)" : selected.name.c_str());
+            if (ImGui::Button("Show in Visual", ImVec2(-1, 0))) st.scene_preview_tab = 1;
+            if (ImGui::Button("Show in Tree", ImVec2(-1, 0))) st.scene_preview_tab = 2;
+        } else {
+            ImGui::TextDisabled("No object selected");
+        }
+        ImGui::Separator();
+
+        // Object collection controls mirror the reference Ruby editor.
+        if (ImGui::Button(ICON_FA_PLUS " New")) {
+            snapshot_scene(st);
+            select_scene_object(st, static_cast<int>(av::scene_create_object(st.scene)));
+            st.scene_dirty = true;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(st.selected_object < 0);
+        if (ImGui::Button("Copy")) {
+            st.scene_object_clipboard = st.scene.objects[st.selected_object];
+            st.scene_has_object_clipboard = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Duplicate")) {
+            snapshot_scene(st);
+            size_t duplicated = 0;
+            if (av::scene_duplicate_object(st.scene, static_cast<size_t>(st.selected_object), &duplicated)) {
+                select_scene_object(st, static_cast<int>(duplicated));
+                st.scene_dirty = true;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Delete")) {
+            snapshot_scene(st);
+            const int deleted = st.selected_object;
+            if (av::scene_delete_object(st.scene, static_cast<size_t>(deleted))) {
+                select_scene_object(st, st.scene.objects.empty() ? -1
+                    : std::min(deleted, static_cast<int>(st.scene.objects.size()) - 1));
+                st.scene_dirty = true;
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!st.scene_has_object_clipboard);
+        if (ImGui::Button("Paste")) {
+            snapshot_scene(st);
+            select_scene_object(st, static_cast<int>(av::scene_paste_object(
+                st.scene, st.scene_object_clipboard)));
+            st.scene_dirty = true;
+        }
+        ImGui::EndDisabled();
+
+        ImGui::BeginDisabled(st.scene_undo_stack.empty());
+        if (ImGui::Button("Undo")) restore_scene_history(st, false);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(st.scene_redo_stack.empty());
+        if (ImGui::Button("Redo")) restore_scene_history(st, true);
+        ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        ImGui::BeginDisabled(st.selected_object <= 0);
+        if (ImGui::ArrowButton("##scene_move_up", ImGuiDir_Up)) {
+            snapshot_scene(st);
+            av::scene_move_object(st.scene, st.selected_object, st.selected_object - 1);
+            select_scene_object(st, st.selected_object - 1);
+            st.scene_dirty = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(st.selected_object < 0 || st.selected_object + 1 >= static_cast<int>(st.scene.objects.size()));
+        if (ImGui::ArrowButton("##scene_move_down", ImGuiDir_Down)) {
+            snapshot_scene(st);
+            av::scene_move_object(st.scene, st.selected_object, st.selected_object + 1);
+            select_scene_object(st, st.selected_object + 1);
+            st.scene_dirty = true;
+        }
+        ImGui::EndDisabled();
         ImGui::Separator();
 
         // ── Selected object editor ───────────────────────────────────
@@ -3123,6 +3730,7 @@ static void draw_properties_panel(ViewerState& st) {
             ImGui::PushItemWidth(-1.0f);
 
             ImGui::Text("Identifier");
+            if (ImGui::IsItemActivated()) snapshot_scene(st);
             if (ImGui::InputText("##obj_name", st.scene_obj_name_buf,
                                  sizeof(st.scene_obj_name_buf))) {
                 obj.name = st.scene_obj_name_buf;
@@ -3142,6 +3750,7 @@ static void draw_properties_panel(ViewerState& st) {
             ImGui::TextColored(ImVec4(0.70f, 0.70f, 0.85f, 1.0f), "Transform");
             ImGui::PushItemWidth(-1.0f);
 
+            if (ImGui::IsItemActivated()) snapshot_scene(st);
             if (ImGui::DragFloat2("##pos_xy", &obj.pos_x, 0.5f, -99999.f, 99999.f, "XY: %.1f")) {
                 st.scene_dirty = true;
             }
@@ -3188,12 +3797,106 @@ static void draw_properties_panel(ViewerState& st) {
             if (ImGui::CollapsingHeader(
                     (std::string(ICON_FA_PUZZLE_PIECE " Components (") +
                      std::to_string(obj.components.size()) + ")").c_str())) {
+                static const std::vector<std::string> component_types = av::scene_component_types();
+                if (!component_types.empty()) {
+                    st.scene_component_type = std::clamp(st.scene_component_type, 0,
+                                                         static_cast<int>(component_types.size()) - 1);
+                    if (ImGui::BeginCombo("##component_type", component_types[st.scene_component_type].c_str())) {
+                        for (int type = 0; type < static_cast<int>(component_types.size()); ++type) {
+                            if (ImGui::Selectable(component_types[type].c_str(), type == st.scene_component_type))
+                                st.scene_component_type = type;
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button(ICON_FA_PLUS " Component")) {
+                        snapshot_scene(st);
+                        if (av::scene_add_component(st.scene, st.selected_object,
+                                                    component_types[st.scene_component_type]))
+                            st.scene_dirty = true;
+                    }
+                }
+
+                int remove_component = -1;
                 for (int ci = 0; ci < (int)obj.components.size(); ++ci) {
                     const auto& c = obj.components[ci];
-                    ImGui::BulletText("%s  (id=%d, %zu bytes)",
-                                      c.type_name.empty() ? "(unnamed)" : c.type_name.c_str(),
-                                      c.type_id, c.raw_data.size());
+                    ImGui::PushID(ci);
+                    const std::string label = (c.type_name.empty() ? "(unnamed)" : c.type_name) +
+                                              "##component";
+                    if (ImGui::TreeNode(label.c_str())) {
+                        ImGui::TextDisabled("Instance ID: %d  |  %zu bytes", c.type_id, c.raw_data.size());
+                        const auto schema = av::g_schemas.find(c.type_name);
+                        const std::vector<av::SceneComponentField> fields = av::scene_component_fields(c);
+                        if (!fields.empty()) {
+                            for (auto field : fields) {
+                                ImGui::PushID(static_cast<int>(field.field_number * 100 + field.occurrence));
+                                bool changed = false;
+                                if (field.is_message) {
+                                    ImGui::TextDisabled("%s: <%s> (%zu bytes)", field.name.c_str(),
+                                        field.class_name.c_str(), field.bytes_value.size());
+                                } else if (field.wire_type == proto::WIRE_VARINT) {
+                                    int value = static_cast<int>(field.varint_value);
+                                    if (ImGui::InputInt(field.name.c_str(), &value)) {
+                                        field.varint_value = static_cast<uint64_t>(std::max(0, value));
+                                        changed = true;
+                                    }
+                                } else if (field.wire_type == proto::WIRE_I32) {
+                                    float value = field.float_value;
+                                    if (ImGui::DragFloat(field.name.c_str(), &value, 0.01f)) {
+                                        field.float_value = value;
+                                        changed = true;
+                                    }
+                                } else if (field.wire_type == proto::WIRE_I64) {
+                                    double value = field.double_value;
+                                    if (ImGui::InputDouble(field.name.c_str(), &value)) {
+                                        field.double_value = value;
+                                        changed = true;
+                                    }
+                                } else if (field.bytes_value.find('\0') == std::string::npos &&
+                                           field.bytes_value.size() < 4096) {
+                                    char value[4096];
+                                    snprintf(value, sizeof(value), "%s", field.bytes_value.c_str());
+                                    if (ImGui::InputText(field.name.c_str(), value, sizeof(value))) {
+                                        field.bytes_value = value;
+                                        changed = true;
+                                    }
+                                } else {
+                                    ImGui::TextDisabled("%s: <%zu bytes>", field.name.c_str(), field.bytes_value.size());
+                                }
+                                if (changed) {
+                                    snapshot_scene(st);
+                                    if (av::scene_set_component_field(obj.components[ci], field))
+                                        st.scene_dirty = true;
+                                }
+                                ImGui::PopID();
+                            }
+                        } else {
+                            ImGui::TextDisabled("Component payload is empty or unavailable.");
+                        }
+                        if (ImGui::Button("Copy Component")) {
+                            st.scene_component_clipboard = c;
+                            st.scene_has_component_clipboard = true;
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Remove Component")) remove_component = ci;
+                        ImGui::TreePop();
+                    }
+                    ImGui::PopID();
                 }
+                if (remove_component >= 0) {
+                    snapshot_scene(st);
+                    if (av::scene_remove_component(st.scene, st.selected_object,
+                                                   static_cast<size_t>(remove_component)))
+                        st.scene_dirty = true;
+                }
+                ImGui::BeginDisabled(!st.scene_has_component_clipboard);
+                if (ImGui::Button("Paste Component")) {
+                    snapshot_scene(st);
+                    if (av::scene_paste_component(st.scene, st.selected_object,
+                                                  st.scene_component_clipboard))
+                        st.scene_dirty = true;
+                }
+                ImGui::EndDisabled();
             }
 
             // ── OnLoad script editor ──────────────────────────────────
@@ -3535,6 +4238,7 @@ static void draw_settings_dialog(ViewerState& st) {
                 av::g_clear_color[2] = st.bg_color[2];
             }
             ImGui::Checkbox("Render Grid Lines", &st.show_grid);
+            ImGui::Checkbox("Show Hidden Scene Objects", &st.scene_show_hidden);
             ImGui::SliderFloat("Grid Plane Size", &st.grid_size, 5.0f, 200.0f, "%.0f");
             
             static int msaa_opt = 1; // MSAA 4x
@@ -3608,7 +4312,13 @@ static bool handle_shortcuts(ViewerState& st) {
     ImGuiIO& io = ImGui::GetIO();
     if (io.WantCaptureKeyboard && !ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) return false;
 
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) return true;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        if (st.preview_type == PREVIEW_SCENE && st.scene_preview_tab == 1 && st.scene_transform_mode != 0) {
+            st.scene_transform_mode = 0;
+            return false;
+        }
+        return true;
+    }
 
     if (ImGui::IsKeyPressed(ImGuiKey_W)) st.show_wireframe = !st.show_wireframe;
     if (ImGui::IsKeyPressed(ImGuiKey_T)) st.show_textured = !st.show_textured;
@@ -3627,17 +4337,7 @@ static bool handle_shortcuts(ViewerState& st) {
             st.camera.distance  = st.model.radius * 2.5f;
             if (st.camera.distance < 1.0f) st.camera.distance = 3.0f;
         } else if (st.preview_type == PREVIEW_SCENE) {
-            float bounds_center_x = (st.scene.bounds_min[0] + st.scene.bounds_max[0]) * 0.5f;
-            float bounds_center_y = (st.scene.bounds_min[1] + st.scene.bounds_max[1]) * 0.5f;
-            float bounds_center_z = (st.scene.bounds_min[2] + st.scene.bounds_max[2]) * 0.5f;
-            st.camera.target[0] = bounds_center_x;
-            st.camera.target[1] = bounds_center_y;
-            st.camera.target[2] = bounds_center_z;
-            float dx = st.scene.bounds_max[0] - st.scene.bounds_min[0];
-            float dy = st.scene.bounds_max[1] - st.scene.bounds_min[1];
-            float dz = st.scene.bounds_max[2] - st.scene.bounds_min[2];
-            st.camera.distance = std::sqrt(dx*dx + dy*dy + dz*dz) * 1.2f;
-            if (st.camera.distance < 5.0f) st.camera.distance = 25.0f;
+            frame_scene_camera(st);
         }
     }
 
@@ -3659,6 +4359,24 @@ static bool handle_shortcuts(ViewerState& st) {
     // Ctrl+S — save current scene (if scene is loaded and has a path)
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
         if (st.preview_type == PREVIEW_SCENE && !st.scene.filepath.empty()) {
+            if (st.scene_preview_tab == 0) {
+                st.has_compile_result = false;
+                const auto start = std::chrono::high_resolution_clock::now();
+                std::string compile_error;
+                if (compile_scene_source(st, &compile_error)) {
+                    st.compile_success = true;
+                    st.scene_save_msg = "Compiled and saved " + st.scene.filename;
+                } else {
+                    st.compile_success = false;
+                    st.compile_error_msg = compile_error;
+                    st.scene_save_msg = "Compile error: " + compile_error;
+                }
+                st.compile_time_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - start).count();
+                st.has_compile_result = true;
+                st.scene_save_msg_timer = 4.0f;
+                return false;
+            }
             // Flush pending OnLoad edits before saving
             if (st.scene_onload_modified &&
                 st.selected_object >= 0 &&
@@ -3669,13 +4387,20 @@ static bool handle_shortcuts(ViewerState& st) {
                 obj.onload = prog.to_string();
                 st.scene_onload_modified = false;
             }
-            av::scene_save(st.scene.filepath, st.scene);
-            st.scene_dirty = false;
-            st.scene_save_msg = "Saved " + st.scene.filename;
+            std::string save_error;
+            const bool saved = av::scene_save(st.scene.filepath, st.scene, &save_error);
+            if (saved) st.scene_dirty = false;
+            st.scene_save_msg = saved ? "Saved " + st.scene.filename : "Save failed: " + save_error;
             st.scene_save_msg_timer = 4.0f;
-            log_file_event("SceneSave", "Saved scene (Ctrl+S): " + st.scene.filename);
+            log_file_event("SceneSave", saved ? "Saved scene (Ctrl+S): " + st.scene.filename
+                                               : "ERROR: " + save_error);
         }
     }
+
+    if (st.preview_type == PREVIEW_SCENE && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z))
+        restore_scene_history(st, false);
+    if (st.preview_type == PREVIEW_SCENE && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y))
+        restore_scene_history(st, true);
 
     if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
         if (st.selected_idx > 0) {
@@ -3895,13 +4620,8 @@ int main(int argc, char* argv[]) {
 
         // Update animation frame rate-independently
         if (g_state.preview_type == PREVIEW_MODEL && g_state.anim_playing && g_state.model.num_frames > 0) {
-            g_state.anim_timer += dt;
-            float step = 1.0f / g_state.anim_fps;
-            if (g_state.anim_timer >= step) {
-                int frames_to_advance = static_cast<int>(g_state.anim_timer / step);
-                g_state.current_frame = (g_state.current_frame + frames_to_advance) % g_state.model.num_frames;
-                g_state.anim_timer = fmodf(g_state.anim_timer, step);
-            }
+            g_state.current_frame = std::fmod(g_state.current_frame + dt * g_state.anim_fps,
+                                              (float)g_state.model.num_frames);
         }
 
         // Tick scene save message timer

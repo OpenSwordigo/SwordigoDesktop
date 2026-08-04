@@ -16,6 +16,7 @@
 #include <arpa/inet.h>
 
 #define SRE_RAKNET_PEER_MT "RakNet.Peer"
+#define MAX_PEERS 8
 
 typedef struct {
     int sockfd;
@@ -23,19 +24,38 @@ typedef struct {
     int max_incoming;
     bool is_started;
     bool is_connected;
-    struct sockaddr_in dest_addr;
+    struct sockaddr_in dest_addr; /* legacy for simple pings */
     uint64_t bytes_sent;
     uint64_t bytes_recv;
     uint32_t pkts_sent;
     uint32_t pkts_recv;
 } SreRakNetPeer;
 
+typedef struct {
+    bool is_active;
+    struct sockaddr_in addr;
+    char scene_name[128];
+    uint32_t last_recv_time;
+    uint8_t last_sequence;
+    void* hero_ghost;
+} SrePeer;
+
 static SreRakNetPeer g_sre_raknet_peer_instance = { -1, 0, 32, false, false, {0}, 0, 0, 0, 0 };
+static SrePeer g_peers[MAX_PEERS];
+
+enum {
+    SRE_NET_DISCONNECT = 0x09,
+    SRE_NET_CONNECTION_REQUEST = 0x0C,
+    SRE_NET_CONNECTION_ACCEPTED = 0x0D,
+    SRE_NET_PLAYER_SYNC = 213,
+    SRE_NET_SCENE_CHANGE = 214,
+    SRE_NET_KEEPALIVE = 215
+};
 
 /* Global LAN Auto-Sync State */
 int   g_sre_lan_sync_active = 0;
 int   g_sre_lan_is_host = 0;
-void* g_remote_hero_ghost = NULL;
+void* g_remote_hero_ghost = NULL; /* Expose first connected client's ghost for global compat */
 
 extern void* caver_getHero_from_view(void* view);
 extern void* caver_getHero_impl(void);
@@ -43,8 +63,82 @@ extern void caver_getPosition_impl(void* obj, float* x, float* y, float* z);
 extern void caver_setPosition_impl(void* obj, float x, float y, float z);
 extern void (*g_sre_CreateHeroObjectAt)(void* sc, void* pos, int facing_dir, int add_to_scene);
 
-/* Forward declaration — defined at bottom of this file */
+extern void* (*g_SceneObject_ComponentWithInterface)(void* obj, void* interface);
+extern void* EntityComponent_Interface;
+extern void* HealthComponent_Interface;
+extern float sre_health_get_hp(void* comp);
+
+extern volatile int g_sre_scene_shift_pending;
+extern char g_sre_scene_shift_target[128];
+extern char g_sre_scene_shift_spawn[64];
+extern char g_sre_current_scene_name[128];
+
 void sre_raknet_shutdown_impl(void);
+
+int sre_raknet_is_connected_impl(void) {
+    for (int i=0; i<MAX_PEERS; i++) {
+        if (g_peers[i].is_active) return 1;
+    }
+    return 0;
+}
+
+static void sre_raknet_note_send(ssize_t sent) {
+    if (sent > 0) {
+        g_sre_raknet_peer_instance.bytes_sent += (uint64_t)sent;
+        g_sre_raknet_peer_instance.pkts_sent++;
+    }
+}
+
+static void sre_raknet_note_receive(ssize_t received) {
+    if (received > 0) {
+        g_sre_raknet_peer_instance.bytes_recv += (uint64_t)received;
+        g_sre_raknet_peer_instance.pkts_recv++;
+    }
+}
+
+static int find_or_add_peer(const struct sockaddr_in* addr) {
+    int free_slot = -1;
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (g_peers[i].is_active) {
+            if (g_peers[i].addr.sin_addr.s_addr == addr->sin_addr.s_addr &&
+                g_peers[i].addr.sin_port == addr->sin_port) {
+                return i;
+            }
+        } else if (free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    if (free_slot >= 0) {
+        memset(&g_peers[free_slot], 0, sizeof(SrePeer));
+        g_peers[free_slot].addr = *addr;
+        g_peers[free_slot].is_active = true;
+        g_sre_raknet_peer_instance.dest_addr = *addr;
+        g_sre_raknet_peer_instance.is_connected = true;
+        printf("[SRE-Net] Added peer %s:%d at slot %d\n", inet_ntoa(addr->sin_addr), ntohs(addr->sin_port), free_slot);
+        return free_slot;
+    }
+    return -1;
+}
+
+static void sre_raknet_accept_client(const struct sockaddr_in* source) {
+    if (!source || !g_sre_lan_is_host) return;
+    int idx = find_or_add_peer(source);
+    if (idx >= 0) {
+        const uint8_t accepted = SRE_NET_CONNECTION_ACCEPTED;
+        ssize_t sent = sendto(g_sre_raknet_peer_instance.sockfd, &accepted, sizeof(accepted), 0,
+                              (const struct sockaddr*)source, sizeof(*source));
+        sre_raknet_note_send(sent);
+        
+        // Also send current scene immediately to sync newly connected client
+        if (g_sre_current_scene_name[0]) {
+            char pkt[129];
+            pkt[0] = SRE_NET_SCENE_CHANGE;
+            strncpy(pkt + 1, g_sre_current_scene_name, 128);
+            sendto(g_sre_raknet_peer_instance.sockfd, pkt, sizeof(pkt), 0,
+                   (struct sockaddr*)source, sizeof(*source));
+        }
+    }
+}
 
 /* peer:Startup(maxConn, socketDesc, priority) */
 static int l_raknet_peer_startup(lua_State* L) {
@@ -70,7 +164,6 @@ static int l_raknet_peer_startup(lua_State* L) {
         return 1;
     }
 
-    /* Enable SO_REUSEADDR and SO_REUSEPORT so bind never fails on port reuse */
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #ifdef SO_REUSEPORT
@@ -97,6 +190,9 @@ static int l_raknet_peer_startup(lua_State* L) {
     g_sre_raknet_peer_instance.port = port;
     g_sre_raknet_peer_instance.max_incoming = max_conn;
     g_sre_raknet_peer_instance.is_started = true;
+    g_sre_raknet_peer_instance.is_connected = false;
+    memset(&g_sre_raknet_peer_instance.dest_addr, 0, sizeof(g_sre_raknet_peer_instance.dest_addr));
+    memset(g_peers, 0, sizeof(g_peers));
     g_sre_lan_sync_active = 1;
     g_sre_lan_is_host = 1;
 
@@ -137,18 +233,22 @@ static int l_raknet_peer_connect(lua_State* L) {
     g_sre_raknet_peer_instance.dest_addr.sin_family = AF_INET;
     g_sre_raknet_peer_instance.dest_addr.sin_port = htons((uint16_t)port);
     inet_pton(AF_INET, host, &g_sre_raknet_peer_instance.dest_addr.sin_addr);
-    g_sre_raknet_peer_instance.is_connected = true;
+    
+    memset(g_peers, 0, sizeof(g_peers));
+    g_sre_raknet_peer_instance.is_connected = false;
     g_sre_lan_sync_active = 1;
+    g_sre_lan_is_host = 0;
 
     printf("\n========================================================\n");
     printf("[SRE-Net] Connecting to Host at %s:%d...\n", host, port);
     printf("[SRE-Net] 60 Hz World & Hero Sync Engine ACTIVATED\n");
     printf("========================================================\n\n");
 
-    /* Send initial UDP ping packet (ID_CONNECTION_REQUEST = 12) */
-    const char ping_pkt[1] = { 12 };
-    sendto(g_sre_raknet_peer_instance.sockfd, ping_pkt, 1, 0,
-           (struct sockaddr*)&g_sre_raknet_peer_instance.dest_addr, sizeof(g_sre_raknet_peer_instance.dest_addr));
+    const uint8_t ping_pkt = SRE_NET_CONNECTION_REQUEST;
+    ssize_t sent = sendto(g_sre_raknet_peer_instance.sockfd, &ping_pkt, sizeof(ping_pkt), 0,
+                          (struct sockaddr*)&g_sre_raknet_peer_instance.dest_addr,
+                          sizeof(g_sre_raknet_peer_instance.dest_addr));
+    sre_raknet_note_send(sent);
 
     if (g_lua_pushstring) g_lua_pushstring(L, "CONNECTION_ATTEMPT_STARTED");
     return 1;
@@ -168,19 +268,27 @@ static int l_raknet_peer_send(lua_State* L) {
         return 1;
     }
 
-    struct sockaddr_in target = g_sre_raknet_peer_instance.dest_addr;
-    if (target.sin_port == 0) {
-        target.sin_family = AF_INET;
-        target.sin_port = htons(12345);
-        inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+    // Try sending to all active peers, or just dest_addr if not connected
+    ssize_t sent = 0;
+    if (sre_raknet_is_connected_impl()) {
+        for (int i=0; i<MAX_PEERS; i++) {
+            if (g_peers[i].is_active) {
+                sent = sendto(g_sre_raknet_peer_instance.sockfd, payload, payload_len, 0,
+                              (struct sockaddr*)&g_peers[i].addr, sizeof(g_peers[i].addr));
+            }
+        }
+    } else {
+        struct sockaddr_in target = g_sre_raknet_peer_instance.dest_addr;
+        if (target.sin_port == 0) {
+            target.sin_family = AF_INET;
+            target.sin_port = htons(12345);
+            inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+        }
+        sent = sendto(g_sre_raknet_peer_instance.sockfd, payload, payload_len, 0,
+                      (struct sockaddr*)&target, sizeof(target));
     }
-
-    ssize_t sent = sendto(g_sre_raknet_peer_instance.sockfd, payload, payload_len, 0,
-                          (struct sockaddr*)&target, sizeof(target));
-    if (sent > 0) {
-        g_sre_raknet_peer_instance.bytes_sent += (uint64_t)sent;
-        g_sre_raknet_peer_instance.pkts_sent++;
-    }
+    
+    sre_raknet_note_send(sent);
 
     if (g_lua_pushinteger) g_lua_pushinteger(L, (int)sent);
     return 1;
@@ -205,10 +313,12 @@ static int l_raknet_peer_receive(lua_State* L) {
         return 1;
     }
 
-    g_sre_raknet_peer_instance.dest_addr = src_addr;
-    g_sre_raknet_peer_instance.is_connected = true;
-    g_sre_raknet_peer_instance.bytes_recv += (uint64_t)bytes_read;
-    g_sre_raknet_peer_instance.pkts_recv++;
+    if ((uint8_t)buf[0] == SRE_NET_CONNECTION_REQUEST) {
+        sre_raknet_accept_client(&src_addr);
+    } else {
+        find_or_add_peer(&src_addr);
+    }
+    sre_raknet_note_receive(bytes_read);
 
     if (g_lua_createtable && g_lua_pushlstring && g_lua_setfield && g_lua_pushinteger) {
         g_lua_createtable(L, 0, 4);
@@ -238,14 +348,12 @@ static int l_raknet_peer_deallocate_packet(lua_State* L) {
 /* peer:Shutdown(blockDuration) */
 static int l_raknet_peer_shutdown(lua_State* L) {
     (void)L;
-    /* Delegate to the canonical shutdown implementation */
     sre_raknet_shutdown_impl();
     return 0;
 }
 
-/* Extra RakNet Telemetry APIs */
 static int l_raknet_peer_is_connected(lua_State* L) {
-    if (g_lua_pushboolean) g_lua_pushboolean(L, g_sre_raknet_peer_instance.is_connected ? 1 : 0);
+    if (g_lua_pushboolean) g_lua_pushboolean(L, sre_raknet_is_connected_impl() ? 1 : 0);
     return 1;
 }
 
@@ -279,23 +387,22 @@ static int l_raknet_get_local_ip(lua_State* L) {
     return 1;
 }
 
-/* peer:NumberOfConnections() -> int */
 static int l_raknet_peer_number_of_connections(lua_State* L) {
-    if (g_lua_pushinteger)
-        g_lua_pushinteger(L, g_sre_raknet_peer_instance.is_connected ? 1 : 0);
+    int active = 0;
+    for (int i=0; i<MAX_PEERS; i++) {
+        if (g_peers[i].is_active) active++;
+    }
+    if (g_lua_pushinteger) g_lua_pushinteger(L, active);
     return 1;
 }
 
-/* peer:GetMyGUID() -> string  (returns fd-based unique string like RakNet GUID) */
 static int l_raknet_peer_get_my_guid(lua_State* L) {
     char guid_str[32];
-    /* Build a reproducible GUID from the local sockfd to mimic RakNet's random GUID */
     snprintf(guid_str, sizeof(guid_str), "SREGUID_%d", g_sre_raknet_peer_instance.sockfd);
     if (g_lua_pushstring) g_lua_pushstring(L, guid_str);
     return 1;
 }
 
-/* peer:GetInternalID(address, idx) -> string  (returns local IP:port) */
 static int l_raknet_peer_get_internal_id(lua_State* L) {
     char id_str[64];
     snprintf(id_str, sizeof(id_str), "127.0.0.1|%d", (int)g_sre_raknet_peer_instance.port);
@@ -303,7 +410,6 @@ static int l_raknet_peer_get_internal_id(lua_State* L) {
     return 1;
 }
 
-/* peer:Ping(host, remotePort, onlyReplyOnAcceptingConnections) */
 static int l_raknet_peer_ping(lua_State* L) {
     if (g_sre_raknet_peer_instance.sockfd < 0) {
         if (g_lua_pushboolean) g_lua_pushboolean(L, 0);
@@ -319,7 +425,6 @@ static int l_raknet_peer_ping(lua_State* L) {
     target.sin_port = htons((uint16_t)port);
     inet_pton(AF_INET, host, &target.sin_addr);
 
-    /* RakNet Ping packet: ID_CONNECTED_PING = 0x00 */
     const char ping_pkt[1] = { 0x00 };
     ssize_t sent = sendto(g_sre_raknet_peer_instance.sockfd, ping_pkt, 1, 0,
                           (struct sockaddr*)&target, sizeof(target));
@@ -327,75 +432,42 @@ static int l_raknet_peer_ping(lua_State* L) {
     return 1;
 }
 
-/* peer:CloseConnection(target_guid, sendDisconnectionNotification, channel) */
 static int l_raknet_peer_close_connection(lua_State* L) {
     (void)L;
-    /* Send RakNet ID_DISCONNECTION_NOTIFICATION = 0x09 to dest, then mark disconnected */
-    if (g_sre_raknet_peer_instance.sockfd >= 0 && g_sre_raknet_peer_instance.is_connected) {
-        const char disc_pkt[1] = { 0x09 };
-        sendto(g_sre_raknet_peer_instance.sockfd, disc_pkt, 1, 0,
-               (struct sockaddr*)&g_sre_raknet_peer_instance.dest_addr,
-               sizeof(g_sre_raknet_peer_instance.dest_addr));
-        g_sre_raknet_peer_instance.is_connected = false;
+    if (g_sre_raknet_peer_instance.sockfd >= 0) {
+        const char disc_pkt[1] = { SRE_NET_DISCONNECT };
+        for (int i=0; i<MAX_PEERS; i++) {
+            if (g_peers[i].is_active) {
+                sendto(g_sre_raknet_peer_instance.sockfd, disc_pkt, 1, 0,
+                       (struct sockaddr*)&g_peers[i].addr, sizeof(g_peers[i].addr));
+                g_peers[i].is_active = false;
+                g_peers[i].hero_ghost = NULL;
+            }
+        }
     }
     return 0;
 }
 
-/* RakNet.GetInstance() — returns a peer table with all RakNet methods.
- * Matches libneedlewarfare raknet_lua.cpp PeerHolder API surface. */
 static int l_raknet_get_instance(lua_State* L) {
     if (!g_lua_createtable || !g_lua_pushcclosure || !g_lua_setfield) return 0;
-
     g_lua_createtable(L, 0, 18);
 
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_startup, 0);
-    g_lua_setfield(L, -2, "Startup");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_set_max_incoming, 0);
-    g_lua_setfield(L, -2, "SetMaximumIncomingConnections");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_connect, 0);
-    g_lua_setfield(L, -2, "Connect");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_send, 0);
-    g_lua_setfield(L, -2, "Send");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_receive, 0);
-    g_lua_setfield(L, -2, "Receive");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_deallocate_packet, 0);
-    g_lua_setfield(L, -2, "DeallocatePacket");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_shutdown, 0);
-    g_lua_setfield(L, -2, "Shutdown");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_is_connected, 0);
-    g_lua_setfield(L, -2, "IsConnected");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_get_system_address, 0);
-    g_lua_setfield(L, -2, "GetSystemAddress");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_get_guid, 0);
-    g_lua_setfield(L, -2, "GetGUID");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_get_statistics, 0);
-    g_lua_setfield(L, -2, "GetStatistics");
-
-    /* --- libneedlewarfare parity: missing methods added --- */
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_number_of_connections, 0);
-    g_lua_setfield(L, -2, "NumberOfConnections");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_get_my_guid, 0);
-    g_lua_setfield(L, -2, "GetMyGUID");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_get_internal_id, 0);
-    g_lua_setfield(L, -2, "GetInternalID");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_ping, 0);
-    g_lua_setfield(L, -2, "Ping");
-
-    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_close_connection, 0);
-    g_lua_setfield(L, -2, "CloseConnection");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_startup, 0); g_lua_setfield(L, -2, "Startup");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_set_max_incoming, 0); g_lua_setfield(L, -2, "SetMaximumIncomingConnections");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_connect, 0); g_lua_setfield(L, -2, "Connect");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_send, 0); g_lua_setfield(L, -2, "Send");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_receive, 0); g_lua_setfield(L, -2, "Receive");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_deallocate_packet, 0); g_lua_setfield(L, -2, "DeallocatePacket");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_shutdown, 0); g_lua_setfield(L, -2, "Shutdown");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_is_connected, 0); g_lua_setfield(L, -2, "IsConnected");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_get_system_address, 0); g_lua_setfield(L, -2, "GetSystemAddress");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_get_guid, 0); g_lua_setfield(L, -2, "GetGUID");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_get_statistics, 0); g_lua_setfield(L, -2, "GetStatistics");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_number_of_connections, 0); g_lua_setfield(L, -2, "NumberOfConnections");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_get_my_guid, 0); g_lua_setfield(L, -2, "GetMyGUID");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_get_internal_id, 0); g_lua_setfield(L, -2, "GetInternalID");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_ping, 0); g_lua_setfield(L, -2, "Ping");
+    g_lua_pushcclosure(L, (lua_CFunction)l_raknet_peer_close_connection, 0); g_lua_setfield(L, -2, "CloseConnection");
 
     return 1;
 }
@@ -412,17 +484,79 @@ void sre_register_raknet_lib(lua_State* L) {
     if (g_lua_settop) g_lua_settop(L, -2);
 }
 
-/* =========================================================================
- * Deeply Connected 60 Hz Background Hero Sync Engine (sre_Scene_Update Integration)
- * ========================================================================= */
 void sre_raknet_lan_sync_update(void* game_scene_view) {
     if (!g_sre_lan_sync_active || g_sre_raknet_peer_instance.sockfd < 0) return;
 
     static uint32_t frame_counter = 0;
     frame_counter++;
 
-    /* 1. Broadcast Local Player Position */
-    if (frame_counter % 2 == 0) {
+    /* 1. Track scene changes and broadcast SCENE_CHANGE */
+    static char last_local_scene[128] = {0};
+    if (strcmp(last_local_scene, g_sre_current_scene_name) != 0) {
+        printf("[SRE-Net] Local scene changed from '%s' to '%s'. Resetting ghosts.\n", last_local_scene, g_sre_current_scene_name);
+        
+        // Reset all remote ghosts as engine destroys them on load
+        for (int i=0; i<MAX_PEERS; i++) {
+            g_peers[i].hero_ghost = NULL;
+        }
+        g_remote_hero_ghost = NULL;
+        strncpy(last_local_scene, g_sre_current_scene_name, sizeof(last_local_scene));
+        
+        // Host forces clients to follow
+        if (g_sre_lan_is_host && g_sre_current_scene_name[0]) {
+            char pkt[129];
+            pkt[0] = SRE_NET_SCENE_CHANGE;
+            strncpy(pkt + 1, g_sre_current_scene_name, 128);
+            for (int i=0; i<MAX_PEERS; i++) {
+                if (g_peers[i].is_active) {
+                    sendto(g_sre_raknet_peer_instance.sockfd, pkt, sizeof(pkt), 0,
+                           (struct sockaddr*)&g_peers[i].addr, sizeof(g_peers[i].addr));
+                }
+            }
+        } else if (!g_sre_lan_is_host && g_sre_current_scene_name[0]) {
+            // Client informs host of scene arrival to enable sync
+            char pkt[129];
+            pkt[0] = SRE_NET_SCENE_CHANGE;
+            strncpy(pkt + 1, g_sre_current_scene_name, 128);
+            for (int i=0; i<MAX_PEERS; i++) {
+                if (g_peers[i].is_active) {
+                    sendto(g_sre_raknet_peer_instance.sockfd, pkt, sizeof(pkt), 0,
+                           (struct sockaddr*)&g_peers[i].addr, sizeof(g_peers[i].addr));
+                }
+            }
+        }
+    }
+
+    /* 2. Keepalives and Timeout processing (1 Hz) */
+    if (frame_counter % 60 == 0) {
+        uint8_t keepalive = SRE_NET_KEEPALIVE;
+        for (int i=0; i<MAX_PEERS; i++) {
+            if (g_peers[i].is_active) {
+                // Send keepalive
+                sendto(g_sre_raknet_peer_instance.sockfd, &keepalive, 1, 0,
+                       (struct sockaddr*)&g_peers[i].addr, sizeof(g_peers[i].addr));
+                       
+                // 5s silence disconnect (300 frames)
+                if (frame_counter - g_peers[i].last_recv_time > 300) {
+                    printf("[SRE-Net] Peer %s:%d timed out.\n", inet_ntoa(g_peers[i].addr.sin_addr), ntohs(g_peers[i].addr.sin_port));
+                    g_peers[i].is_active = false;
+                    g_peers[i].hero_ghost = NULL;
+                }
+            }
+        }
+        
+        // Re-assign global ghost for compatibility
+        g_remote_hero_ghost = NULL;
+        for (int i=0; i<MAX_PEERS; i++) {
+            if (g_peers[i].is_active && g_peers[i].hero_ghost) {
+                g_remote_hero_ghost = g_peers[i].hero_ghost;
+                break;
+            }
+        }
+    }
+
+    /* 3. Send local player state (30 Hz) */
+    if (frame_counter % 2 == 0 && sre_raknet_is_connected_impl()) {
         void* local_hero = caver_getHero_from_view(game_scene_view);
         if (!local_hero) local_hero = caver_getHero_impl();
         
@@ -431,32 +565,42 @@ void sre_raknet_lan_sync_update(void* game_scene_view) {
             caver_getPosition_impl(local_hero, &x, &y, &z);
 
             if (x != 0.0f || y != 0.0f) {
-                static int send_log_counter = 0;
-                if (send_log_counter++ % 60 == 0) {
-                    printf("[SRE-Net] Transmitting Player Position (x=%.2f, y=%.2f, z=%.2f) over UDP...\n", x, y, z);
+                int facing_dir = 1;
+                if (g_SceneObject_ComponentWithInterface && EntityComponent_Interface) {
+                    void* comp = g_SceneObject_ComponentWithInterface(local_hero, EntityComponent_Interface);
+                    if (comp) facing_dir = *(int*)((char*)comp + 0x70);
                 }
 
-                char pkt_buf[17];
-                pkt_buf[0] = (char)213; /* ID_SWORDIGO_PLAYER_SYNC */
-                memcpy(pkt_buf + 1,  &x, 4);
-                memcpy(pkt_buf + 5,  &y, 4);
-                memcpy(pkt_buf + 9,  &z, 4);
-                float dummy_dir = 1.0f;
-                memcpy(pkt_buf + 13, &dummy_dir, 4);
-
-                struct sockaddr_in target = g_sre_raknet_peer_instance.dest_addr;
-                if (target.sin_port == 0) {
-                    target.sin_family = AF_INET;
-                    target.sin_port = htons(12345);
-                    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+                uint8_t hp = 100;
+                if (g_SceneObject_ComponentWithInterface && HealthComponent_Interface) {
+                    void* comp = g_SceneObject_ComponentWithInterface(local_hero, HealthComponent_Interface);
+                    if (comp) hp = (uint8_t)sre_health_get_hp(comp);
                 }
-                sendto(g_sre_raknet_peer_instance.sockfd, pkt_buf, 17, 0,
-                       (struct sockaddr*)&target, sizeof(target));
+
+                char pkt_buf[18];
+                pkt_buf[0] = SRE_NET_PLAYER_SYNC;
+                static uint8_t local_seq = 0;
+                pkt_buf[1] = local_seq++;
+                memcpy(pkt_buf + 2,  &x, 4);
+                memcpy(pkt_buf + 6,  &y, 4);
+                memcpy(pkt_buf + 10,  &z, 4);
+                pkt_buf[14] = (uint8_t)facing_dir;
+                pkt_buf[15] = hp;
+                pkt_buf[16] = 0;
+                pkt_buf[17] = 0;
+
+                for (int i=0; i<MAX_PEERS; i++) {
+                    if (g_peers[i].is_active && strcmp(g_peers[i].scene_name, g_sre_current_scene_name) == 0) {
+                        ssize_t sent = sendto(g_sre_raknet_peer_instance.sockfd, pkt_buf, 18, 0,
+                                              (struct sockaddr*)&g_peers[i].addr, sizeof(g_peers[i].addr));
+                        sre_raknet_note_send(sent);
+                    }
+                }
             }
         }
     }
 
-    /* 2. Receive Remote Player UDP Packets */
+    /* 4. Receive Remote Packets */
     char recv_buf[512];
     struct sockaddr_in src_addr;
     socklen_t addr_len = sizeof(src_addr);
@@ -464,61 +608,95 @@ void sre_raknet_lan_sync_update(void* game_scene_view) {
     while (1) {
         ssize_t n = recvfrom(g_sre_raknet_peer_instance.sockfd, recv_buf, sizeof(recv_buf), 0,
                              (struct sockaddr*)&src_addr, &addr_len);
-        if (n < 17) break;
+        if (n <= 0) break;
 
-        if ((uint8_t)recv_buf[0] == 213) {
-            float rx = 0, ry = 0, rz = 0;
-            memcpy(&rx, recv_buf + 1, 4);
-            memcpy(&ry, recv_buf + 5, 4);
-            memcpy(&rz, recv_buf + 9, 4);
+        sre_raknet_note_receive(n);
 
-            if (rx != 0.0f || ry != 0.0f) {
-                g_sre_raknet_peer_instance.dest_addr = src_addr;
+        int peer_idx = find_or_add_peer(&src_addr);
+        if (peer_idx < 0) continue;
+        
+        g_peers[peer_idx].last_recv_time = frame_counter;
+
+        uint8_t pkt_id = (uint8_t)recv_buf[0];
+
+        if (pkt_id == SRE_NET_CONNECTION_REQUEST) {
+            sre_raknet_accept_client(&src_addr);
+        } else if (pkt_id == SRE_NET_CONNECTION_ACCEPTED) {
+            if (!g_sre_lan_is_host) {
+                printf("[SRE-Net] Connected to host %s:%d\n", inet_ntoa(src_addr.sin_addr), ntohs(src_addr.sin_port));
                 g_sre_raknet_peer_instance.is_connected = true;
-
-                static int recv_log_counter = 0;
-                if (recv_log_counter++ % 30 == 0) {
-                    printf("[SRE-Net] Received Remote Hero Position from %s:%d -> (x=%.2f, y=%.2f, z=%.2f)\n",
-                           inet_ntoa(src_addr.sin_addr), ntohs(src_addr.sin_port), rx, ry, rz);
+                if (g_sre_current_scene_name[0]) {
+                    char pkt[129];
+                    pkt[0] = SRE_NET_SCENE_CHANGE;
+                    strncpy(pkt + 1, g_sre_current_scene_name, 128);
+                    sendto(g_sre_raknet_peer_instance.sockfd, pkt, sizeof(pkt), 0,
+                           (struct sockaddr*)&src_addr, sizeof(src_addr));
                 }
+            }
+        } else if (pkt_id == SRE_NET_DISCONNECT) {
+            printf("[SRE-Net] Peer %d disconnected.\n", peer_idx);
+            g_peers[peer_idx].is_active = false;
+            g_peers[peer_idx].hero_ghost = NULL;
+        } else if (pkt_id == SRE_NET_SCENE_CHANGE && n >= 129) {
+            char new_scene[128];
+            memcpy(new_scene, recv_buf + 1, 128);
+            new_scene[127] = '\0';
+            
+            strncpy(g_peers[peer_idx].scene_name, new_scene, 128);
+            
+            if (!g_sre_lan_is_host && strcmp(g_sre_current_scene_name, new_scene) != 0) {
+                printf("[SRE-Net] Host entered scene '%s'. Transitioning to follow...\n", new_scene);
+                g_sre_scene_shift_pending = 1;
+                strncpy((char*)g_sre_scene_shift_target, new_scene, sizeof(g_sre_scene_shift_target));
+                strncpy((char*)g_sre_scene_shift_spawn, "start", sizeof(g_sre_scene_shift_spawn));
+            } else {
+                printf("[SRE-Net] Peer %d entered scene '%s'.\n", peer_idx, new_scene);
+            }
+        } else if (pkt_id == SRE_NET_PLAYER_SYNC && n >= 18) {
+            // Only process state sync if peer is in same scene
+            if (strcmp(g_peers[peer_idx].scene_name, g_sre_current_scene_name) == 0) {
+                uint8_t seq = (uint8_t)recv_buf[1];
+                if ((int8_t)(seq - g_peers[peer_idx].last_sequence) > 0) {
+                    g_peers[peer_idx].last_sequence = seq;
+                    
+                    float rx = 0, ry = 0, rz = 0;
+                    memcpy(&rx, recv_buf + 2, 4);
+                    memcpy(&ry, recv_buf + 6, 4);
+                    memcpy(&rz, recv_buf + 10, 4);
+                    uint8_t facing = (uint8_t)recv_buf[14];
+                    // hp = recv_buf[15]; (Could apply later)
 
-                /* Automatically instantiate remote player hero model in render scene without replacing main player hero */
-                if (!g_remote_hero_ghost && g_sre_CreateHeroObjectAt && game_scene_view) {
-                    uint64_t gc = *(uint64_t*)((char*)game_scene_view + 0xF8);
-                    if (gc) {
-                        void* sc = (void*)*(uint64_t*)((char*)gc + 0xC8);
-                        if (sc) {
-                            void* main_hero = *(void**)((char*)sc + 0x8); /* Save main hero pointer */
-                            float spawn_pos[3] = { rx, ry, rz };
-                            g_sre_CreateHeroObjectAt(sc, spawn_pos, 1, 1);
-                            g_remote_hero_ghost = *(void**)((char*)sc + 0x8); /* Capture newly created 2nd hero ghost pointer */
-                            *(void**)((char*)sc + 0x8) = main_hero; /* 1. Restore main hero pointer! */
-
-                            /* 2. Re-bind CameraController to main_hero via UpdateTarget (0x0034A6BC) */
+                    if (rx != 0.0f || ry != 0.0f) {
+                        if (!g_sre_CreateHeroObjectAt) {
                             extern uint64_t g_swordigo_base;
-                            typedef void (*pfn_UpdateTarget)(void* sc);
-                            pfn_UpdateTarget fn_UpdateTarget = (pfn_UpdateTarget)(g_swordigo_base + 0x34A6BC);
-                            if (fn_UpdateTarget) fn_UpdateTarget(sc);
+                            g_sre_CreateHeroObjectAt = (void*)(g_swordigo_base + 0x34a6bc);
+                        }
+                        if (!g_peers[peer_idx].hero_ghost && g_sre_CreateHeroObjectAt && game_scene_view) {
+                            void* sc = *(void**)((char*)game_scene_view + 0xF0);
+                            if (sc) {
+                                void* main_hero = *(void**)((char*)sc + 0xd8);
+                                float spawn_pos[3] = { rx, ry, rz };
+                                g_sre_CreateHeroObjectAt(sc, spawn_pos, (int)facing, 1);
+                                g_peers[peer_idx].hero_ghost = *(void**)((char*)sc + 0xd8);
+                                *(void**)((char*)sc + 0xd8) = main_hero;
 
-                            printf("[SRE-Net] FORCED SPAWN Remote Player Hero Ghost in Scene at (x=%.2f, y=%.2f, z=%.2f)!\n", rx, ry, rz);
+                                printf("[SRE-Net] Spawned remote hero for peer %d at (x=%.2f, y=%.2f, z=%.2f).\n", peer_idx, rx, ry, rz);
+                            }
+                        }
+
+                        if (g_peers[peer_idx].hero_ghost) {
+                            caver_setPosition_impl(g_peers[peer_idx].hero_ghost, rx, ry, rz);
+                            if (g_SceneObject_ComponentWithInterface && EntityComponent_Interface) {
+                                void* comp = g_SceneObject_ComponentWithInterface(g_peers[peer_idx].hero_ghost, EntityComponent_Interface);
+                                if (comp) *(int*)((char*)comp + 0x70) = (int)facing;
+                            }
                         }
                     }
-                }
-
-                if (g_remote_hero_ghost) {
-                    caver_setPosition_impl(g_remote_hero_ghost, rx, ry, rz);
                 }
             }
         }
     }
 }
-
-/* =========================================================================
- * sre_raknet_c.c Public C API (called from sre_lua_libs.c Swd.Net delegates)
- *
- * These functions expose the RakNet peer lifecycle without requiring a
- * lua_State. Called from l_swd_net_host / l_swd_net_join in sre_lua_libs.c.
- * ========================================================================= */
 
 int sre_raknet_startup_impl(uint16_t port) {
     if (port == 0) port = 12345;
@@ -550,7 +728,7 @@ int sre_raknet_startup_impl(uint16_t port) {
 
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         close(fd);
-        printf("[SRE-Net] Swd.Net.Host: bind() failed on port %d (already in use?)\n", (int)port);
+        printf("[SRE-Net] Swd.Net.Host: bind() failed on port %d\n", (int)port);
         return -1;
     }
 
@@ -558,6 +736,9 @@ int sre_raknet_startup_impl(uint16_t port) {
     g_sre_raknet_peer_instance.port         = port;
     g_sre_raknet_peer_instance.max_incoming = 32;
     g_sre_raknet_peer_instance.is_started   = true;
+    g_sre_raknet_peer_instance.is_connected = false;
+    memset(&g_sre_raknet_peer_instance.dest_addr, 0, sizeof(g_sre_raknet_peer_instance.dest_addr));
+    memset(g_peers, 0, sizeof(g_peers));
     g_sre_lan_sync_active = 1;
     g_sre_lan_is_host     = 1;
 
@@ -572,7 +753,6 @@ int sre_raknet_connect_impl(const char* host, uint16_t port) {
     if (!host || host[0] == '\0') host = "127.0.0.1";
     if (port == 0) port = 12345;
 
-    /* Create client socket if not already open */
     if (g_sre_raknet_peer_instance.sockfd < 0) {
         int fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd < 0) {
@@ -587,20 +767,21 @@ int sre_raknet_connect_impl(const char* host, uint16_t port) {
         g_sre_raknet_peer_instance.is_started = true;
     }
 
-    memset(&g_sre_raknet_peer_instance.dest_addr, 0,
-           sizeof(g_sre_raknet_peer_instance.dest_addr));
+    memset(&g_sre_raknet_peer_instance.dest_addr, 0, sizeof(g_sre_raknet_peer_instance.dest_addr));
     g_sre_raknet_peer_instance.dest_addr.sin_family = AF_INET;
     g_sre_raknet_peer_instance.dest_addr.sin_port   = htons(port);
     inet_pton(AF_INET, host, &g_sre_raknet_peer_instance.dest_addr.sin_addr);
-    g_sre_raknet_peer_instance.is_connected = true;
+    
+    memset(g_peers, 0, sizeof(g_peers));
+    g_sre_raknet_peer_instance.is_connected = false;
     g_sre_lan_sync_active = 1;
     g_sre_lan_is_host     = 0;
 
-    /* Send RakNet ID_CONNECTION_REQUEST = 0x0C */
-    const char ping_pkt[1] = { 0x0C };
-    sendto(g_sre_raknet_peer_instance.sockfd, ping_pkt, 1, 0,
-           (struct sockaddr*)&g_sre_raknet_peer_instance.dest_addr,
-           sizeof(g_sre_raknet_peer_instance.dest_addr));
+    const uint8_t ping_pkt = SRE_NET_CONNECTION_REQUEST;
+    ssize_t sent = sendto(g_sre_raknet_peer_instance.sockfd, &ping_pkt, sizeof(ping_pkt), 0,
+                          (struct sockaddr*)&g_sre_raknet_peer_instance.dest_addr,
+                          sizeof(g_sre_raknet_peer_instance.dest_addr));
+    sre_raknet_note_send(sent);
 
     printf("\n========================================================\n");
     printf("[SRE-Net] Swd.Net.Join: connecting to %s:%d\n", host, (int)port);
@@ -609,20 +790,14 @@ int sre_raknet_connect_impl(const char* host, uint16_t port) {
     return 0;
 }
 
-/**
- * sre_raknet_shutdown_impl — close the UDP peer socket and reset all state.
- * Called by Swd.Net.Disconnect() in sre_lua_libs.c, and by the Lua
- * peer:Shutdown() method in l_raknet_peer_shutdown.
- */
 void sre_raknet_shutdown_impl(void) {
     if (g_sre_raknet_peer_instance.sockfd >= 0) {
-        /* Send ID_DISCONNECTION_NOTIFICATION = 0x09 to peer before closing */
-        if (g_sre_raknet_peer_instance.is_connected &&
-            g_sre_raknet_peer_instance.dest_addr.sin_port != 0) {
-            const char disc_pkt[1] = { 0x09 };
-            sendto(g_sre_raknet_peer_instance.sockfd, disc_pkt, 1, 0,
-                   (struct sockaddr*)&g_sre_raknet_peer_instance.dest_addr,
-                   sizeof(g_sre_raknet_peer_instance.dest_addr));
+        const char disc_pkt[1] = { SRE_NET_DISCONNECT };
+        for (int i=0; i<MAX_PEERS; i++) {
+            if (g_peers[i].is_active) {
+                sendto(g_sre_raknet_peer_instance.sockfd, disc_pkt, 1, 0,
+                       (struct sockaddr*)&g_peers[i].addr, sizeof(g_peers[i].addr));
+            }
         }
         close(g_sre_raknet_peer_instance.sockfd);
         g_sre_raknet_peer_instance.sockfd = -1;
@@ -630,6 +805,7 @@ void sre_raknet_shutdown_impl(void) {
     g_sre_raknet_peer_instance.is_started   = false;
     g_sre_raknet_peer_instance.is_connected = false;
     g_sre_raknet_peer_instance.port         = 0;
+    memset(g_peers, 0, sizeof(g_peers));
     g_sre_lan_sync_active = 0;
     g_sre_lan_is_host     = 0;
     g_remote_hero_ghost   = NULL;

@@ -94,11 +94,12 @@ static const char* GRID_VS = R"GLSL(
 layout(location=0) in vec3 aPos;
 
 uniform mat4 uMVP;
+uniform mat4 uModel;
 
 out vec3 vWorldPos;
 
 void main() {
-    vWorldPos   = aPos;
+    vWorldPos   = vec3(uModel * vec4(aPos, 1.0));
     gl_Position = uMVP * vec4(aPos, 1.0);
 }
 )GLSL";
@@ -115,11 +116,14 @@ out vec4 FragColor;
 void main() {
     // Distance-based fade from center
     float dist = length(vWorldPos.xz);
-    float fade = 1.0 - smoothstep(uGridSize * 0.5, uGridSize, dist);
+    float fade = 1.0 - smoothstep(uGridSize * 0.65, uGridSize, dist);
 
-    // Grid lines: fract in grid-cell space, thin line at cell edges
-    vec2  grid = abs(fract(vWorldPos.xz / uGridSize * 10.0) - 0.5);
-    float line = 1.0 - smoothstep(0.0, 0.02, min(grid.x, grid.y));
+    // One world-unit minor grid, with thicker ten-unit major lines.
+    vec2 minorCoord = abs(fract(vWorldPos.xz) - 0.5);
+    vec2 majorCoord = abs(fract(vWorldPos.xz / 10.0) - 0.5);
+    float minorLine = 1.0 - smoothstep(0.46, 0.49, max(minorCoord.x, minorCoord.y));
+    float majorLine = 1.0 - smoothstep(0.47, 0.495, max(majorCoord.x, majorCoord.y));
+    float line = max(minorLine * 0.45, majorLine);
 
     FragColor = vec4(uGridColor.rgb, uGridColor.a * line * fade);
 }
@@ -146,6 +150,7 @@ static GLint s_loc_alpha      = -1;
 
 // Grid shader uniform locations
 static GLint s_loc_grid_mvp   = -1;
+static GLint s_loc_grid_model = -1;
 static GLint s_loc_grid_size  = -1;
 static GLint s_loc_grid_color = -1;
 
@@ -451,6 +456,7 @@ bool renderer_init() {
     }
 
     s_loc_grid_mvp   = glGetUniformLocation(s_grid_prog, "uMVP");
+    s_loc_grid_model = glGetUniformLocation(s_grid_prog, "uModel");
     s_loc_grid_size  = glGetUniformLocation(s_grid_prog, "uGridSize");
     s_loc_grid_color = glGetUniformLocation(s_grid_prog, "uGridColor");
 
@@ -487,7 +493,7 @@ void renderer_shutdown() {
 // ============================================================================
 
 GPUMesh upload_mesh(const float* positions, const float* normals, const float* uvs,
-                    int num_verts, const uint16_t* indices, int num_indices) {
+                    int num_verts, const uint32_t* indices, int num_indices) {
     GPUMesh mesh{};
     if (!positions || num_verts <= 0) return mesh;
 
@@ -552,7 +558,7 @@ GPUMesh upload_mesh(const float* positions, const float* normals, const float* u
         glGenBuffers(1, &mesh.ebo);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                     num_indices * sizeof(uint16_t), indices, GL_STATIC_DRAW);
+                     num_indices * sizeof(uint32_t), indices, GL_STATIC_DRAW);
         mesh.index_count = num_indices;
     } else {
         mesh.index_count = num_verts;  // non-indexed: draw all verts
@@ -560,6 +566,24 @@ GPUMesh upload_mesh(const float* positions, const float* normals, const float* u
 
     glBindVertexArray(0);
     return mesh;
+}
+
+void update_mesh_vertices(const GPUMesh& mesh, const float* positions,
+                          const float* normals, const float* uvs, int num_verts) {
+    if (!mesh.vbo || !positions || num_verts <= 0) return;
+    constexpr int stride_floats = 8;
+    std::vector<float> data(static_cast<size_t>(num_verts) * stride_floats);
+    for (int i = 0; i < num_verts; ++i) {
+        float* dst = &data[static_cast<size_t>(i) * stride_floats];
+        std::memcpy(dst, positions + i * 3, 3 * sizeof(float));
+        if (normals) std::memcpy(dst + 3, normals + i * 3, 3 * sizeof(float));
+        else { dst[3] = 0; dst[4] = 1; dst[5] = 0; }
+        if (uvs) std::memcpy(dst + 6, uvs + i * 2, 2 * sizeof(float));
+        else { dst[6] = dst[7] = 0; }
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, data.size() * sizeof(float), data.data());
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
 void free_mesh(GPUMesh& mesh) {
@@ -671,8 +695,10 @@ void begin_3d(unsigned int fbo, int w, int h, const Camera& cam) {
     glDepthFunc(GL_LESS);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
+    // Swordigo assets contain both winding conventions (POD and embedded
+    // GroundMesh). Keep both visible in the editor; this is an inspection and
+    // authoring viewport, not a back-face-culled game pass.
+    glDisable(GL_CULL_FACE);
 
     // Compute view and projection matrices
     float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
@@ -736,18 +762,49 @@ void render_mesh(const GPUMesh& mesh, const float* model_matrix,
 
     if (mesh.ebo) {
         glDrawElements(GL_TRIANGLES, mesh.index_count,
-                       GL_UNSIGNED_SHORT, nullptr);
+                       GL_UNSIGNED_INT, nullptr);
     } else {
         glDrawArrays(GL_TRIANGLES, 0, mesh.index_count);
     }
 
     if (wireframe) {
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-        glEnable(GL_CULL_FACE);
+        glDisable(GL_CULL_FACE);
     }
 
     glBindVertexArray(0);
     glUseProgram(0);
+}
+
+void render_lines(const float* positions, int vertex_count, const float color[4],
+                  const float* model_matrix, float width) {
+    if (!positions || vertex_count < 2 || !s_model_prog) return;
+    float model[16];
+    if (model_matrix) std::memcpy(model, model_matrix, sizeof(model));
+    else mat4_identity(model);
+    float mvp[16], normal[9];
+    mat4_multiply(mvp, s_vp, model);
+    mat4_normal_matrix(normal, model);
+
+    std::vector<float> vertices(static_cast<size_t>(vertex_count) * 8, 0.0f);
+    for (int i = 0; i < vertex_count; ++i) {
+        std::memcpy(&vertices[static_cast<size_t>(i) * 8], positions + i * 3, 3 * sizeof(float));
+        vertices[static_cast<size_t>(i) * 8 + 4] = 1.0f;
+    }
+    GLuint vao = 0, vbo = 0;
+    glGenVertexArrays(1, &vao); glGenBuffers(1, &vbo);
+    glBindVertexArray(vao); glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STREAM_DRAW);
+    glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8*sizeof(float), nullptr);
+    glEnableVertexAttribArray(1); glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)(3*sizeof(float)));
+    glEnableVertexAttribArray(2); glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)(6*sizeof(float)));
+    glUseProgram(s_model_prog);
+    glUniformMatrix4fv(s_loc_mvp, 1, GL_FALSE, mvp); glUniformMatrix4fv(s_loc_model, 1, GL_FALSE, model);
+    glUniformMatrix3fv(s_loc_normalmat, 1, GL_FALSE, normal);
+    glUniform1i(s_loc_has_tex, 0); glUniform4fv(s_loc_mat_color, 1, color); glUniform1f(s_loc_alpha, color[3]);
+    glUniform3f(s_loc_light_dir, 0, 0, 0); glUniform3f(s_loc_light_col, 0, 0, 0); glUniform3f(s_loc_ambient, 1, 1, 1);
+    glLineWidth(width); glDrawArrays(GL_LINES, 0, vertex_count); glLineWidth(1.0f);
+    glBindVertexArray(0); glDeleteBuffers(1, &vbo); glDeleteVertexArrays(1, &vao); glUseProgram(0);
 }
 
 void render_grid(float size, float y_level) {
@@ -768,6 +825,7 @@ void render_grid(float size, float y_level) {
 
     glUseProgram(s_grid_prog);
     glUniformMatrix4fv(s_loc_grid_mvp, 1, GL_FALSE, mvp);
+    glUniformMatrix4fv(s_loc_grid_model, 1, GL_FALSE, model);
     glUniform1f(s_loc_grid_size, size);
     glUniform4f(s_loc_grid_color, 0.4f, 0.4f, 0.5f, 0.5f);
 
@@ -780,7 +838,34 @@ void render_grid(float size, float y_level) {
     glBindVertexArray(0);
 
     glDepthMask(GL_TRUE);
-    glEnable(GL_CULL_FACE);
+    glDisable(GL_CULL_FACE);
+    glUseProgram(0);
+}
+
+void render_grid_xy(float size, float z_level) {
+    if (!s_grid_vao || !s_grid_prog) return;
+    float scale_m[16], rotate_m[16], trans_m[16], temp[16], model[16];
+    mat4_identity(scale_m);
+    scale_m[0] = size;
+    scale_m[10] = size;
+    mat4_rotate_x(rotate_m, 90.0f);
+    mat4_translate(trans_m, 0.0f, 0.0f, z_level);
+    mat4_multiply(temp, rotate_m, scale_m);
+    mat4_multiply(model, trans_m, temp);
+
+    float mvp[16];
+    mat4_multiply(mvp, s_vp, model);
+    glUseProgram(s_grid_prog);
+    glUniformMatrix4fv(s_loc_grid_mvp, 1, GL_FALSE, mvp);
+    glUniformMatrix4fv(s_loc_grid_model, 1, GL_FALSE, model);
+    glUniform1f(s_loc_grid_size, size);
+    glUniform4f(s_loc_grid_color, 0.35f, 0.42f, 0.55f, 0.5f);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glBindVertexArray(s_grid_vao);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+    glBindVertexArray(0);
+    glDepthMask(GL_TRUE);
     glUseProgram(0);
 }
 
@@ -793,6 +878,10 @@ void end_3d() {
     // Reset state to sane defaults for ImGui
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glUseProgram(0);
 }
 
 } // namespace av

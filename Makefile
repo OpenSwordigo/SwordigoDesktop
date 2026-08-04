@@ -193,6 +193,20 @@ $(LIB_DIR)/libswfmt.so: $(FORMATS_OBJS) | $(LIB_DIR)/libswcore.so
 	    -L$(LIB_DIR) -lswcore \
 	    $(ZLIB_LIBS)
 
+POD_SRCS := src/tools/pod_loader.cpp src/tools/scene_loader.cpp src/tools/scene_schemas.cpp
+POD_OBJS := $(patsubst src/%.cpp, $(BUILD)/pod/%.o, $(POD_SRCS))
+POD_DEPS := $(POD_OBJS:.o=.d)
+
+$(BUILD)/pod/%.o: src/%.cpp
+	@mkdir -p $(dir $@)
+	@echo "[CXX/pod]   $<"
+	@$(CXX) $(SO_CXXFLAGS) -c $< -o $@
+
+$(LIB_DIR)/libswpod.so: $(POD_OBJS) | $(LIB_DIR)/libswcore.so
+	@mkdir -p $(LIB_DIR)
+	@echo "[LINK/so]   $@"
+	@$(CXX) -shared -fPIC $(RPATH_FLAGS) -o $@ $^ -L$(LIB_DIR) -lswcore
+
 # ============================================================================
 # ── libfilerift.so ── Filerift engine + Host Lua 5.1
 #    filerift.cpp, scene_schemas.cpp, boulder.cpp + 28 Lua source files.
@@ -353,10 +367,16 @@ ALL_HOST_SO := \
     $(LIB_DIR)/libswcore.so \
     $(LIB_DIR)/libswgui.so \
     $(LIB_DIR)/libswfmt.so \
+    $(LIB_DIR)/libswpod.so \
     $(LIB_DIR)/libfilerift.so \
     $(LIB_DIR)/libswgfx.so \
     $(LIB_DIR)/libswemu.so \
     $(LIB_DIR)/libswordfare.so
+
+# Optional native OpenSwordigo bridge. The engine is built independently in
+# OpenSwordigo and loaded at runtime by --openswordigo; it is not linked into
+# the normal Swordfare binary.
+OPENSWORDIGO_LIB := OpenSwordigo/build/bin/libopenswordigo.so
 
 # ============================================================================
 # ── bin/swordfare ── Main desktop engine executable
@@ -365,6 +385,7 @@ ALL_HOST_SO := \
 BOOT_SRCS := \
     src/main.cpp \
     src/platform/display.cpp \
+    src/platform/openswordigo_host.cpp \
     src/platform/gui.cpp \
     src/platform/input_config.cpp \
     src/platform/binary_selector.cpp
@@ -382,14 +403,24 @@ $(BIN_DIR)/swordfare: $(BOOT_OBJS) | $(ALL_HOST_SO)
 	@echo "[LINK] $@"
 	@$(CXX) -rdynamic $(RPATH_FLAGS) -o $@ $^ \
 	    -L$(LIB_DIR) \
-	    -lswcore -lswgui -lswfmt -lfilerift \
+	    -lswcore -lswgui -lswfmt -lswpod -lfilerift \
 	    -lswgfx -lswemu -lswordfare \
+	    -Wl,--whole-archive \
 	    $(DYNARMIC_STATIC_LIBS) \
 	    $(FFMPEG_STATIC_LIBS) \
+	    -Wl,--no-whole-archive \
 	    $(SDL3_LIBS) $(SDL3I_LIBS) $(VORB_LIBS) $(MP3_LIBS) \
 	    $(ZLIB_LIBS) $(OAL_LIBS) \
 	    -lGL -lpthread -lm -ldl
 	@echo "[OK]   bin/swordfare  —  run with: ./run_swordigo.sh"
+
+openswordigo:
+	@$(MAKE) $(LIB_DIR)/libswpod.so
+	@cmake -S OpenSwordigo -B OpenSwordigo/build -DCMAKE_BUILD_TYPE=Release
+	@cmake --build OpenSwordigo/build -j$(nproc) --target openswordigo_swordfare
+	@mkdir -p $(LIB_DIR)
+	@cp $(OPENSWORDIGO_LIB) $(LIB_DIR)/libopenswordigo.so
+	@echo "[OK]   $(LIB_DIR)/libopenswordigo.so"
 
 # ============================================================================
 # ── bin/ruby ── Standalone asset browser / previewer
@@ -397,7 +428,6 @@ $(BIN_DIR)/swordfare: $(BOOT_OBJS) | $(ALL_HOST_SO)
 # ============================================================================
 RUBY_SRCS := \
     src/tools/asset_viewer.cpp \
-    src/tools/pod_loader.cpp \
     src/tools/av_renderer.cpp \
     src/tools/av_audio.cpp \
     src/tools/scene_loader.cpp \
@@ -416,12 +446,13 @@ $(BIN_DIR)/ruby: $(RUBY_OBJS) | \
     $(LIB_DIR)/libswcore.so \
     $(LIB_DIR)/libswgui.so \
     $(LIB_DIR)/libswfmt.so \
+    $(LIB_DIR)/libswpod.so \
     $(LIB_DIR)/libfilerift.so
 	@mkdir -p $(BIN_DIR)
 	@echo "[LINK] $@"
 	@$(CXX) $(RPATH_FLAGS) -o $@ $^ \
 	    -L$(LIB_DIR) \
-	    -lswcore -lswgui -lswfmt -lfilerift \
+	    -lswcore -lswgui -lswfmt -lswpod -lfilerift \
 	    $(SDL3_LIBS) $(SDL3I_LIBS) $(ZLIB_LIBS) \
 	    -lGL -lutil -lm
 	@echo "[AV]   bin/ruby  —  run with: ./bin/ruby"
@@ -515,7 +546,7 @@ install-sre: libsre.so
 # ============================================================================
 ALL_DEPS := \
     $(CORE_DEPS) $(GUI_DEPS) $(FORMATS_DEPS) $(FILERIFT_DEPS) \
-    $(GFX_DEPS) $(EMU_DEPS) $(UI_DEPS) \
+    $(GFX_DEPS) $(EMU_DEPS) $(UI_DEPS) $(POD_DEPS) \
     $(BOOT_DEPS) $(RUBY_DEPS)
 
 -include $(ALL_DEPS)

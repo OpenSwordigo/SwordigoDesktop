@@ -83,7 +83,7 @@ SreHookEntry sre_hook_table[] = {
      * per-frame overhead. Lua resume errors will crash without this. */
      { 0, "sre_ProgramState_Update" },
      // { 0, "sre_ProgramState_destructor" },
-     { 0x479aac, "sre_updateApplication" },
+     { 0x478ccc, "sre_updateApplication" },
 
     /* Scene Loading Pipeline Hooks — Safety Filters & Error Recovery */
     /* SceneLoadingView::InitWithGameState — offset resolved via sym_hooks (not yet wired,

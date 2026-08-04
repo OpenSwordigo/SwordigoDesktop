@@ -14,12 +14,17 @@
 
 namespace av {
 
+// Hosts may provide VFS-backed asset reads. The parser remains usable by
+// tools without a host by falling back to the filesystem when unset.
+using PODFileLoader = bool (*)(const std::string& path, std::vector<uint8_t>& data);
+void set_pod_file_loader(PODFileLoader loader);
+
 // ─── Per-mesh data ───────────────────────────────────────────────────
 struct PODMesh {
     std::vector<float>    positions;   // flat xyz, 3 floats per vertex
     std::vector<float>    normals;     // flat xyz, 3 floats per vertex
     std::vector<float>    uvs;         // flat uv,  2 floats per vertex
-    std::vector<uint16_t> indices;     // triangle indices
+    std::vector<uint32_t> indices;    // triangle indices (widened to u32 per main.js)
 
     std::vector<float>    bone_indices; // flat float (or int), bones_per_vertex floats per vertex
     std::vector<float>    bone_weights; // flat float, bones_per_vertex floats per vertex
@@ -47,6 +52,8 @@ struct PODMesh {
 struct PODMaterial {
     std::string name;
     int diffuse_texture_index = -1; // index into texture_filenames
+    float opacity = 1.0f;          // matOpacity (3002), default 1
+    float diffuse[3] = {1, 1, 1};  // matDiffuse (3004), default [1,1,1]
 };
 
 // ─── Hierarchical node data ──────────────────────────────────────────
@@ -93,11 +100,14 @@ struct PODModel {
 
     std::string version;
     int num_frames     = 0;
+    float fps           = 30.0f;
     int num_mesh_nodes = 0; // first num_mesh_nodes nodes are mesh nodes
 
     // Bounding sphere (computed from union of all mesh AABBs)
     float center_x = 0, center_y = 0, center_z = 0;
     float radius   = 1.0f;
+    float center_point[3] = {0, 0, 0}; // world-space CenterPoint node, main.js::qa
+    bool has_center_point = false;
 
     // Totals across all meshes
     int total_vertices = 0;
@@ -114,7 +124,12 @@ PODModel pod_load(const std::string& path);
 // Parse a POD model from an in-memory buffer.
 PODModel pod_parse(const uint8_t* data, size_t size);
 
-// Construct absolute world matrix for a node at a given frame.
-void get_node_matrix(const PODModel& model, int node_idx, int frame, float* mOut);
+// Construct absolute world matrix for a node at a fractional animation frame.
+void get_node_matrix(const PODModel& model, int node_idx, float frame, float* mOut);
+
+// CPU-skin a mesh using POD bone batches and the engine's bind-pose-relative
+// bone matrices. Returns false for rigid meshes or malformed skin data.
+bool skin_mesh(const PODModel& model, int mesh_node_idx, float frame,
+               std::vector<float>& positions, std::vector<float>& normals);
 
 } // namespace av

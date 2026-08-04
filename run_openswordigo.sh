@@ -1,5 +1,5 @@
 #!/bin/bash
-# run_openswordigo.sh — Build and launch native OpenSwordigo engine
+# run_openswordigo.sh — Build and launch OpenSwordigo through Swordfare
 # Usage: ./run_openswordigo.sh [scene_name.scene] [--clean] [--no-build]
 
 set -e
@@ -18,7 +18,7 @@ for arg in "$@"; do
             echo "  --clean     Perform a clean rebuild"
             echo "  --no-build  Skip build and run directly"
             exit 0 ;;
-        *.scene)
+        *.scene|*.POD|*.pod|*hiro*|*anim*)
             SCENE="$arg" ;;
     esac
 done
@@ -28,18 +28,13 @@ echo "  OpenSwordigo Native Engine Launcher"
 echo "=========================================="
 
 if [ $NO_BUILD -eq 0 ]; then
-    if [ ! -d "OpenSwordigo/build" ]; then
-        echo "=== Configuring CMake Build System ==="
-        cmake -B OpenSwordigo/build -S OpenSwordigo
-    fi
-
     if [ $CLEAN -eq 1 ]; then
-        echo "=== Clean Rebuilding OpenSwordigo ==="
-        cmake --build OpenSwordigo/build --target clean
+        echo "=== Cleaning OpenSwordigo Build ==="
+        rm -rf OpenSwordigo/build
     fi
 
-    echo "=== Compiling OpenSwordigo Native Engine ==="
-    cmake --build OpenSwordigo/build -j$(nproc)
+    echo "=== Building Swordfare Host and OpenSwordigo Plugin ==="
+    make -j"$(nproc)" bin/swordfare openswordigo
     echo ""
 fi
 
@@ -47,4 +42,5 @@ echo "=========================================="
 echo "  Launching OpenSwordigo ($SCENE)"
 echo "=========================================="
 echo ""
-exec ./OpenSwordigo/build/openswordigo_render "$SCENE"
+exec ./bin/swordfare --openswordigo --openswordigo-scene "$SCENE" \
+    --openswordigo-lib ./bin/libs/libopenswordigo.so

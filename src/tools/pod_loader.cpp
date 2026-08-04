@@ -13,6 +13,13 @@
 
 namespace av {
 
+static void finalize_model_bounds(PODModel& model);
+static PODFileLoader g_pod_file_loader = nullptr;
+
+void set_pod_file_loader(PODFileLoader loader) {
+    g_pod_file_loader = loader;
+}
+
 // ─── Tag Constants from SDK ──────────────────────────────────────────
 static constexpr uint32_t kEndTagMask = 0x80000000u;
 
@@ -27,6 +34,7 @@ static constexpr uint32_t eSceneNumMeshNodes            = 2006;
 static constexpr uint32_t eSceneNumTextures             = 2007;
 static constexpr uint32_t eSceneNumMaterials            = 2008;
 static constexpr uint32_t eSceneNumFrames               = 2009;
+static constexpr uint32_t eSceneFPS                     = 2017;
 static constexpr uint32_t eSceneMesh                    = 2012;
 static constexpr uint32_t eSceneNode                    = 2013;
 static constexpr uint32_t eSceneTexture                 = 2014;
@@ -35,6 +43,8 @@ static constexpr uint32_t eSceneMaterial                = 2015;
 // Material properties
 static constexpr uint32_t eMaterialName                 = 3000;
 static constexpr uint32_t eMaterialDiffuseTextureIndex  = 3001;
+static constexpr uint32_t eMaterialOpacity              = 3002;
+static constexpr uint32_t eMaterialDiffuse              = 3004;
 
 // Texture properties
 static constexpr uint32_t eTextureFilename              = 4000;
@@ -196,15 +206,18 @@ static std::vector<float> unpack_vertex_data(
     else if (type == 3 || type == 11 || type == 12 || type == 16) comp_size = 2; // short / ushort
     else if (type == 10 || type == 13 || type == 14 || type == 15) comp_size = 1; // byte / ubyte
 
+    // main.js Is(): stride defaults to blockNumComponents * compSize when 0
+    uint32_t block_components = (de.num_components > 0) ? de.num_components : (uint32_t)num_components;
     if (stride == 0) {
-        stride = num_components * comp_size;
+        stride = block_components * comp_size;
     }
+    int read_components = std::min((int)block_components, num_components);
 
     for (int i = 0; i < num_vertices; ++i) {
         const uint8_t* vert_ptr = src_ptr + i * stride;
         if (vert_ptr + stride > limit_ptr) break;
 
-        for (int c = 0; c < num_components; ++c) {
+        for (int c = 0; c < read_components; ++c) {
             const uint8_t* comp_ptr = vert_ptr + c * comp_size;
             if (comp_ptr + comp_size > limit_ptr) continue;
 
@@ -245,25 +258,30 @@ static std::vector<float> unpack_vertex_data(
 }
 
 // Parse indices (Face Index List)
+// Matches main.js yS: indices are decoded by dataType and widened into a
+// Uint32Array of size numFaces*3 (never truncated to 16-bit).
 static void parse_indices(const DataElement& de, int num_faces, PODMesh& mesh) {
     if (!de.payload || de.payload_size == 0) return;
     int index_count = num_faces * 3;
-    mesh.indices.reserve(index_count);
+    mesh.indices.resize(index_count);
 
-    if (de.type == 3 || de.stride == 2) { // Unsigned Short
-        for (int i = 0; i < index_count; i++) {
-            if (i * 2 + 2 > (int)de.payload_size) break;
-            uint16_t val;
-            std::memcpy(&val, de.payload + i * 2, 2);
-            mesh.indices.push_back(val);
+    size_t comp_size = 4;
+    if (de.type == 3 || de.type == 11 || de.type == 12 || de.type == 16) comp_size = 2; // short
+    else if (de.type == 7 || de.type == 10 || de.type == 13 || de.type == 14 || de.type == 15) comp_size = 1; // byte
+
+    for (int i = 0; i < index_count; i++) {
+        if ((size_t)(i + 1) * comp_size > de.payload_size) break;
+        uint32_t val = 0;
+        if (comp_size == 4) {
+            if (de.type == 2) { int32_t v; std::memcpy(&v, de.payload + i * 4, 4); val = (uint32_t)v; }
+            else std::memcpy(&val, de.payload + i * 4, 4);
+        } else if (comp_size == 2) {
+            uint16_t v; std::memcpy(&v, de.payload + i * 2, 2);
+            val = v;
+        } else {
+            val = de.payload[i];
         }
-    } else { // Unsigned Int / 32-bit Indices
-        for (int i = 0; i < index_count; i++) {
-            if (i * 4 + 4 > (int)de.payload_size) break;
-            uint32_t val;
-            std::memcpy(&val, de.payload + i * 4, 4);
-            mesh.indices.push_back(static_cast<uint16_t>(val & 0xFFFF));
-        }
+        mesh.indices[i] = val;
     }
 }
 
@@ -401,12 +419,6 @@ static PODNode readNodeBlock(const uint8_t* data, size_t size, size_t& off) {
     PODNode node;
     uint32_t end_tag = eSceneNode | kEndTagMask;
 
-    bool is_old_format = false;
-    float pos[3] = {0,0,0};
-    float rot[4] = {0,0,0,1};
-    float scl[3] = {1,1,1};
-    float mat[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-
     while (off < size) {
         uint32_t tag = read_u32(data, size, off);
         uint32_t len = read_u32(data, size, off);
@@ -432,36 +444,36 @@ static PODNode readNodeBlock(const uint8_t* data, size_t size, size_t& off) {
                 break;
             case eNodePosition: // static translation
                 if (len >= 12) {
-                    pos[0] = read_float(data, size, off);
-                    pos[1] = read_float(data, size, off);
-                    pos[2] = read_float(data, size, off);
-                    is_old_format = true;
+                    node.translation[0] = read_float(data, size, off);
+                    node.translation[1] = read_float(data, size, off);
+                    node.translation[2] = read_float(data, size, off);
+                    node.has_translation = true;
                     off += (len - 12);
                 } else off += len;
                 break;
             case eNodeRotation: // static rotation
                 if (len >= 16) {
-                    rot[0] = read_float(data, size, off);
-                    rot[1] = read_float(data, size, off);
-                    rot[2] = read_float(data, size, off);
-                    rot[3] = read_float(data, size, off);
-                    is_old_format = true;
+                    node.rotation[0] = read_float(data, size, off);
+                    node.rotation[1] = read_float(data, size, off);
+                    node.rotation[2] = read_float(data, size, off);
+                    node.rotation[3] = read_float(data, size, off);
+                    node.has_rotation = true;
                     off += (len - 16);
                 } else off += len;
                 break;
             case eNodeScale: // static scale
                 if (len >= 12) {
-                    scl[0] = read_float(data, size, off);
-                    scl[1] = read_float(data, size, off);
-                    scl[2] = read_float(data, size, off);
-                    is_old_format = true;
+                    node.scale[0] = read_float(data, size, off);
+                    node.scale[1] = read_float(data, size, off);
+                    node.scale[2] = read_float(data, size, off);
+                    node.has_scale = true;
                     off += (len - 12);
                 } else off += len;
                 break;
             case eNodeMatrix: // static matrix
                 if (len >= 64) {
-                    for (int i = 0; i < 16; i++) mat[i] = read_float(data, size, off);
-                    is_old_format = true;
+                    for (int i = 0; i < 16; i++) node.matrix[i] = read_float(data, size, off);
+                    node.has_matrix = true;
                     off += (len - 64);
                 } else off += len;
                 break;
@@ -496,17 +508,6 @@ static PODNode readNodeBlock(const uint8_t* data, size_t size, size_t& off) {
                 off += len;
                 break;
         }
-    }
-
-    if (is_old_format) {
-        node.has_translation = true;
-        std::memcpy(node.translation, pos, 12);
-        node.has_rotation = true;
-        std::memcpy(node.rotation, rot, 16);
-        node.has_scale = true;
-        std::memcpy(node.scale, scl, 12);
-        node.has_matrix = true;
-        std::memcpy(node.matrix, mat, 64);
     }
 
     return node;
@@ -555,6 +556,18 @@ static PODMaterial readMaterialBlock(const uint8_t* data, size_t size, size_t& o
                 break;
             case eMaterialDiffuseTextureIndex:
                 mat.diffuse_texture_index = static_cast<int>(read_u32(data, size, off));
+                break;
+            case eMaterialOpacity:
+                if (len >= 4) mat.opacity = read_float(data, size, off);
+                else off += len;
+                break;
+            case eMaterialDiffuse:
+                if (len >= 12) {
+                    mat.diffuse[0] = read_float(data, size, off);
+                    mat.diffuse[1] = read_float(data, size, off);
+                    mat.diffuse[2] = read_float(data, size, off);
+                    off += (len - 12);
+                } else off += len;
                 break;
             default:
                 off += len;
@@ -607,6 +620,12 @@ static void readSceneBlock(const uint8_t* data, size_t size, size_t& off, PODMod
                     model.num_frames = static_cast<int>(read_u32(data, size, off));
                 } else off += len;
                 break;
+            case eSceneFPS:
+                if (len >= 4) {
+                    model.fps = static_cast<float>(read_u32(data, size, off));
+                    if (model.fps <= 0.0f) model.fps = 30.0f;
+                } else off += len;
+                break;
             case eSceneMesh:
                 model.meshes.push_back(readMeshBlock(data, size, off));
                 break;
@@ -648,37 +667,20 @@ PODModel pod_parse(const uint8_t* data, size_t size) {
         }
     }
 
-    // Accumulate total bounding sphere and counts
-    for (const auto& m : model.meshes) {
-        model.total_vertices += m.num_vertices;
-        model.total_faces    += m.num_faces;
-
-        if (!m.positions.empty()) {
-            model.min_x = std::min(model.min_x, m.min_x);
-            model.min_y = std::min(model.min_y, m.min_y);
-            model.min_z = std::min(model.min_z, m.min_z);
-            model.max_x = std::max(model.max_x, m.max_x);
-            model.max_y = std::max(model.max_y, m.max_y);
-            model.max_z = std::max(model.max_z, m.max_z);
-        }
-    }
-
-    if (model.total_vertices > 0) {
-        model.center_x = (model.min_x + model.max_x) * 0.5f;
-        model.center_y = (model.min_y + model.max_y) * 0.5f;
-        model.center_z = (model.min_z + model.max_z) * 0.5f;
-
-        float dx = model.max_x - model.min_x;
-        float dy = model.max_y - model.min_y;
-        float dz = model.max_z - model.min_z;
-        model.radius = std::sqrt(dx * dx + dy * dy + dz * dz) * 0.5f;
-        if (model.radius < 1e-5f) model.radius = 1.0f;
-    }
+    finalize_model_bounds(model);
 
     return model;
 }
 
 PODModel pod_load(const std::string& path) {
+    if (g_pod_file_loader) {
+        std::vector<uint8_t> data;
+        if (g_pod_file_loader(path, data) && !data.empty()) {
+            return pod_parse(data.data(), data.size());
+        }
+        return {};
+    }
+
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f.is_open()) return {};
 
@@ -707,18 +709,21 @@ PODModel pod_load(const std::string& path) {
             is_2x = true;
         }
 
-        // Find the first underscore to extract the prefix
-        size_t underscore_pos = stem.find('_');
-        if (underscore_pos != std::string::npos) {
-            std::string prefix = stem.substr(0, underscore_pos);
-            
+        if (stem.find('_') != std::string::npos) {
             std::vector<fs::path> candidates;
-            if (is_2x) {
-                candidates.push_back(parent_dir / (prefix + "_2x.pod"));
-                candidates.push_back(parent_dir / (prefix + "_2x.POD"));
+            // Animation names are commonly nested, e.g.
+            // boss1_shadowform_spin.POD -> boss1_shadowform.POD. Try the
+            // longest prefix first instead of truncating at the first '_'.
+            std::string prefix = stem;
+            while (prefix.find('_') != std::string::npos) {
+                prefix.resize(prefix.rfind('_'));
+                if (is_2x) {
+                    candidates.push_back(parent_dir / (prefix + "_2x.pod"));
+                    candidates.push_back(parent_dir / (prefix + "_2x.POD"));
+                }
+                candidates.push_back(parent_dir / (prefix + ".pod"));
+                candidates.push_back(parent_dir / (prefix + ".POD"));
             }
-            candidates.push_back(parent_dir / (prefix + ".pod"));
-            candidates.push_back(parent_dir / (prefix + ".POD"));
 
             fs::path base_path;
             for (const auto& cand : candidates) {
@@ -741,7 +746,7 @@ PODModel pod_load(const std::string& path) {
                         entry_stem = entry_stem.substr(0, entry_stem.size() - 3);
                     }
 
-                    if (entry_stem == prefix && entry.path() != anim_path) {
+                    if (stem.rfind(entry_stem + "_", 0) == 0 && entry.path() != anim_path) {
                         base_path = entry.path();
                         break;
                     }
@@ -753,6 +758,7 @@ PODModel pod_load(const std::string& path) {
                 PODModel base_model = pod_load(base_path.string());
                 if (!base_model.meshes.empty()) {
                     base_model.num_frames = model.num_frames;
+                    base_model.fps = model.fps;
                     for (auto& base_node : base_model.nodes) {
                         for (const auto& anim_node : model.nodes) {
                             if (base_node.name == anim_node.name) {
@@ -769,6 +775,7 @@ PODModel pod_load(const std::string& path) {
                             }
                         }
                     }
+                    finalize_model_bounds(base_model);
                     return base_model;
                 }
             }
@@ -798,8 +805,42 @@ static void local_mat4_mul(const float a[16], const float b[16], float out[16]) 
     std::memcpy(out, tmp, 16 * sizeof(float));
 }
 
+static bool local_mat4_inverse(const float in[16], float out[16]) {
+    float a[16];
+    std::memcpy(a, in, sizeof(a));
+    local_mat4_identity(out);
+    for (int col = 0; col < 4; ++col) {
+        int pivot = col;
+        for (int row = col + 1; row < 4; ++row)
+            if (std::fabs(a[col * 4 + row]) > std::fabs(a[col * 4 + pivot])) pivot = row;
+        if (std::fabs(a[col * 4 + pivot]) < 1e-8f) return false;
+        if (pivot != col) {
+            for (int c = 0; c < 4; ++c) {
+                std::swap(a[c * 4 + col], a[c * 4 + pivot]);
+                std::swap(out[c * 4 + col], out[c * 4 + pivot]);
+            }
+        }
+        float scale = 1.0f / a[col * 4 + col];
+        for (int c = 0; c < 4; ++c) {
+            a[c * 4 + col] *= scale;
+            out[c * 4 + col] *= scale;
+        }
+        for (int row = 0; row < 4; ++row) {
+            if (row == col) continue;
+            float factor = a[col * 4 + row];
+            for (int c = 0; c < 4; ++c) {
+                a[c * 4 + row] -= factor * a[c * 4 + col];
+                out[c * 4 + row] -= factor * out[c * 4 + col];
+            }
+        }
+    }
+    return true;
+}
+
 static void local_mat4_from_quat(const float q[4], float m[16]) {
-    float x = q[0], y = q[1], z = q[2], w = q[3];
+    // main.js::$c converts POD quaternions into the editor coordinate system
+    // by negating xyz while preserving w.
+    float x = -q[0], y = -q[1], z = -q[2], w = q[3];
     m[0] = 1.0f - 2.0f * (y * y + z * z);
     m[1] = 2.0f * (x * y + z * w);
     m[2] = 2.0f * (x * z - y * w);
@@ -821,7 +862,48 @@ static void local_mat4_from_quat(const float q[4], float m[16]) {
     m[15] = 1.0f;
 }
 
-static void get_node_matrix_internal(const PODModel& model, int node_idx, int frame, float* mOut, int depth) {
+// POD animation streams may be compact keyframe arrays accompanied by one
+// keyframe index per scene frame.  A missing index array means dense frames.
+static int animation_key_index(const std::vector<uint32_t>& indices,
+                               size_t value_count, int frame, int components) {
+    if (value_count < static_cast<size_t>(components) || components <= 0)
+        return -1;
+    int frame_index = std::max(frame, 0);
+    if (!indices.empty() && frame_index < static_cast<int>(indices.size()))
+        frame_index = static_cast<int>(indices[frame_index]);
+    const int key_count = static_cast<int>(value_count / components);
+    return std::clamp(frame_index, 0, key_count - 1);
+}
+
+static void lerp3(float out[3], const float* a, const float* b, float t) {
+    for (int i = 0; i < 3; ++i) out[i] = a[i] + (b[i] - a[i]) * t;
+}
+
+static void slerp_quat(float out[4], const float* a, const float* b, float t) {
+    float end[4] = {b[0], b[1], b[2], b[3]};
+    float dot = a[0]*end[0] + a[1]*end[1] + a[2]*end[2] + a[3]*end[3];
+    if (dot < 0.0f) {
+        dot = -dot;
+        for (float& v : end) v = -v;
+    }
+    if (dot > 0.9995f) {
+        float length_sq = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            out[i] = a[i] + (end[i] - a[i]) * t;
+            length_sq += out[i] * out[i];
+        }
+        float inv_length = length_sq > 0.0f ? 1.0f / std::sqrt(length_sq) : 1.0f;
+        for (int i = 0; i < 4; ++i) out[i] *= inv_length;
+        return;
+    }
+    float theta = std::acos(std::clamp(dot, -1.0f, 1.0f));
+    float sin_theta = std::sin(theta);
+    float wa = std::sin((1.0f - t) * theta) / sin_theta;
+    float wb = std::sin(t * theta) / sin_theta;
+    for (int i = 0; i < 4; ++i) out[i] = a[i] * wa + end[i] * wb;
+}
+
+static void get_node_matrix_internal(const PODModel& model, int node_idx, float frame, float* mOut, int depth) {
     if (depth > 64 || node_idx < 0 || node_idx >= (int)model.nodes.size()) {
         std::memset(mOut, 0, 16 * sizeof(float));
         mOut[0] = mOut[5] = mOut[10] = mOut[15] = 1.0f;
@@ -829,13 +911,27 @@ static void get_node_matrix_internal(const PODModel& model, int node_idx, int fr
     }
 
     const auto& node = model.nodes[node_idx];
+    const int whole_frame = std::max(0, static_cast<int>(frame));
+    const int next_frame = model.num_frames > 0
+        ? std::min(whole_frame + 1, model.num_frames - 1) : whole_frame;
+    const float fraction = std::clamp(frame - static_cast<float>(whole_frame), 0.0f, 1.0f);
+
+    auto stream_has_animation = [&](uint32_t flag, size_t values, int components) {
+        return values >= static_cast<size_t>(components) &&
+               ((node.anim_flags & flag) != 0 || node.anim_flags == 0);
+    };
 
     float local[16];
     local_mat4_identity(local);
 
-    if (!node.anim_matrix.empty()) {
-        int f_clamped = std::clamp(frame, 0, (int)node.anim_matrix.size() / 16 - 1);
-        std::memcpy(local, &node.anim_matrix[f_clamped * 16], sizeof(local));
+    const bool has_anim_matrix = stream_has_animation(8u, node.anim_matrix.size(), 16);
+    const bool has_anim_translation = stream_has_animation(1u, node.anim_translation.size(), 3);
+    const bool has_anim_rotation = stream_has_animation(2u, node.anim_rotation.size(), 4);
+    const bool has_anim_scale = stream_has_animation(4u, node.anim_scale.size(), 3);
+
+    if (has_anim_matrix) {
+        int key = animation_key_index(node.anim_matrix_idx, node.anim_matrix.size(), whole_frame, 16);
+        if (key >= 0) std::memcpy(local, &node.anim_matrix[key * 16], sizeof(local));
     } else if (node.has_matrix) {
         std::memcpy(local, node.matrix, sizeof(local));
     } else {
@@ -845,33 +941,47 @@ static void get_node_matrix_internal(const PODModel& model, int node_idx, int fr
         local_mat4_identity(T);
 
         float t_val[3] = {node.translation[0], node.translation[1], node.translation[2]};
-        if (!node.anim_translation.empty()) {
-            int f_clamped = std::clamp(frame, 0, (int)node.anim_translation.size() / 3 - 1);
-            t_val[0] = node.anim_translation[f_clamped * 3 + 0];
-            t_val[1] = node.anim_translation[f_clamped * 3 + 1];
-            t_val[2] = node.anim_translation[f_clamped * 3 + 2];
+        if (!node.anim_translation.empty())
+            std::memcpy(t_val, node.anim_translation.data(), sizeof(t_val));
+        if (has_anim_translation) {
+            int key0 = animation_key_index(node.anim_translation_idx,
+                                            node.anim_translation.size(), whole_frame, 3);
+            int key1 = animation_key_index(node.anim_translation_idx,
+                                            node.anim_translation.size(), next_frame, 3);
+            if (key0 >= 0 && key1 >= 0)
+                lerp3(t_val, &node.anim_translation[key0 * 3],
+                      &node.anim_translation[key1 * 3], fraction);
         }
         T[12] = t_val[0];
         T[13] = t_val[1];
         T[14] = t_val[2];
 
         float r_val[4] = {node.rotation[0], node.rotation[1], node.rotation[2], node.rotation[3]};
-        if (!node.anim_rotation.empty()) {
-            int f_clamped = std::clamp(frame, 0, (int)node.anim_rotation.size() / 4 - 1);
-            r_val[0] = node.anim_rotation[f_clamped * 4 + 0];
-            r_val[1] = node.anim_rotation[f_clamped * 4 + 1];
-            r_val[2] = node.anim_rotation[f_clamped * 4 + 2];
-            r_val[3] = node.anim_rotation[f_clamped * 4 + 3];
+        if (!node.anim_rotation.empty())
+            std::memcpy(r_val, node.anim_rotation.data(), sizeof(r_val));
+        if (has_anim_rotation) {
+            int key0 = animation_key_index(node.anim_rotation_idx,
+                                            node.anim_rotation.size(), whole_frame, 4);
+            int key1 = animation_key_index(node.anim_rotation_idx,
+                                            node.anim_rotation.size(), next_frame, 4);
+            if (key0 >= 0 && key1 >= 0)
+                slerp_quat(r_val, &node.anim_rotation[key0 * 4],
+                          &node.anim_rotation[key1 * 4], fraction);
         }
         local_mat4_from_quat(r_val, R);
 
         float s_val[3] = {node.scale[0], node.scale[1], node.scale[2]};
-        if (!node.anim_scale.empty()) {
-            int stride = (node.anim_scale.size() / std::max(1, model.num_frames) >= 7) ? 7 : 3;
-            int f_clamped = std::clamp(frame, 0, (int)node.anim_scale.size() / stride - 1);
-            s_val[0] = node.anim_scale[f_clamped * stride + 0];
-            s_val[1] = node.anim_scale[f_clamped * stride + 1];
-            s_val[2] = node.anim_scale[f_clamped * stride + 2];
+        if (node.anim_scale.size() >= 3)
+            std::memcpy(s_val, node.anim_scale.data(), sizeof(s_val));
+        if (has_anim_scale) {
+            int stride = (node.anim_scale.size() % 7 == 0) ? 7 : 3;
+            int key0 = animation_key_index(node.anim_scale_idx,
+                                            node.anim_scale.size(), whole_frame, stride);
+            int key1 = animation_key_index(node.anim_scale_idx,
+                                            node.anim_scale.size(), next_frame, stride);
+            if (key0 >= 0 && key1 >= 0)
+                lerp3(s_val, &node.anim_scale[key0 * stride],
+                      &node.anim_scale[key1 * stride], fraction);
         }
         S[0] = s_val[0];
         S[5] = s_val[1];
@@ -891,8 +1001,147 @@ static void get_node_matrix_internal(const PODModel& model, int node_idx, int fr
     }
 }
 
-void get_node_matrix(const PODModel& model, int node_idx, int frame, float* mOut) {
+void get_node_matrix(const PODModel& model, int node_idx, float frame, float* mOut) {
     get_node_matrix_internal(model, node_idx, frame, mOut, 0);
+}
+
+bool skin_mesh(const PODModel& model, int mesh_node_idx, float frame,
+               std::vector<float>& positions, std::vector<float>& normals) {
+    if (mesh_node_idx < 0 || mesh_node_idx >= static_cast<int>(model.nodes.size())) return false;
+    const auto& mesh_node = model.nodes[mesh_node_idx];
+    if (mesh_node.object_index < 0 || mesh_node.object_index >= static_cast<int>(model.meshes.size())) return false;
+    const auto& mesh = model.meshes[mesh_node.object_index];
+    if (!mesh.bones_per_vertex || mesh.bone_indices.size() < static_cast<size_t>(mesh.num_vertices * mesh.bones_per_vertex)) return false;
+
+    positions.assign(mesh.positions.size(), 0.0f);
+    normals.assign(mesh.normals.size(), 0.0f);
+    float mesh_world[16];
+    get_node_matrix(model, mesh_node_idx, frame, mesh_world);
+    float mesh_inverse[16];
+    if (!local_mat4_inverse(mesh_world, mesh_inverse)) return false;
+
+    std::vector<float> bind_world(model.nodes.size() * 16), current_world(model.nodes.size() * 16);
+    for (size_t i = 0; i < model.nodes.size(); ++i) {
+        get_node_matrix(model, static_cast<int>(i), 0.0f, &bind_world[i * 16]);
+        get_node_matrix(model, static_cast<int>(i), frame, &current_world[i * 16]);
+    }
+    std::vector<float> skin_matrices(model.nodes.size() * 16);
+    for (size_t i = 0; i < model.nodes.size(); ++i) {
+        float inverse_bind[16];
+        if (!local_mat4_inverse(&bind_world[i * 16], inverse_bind)) local_mat4_identity(inverse_bind);
+        float animated_from_bind[16], animated_model[16];
+        local_mat4_mul(&current_world[i * 16], inverse_bind, animated_from_bind);
+        local_mat4_mul(animated_from_bind, &bind_world[static_cast<size_t>(mesh_node_idx) * 16], animated_model);
+        local_mat4_mul(mesh_inverse, animated_model, &skin_matrices[i * 16]);
+    }
+
+    const int influence_count = mesh.bones_per_vertex;
+    for (int vertex = 0; vertex < mesh.num_vertices; ++vertex) {
+        float weight_sum = 0.0f;
+        for (int influence = 0; influence < influence_count; ++influence) {
+            const size_t index = static_cast<size_t>(vertex * influence_count + influence);
+            int bone = static_cast<int>(mesh.bone_indices[index]);
+            if (mesh.has_bone_batches && !mesh.bone_batches.indices.empty() && bone >= 0 &&
+                bone < static_cast<int>(mesh.bone_batches.indices.size()))
+                bone = static_cast<int>(mesh.bone_batches.indices[bone]);
+            if (bone < 0 || bone >= static_cast<int>(model.nodes.size())) continue;
+            float weight = mesh.bone_weights.size() > index ? mesh.bone_weights[index] : 0.0f;
+            if (weight <= 0.0f) continue;
+            weight_sum += weight;
+            const float* matrix = &skin_matrices[static_cast<size_t>(bone) * 16];
+            const float* point = &mesh.positions[static_cast<size_t>(vertex) * 3];
+            float* result = &positions[static_cast<size_t>(vertex) * 3];
+            result[0] += (matrix[0]*point[0] + matrix[4]*point[1] + matrix[8]*point[2] + matrix[12]) * weight;
+            result[1] += (matrix[1]*point[0] + matrix[5]*point[1] + matrix[9]*point[2] + matrix[13]) * weight;
+            result[2] += (matrix[2]*point[0] + matrix[6]*point[1] + matrix[10]*point[2] + matrix[14]) * weight;
+            if (!mesh.normals.empty()) {
+                const float* normal = &mesh.normals[static_cast<size_t>(vertex) * 3];
+                float* normal_result = &normals[static_cast<size_t>(vertex) * 3];
+                normal_result[0] += (matrix[0]*normal[0] + matrix[4]*normal[1] + matrix[8]*normal[2]) * weight;
+                normal_result[1] += (matrix[1]*normal[0] + matrix[5]*normal[1] + matrix[9]*normal[2]) * weight;
+                normal_result[2] += (matrix[2]*normal[0] + matrix[6]*normal[1] + matrix[10]*normal[2]) * weight;
+            }
+        }
+        if (weight_sum <= 0.0f) {
+            std::memcpy(&positions[static_cast<size_t>(vertex) * 3], &mesh.positions[static_cast<size_t>(vertex) * 3], 3 * sizeof(float));
+            if (!mesh.normals.empty()) std::memcpy(&normals[static_cast<size_t>(vertex) * 3], &mesh.normals[static_cast<size_t>(vertex) * 3], 3 * sizeof(float));
+        } else if (!normals.empty()) {
+            float* normal = &normals[static_cast<size_t>(vertex) * 3];
+            float length = std::sqrt(normal[0]*normal[0] + normal[1]*normal[1] + normal[2]*normal[2]);
+            if (length > 1e-8f) { normal[0] /= length; normal[1] /= length; normal[2] /= length; }
+        }
+    }
+    return true;
+}
+
+static void transform_point(const float m[16], float x, float y, float z, float out[3]) {
+    out[0] = m[0]*x + m[4]*y + m[8]*z + m[12];
+    out[1] = m[1]*x + m[5]*y + m[9]*z + m[13];
+    out[2] = m[2]*x + m[6]*y + m[10]*z + m[14];
+}
+
+static void finalize_model_bounds(PODModel& model) {
+    model.total_vertices = model.total_faces = 0;
+    model.min_x = model.min_y = model.min_z = 1e9f;
+    model.max_x = model.max_y = model.max_z = -1e9f;
+    model.has_center_point = false;
+
+    for (int i = 0; i < static_cast<int>(model.nodes.size()); ++i) {
+        if (model.nodes[i].name != "CenterPoint") continue;
+        float matrix[16];
+        get_node_matrix(model, i, 0.0f, matrix);
+        model.center_point[0] = matrix[12];
+        model.center_point[1] = matrix[13];
+        model.center_point[2] = matrix[14];
+        model.has_center_point = true;
+        break;
+    }
+
+    for (const auto& mesh : model.meshes) {
+        model.total_vertices += mesh.num_vertices;
+        model.total_faces += mesh.num_faces;
+    }
+
+    for (int node_index = 0; node_index < model.num_mesh_nodes &&
+         node_index < static_cast<int>(model.nodes.size()); ++node_index) {
+        const auto& node = model.nodes[node_index];
+        if (node.object_index < 0 || node.object_index >= static_cast<int>(model.meshes.size())) continue;
+        const auto& mesh = model.meshes[node.object_index];
+        if (mesh.positions.empty()) continue;
+        float matrix[16];
+        get_node_matrix(model, node_index, 0.0f, matrix);
+        for (size_t vertex = 0; vertex + 2 < mesh.positions.size(); vertex += 3) {
+            float point[3];
+            transform_point(matrix, mesh.positions[vertex], mesh.positions[vertex+1],
+                            mesh.positions[vertex+2], point);
+            if (model.has_center_point) {
+                point[0] -= model.center_point[0];
+                point[1] -= model.center_point[1];
+                point[2] -= model.center_point[2];
+            }
+            model.min_x = std::min(model.min_x, point[0]); model.max_x = std::max(model.max_x, point[0]);
+            model.min_y = std::min(model.min_y, point[1]); model.max_y = std::max(model.max_y, point[1]);
+            model.min_z = std::min(model.min_z, point[2]); model.max_z = std::max(model.max_z, point[2]);
+        }
+    }
+
+    // Node-less PODs are uncommon but valid; preserve their mesh-space bounds.
+    if (model.min_x > model.max_x) {
+        for (const auto& mesh : model.meshes) {
+            if (mesh.positions.empty()) continue;
+            model.min_x = std::min(model.min_x, mesh.min_x); model.max_x = std::max(model.max_x, mesh.max_x);
+            model.min_y = std::min(model.min_y, mesh.min_y); model.max_y = std::max(model.max_y, mesh.max_y);
+            model.min_z = std::min(model.min_z, mesh.min_z); model.max_z = std::max(model.max_z, mesh.max_z);
+        }
+    }
+
+    if (model.min_x <= model.max_x) {
+        model.center_x = (model.min_x + model.max_x) * 0.5f;
+        model.center_y = (model.min_y + model.max_y) * 0.5f;
+        model.center_z = (model.min_z + model.max_z) * 0.5f;
+        float dx = model.max_x - model.min_x, dy = model.max_y - model.min_y, dz = model.max_z - model.min_z;
+        model.radius = std::max(0.5f * std::sqrt(dx*dx + dy*dy + dz*dz), 1.0f);
+    }
 }
 
 } // namespace av

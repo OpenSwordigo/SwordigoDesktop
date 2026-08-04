@@ -16,7 +16,7 @@
 //     GUI label, button and text invisible on the main menu.
 //
 //   BUG 2 — SHORT-FUNCTION HAZARD
-//     Java_..._updateApplication (Ghidra: 0x479aac, size = 28 bytes / 7 insns)
+//     Java_..._updateApplication (IDA/nm: 0x478ccc, size = 28 bytes / 7 insns)
 //       void updateApplication(void) {
 //           if (DAT_007e9c20 != NULL)
 //               (**(code**)(*DAT_007e9c20 + 0x68))();   // vtable+0x68 = CaverShell::Update

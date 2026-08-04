@@ -551,9 +551,16 @@ bool SwordfareGUI::process_event(const SDL_Event& event) {
     
     ImGuiIO& io = ImGui::GetIO();
 
-    // Forward keyboard capture when debug/mod overlay is visible
+    // Global overlays must remain toggleable even while ImGui captures input.
+    if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+        event.key.key == SDLK_F11) {
+        toggle_mod_overlay();
+        return true;
+    }
+
+    // Capture keyboard input for every visible ImGui surface, not only debug.
     if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP)
-        return m_visible && io.WantCaptureKeyboard;
+        return (m_visible || m_mod_overlay_visible || m_console_open) && io.WantCaptureKeyboard;
 
     // For mouse events: block if ImGui wants it OR if the click lands on any
     // SRE overlay or button area (even when the mod-menu is hidden)
@@ -3786,5 +3793,4 @@ void SwordfareGUI::tcp_server_loop() {
         }
     }
 }
-
 

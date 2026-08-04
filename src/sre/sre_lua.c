@@ -1190,7 +1190,7 @@ void sre_ProgramState_Resume(void* self, int stackIndex) {
  *
  * Accurately replicates the Ghidra decompilation of ProgramState::Update:
  *
- *   Ghidra (libswordigo_v1.4.12.so.c lines 551876–551949 / address 0x3198bd):
+ *   ARM64 v1.4.12 ProgramState::Update address from nm: 0x4c15fc.
  *
  *   if ((this[0x51] != 0) || (this[0x52] != 0)) {          // condition1 || paused
  *       if (this[0x20] != NULL)                             // has SceneObject?
@@ -1423,8 +1423,7 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
                 if (child_depth >= 0 && sre_setjmp(g_sre_recovery_stack[child_depth].buf) != 0) {
                     /* longjmp fired from inside child iteration */
                     recovery_pop(child_depth);
-                    pthread_mutex_unlock(&g_lua_mutex);  /* FORCE UNLOCK — may have been left locked */
-                    fprintf(stderr, "[SRE/ProgramState] Child exception caught — mutex force-released, continuing.\n");
+                    fprintf(stderr, "[SRE/ProgramState] Child exception caught; continuing.\n");
                     /* Don't restore suspended — fall through to restore below */
                 } else {
                     g_orig_ProgramState_Update(self, deltaTime);
@@ -1475,8 +1474,10 @@ child_update:
  * which is called from within the original's vtable dispatch. */
 typedef void (*pfn_orig_updateApp)(void* env, void* obj);
 pfn_orig_updateApp g_orig_updateApplication = 0;
+volatile uint64_t g_sre_update_application_ticks = 0;
 
 void sre_updateApplication(void* env, void* obj) {
+    g_sre_update_application_ticks++;
     /* 1. Service Lua console & Mini injection BEFORE the frame tick */
     if (g_sre_last_lua_state) {
         extern void sre_mini_ensure_injected(lua_State* L);
@@ -1486,8 +1487,6 @@ void sre_updateApplication(void* env, void* obj) {
             g_lua_console_pending = 0;
             sre_run_console(g_sre_last_lua_state);
         }
-        extern void sre_tick_console_coroutines(lua_State* L);
-        sre_tick_console_coroutines(g_sre_last_lua_state);
     }
 
     /* 2. Compute delta time from host wall clock.

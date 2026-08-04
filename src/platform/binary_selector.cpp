@@ -8,8 +8,26 @@
 #include <iomanip>
 #include <algorithm>
 #include <map>
+#include <cstdlib>
+#include <cctype>
 
 namespace fs = std::filesystem;
+
+static std::string shell_quote(const std::string& value) {
+    std::string quoted = "'";
+    for (char c : value) quoted += c == '\'' ? "'\\''" : std::string(1, c);
+    return quoted + "'";
+}
+
+static std::string safe_instance_name(const std::string& name) {
+    std::string result;
+    for (unsigned char c : name) {
+        if (std::isalnum(c) || c == '-' || c == '_') result += static_cast<char>(c);
+        else if (std::isspace(c) && !result.empty() && result.back() != '-') result += '-';
+    }
+    while (!result.empty() && result.back() == '-') result.pop_back();
+    return result.empty() ? "Imported-APK" : result;
+}
 
 // ============================================================================
 // Minimal SHA-256 implementation (no OpenSSL dependency)
@@ -457,6 +475,22 @@ void BinarySelector::set_loaded(const std::string& filepath) {
     loaded_binary = filepath;
 }
 
+void BinarySelector::strip_sre_conflicts_from_last() {
+    if (binaries.empty()) return;
+
+    auto& b = binaries.back();
+    b.dependencies.erase(
+        std::remove_if(b.dependencies.begin(), b.dependencies.end(), [](const std::string& d) {
+            return d == "libmini.so" || d == "libGlossHook.so" || d == "libkiwi.so";
+        }), b.dependencies.end());
+    b.dep_paths.erase(
+        std::remove_if(b.dep_paths.begin(), b.dep_paths.end(), [](const std::string& p) {
+            return p.find("libmini.so") != std::string::npos ||
+                   p.find("libGlossHook.so") != std::string::npos ||
+                   p.find("libkiwi.so") != std::string::npos;
+        }), b.dep_paths.end());
+}
+
 // ============================================================================
 // Add a custom binary instance from a .so file
 // ============================================================================
@@ -605,6 +639,100 @@ bool BinarySelector::add_custom_instance(const std::string& so_filepath, const s
 
     std::cout << "[BinSel] Added custom instance: " << info.label << " → " << info.filepath << std::endl;
     return true;
+}
+
+bool BinarySelector::import_apk_instance(const std::string& apk_path, const std::string& name,
+                                         std::string* error_message) {
+    auto fail = [&](const std::string& message) {
+        if (error_message) *error_message = message;
+        std::cerr << "[BinSel/APK] " << message << std::endl;
+        return false;
+    };
+    if (!fs::is_regular_file(apk_path)) return fail("APK file does not exist");
+    if (data_dir.empty()) return fail("Launcher data directory is not configured");
+    if (std::system("command -v unzip >/dev/null 2>&1") != 0)
+        return fail("The 'unzip' utility is required to import APK files");
+
+    const std::string slug = safe_instance_name(name);
+    const std::string version_dir = "apk-" + slug;
+    const std::string assets_dir_name = "inst-" + slug;
+    const fs::path temp = fs::path(data_dir) / (".apk-import-" + slug);
+    const fs::path engine_dest = fs::path(data_dir) / "engine" / version_dir;
+    const fs::path assets_dest = fs::path(data_dir) / assets_dir_name;
+
+    try {
+        fs::remove_all(temp);
+        fs::create_directories(temp);
+        // APKs also contain large DEX/resource tables that Swordigo Desktop
+        // never consumes. Extract only game assets and native libraries.
+        const std::string command = "unzip -qq " + shell_quote(apk_path) +
+            " 'assets/*' 'lib/*/*.so' -d " + shell_quote(temp.string());
+        if (std::system(command.c_str()) != 0) {
+            fs::remove_all(temp);
+            return fail("Failed to extract APK (invalid or unsupported archive)");
+        }
+        const fs::path extracted_assets = temp / "assets";
+        if (!fs::is_directory(extracted_assets / "resources")) {
+            fs::remove_all(temp);
+            return fail("APK has no assets/resources directory");
+        }
+        fs::remove_all(extracted_assets / "dexopt");
+
+        fs::remove_all(engine_dest);
+
+        size_t imported = 0;
+        const fs::path lib_root = temp / "lib";
+        for (const auto& abi : {std::string("armeabi-v7a"), std::string("arm64-v8a")}) {
+            const fs::path source = lib_root / abi;
+            if (!fs::is_regular_file(source / "libswordigo.so")) continue;
+            const BinaryArch architecture = abi == "arm64-v8a" ? BinaryArch::ARM64 : BinaryArch::ARM32;
+            const fs::path destination = engine_dest / abi;
+            fs::create_directories(destination);
+            for (const auto& library : fs::directory_iterator(source)) {
+                if (!library.is_regular_file() || library.path().extension() != ".so") continue;
+                fs::copy_file(library.path(), destination / library.path().filename(),
+                              fs::copy_options::overwrite_existing);
+            }
+            const fs::path registered = destination / "libswordigo.so";
+            if (!fs::is_regular_file(registered)) return fail("APK ABI is missing libswordigo.so");
+            BinaryInfo info;
+            info.filename = "libswordigo.so";
+            info.filepath = (fs::path("engine") / version_dir / abi / info.filename).string();
+            info.version_dir = version_dir;
+            info.arch = architecture;
+            info.file_size = fs::file_size(registered);
+            info.sha256 = compute_sha256(registered.string());
+            info.is_default = false;
+            info.game_type = "Swordigo";
+            info.assets_dir = assets_dir_name;
+            info.label = "[APK] " + name + " [" + arch_string(info.arch) + "]";
+            info.status = BinaryStatus::UNKNOWN;
+            for (const auto& library : fs::directory_iterator(destination)) {
+                if (library.path().filename() == "libswordigo.so") continue;
+                info.dependencies.push_back(library.path().filename().string());
+                info.dep_paths.push_back(library.path().string());
+            }
+            binaries.push_back(std::move(info));
+            save_instance_ini(info);
+            ++imported;
+        }
+        if (imported == 0) {
+            fs::remove_all(temp);
+            return fail("APK contains no lib/armeabi-v7a or lib/arm64-v8a libswordigo.so");
+        }
+        // Commit assets only after at least one ABI has registered correctly.
+        fs::remove_all(assets_dest);
+        fs::rename(extracted_assets, assets_dest);
+        for (auto& info : binaries)
+            if (info.version_dir == version_dir) save_instance_ini(info);
+        fs::remove_all(temp);
+        std::cout << "[BinSel/APK] Imported " << imported << " ABI(s), assets -> " << assets_dest << std::endl;
+        return true;
+    } catch (const std::exception& error) {
+        std::error_code ignored;
+        fs::remove_all(temp, ignored);
+        return fail(error.what());
+    }
 }
 
 // ============================================================================
@@ -1027,6 +1155,12 @@ void BinarySelector::load_manifest(const std::string& manifest_path) {
 
 void BinarySelector::load_user_instances(const std::string& json_path) {
     // NO-OP: Handled dynamically by scanning directory in load_manifest
+}
+
+void BinarySelector::reload_instances() {
+    if (data_dir.empty()) return;
+    binaries.clear();
+    scan_engine_directory((fs::path(data_dir) / "engine").string());
 }
 
 void BinarySelector::save_user_instances(const std::string& json_path) const {

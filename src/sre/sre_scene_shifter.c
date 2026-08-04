@@ -65,6 +65,8 @@ int      g_sre_scene_list_count = 0;
 volatile int     g_sre_scene_shift_pending   = 0;
 char             g_sre_scene_shift_target[SRE_SCENE_NAME_MAX] = {0};
 char             g_sre_scene_shift_spawn[64]                  = "start";
+volatile uint64_t g_sre_scene_shifter_poll_ticks = 0;
+volatile uint64_t g_sre_scene_shifter_dispatch_count = 0;
 
 /* --- Instant load state (Forced gateway arm) --- */
 volatile int     g_sre_instant_scene_load_enabled = 0;  /* 1 = short-circuit next Update */
@@ -82,7 +84,7 @@ int              g_sre_scene_shift_active   = 0; /* 1 while forced load in fligh
  *   Verified: nm -D libswordigo.so | grep GotoLevel → 0000000000358a74
  *
  * CaverShell singleton global (BSS, v1.4.12):
- *   0x007F3C20 — DAT_007F3C20 = CaverShell*
+ *   0x006E9C20 — qword_6E9C20 = CaverShell*
  *   CaverShell+0x98  = GUINavigationController* (set in InitView, confirmed Ghidra)
  *   GUINavCtrl+0x10  = boost::shared_ptr<GUIViewController>.px = raw GVC*
  *   (boost::shared_ptr layout: +0x00=px raw ptr, +0x08=pn refcount block)
@@ -99,13 +101,12 @@ int              g_sre_scene_shift_active   = 0; /* 1 while forced load in fligh
  * ========================================================================= */
 
 #define OFF_GotoLevel               0x00358A74ULL
-#define OFF_SceneLoadingView_Update 0x0043650CULL
 
 /* CaverShell global pointer in BSS (DAT_007F3C20, confirmed frame_loop + Ghidra) */
-#define OFF_CaverShell_globalptr    0x007F3C20ULL
+#define OFF_CaverShell_globalptr    0x006E9C20ULL
 
 /* CaverShell struct offsets (Ghidra CaverShell::Update + InitView) */
-#define CAVERSHELL_OFF_NAV_CTRL     0x98  /* GUINavigationController* */
+#define CAVERSHELL_OFF_NAV_CTRL     0x98  /* shared_ptr: px at +0x98 */
 
 /* GUINavigationController struct offsets
  * Confirmed via aarch64 disassembly of SetCurrentViewController (0x49a550):
@@ -137,10 +138,10 @@ typedef void (*pfn_GotoLevel)(void* self, SreString* level_name, SreString* spaw
  *
  * Chain (all confirmed via Ghidra + sre_frame_loop.c):
  *   g_swordigo_base + OFF_CaverShell_globalptr
- *     → CaverShell*                        (DAT_007F3C20)
+ *     → CaverShell*                        (qword_6E9C20)
  *   CaverShell* + CAVERSHELL_OFF_NAV_CTRL (0x98)
  *     → GUINavigationController*
- *   GUINavigationController* + NAVCTRL_OFF_CURRENT_VC_PX (0x10)
+ *   GUINavigationController* + NAVCTRL_OFF_CURRENT_VC_PX (0x50)
  *     → px field of boost::shared_ptr<GUIViewController> = raw GVC*
  *
  * Returns NULL if any pointer in the chain is invalid.
@@ -172,8 +173,10 @@ static void* sre_get_active_gvc(void) {
         return NULL;
     }
 
-    /* raw GVC* from NavCtrl+0x50 (px of boost::shared_ptr<GVC>)
-     * Confirmed: SetCurrentViewController ldr x0, [x19, #80] (80=0x50) */
+    /* Current view controller is GUINavigationController::currentViewController,
+     * whose shared_ptr px is at +0x50. The old code incorrectly described the
+     * shell field as a raw pointer, but InitView stores a boost::shared_ptr at
+     * shell+0x98, so dereference its px field first. */
     void** gvc_slot = (void**)((char*)nav_ctrl + NAVCTRL_OFF_CURRENT_VC_PX);
     void*  gvc      = *gvc_slot;
     fprintf(stderr, "[SRE/SceneShifter] GVC chain: nav_ctrl+0x%x => gvc=%p\n",
@@ -229,7 +232,7 @@ static int sre_scene_shifter_call_goto_level(const char* level_name,
     void* gvc = sre_get_active_gvc();
     if (!gvc) {
         snprintf(g_sre_scene_shift_last_error, sizeof(g_sre_scene_shift_last_error),
-                 "No active GameViewController (CaverShell chain: shell+0x98->NavCtrl+0x10->GVC)");
+                  "No active GameViewController (CaverShell chain: shell+0x98->NavCtrl+0x50->GVC)");
         g_sre_scene_shift_active = 0;
         return 0;
     }
@@ -331,10 +334,12 @@ int sre_scene_shifter_forced(const char* level_name, const char* spawn_point) {
  * Mode 2 = Forced gateway (same mechanics, labelled differently in UI)
  * ========================================================================= */
 void sre_scene_shifter_tick(void) {
+    g_sre_scene_shifter_poll_ticks++;
     if (!g_sre_scene_shift_pending) return;
 
     int mode = g_sre_scene_shift_pending;
     g_sre_scene_shift_pending = 0;  /* clear first to prevent double-fire */
+    g_sre_scene_shifter_dispatch_count++;
 
     char level[SRE_SCENE_NAME_MAX];
     char spawn[64];
@@ -355,6 +360,9 @@ void sre_scene_shifter_tick(void) {
     } else if (mode == 2) {
         sre_scene_shifter_forced(level, spawn);
     }
+    
+    strncpy(g_sre_current_scene_name, level, 127);
+    g_sre_current_scene_name[127] = '\0';
 }
 
 /* =========================================================================
@@ -491,9 +499,8 @@ static int sre_lua_list_scenes(lua_State* L) {
     if (g_lua_createtable) {
         g_lua_createtable(L, g_sre_scene_list_count, 0);
         for (int i = 0; i < g_sre_scene_list_count; i++) {
-            if (g_lua_pushnumber) g_lua_pushnumber(L, i + 1);
             if (g_lua_pushstring) g_lua_pushstring(L, g_sre_scene_list[i]);
-            if (g_lua_settable)   g_lua_settable(L, -3);
+            if (g_lua_rawseti) g_lua_rawseti(L, -2, i + 1);
         }
     }
     return 1;

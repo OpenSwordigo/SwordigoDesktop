@@ -1,104 +1,55 @@
 #!/bin/bash
-# run_swordigo.sh — One-shot build, install, and run
-# Usage: ./run_swordigo.sh [--clean] [--sre-only] [--no-build] [--no-dynarmic]
-
 set -e
-cd ~/SwordigoDesktop
-
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="$ROOT_DIR/build-cmake"
 CLEAN=0
 SRE_ONLY=0
-NO_BUILD=0
+BUILD=1
 USE_DYNARMIC=1
-
+ARGS=()
 for arg in "$@"; do
-    case $arg in
-        --clean)       CLEAN=1 ;;
-        --sre-only)    SRE_ONLY=1 ;;
-        --no-build)    NO_BUILD=1 ;;
+    case "$arg" in
+        --clean) CLEAN=1 ;;
+        --sre-only) SRE_ONLY=1 ;;
+        --build) BUILD=1 ;;
+        --no-build) BUILD=0 ;;
         --no-dynarmic) USE_DYNARMIC=0 ;;
-        --help)
-            echo "Usage: ./run_swordigo.sh [--clean] [--sre-only] [--no-build] [--no-dynarmic]"
-            echo "  --clean        Full clean rebuild"
-            echo "  --sre-only     Only rebuild libsre.so"
-            echo "  --no-build     Skip build, just install and run"
-            echo "  --no-dynarmic  Use Unicorn interpreter instead of Dynarmic JIT"
-            exit 0 ;;
+        --help) printf '%s\n' 'Usage: ./run_swordigo.sh [--build] [--clean] [--sre-only] [--no-build] [--no-dynarmic]' '  --build        Incremental build before launching (default)' '  --clean        Delete build-cmake and rebuild everything' '  --sre-only     Incrementally build only libsre.so' '  --no-build     Skip the incremental build' '  --no-dynarmic  Use Unicorn instead of Dynarmic'; exit 0 ;;
+        *) ARGS+=("$arg") ;;
     esac
 done
-
-ENGINE_DIR="$HOME/.local/share/swordigo-desktop/engine/v1.4.12/arm64-v8a"
-DYNARMIC_LIB="deps/dynarmic/build/src/dynarmic/libdynarmic.a"
-
-# ---- Build Dynarmic JIT (if needed) ----
-if [ $USE_DYNARMIC -eq 1 ] && [ $NO_BUILD -eq 0 ]; then
-    if [ ! -f "$DYNARMIC_LIB" ]; then
-        echo "=== Building Dynarmic JIT from source (first time only) ==="
-        make dynarmic-build
-        echo ""
-    fi
-fi
-
-# ---- Build ----
-if [ $NO_BUILD -eq 0 ]; then
-    if [ $CLEAN -eq 1 ]; then
-        echo "=== CLEAN BUILD ==="
-        make clean
-    fi
-
-    if [ $SRE_ONLY -eq 1 ]; then
-        echo "=== Building libsre.so only ==="
-        make libsre.so
+if [ "$CLEAN" -eq 1 ] || [ "$SRE_ONLY" -eq 1 ]; then BUILD=1; fi
+if [ "$CLEAN" -eq 1 ]; then rm -rf "$BUILD_DIR"; fi
+if [ "$BUILD" -eq 1 ]; then
+    cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -DSWORDIGO_USE_DYNARMIC="$USE_DYNARMIC" -DSWORDIGO_BUILD_SRE=ON
+    if [ "$SRE_ONLY" -eq 1 ]; then
+        cmake --build "$BUILD_DIR" --target sre -j "$(nproc)"
     else
-        if [ $USE_DYNARMIC -eq 1 ]; then
-            echo "=== Building with Dynarmic JIT ==="
-            make -j$(nproc) DYNARMIC=1
-        else
-            echo "=== Building with Unicorn ==="
-            make -j$(nproc)
+        if [ "$USE_DYNARMIC" -eq 1 ] && [ ! -f "$ROOT_DIR/deps/dynarmic/build/src/dynarmic/libdynarmic.a" ]; then
+            cmake --build "$BUILD_DIR" --target dynarmic-build -j "$(nproc)"
         fi
+        cmake --build "$BUILD_DIR" --target sre -j "$(nproc)"
+        cmake --build "$BUILD_DIR" -j "$(nproc)"
     fi
 fi
-
-# ---- Install libsre.so to ALL ARM64 engine directories ----
-if [ -f libsre.so ]; then
+if [ ! -x "$ROOT_DIR/bin/swordfare" ]; then
+    echo "Swordfare is not built. Run: ./run_swordigo.sh --build" >&2
+    exit 1
+fi
+if [ -f "$ROOT_DIR/libsre.so" ]; then
     SRE_INSTALLED=0
-    # Overwrite libsre.so inside all matching engine instance subdirectories
     while IFS= read -r dir; do
         if [ -d "$dir" ]; then
-            cp libsre.so "$dir/libsre.so"
-            echo "[OK] libsre.so -> $dir/"
+            cp "$ROOT_DIR/libsre.so" "$dir/libsre.so"
             SRE_INSTALLED=$((SRE_INSTALLED + 1))
         fi
-    done < <(find "$HOME/.local/share/swordigo-desktop/engine" -type d -name "arm64-v8a" 2>/dev/null)
-
-    if [ $SRE_INSTALLED -eq 0 ]; then
+    done < <(find "$HOME/.local/share/swordigo-desktop/engine" -type d -name arm64-v8a 2>/dev/null)
+    if [ "$SRE_INSTALLED" -eq 0 ]; then
+        ENGINE_DIR="$HOME/.local/share/swordigo-desktop/engine/v1.4.12/arm64-v8a"
         mkdir -p "$ENGINE_DIR"
-        cp libsre.so "$ENGINE_DIR/libsre.so"
-        echo "[OK] libsre.so -> $ENGINE_DIR/ (fallback)"
-    else
-        echo "[OK] libsre.so installed to $SRE_INSTALLED ARM64 engine dir(s)"
+        cp "$ROOT_DIR/libsre.so" "$ENGINE_DIR/libsre.so"
     fi
-else
-    echo "[WARN] libsre.so not found — skipping install"
 fi
-
-# ---- Install updated manifest.json ----
-if [ -f engine/manifest.json ]; then
-    MANIFEST_DIR="$HOME/.local/share/swordigo-desktop/engine"
-    mkdir -p "$MANIFEST_DIR"
-    cp engine/manifest.json "$MANIFEST_DIR/manifest.json"
-    echo "[OK] manifest.json -> $MANIFEST_DIR/"
-fi
-
-# ---- Run ----
-echo ""
-echo "=========================================="
-if [ $USE_DYNARMIC -eq 1 ]; then
-    echo "  Launching Swordigo Desktop (Dynarmic JIT)"
-else
-    echo "  Launching Swordigo Desktop (Unicorn)"
-fi
-echo "=========================================="
-echo ""
-export LD_LIBRARY_PATH="$(dirname "$0")/bin/libs:$LD_LIBRARY_PATH"
-exec ./bin/swordfare "$@"
+if [ -f "$ROOT_DIR/engine/manifest.json" ]; then mkdir -p "$HOME/.local/share/swordigo-desktop/engine"; cp "$ROOT_DIR/engine/manifest.json" "$HOME/.local/share/swordigo-desktop/engine/manifest.json"; fi
+export LD_LIBRARY_PATH="$ROOT_DIR/bin/libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$ROOT_DIR/bin/swordfare" "${ARGS[@]}"

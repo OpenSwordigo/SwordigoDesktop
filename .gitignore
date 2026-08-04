@@ -4,6 +4,7 @@
 # -------- BUILDS / OUTPUTS / BINARIES --------
 # Build artifacts
 build/
+build-cmake/
 *.o
 swordigo_boot
 swordigo_headless

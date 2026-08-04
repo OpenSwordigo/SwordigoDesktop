@@ -93,6 +93,7 @@ void sre_effects_frame_reset(void) {
  */
 
 void sre_PortalEffectComponent_Draw(void* self, void* ctx, void* matrix_ref, void* vec3_a, void* vec3_b) {
+    if (!self) return;
     float* vp = (float*)matrix_ref;  /* VP matrix from x2 */
     char* s = (char*)self;
     
@@ -151,6 +152,7 @@ void sre_PortalEffectComponent_Draw(void* self, void* ctx, void* matrix_ref, voi
  * Original: SimpleGlowComponent::Draw at 0x2b0e90
  */
 void sre_SimpleGlowComponent_Draw(void* self, void* ctx, void* matrix_ref, void* vec3_a, void* vec3_b) {
+    if (!self || !matrix_ref) return;
     float* mat = (float*)matrix_ref;
     g_sre_glow_x = mat[12];
     g_sre_glow_y = mat[13];
@@ -179,6 +181,7 @@ extern SreTrinketGlowRef g_sre_trinket_glows[16];
 extern int g_sre_trinket_glow_count;
 
 void sre_WeaponGlowComponent_Draw(void* self, void* ctx, void* matrix_ref, void* vec3_a, void* vec3_b) {
+    if (!self) return;
     char* s = (char*)self;
     
     /* Read default glow color from component (FloatColor at ~0x60) */
@@ -211,6 +214,7 @@ float   g_sre_weapon_trail_b = 1.0f;
 float   g_sre_weapon_trail_a = 0.8f;
 
 void sre_WeaponTrailComponent_Draw(void* self, void* ctx, void* matrix_ref, void* vec3_a, void* vec3_b) {
+    if (!self) return;
     char* s = (char*)self;
     
     /* Read trail color from component (FloatColor at ~0x70) */

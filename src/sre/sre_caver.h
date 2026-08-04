@@ -329,7 +329,7 @@ static inline void sre_scene_object_set_speed(SceneObject* obj, float speed) {
  *
  * gameController (Lua global "gameController") is a lightuserdata.
  * GameController+0xc8 → GameSceneController*
- * GameSceneController+0x8 → Hero SceneObject*
+ * GameSceneController+0xd8 → active Hero SceneObject*
  * ========================================================================= */
 
 /* Get the active GameController* from a Lua state (reads "gameController" global) */
@@ -352,10 +352,10 @@ static inline SceneController* sre_scene_controller_from_L(lua_State* L) {
     return sre_scene_controller_from_gc(sre_game_controller_from_L(L));
 }
 
-/* Get hero SceneObject* from scene controller (SceneController+0x8) */
+/* Get active hero SceneObject* from scene controller (SceneController+0xd8) */
 static inline SceneObject* sre_hero_object_from_sc(SceneController* sc) {
     if (!sc) return (void*)0;
-    return (SceneObject*)$F(void*, sc, 0x8);
+    return (SceneObject*)$F(void*, sc, 0xd8);
 }
 
 static inline SceneObject* sre_hero_object_from_L(lua_State* L) {

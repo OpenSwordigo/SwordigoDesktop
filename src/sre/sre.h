@@ -130,6 +130,9 @@ typedef struct { float r, g, b, a; } SreColor;
 /* Per-frame coroutine time-budget state (volatile, polled by ProgramState_Update) */
 extern volatile int   g_sre_frame_budget_expired;
 extern volatile float g_sre_frame_budget_ms_remaining;
+extern volatile uint64_t g_sre_update_application_ticks;
+extern volatile uint64_t g_sre_frame_update_ticks;
+extern volatile uint64_t g_sre_frame_shell_ticks;
 
 /* Called at the start of each host frame to reset the time budget */
 void sre_frame_budget_start(void);
@@ -169,5 +172,9 @@ extern uint64_t g_orig_GameData_Clear;
 /* ComponentOutletBase::Connect vtable safety guard (sre_scene_update.c) */
 uint64_t sre_ComponentOutletBase_Connect(void* this_, void* a2);
 extern uint64_t g_orig_ComponentOutletBase_Connect;
+
+/* Proto::SceneObject destructor guard used during scene teardown. */
+void sre_Proto_SceneObject_Destroy(void* this_);
+extern uint64_t g_orig_Proto_SceneObject_Destroy;
 
 #endif /* SRE_H */
