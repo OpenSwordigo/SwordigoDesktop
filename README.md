@@ -1,4 +1,4 @@
-# SwordigoDesktop & Swordigo Runtime Engine (SRE)
+# SwordigoDesktop & Swordigo Developement Kit (SDK)
 
 Standard Binary Compatibility Layer, ARM64 JIT Execution Runtime, and Software Development Kit for Linux.
 
