@@ -9,6 +9,7 @@
 #include "platform/save_editor.h"
 #include "platform/IconsFontAwesome6.h"
 #include "platform/pvr_loader.h"
+#include "platform/embedded_assets.h"
 
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_sdl3.h"
@@ -217,6 +218,50 @@ static GLuint LoadTextureFromFile(const char* path, int* out_w, int* out_h) {
     if (out_h) *out_h = rgba->h;
     SDL_DestroySurface(rgba);
     return tex;
+}
+
+// Decode an embedded (or in-memory) PNG/JPEG into a GL texture.
+// This is the permanent fallback: assets baked into the binary always work,
+// even when deb/rpm packaging drops the launcher/ asset directory.
+static GLuint LoadTextureFromMemory(const unsigned char* data, size_t size, int* out_w, int* out_h) {
+    if (!data || size < 8) return 0;
+    int w = 0, h = 0;
+    unsigned char* px = nullptr;
+    if (!asset_decode_image(data, size, &px, &w, &h)) return 0;
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    asset_image_free(px);
+    return tex;
+}
+
+// Decode an embedded image into an SDL surface (for window icons).
+static SDL_Surface* LoadSurfaceFromMemory(const unsigned char* data, size_t size) {
+    if (!data || size < 8) return nullptr;
+    int w = 0, h = 0;
+    unsigned char* px = nullptr;
+    if (!asset_decode_image(data, size, &px, &w, &h)) return nullptr;
+    SDL_Surface* surf = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_ABGR8888, px, w * 4);
+    if (!surf) { asset_image_free(px); return nullptr; }
+    // Copy pixels into a surface that owns its own buffer, then free the stb buffer.
+    SDL_Surface* copy = SDL_DuplicateSurface(surf);
+    SDL_DestroySurface(surf);
+    asset_image_free(px);
+    return copy;
+}
+
+// Try an embedded asset by any of its known names; returns first hit.
+static GLuint LoadTextureEmbedded(const char* name, int* out_w = nullptr, int* out_h = nullptr) {
+    const unsigned char* data = nullptr;
+    size_t size = 0;
+    if (embedded_asset(name, &data, &size))
+        return LoadTextureFromMemory(data, size, out_w, out_h);
+    return 0;
 }
 
 static std::string ReadFileToString(const std::string& path) {
@@ -851,10 +896,12 @@ static void DrawHomePage(BinarySelector& selector, int& selected,
     // ── Quick stats row ──
     {
         float cw = (ImGui::GetContentRegionAvail().x - 36) / 3.0f;
-        struct StatCard { const char* icon; const char* val; const char* lbl; ImVec4 col; };
+        const std::string instance_count = std::to_string(bins.size());
+        const std::string mod_count = std::to_string(g_mods.size());
+        struct StatCard { const char* icon; std::string val; const char* lbl; ImVec4 col; };
         StatCard cards[] = {
-            { ICON_FA_GAMEPAD,  std::to_string(bins.size()).c_str(), "Instances",    ImVec4(0.35f, 0.65f, 1.0f, 1.0f) },
-            { ICON_FA_PUZZLE_PIECE, std::to_string(g_mods.size()).c_str(), "Mods Active", ImVec4(0.24f, 0.72f, 0.31f, 1.0f) },
+            { ICON_FA_GAMEPAD,  instance_count, "Instances",    ImVec4(0.35f, 0.65f, 1.0f, 1.0f) },
+            { ICON_FA_PUZZLE_PIECE, mod_count, "Mods Active", ImVec4(0.24f, 0.72f, 0.31f, 1.0f) },
             { ICON_FA_CLOCK,    "—",                                "Hours Played", ImVec4(0.82f, 0.60f, 0.13f, 1.0f) },
         };
         for (int i = 0; i < 3; i++) {
@@ -866,7 +913,7 @@ static void DrawHomePage(BinarySelector& selector, int& selected,
             ImGui::TextColored(cards[i].col, "%s", cards[i].icon);
             ImGui::SameLine();
             if (g_font_heading) ImGui::PushFont(g_font_heading);
-            ImGui::TextColored(ImVec4(0.92f, 0.94f, 0.97f, 1.0f), "%s", cards[i].val);
+            ImGui::TextColored(ImVec4(0.92f, 0.94f, 0.97f, 1.0f), "%s", cards[i].val.c_str());
             if (g_font_heading) ImGui::PopFont();
             ImGui::SetCursorPosX(14);
             ImGui::TextDisabled("%s", cards[i].lbl);
@@ -2186,27 +2233,38 @@ LaunchConfig show_launcher(BinarySelector& selector) {
     g_sdl_window = window;
     SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 
-    // Set window icon
+    // Set window icon — embedded asset first (permanent), then disk fallbacks
     {
-        std::string icon_via_data = get_data_path("src/assets/launcer_icon.png");
-        std::string icon_via_launcher = get_user_data_dir() + "/launcher/launcer_icon.png";
-        const char* icon_paths[] = {
-            icon_via_data.c_str(),
-            "src/assets/launcer_icon.png",
-            icon_via_launcher.c_str(),
-            "src/assets/icon_gnome.png",
-            "/usr/share/icons/hicolor/128x128/apps/swordigo-desktop.png",
-            "/usr/share/pixmaps/swordigo-desktop.png",
-            nullptr
-        };
-        for (int i = 0; icon_paths[i]; i++) {
-            SDL_Surface* icon_surf = IMG_Load(icon_paths[i]);
-            if (icon_surf) {
-                SDL_SetWindowIcon(window, icon_surf);
-                SDL_DestroySurface(icon_surf);
-                std::cout << "[Launcher] Icon loaded from: " << icon_paths[i] << std::endl;
-                break;
+        SDL_Surface* icon_surf = nullptr;
+        const unsigned char* icon_data = nullptr;
+        size_t icon_size = 0;
+        if (embedded_asset("launcer_icon.png", &icon_data, &icon_size)) {
+            icon_surf = LoadSurfaceFromMemory(icon_data, icon_size);
+            if (icon_surf) std::cout << "[Launcher] Icon loaded from embedded assets" << std::endl;
+        }
+        if (!icon_surf) {
+            std::string icon_via_data = get_data_path("src/assets/launcer_icon.png");
+            std::string icon_via_launcher = get_user_data_dir() + "/launcher/launcer_icon.png";
+            const char* icon_paths[] = {
+                icon_via_data.c_str(),
+                "src/assets/launcer_icon.png",
+                icon_via_launcher.c_str(),
+                "src/assets/icon_gnome.png",
+                "/usr/share/icons/hicolor/128x128/apps/swordigo-desktop.png",
+                "/usr/share/pixmaps/swordigo-desktop.png",
+                nullptr
+            };
+            for (int i = 0; icon_paths[i]; i++) {
+                icon_surf = IMG_Load(icon_paths[i]);
+                if (icon_surf) {
+                    std::cout << "[Launcher] Icon loaded from: " << icon_paths[i] << std::endl;
+                    break;
+                }
             }
+        }
+        if (icon_surf) {
+            SDL_SetWindowIcon(window, icon_surf);
+            SDL_DestroySurface(icon_surf);
         }
     }
 
@@ -2248,6 +2306,9 @@ LaunchConfig show_launcher(BinarySelector& selector) {
         text_cfg.OversampleH = 3;
         text_cfg.OversampleV = 2;
         text_cfg.PixelSnapH = true;
+        // Embedded fonts are static .rodata in the binary — never let the
+        // atlas free() them (default is owned=true → free(): invalid size crash)
+        text_cfg.FontDataOwnedByAtlas = false;
         
         // Icon font config (Font Awesome — merged into same atlas)
         static const ImWchar icon_ranges[] = { ICON_FA_MIN, ICON_FA_MAX, 0 };
@@ -2258,6 +2319,7 @@ LaunchConfig show_launcher(BinarySelector& selector) {
         icon_cfg.PixelSnapH = true;
         icon_cfg.GlyphMinAdvanceX = font_size_main;
         icon_cfg.GlyphOffset = ImVec2(0, 2);
+        icon_cfg.FontDataOwnedByAtlas = false;
         
         // Search paths — SpaceGrotesk is the primary launcher font
         std::string inter_paths[] = {
@@ -2309,7 +2371,7 @@ LaunchConfig show_launcher(BinarySelector& selector) {
             "/usr/share/swordigo-desktop/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
         };
         
-        // Find font files
+        // Find font files (disk fallback only)
         std::string inter_path, fa_path;
         for (auto& fp : inter_paths) {
             if (fs::exists(fp)) { inter_path = fp; break; }
@@ -2317,9 +2379,54 @@ LaunchConfig show_launcher(BinarySelector& selector) {
         for (auto& fp : fa_paths) {
             if (fs::exists(fp)) { fa_path = fp; break; }
         }
-        
+
+        // ── Embedded fonts FIRST (permanent fix — always available) ──
+        const unsigned char* emb_main = nullptr; size_t emb_main_size = 0;
+        const unsigned char* emb_fa   = nullptr; size_t emb_fa_size   = 0;
+        const char* emb_font_names[] = {
+            "fonts/SpaceGrotesk-VariableFont_wght.ttf",
+            "fonts/MegalopolisExtra-Regular.otf",
+            "fonts/Inter-Regular.ttf",
+        };
+        for (const char* n : emb_font_names) {
+            if (embedded_asset(n, &emb_main, &emb_main_size)) break;
+        }
+        if (!embedded_asset("fonts/fa-solid-900.ttf", &emb_fa, &emb_fa_size))
+            embedded_asset("fonts/fa-solid-900.otf", &emb_fa, &emb_fa_size);
+
         bool font_loaded = false;
-        if (!inter_path.empty()) {
+        if (emb_main && emb_main_size > 0) {
+            g_font_main = io.Fonts->AddFontFromMemoryTTF((void*)emb_main, (int)emb_main_size,
+                                                         font_size_main, &text_cfg);
+            // Merge Font Awesome icons into main font
+            if (g_font_main && emb_fa && emb_fa_size > 0) {
+                ImFontConfig icon_cfg_emb = icon_cfg;
+                icon_cfg_emb.GlyphMinAdvanceX = font_size_main;
+                icon_cfg_emb.GlyphOffset = ImVec2(0, 2);
+                io.Fonts->AddFontFromMemoryTTF((void*)emb_fa, (int)emb_fa_size,
+                                               font_size_main * 0.85f, &icon_cfg_emb, icon_ranges);
+                std::cout << "[Launcher] FontAwesome icons merged from embedded font" << std::endl;
+            }
+            // Load heading font from the same embedded face
+            ImFontConfig heading_cfg = text_cfg;
+            g_font_heading = io.Fonts->AddFontFromMemoryTTF((void*)emb_main, (int)emb_main_size,
+                                                            font_size_heading, &heading_cfg);
+            if (g_font_heading && emb_fa && emb_fa_size > 0) {
+                ImFontConfig icon_heading_cfg = icon_cfg;
+                icon_heading_cfg.GlyphMinAdvanceX = font_size_heading;
+                icon_heading_cfg.GlyphOffset = ImVec2(0, 3);
+                io.Fonts->AddFontFromMemoryTTF((void*)emb_fa, (int)emb_fa_size,
+                                               font_size_heading * 0.85f, &icon_heading_cfg, icon_ranges);
+            }
+            if (g_font_main && g_font_heading) {
+                font_loaded = true;
+                std::cout << "[Launcher] Embedded font loaded (scale=" << dpi_scale
+                          << "x, size=" << font_size_main << "px)" << std::endl;
+            }
+        }
+
+        // Disk fallback (old behaviour)
+        if (!font_loaded && !inter_path.empty()) {
             g_font_main = io.Fonts->AddFontFromFileTTF(inter_path.c_str(), font_size_main, &text_cfg);
             
             // Merge Font Awesome icons into main font
@@ -2372,8 +2479,16 @@ LaunchConfig show_launcher(BinarySelector& selector) {
         auto try_load = [](const char* sub, int* ow = nullptr, int* oh = nullptr) -> GLuint {
             int w = 0, h = 0;
             GLuint tex = 0;
+            // Try 0: embedded in binary — ALWAYS available (permanent fix)
+            tex = LoadTextureEmbedded(sub, &w, &h);
+            if (!tex) {
+                // Also try without a leading dir if the caller passed an "icons/" path
+                const char* slash = strrchr(sub, '/');
+                if (slash) tex = LoadTextureEmbedded(slash + 1, &w, &h);
+            }
             // Try 1: relative to CWD (dev mode)
-            tex = LoadTextureFromFile((std::string("src/assets/") + sub).c_str(), &w, &h);
+            if (!tex)
+                tex = LoadTextureFromFile((std::string("src/assets/") + sub).c_str(), &w, &h);
             // Try 2: launcher/ subfolder in user data dir (RPM/DEB friendly)
             if (!tex) {
                 std::string p2 = get_user_data_dir() + "launcher/" + sub;
@@ -2487,7 +2602,10 @@ LaunchConfig show_launcher(BinarySelector& selector) {
         if (!running) break;
 
         // Animation timer
-        g_anim_time += 1.0f / 60.0f;
+        static Uint64 animation_time = SDL_GetTicks();
+        Uint64 now = SDL_GetTicks();
+        g_anim_time += std::min(0.1f, (float)(now - animation_time) / 1000.0f);
+        animation_time = now;
 
         // Update mock mod download progress
         for (int i = 0; i < 6; i++) {

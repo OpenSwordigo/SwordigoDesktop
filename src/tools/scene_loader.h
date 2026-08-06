@@ -56,6 +56,9 @@ struct SceneComponentField {
     std::string bytes_value;
 };
 
+// Forward declaration (full definition below SceneData).
+struct SceneGroup;
+
 // ============================================================
 // One object in the scene (game object + transform + components)
 // ============================================================
@@ -83,10 +86,49 @@ struct SceneObject {
     std::string mesh_name;           // .POD model name if MeshRenderer found
     std::string texture_name;        // texture name if found in component data
     std::string background_name;     // background model if Background component
+    bool        is_spawn_point = false;  // SpawnPoint component (camera port)
+
+    // True when this object carries no renderable geometry — its components are
+    // purely non-visual (Light, Portal, CollisionShape, SpawnPoint, controllers,
+    // AI, triggers). Such objects resolve fine but have nothing to draw, so the
+    // editor shows a tiny neutral marker instead of a "missing model" dot.
+    bool is_non_visual() const {
+        if (!mesh_name.empty() || !background_name.empty() || !ground_meshes.empty())
+            return false;
+        if (components.empty() && resolved_components.empty())
+            return false;
+        for (const auto& c : resolved_components.empty() ? components : resolved_components) {
+            const std::string& t = c.type_name;
+            if (t.find("MeshRenderer") != std::string::npos ||
+                t.find("ModelComponent") != std::string::npos ||
+                t.find("GroundMesh") != std::string::npos ||
+                t.find("Sprite") != std::string::npos ||
+                t.find("Particle") != std::string::npos ||
+                t.find("FireEmitter") != std::string::npos ||
+                t.find("WaterMesh") != std::string::npos ||
+                t.find("Skeleton") != std::string::npos)
+                return false;
+        }
+        return true;
+    }
 
     // --- Embedded GroundMesh meshes and textures ---
     std::vector<PODMesh>       ground_meshes;
     std::vector<std::string>   ground_mesh_textures;
+
+    // --- GroundMesh round-trip state (vertex editing support) ---
+    // ground_mesh_raw[i]   = original serialized MeshData message for mesh i
+    //                        (field 1 num_verts, field 10 material, field 50
+    //                        vertex stream, field 51 index stream, ...).
+    // ground_mesh_fields[i] = the GroundMeshComponent child field number the
+    //                        mesh was read from (6=Mesh, 8=FrontMesh, 9=SurfaceMesh).
+    // ground_meshes_dirty   = true once the parsed vertex data was modified;
+    //                        scene_save then re-serializes the GroundMesh
+    //                        component from ground_meshes instead of writing
+    //                        the original raw_data verbatim.
+    std::vector<std::string>   ground_mesh_raw;
+    std::vector<int>           ground_mesh_fields;
+    bool                       ground_meshes_dirty = false;
 };
 
 // ============================================================
@@ -106,12 +148,63 @@ struct SceneData {
     std::vector<std::string> groups;            // tag 4: Group (SceneObjectGroup)[]
     std::vector<std::string> onload_scripts;    // tag 5: OnLoad (Program)[]
 
+    // External .scl object libraries referenced by ObjectLibrary.ImportedLibrary
+    // (tag 3). Loaded from disk during scene_load for template resolution only —
+    // never serialized back into the scene file.
+    std::vector<std::string> external_libraries;
+
+    // Names of imported libraries that could not be found on disk (diagnostics).
+    std::vector<std::string> missing_libraries;
+
+    // Parsed view of the raw SceneObjectGroup messages (never serialized).
+    std::vector<SceneGroup> parsed_groups;
+
+    // Parsed WaterMesh components (never serialized — render-time fluid).
+    // WaterMeshComponent payload (114) -> { BoundsShapeId (shape id),
+    // TextureMappingId (tex id), FrontColor (RGBA), SurfaceColor (RGBA) }.
+    // The bounds shape (a ShapeComponent payload 120 Rectangle) defines the
+    // fluid sheet: x, y, w, h in object-local coordinates. The texture mapping
+    // (TextureMapping payload 113 field 1) names the texture (e.g. "water").
+    struct SceneWater {
+        int    object_index = -1;    // owning SceneObject index
+        float  rect[4] = {0, 0, 0, 0};   // x, y, w, h (object-local)
+        float  front_color[4] = {0.5f, 0.7f, 1.0f, 0.7f};   // RGBA
+        float  surface_color[4] = {0.7f, 0.9f, 1.0f, 0.7f}; // RGBA
+        float  tile_size = 64.0f;    // texture tile size (TextureMapping f2)
+        float  tex_offset[2] = {0, 0}; // texture offset (TextureMapping f3)
+        std::string texture;         // texture name (e.g. "water")
+    };
+    std::vector<SceneWater> waters;
+
+    // Parsed Light components (never serialized — render-time lighting).
+    // LightComponent payload: f130 { f1 Type(1=Ambient,2=Dir,4=Point),
+    // f2 Intensity, f3 Color, f6 Offset, f7 Radius }.
+    struct SceneLight {
+        int     type      = 4;        // 1 Ambient, 2 Directional, 4 Point
+        float   intensity = 1.0f;
+        float   color[3]  = {1.0f, 0.95f, 0.8f};
+        float   pos[3]    = {0, 0, 0};
+        float   radius    = 300.0f;
+    };
+    std::vector<SceneLight> lights;
+
     // Any unrecognised top-level fields — preserved verbatim for forward compat
     std::vector<proto::Field> other_fields;
 
     // Axis-aligned bounding box computed from object positions
     float bounds_min[3] = {0, 0, 0};
     float bounds_max[3] = {0, 0, 0};
+};
+
+// A scene-level group (SceneObjectGroup) that bunches objects together for
+// hide/show and selection. Members reference SceneObject.name (tag 2). The raw
+// protobuf message is preserved in `raw` for verbatim round-trip serialization.
+struct SceneGroup {
+    std::string               name;       // tag 1  Identifier
+    std::vector<std::string>  members;    // tag 2  ObjectIdentifier[] (repeated)
+    bool                      hidden = false;    // tag 3  Hidden
+    bool                      locked  = false;   // tag 30 Locked
+    std::string               raw;        // original message bytes (round-trip)
 };
 
 // Load and parse a .scene file.  Returns an empty SceneData on failure.
@@ -124,9 +217,23 @@ std::string scene_serialize(const SceneData& scene);
 // Refresh derived object count and bounds after editing the object list.
 void scene_refresh(SceneData& scene);
 
+// Mark an object's ground meshes as edited so the next scene_save re-encodes
+// the GroundMesh component from the parsed vertex/index data.
+void scene_mark_ground_mesh_dirty(SceneData& scene, size_t object_index);
+
+// Swap the texture name of one ground mesh on an object. The material sub-message
+// (MeshData field 10) is rewritten in place so the change persists through
+// scene_save; ground_mesh_textures[mesh_index] is updated and the object is
+// flagged dirty. Returns false if the mesh index is out of range.
+bool scene_set_ground_mesh_texture(SceneObject& obj, size_t mesh_index,
+                                   const std::string& texture_name);
+
 // Object-list editing helpers. New and duplicated objects receive a unique
 // objN identifier, matching Ruby's reference editor behavior.
 std::string scene_fresh_identifier(const SceneData& scene);
+
+// Parse the raw SceneObjectGroup messages into SceneGroup structs.
+std::vector<SceneGroup> parse_scene_groups(const std::vector<std::string>& raw_groups);
 size_t scene_create_object(SceneData& scene, const std::string& template_name = "SceneObject");
 bool scene_duplicate_object(SceneData& scene, size_t index, size_t* new_index = nullptr);
 size_t scene_paste_object(SceneData& scene, const SceneObject& object);

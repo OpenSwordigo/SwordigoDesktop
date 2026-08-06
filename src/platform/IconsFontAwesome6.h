@@ -28,6 +28,10 @@
 
 // --- Objects ---
 #define ICON_FA_GEAR             "\xef\x80\x93"  // U+F013
+#define ICON_FA_PAUSE            "\xef\x81\x8c"  // U+F04C
+#define ICON_FA_STOP             "\xef\x81\x8d"  // U+F04D
+#define ICON_FA_WARNING          "\xef\x81\xb1"  // U+F071
+#define ICON_FA_MOUNTAIN_SUN     "\xef\x95\xbe"  // U+F6FE
 #define ICON_FA_STAR             "\xef\x80\x85"  // U+F005
 #define ICON_FA_FLOPPY_DISK      "\xef\x83\x87"  // U+F0C7
 #define ICON_FA_FOLDER           "\xef\x81\xbb"  // U+F07B

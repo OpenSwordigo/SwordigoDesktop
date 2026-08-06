@@ -2,6 +2,59 @@
 
 All notable changes to Swordigo Desktop.
 
+## [v8.0 Beta 3] — 2026-08-06
+
+### Added — Ruby SDK Scene Editor (2-day drop)
+- **Vanilla Lighting & Atmosphere**: Light components parsed from real scene data (type/intensity/color/offset/radius) plus SimpleGlow torch/fire as warm point lights; up to 16 point lights with smooth falloff; vanilla golden-sun + deep cave-ambient defaults; Scene Lights panel + render toggle.
+- **Camera Ports**: Scene opens framed at `spawn_default`; View → Camera Ports submenu lists every SpawnPoint for one-click jumps (framing distance 160, pitch 30°).
+- **Background Layer Picker**: Inspector section to pick any background layer object by name/texture (Auto = first visible default).
+- **Emissive Bloom for Torches**: Additive camera-facing glow billboards at Light/SimpleGlow positions feeding the PostFX bloom bright-pass.
+- **Depth Fog**: Distance-based atmospheric darkening in the model shader (vanilla cave depth), camera-distance-scaled, toggleable.
+- **Fluid Rendering (Water / Lava)**: WaterMesh components parsed (shape rectangle + FrontColor/SurfaceColor + texture mapping) and rendered as animated semi-transparent fluid sheets with sine-wave surface + scrolling UV; `water_2x.pvr` auto-resolved; Settings toggle.
+- **High-DPI Render Scale**: 1x/1.5x/2x/3x FBO + PostFX rendering (default 3x) with logical-size UI display.
+- **HiDPI Texture Filtering**: Trilinear mipmaps + 4x anisotropy on uncompressed texture paths (compressed ETC1/PVRTC kept GL_LINEAR).
+- **Ground Mesh Generator Rework**: Mesh tab hides the right inspector panel and donates full width to the editor; live 3D preview enlarged; preview textures now probe `_2x.pvr` variants (fixes white preview); GM depth editing.
+- **Template/Proxy Cleanup**: Purely non-visual objects (Light/Portal/CollisionShape/SpawnPoint/controllers) render as tiny neutral markers instead of orange "missing model" dots; `scanscene` classifies them as non-visual.
+- **GLTF import/export + POD writer wired into build** (were referenced but never linked into `bin/ruby`).
+- **About page credits**: DanielSpaniel (official Python FileRift + Boulder engine, translated to C++), MrSinup, OpenSwordigo.
+
+### Fixed
+- **Scene-viewport input bug**: viewport hover captured immediately after `ImGui::Image` so orbit/zoom/pan/picking work reliably.
+- **Render-scale mismatch**: picking/overlays use logical size while FBO/PostFX use scaled size — no more broken picking at non-1x scales.
+- **Spawn camera too close**: reframed at in-game hero distance instead of hugging the spawn point.
+- **Model viewport**: fog/light state no longer leaks into POD + GM previews.
+- **`scanscene` stale-binary crash** resolved by forced rebuild; reports `non-visual` vs `missing-models` correctly.
+- **`scene_loader` water parsing**: WaterMesh rect + colors + texture resolved from real scene data (verified against fire_part1 + florennum_jail_boss).
+
+---
+
+## [v8.0 Beta 2] — 2026-07-31
+
+### Added
+- **RakNet Network Framework Integration**: Integrated RakNet cross-platform UDP engine into core build tree with low-level packet serialization, GUID handshakes, and peer connection state management.
+- **Modular Shared Object (.so) Build System**: Split monolithic code into 9 modular shared libraries (`libswcore.so`, `libswemu.so`, `libswgfx.so`, `libswgui.so`, `libfilerift.so`, `libswordfare.so`, `libswfmt.so`, `libsre.so`, `libswordigo.so`) under `bin/` with `swordfare` primary executable.
+- **Swordfare Editor (IntelliJ) Overhaul**: Stateful multiline tokenization (`LexState`), custom `.styx` theme parser (`FileRift (Grove)`, `BatSyntax`), quote-aware comment stripping, string/comment-aware bracket error checking, line token caching, and Swordigo SDK autocomplete/symbol metadata (`Game`, `Character`, `Scene`, `PhysicsObject`, `Vector3`, `Shardshi`).
+- **OptiX Architectural Framework**: 10 master technical research specifications for modern graphics, PBR lighting, reflection hooks, and Dynarmic ARM64 JIT hardware acceleration.
+- **Dynarmic ARM64 JIT Tuning**: 512MB code cache allocation, unsafe FMA3 host instruction flags, and compiler optimization flags (`Unsafe_UnfuseFMA`, `Unsafe_ReducedErrorFP`, `Unsafe_InaccurateNaN`).
+
+### Fixed
+- **Regex Engine Stability**: Resolved `std::regex_error` lookbehind issues in `FileRift (Grove)` theme.
+- **Quote-Aware Config Comment Stripping**: Prevented comment stripping from destroying strings containing `//` or `--`.
+- **Modern Memory Access**: Standardized buffer access using C++17 `buffer->data()`.
+- **RPM Build Spec**: Fixed `/usr/bin/ruby` unpackaged file error in RPM packaging.
+
+---
+
+## [v8.0 Beta 1] — 2026-07-11
+
+### Added
+- **Universal Mod Virtual File System (VFS)**: 5-layer prioritized asset loading hierarchy.
+- **Native Uncompressed PVR & PVRTC Decoding**: Host-side PVR/PVRTC decompression.
+- **SwKiwi Native UI Overlays**: Interactive ImGui window overlays with input gating.
+- **True Lua Console & SRE Native Invocation**: `caver.call()` API and direct raw memory Read/Write APIs.
+
+---
+
 ## [v7.1] — 2026-06-25
 
 ### Added

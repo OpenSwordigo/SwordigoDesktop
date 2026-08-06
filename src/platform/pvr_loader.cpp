@@ -28,6 +28,8 @@
  *   [pixel data]
  */
 
+// Enable GL extension prototypes BEFORE any GL includes (glGenerateMipmap).
+#define GL_GLEXT_PROTOTYPES 1
 #include "pvr_loader.h"
 #include "pvrtc_decoder.h"
 #include <cstdio>
@@ -478,6 +480,9 @@ bool pvr_upload_compressed_to_tex(const uint8_t* file_data, size_t file_size, GL
 
     glBindTexture(GL_TEXTURE_2D, tex_name);
     glCompressedTexImage2D(GL_TEXTURE_2D, 0, internal_format, w, h, 0, (GLsizei)data_size, pixel_data);
+    // Compressed (ETC1/PVRTC) textures keep plain GL_LINEAR: glGenerateMipmap is
+    // not guaranteed for compressed formats in GL 3.3 core, and an incomplete
+    // mipmap chain would sample black.
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
@@ -546,7 +551,8 @@ GLuint pvr_load_texture(const char* path, int* out_width, int* out_height) {
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, 
                  GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);

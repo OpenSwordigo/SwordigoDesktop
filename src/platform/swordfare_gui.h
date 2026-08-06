@@ -104,9 +104,23 @@ public:
     bool is_visible()     const { return m_visible; }
 
     // Mod Overlay (Kiwi-compatible custom menu) visibility
-    void toggle_mod_overlay() { m_mod_overlay_visible = !m_mod_overlay_visible; }
+    void toggle_mod_overlay() {
+        m_mod_overlay_visible = !m_mod_overlay_visible;
+        m_f11_overlay_active = false;
+    }
     bool is_mod_overlay_visible() const { return m_mod_overlay_visible; }
     void set_mod_overlay_visible(bool visible) { m_mod_overlay_visible = visible; }
+    // F11 owns the scene/display toolbox and behaves as a real toggle.
+    void toggle_scene_toolbox() {
+        if (m_mod_overlay_visible && m_f11_overlay_active) {
+            m_mod_overlay_visible = false;
+            m_f11_overlay_active = false;
+            return;
+        }
+        m_mod_overlay_visible = true;
+        m_f11_overlay_active = true;
+        m_overlay_forced_tab = 2;
+    }
 
     // Draw the debug panel — call between begin_frame()/end_frame() when visible
     void draw_debug(const SwordfareDebugStats& stats);
@@ -206,6 +220,22 @@ private:
     bool          m_initialized = false;
     bool          m_visible     = false;
     bool          m_mod_overlay_visible = false;
+    bool          m_f11_overlay_active = false;
+    bool          m_buttons_globally_hidden = false;
+
+    int m_overlay_forced_tab = -1;   // -1 = none; 1 = Options; 2 = Scene Shifter
+
+    // ── Remaster textures (OpenGL path only; Vulkan falls back to vector UI) ──
+    GLuint m_tex_overlay_bg     = 0;   // launcher_bg.png / ui_panel.png backdrop
+    GLuint m_tex_swordigo_icon  = 0;   // swordigo_default.png / icon_app.png
+    int    m_tex_overlay_bg_w   = 0, m_tex_overlay_bg_h   = 0;
+    int    m_tex_swordigo_icon_w = 0, m_tex_swordigo_icon_h = 0;
+    GLuint m_tex_btn_wide       = 0;   // ui_button_wide.png (game button art)
+    int    m_tex_btn_wide_w     = 0, m_tex_btn_wide_h     = 0;
+    GLuint m_tex_panel          = 0;   // ui_panel.png (game panel art)
+    int    m_tex_panel_w        = 0, m_tex_panel_h       = 0;
+    GLuint m_tex_items[4]       = {0}; // item icons (sword, trinkets, potion)
+    int    m_tex_items_w[4]     = {0}, m_tex_items_h[4]   = {0};
 
     void*         m_last_buttons_ptr = nullptr;
     void*         m_last_overlays_ptr = nullptr;

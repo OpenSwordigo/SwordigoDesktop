@@ -10,7 +10,6 @@ option(SWORDIGO_USE_DYNARMIC "Build and link the Dynarmic ARM64 JIT" ON)
 option(SWORDIGO_BUILD_SRE "Build the ARM64 guest libsre.so" ON)
 option(SWORDIGO_BUILD_RUBY "Build the asset viewer" ON)
 option(SWORDIGO_BUILD_OPENSWORDIGO "Build the optional native OpenSwordigo runtime" OFF)
-option(SWORDIGO_USE_BUNDLED_FFMPEG "Link against the bundled static FFmpeg build" ON)
 set(SWORDIGO_FFMPEG_ROOT "${CMAKE_SOURCE_DIR}/src/tools/ffmpeg/build" CACHE PATH "Local static FFmpeg prefix")
 set(SWORDIGO_DYNARMIC_ROOT "${CMAKE_SOURCE_DIR}/deps/dynarmic/build" CACHE PATH "Dynarmic build directory")
 
@@ -33,25 +32,6 @@ pkg_check_modules(VORBISFILE REQUIRED vorbisfile)
 pkg_check_modules(MPG123 REQUIRED libmpg123)
 find_library(UNICORN_LIBRARY NAMES unicorn REQUIRED)
 
-if (SWORDIGO_USE_BUNDLED_FFMPEG)
-    set(FFMPEG_LIB_DIR "${SWORDIGO_FFMPEG_ROOT}/lib")
-    set(FFMPEG_LINK_LIBS
-        -Wl,--whole-archive
-        "${FFMPEG_LIB_DIR}/libavformat.a" "${FFMPEG_LIB_DIR}/libavcodec.a"
-        "${FFMPEG_LIB_DIR}/libswscale.a" "${FFMPEG_LIB_DIR}/libavutil.a"
-        -Wl,--no-whole-archive)
-else()
-    pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
-    pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec)
-    pkg_check_modules(SWSCALE REQUIRED IMPORTED_TARGET libswscale)
-    pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil)
-    set(FFMPEG_LINK_LIBS
-        PkgConfig::AVFORMAT
-        PkgConfig::AVCODEC
-        PkgConfig::SWSCALE
-        PkgConfig::AVUTIL)
-endif()
-
 set(SRC_DIR "${CMAKE_SOURCE_DIR}/src")
 set(INCLUDE_DIR "${CMAKE_SOURCE_DIR}/include")
 set(COMMON_INCLUDES
@@ -66,6 +46,8 @@ if (SWORDIGO_USE_DYNARMIC)
     list(APPEND COMMON_DEFINITIONS USE_DYNARMIC SWORDIGO_HAS_DYNARMIC)
 endif()
 set(SWORDIGO_RPATH "$ORIGIN/libs;$ORIGIN;$ORIGIN/../libs;$ORIGIN/../share/swordigo-desktop/libs;/usr/share/swordigo-desktop/libs;/usr/share/swordigo-desktop")
+set(FFMPEG_LIB_DIR "${SWORDIGO_FFMPEG_ROOT}/lib")
+
 function(swordigo_target target)
     target_include_directories(${target} PRIVATE ${COMMON_INCLUDES} ${SDL3_IMAGE_INCLUDE_DIRS})
     target_compile_definitions(${target} PRIVATE ${COMMON_DEFINITIONS})
@@ -78,8 +60,10 @@ function(swordigo_library target)
     swordigo_target(${target})
 endfunction()
 
-swordigo_library(swcore ${SRC_DIR}/platform/data_path.cpp ${SRC_DIR}/platform/io_thread.cpp ${SRC_DIR}/android/log.c)
+swordigo_library(swcore ${SRC_DIR}/platform/data_path.cpp ${SRC_DIR}/platform/io_thread.cpp ${SRC_DIR}/platform/embedded_assets.cpp ${SRC_DIR}/android/log.c)
 target_link_libraries(swcore PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+# embedded_assets.cpp is a ~60MB generated TU of const byte arrays — no -O3 needed
+set_source_files_properties(${SRC_DIR}/platform/embedded_assets.cpp PROPERTIES COMPILE_OPTIONS "-O0")
 swordigo_library(swgui
     ${SRC_DIR}/imgui/imgui.cpp ${SRC_DIR}/imgui/imgui_draw.cpp ${SRC_DIR}/imgui/imgui_tables.cpp ${SRC_DIR}/imgui/imgui_widgets.cpp
     ${SRC_DIR}/imgui/backends/imgui_impl_sdl3.cpp ${SRC_DIR}/imgui/backends/imgui_impl_opengl3.cpp ${SRC_DIR}/imgui/backends/imgui_impl_vulkan.cpp)
@@ -99,7 +83,9 @@ set(HOST_LUA_SRCS)
 foreach(name IN LISTS LUA_SRCS)
     list(APPEND HOST_LUA_SRCS ${SRC_DIR}/sre/lua/src/${name}.c)
 endforeach()
-swordigo_library(filerift ${SRC_DIR}/tools/filerift.cpp ${SRC_DIR}/tools/scene_schemas.cpp ${SRC_DIR}/tools/boulder.cpp ${HOST_LUA_SRCS})
+# scene_schemas.cpp lives only in swpod: defining av::g_schemas twice caused
+# two destructor registrations for one interposed object -> double free at exit.
+swordigo_library(filerift ${SRC_DIR}/tools/filerift.cpp ${SRC_DIR}/tools/boulder.cpp ${HOST_LUA_SRCS})
 target_compile_definitions(filerift PRIVATE "LUAI_FUNC=extern __attribute__((visibility(\"default\")))")
 target_link_libraries(filerift PRIVATE swcore swfmt ZLIB::ZLIB m)
 swordigo_library(swgfx ${SRC_DIR}/platform/fbo_scaler.cpp ${SRC_DIR}/platform/vulkan_backend.cpp ${SRC_DIR}/platform/video_background.cpp ${SRC_DIR}/platform/srt_overlay.cpp)
@@ -119,7 +105,9 @@ add_executable(swordfare_boot ${SRC_DIR}/main.cpp ${SRC_DIR}/platform/display.cp
 set_target_properties(swordfare_boot PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin" OUTPUT_NAME swordfare)
 swordigo_target(swordfare_boot)
 target_link_libraries(swordfare_boot PRIVATE swcore swgui swfmt swpod filerift swgfx swemu swordfare
-    ${FFMPEG_LINK_LIBS}
+    -Wl,--whole-archive
+    ${FFMPEG_LIB_DIR}/libavformat.a ${FFMPEG_LIB_DIR}/libavcodec.a ${FFMPEG_LIB_DIR}/libswscale.a ${FFMPEG_LIB_DIR}/libavutil.a
+    -Wl,--no-whole-archive
     SDL3::SDL3 ${SDL3_IMAGE_LINK} ${VORBISFILE_LIBRARIES} ${MPG123_LIBRARIES} ZLIB::ZLIB OpenAL::OpenAL OpenGL::GL Threads::Threads ${CMAKE_DL_LIBS} m)
 if (SWORDIGO_USE_DYNARMIC)
     target_link_libraries(swordfare_boot PRIVATE
@@ -129,7 +117,7 @@ endif()
 target_link_options(swordfare_boot PRIVATE -rdynamic -Wl,--allow-shlib-undefined)
 
 if (SWORDIGO_BUILD_RUBY)
-    add_executable(ruby ${SRC_DIR}/tools/asset_viewer.cpp ${SRC_DIR}/tools/av_renderer.cpp ${SRC_DIR}/tools/av_audio.cpp ${SRC_DIR}/tools/scene_loader.cpp ${SRC_DIR}/tools/intellij.cpp ${SRC_DIR}/tools/batch_converter.cpp)
+    add_executable(ruby ${SRC_DIR}/tools/asset_viewer.cpp ${SRC_DIR}/tools/av_renderer.cpp ${SRC_DIR}/tools/av_audio.cpp ${SRC_DIR}/tools/scene_loader.cpp ${SRC_DIR}/tools/scene_workspace.cpp ${SRC_DIR}/tools/intellij.cpp ${SRC_DIR}/tools/batch_converter.cpp ${SRC_DIR}/tools/pod_writer.cpp ${SRC_DIR}/tools/gltf_export.cpp ${SRC_DIR}/tools/gltf_import.cpp ${SRC_DIR}/imgui/Guizmo/src/ImGuizmo.cpp)
     set_target_properties(ruby PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin")
     swordigo_target(ruby)
     target_link_libraries(ruby PRIVATE swcore swgui swfmt swpod filerift SDL3::SDL3 ${SDL3_IMAGE_LINK} OpenGL::GL ZLIB::ZLIB m util)
@@ -170,10 +158,11 @@ if (SWORDIGO_BUILD_SRE)
             DEPENDS "${source}" ${SRC_DIR}/sre/sre_lua_compat.h VERBATIM)
         list(APPEND SRE_OBJECTS "${object}")
     endforeach()
-    add_custom_command(OUTPUT "${CMAKE_SOURCE_DIR}/libsre.so"
-        COMMAND ${AARCH64_CC} -shared -fPIC -nostdlib -o "${CMAKE_SOURCE_DIR}/libsre.so" ${SRE_OBJECTS}
+    add_custom_command(OUTPUT "${CMAKE_SOURCE_DIR}/bin/libs/libsre.so"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/bin/libs"
+        COMMAND ${AARCH64_CC} -shared -fPIC -nostdlib -o "${CMAKE_SOURCE_DIR}/bin/libs/libsre.so" ${SRE_OBJECTS}
         DEPENDS ${SRE_OBJECTS} VERBATIM)
-    add_custom_target(sre ALL DEPENDS "${CMAKE_SOURCE_DIR}/libsre.so")
+    add_custom_target(sre ALL DEPENDS "${CMAKE_SOURCE_DIR}/bin/libs/libsre.so")
 endif()
 
 add_custom_target(dynarmic-build
@@ -181,7 +170,7 @@ add_custom_target(dynarmic-build
     COMMAND ${CMAKE_COMMAND} --build ${SWORDIGO_DYNARMIC_ROOT} --target dynarmic -j
     USES_TERMINAL)
 add_custom_target(ffmpeg-build COMMAND ${CMAKE_COMMAND} -E chdir ${SRC_DIR}/tools/ffmpeg ./configure --prefix=build --enable-static --disable-shared --disable-all --enable-avformat --enable-avcodec --enable-swscale --enable-decoder=h264 --enable-demuxer=mov --enable-parser=h264 --enable-protocols --enable-protocol=file --disable-programs --disable-doc --disable-avdevice --disable-avfilter --disable-swresample --disable-libdrm --disable-vulkan --disable-hwaccels --disable-network --disable-iconv --disable-bzlib --disable-libxcb --disable-lzma --disable-sdl2 --disable-xlib --disable-zlib COMMAND ${CMAKE_COMMAND} -E chdir ${SRC_DIR}/tools/ffmpeg make -j COMMAND ${CMAKE_COMMAND} -E chdir ${SRC_DIR}/tools/ffmpeg make install USES_TERMINAL)
-add_custom_target(install-sre DEPENDS sre COMMAND ${CMAKE_COMMAND} -E make_directory $ENV{HOME}/.local/share/swordigo-desktop/engine/v1.4.12/arm64-v8a COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/libsre.so $ENV{HOME}/.local/share/swordigo-desktop/engine/v1.4.12/arm64-v8a/libsre.so)
+add_custom_target(install-sre DEPENDS sre COMMAND echo "[SRE] install-sre is deprecated")
 
 install(TARGETS swordfare_boot DESTINATION bin)
 if (SWORDIGO_BUILD_RUBY)

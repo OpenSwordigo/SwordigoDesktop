@@ -1,4 +1,5 @@
 #include "tools/boulder.h"
+#include "platform/protobuf_reader.h"
 #include <sstream>
 #include <iostream>
 #include <cmath>
@@ -439,10 +440,33 @@ static GroundMesh parse_gmesh(const std::string& content) {
                 val = val.substr(1, val.size() - 2);
             }
             gm.bottom_texture = val;
+        } else if (key == "Z") {
+            line_ss >> gm.z;
         }
     }
     
     return gm;
+}
+
+GroundMesh parse_ground_mesh(const std::string& content) {
+    return parse_gmesh(content);
+}
+
+std::string serialize_swdm(const GroundMesh& gm) {
+    std::stringstream ss;
+    ss << "// Swordigo Desktop Mesh (.swdm)\n";
+    ss << "Z " << gm.z << "\n";
+    ss << "MinDepth " << gm.min_depth << "\n";
+    ss << "MaxDepth " << gm.max_depth << "\n";
+    ss << "TopAngle " << gm.top_angle << "\n";
+    ss << "GenerateTop " << (gm.generate_top ? "true" : "false") << "\n";
+    ss << "TopTexture \"" << gm.top_texture << "\"\n";
+    ss << "BottomTexture \"" << gm.bottom_texture << "\"\n";
+    ss << "Vertex[\n";
+    for (const auto& v : gm.polygon)
+        ss << v.x << " " << v.y << "\n";
+    ss << "]\n";
+    return ss.str();
 }
 
 std::string generate_ground_mesh(const std::string& gmesh_content) {
@@ -649,6 +673,259 @@ std::string generate_ground_mesh(const std::string& gmesh_content) {
     );
     
     return main_desc;
+}
+
+// ============================================================================
+// Direct protobuf builder — builds a complete GroundMesh scene object as
+// binary Scene bytes without the lossy markup->recode text round-trip.
+// ============================================================================
+
+namespace {
+
+// Helper writers matching the Swordigo protobuf schemas.
+static proto::Writer make_vector2(double x, double y) {
+    proto::Writer w;
+    w.write_float_field(1, static_cast<float>(x));
+    w.write_float_field(2, static_cast<float>(y));
+    return w;
+}
+
+static proto::Writer make_rectangle(double x, double y, double width, double height) {
+    proto::Writer w;
+    w.write_float_field(1, static_cast<float>(x));
+    w.write_float_field(2, static_cast<float>(y));
+    w.write_float_field(3, static_cast<float>(width));
+    w.write_float_field(4, static_cast<float>(height));
+    return w;
+}
+
+static proto::Writer make_float_color(float r, float g, float b, float a) {
+    proto::Writer w;
+    w.write_float_field(1, r);
+    w.write_float_field(2, g);
+    w.write_float_field(3, b);
+    w.write_float_field(4, a);
+    return w;
+}
+
+// MeshMaterial{ Texture{ Name, PixelFormat=1, ImageType=1 } } (field 5 of material)
+static proto::Writer make_mesh_material(const std::string& texture_name) {
+    proto::Writer tex;
+    tex.write_string_field(1, texture_name);
+    tex.write_varint_field(2, 1);   // PixelFormat (1 = RGBA8888)
+    tex.write_varint_field(4, 1);   // ImageType (1 = PNG, matches real scene data)
+    proto::Writer mat;
+    mat.write_nested_field(1, make_float_color(1, 1, 1, 1)); // AmbientColor
+    mat.write_nested_field(2, make_float_color(1, 1, 1, 1)); // DiffuseColor
+    mat.write_nested_field(3, make_float_color(1, 1, 1, 1)); // SpecularColor
+    mat.write_float_field(4, 0.0f); // Shininess
+    mat.write_nested_field(5, tex); // Texture
+    return mat;
+}
+
+// MeshData{ ValueType, ValuesPerVertex, Stride, DataOffset } — the layout
+// descriptors the game uses to decode the interleaved VertexData stream.
+// (Real scenes: 4=uint16 for indices, 7=float32 for pos/nrm/uv.)
+static proto::Writer make_mesh_data(int value_type, int values_per_vertex,
+                                    int stride, int data_offset) {
+    proto::Writer w;
+    w.write_varint_field(1, static_cast<uint64_t>(value_type));
+    w.write_varint_field(2, static_cast<uint64_t>(values_per_vertex));
+    w.write_varint_field(3, static_cast<uint64_t>(stride));
+    w.write_varint_field(4, static_cast<uint64_t>(data_offset));
+    return w;
+}
+
+// Box{ X, Y, Z, Width, Height, Depth } (6 float fields, matches scene_schemas).
+static proto::Writer make_box(float x, float y, float z,
+                              float width, float height, float depth) {
+    proto::Writer w;
+    w.write_float_field(1, x);
+    w.write_float_field(2, y);
+    w.write_float_field(3, z);
+    w.write_float_field(4, width);
+    w.write_float_field(5, height);
+    w.write_float_field(6, depth);
+    return w;
+}
+
+// Axis-aligned bounds of the interleaved vertex stream (pos = first 3 floats).
+static void vertex_bounds(const std::vector<uint8_t>& vertex_bits,
+                          float* mn, float* mx) {
+    mn[0] = mn[1] = mn[2] = 1e9f;
+    mx[0] = mx[1] = mx[2] = -1e9f;
+    const int n = static_cast<int>(vertex_bits.size() / vertexSize);
+    for (int i = 0; i < n; ++i) {
+        const float* p = reinterpret_cast<const float*>(vertex_bits.data() + i * vertexSize);
+        for (int c = 0; c < 3; ++c) {
+            if (p[c] < mn[c]) mn[c] = p[c];
+            if (p[c] > mx[c]) mx[c] = p[c];
+        }
+    }
+    if (n == 0) { mn[0] = mn[1] = mn[2] = 0.0f; mx[0] = mx[1] = mx[2] = 0.0f; }
+}
+
+// Mesh{ NumVertices, NumFaces, Indices/Vertices/Normals/TexCoordSet (MeshData
+// layout descriptors — REQUIRED by the game, without them the mesh is invisible
+// while collision still works), Material, BoundingBox, VertexData(50), IndexData(51) }
+static proto::Writer make_mesh(const std::vector<uint8_t>& vertex_bits,
+                               const std::vector<uint8_t>& index_bits,
+                               const std::string& texture_name) {
+    proto::Writer w;
+    const int num_vertices = static_cast<int>(vertex_bits.size() / vertexSize);
+    // Non-indexed meshes (FrontMesh) encode one triangle per 3 vertices.
+    const int num_faces = !index_bits.empty()
+        ? static_cast<int>(index_bits.size() / triSize)
+        : static_cast<int>(vertex_bits.size() / (3 * vertexSize));
+    w.write_varint_field(1, static_cast<uint64_t>(num_vertices));
+    w.write_varint_field(2, static_cast<uint64_t>(num_faces));
+    // Interleaved layout: pos(3f) @0, normal(3f) @12, uv(2f) @24, stride 32.
+    if (!index_bits.empty())
+        w.write_nested_field(3, make_mesh_data(4, 1, 2, 0));    // Indices (uint16)
+    w.write_nested_field(4, make_mesh_data(7, 3, 32, 0));       // Vertices
+    w.write_nested_field(5, make_mesh_data(7, 3, 32, 12));      // Normals
+    w.write_nested_field(6, make_mesh_data(7, 2, 32, 24));      // TexCoordSet
+    w.write_nested_field(10, make_mesh_material(texture_name));
+    float mn[3], mx[3];
+    vertex_bounds(vertex_bits, mn, mx);
+    w.write_nested_field(11, make_box(mn[0], mn[1], mn[2],
+                                      mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]));
+    w.write_bytes_field(50, std::string(vertex_bits.begin(), vertex_bits.end()));
+    if (!index_bits.empty())
+        w.write_bytes_field(51, std::string(index_bits.begin(), index_bits.end()));
+    return w;
+}
+
+} // namespace
+
+std::string generate_ground_mesh_object(const std::string& gmesh_content,
+                                        const std::string& identifier,
+                                        double depth) {
+    GroundMesh gm = parse_gmesh(gmesh_content);
+    if (gm.polygon.size() < 3) return "";
+
+    double left = gm.polygon[0].x, right = gm.polygon[0].x;
+    double bottom = gm.polygon[0].y, top = gm.polygon[0].y;
+    for (const auto& v : gm.polygon) {
+        left = std::min(left, v.x);   right = std::max(right, v.x);
+        bottom = std::min(bottom, v.y); top = std::max(top, v.y);
+    }
+
+    // ── geometry (identical to the markup path) ──
+    std::vector<uint8_t> top_v, top_i;
+    if (gm.generate_top) generate_top_mesh(gm, top_v, top_i);
+    std::vector<uint8_t> side_v, side_i;
+    generate_side_mesh(gm, side_v, side_i);
+    std::vector<uint8_t> face_v = generate_face_mesh(gm);
+
+    // ── polygon message (used by GroundPolygon + CollisionShape) ──
+    proto::Writer poly;
+    for (const auto& v : gm.polygon)
+        poly.write_nested_field(1, make_vector2(v.x, v.y)); // Polygon.Vertex
+    poly.write_varint_field(2, 0); // Convex
+    poly.write_varint_field(3, 1); // Closed
+
+    // ── GroundPolygonComponent ──
+    proto::Writer gpc;
+    gpc.write_nested_field(2, poly);                 // Polygon
+    gpc.write_varint_field(3, 1);                    // Collides
+    gpc.write_float_field(4, static_cast<float>(gm.min_depth)); // MinDepth
+    gpc.write_float_field(5, static_cast<float>(gm.max_depth)); // MaxDepth
+    proto::Writer comp_ground_polygon;
+    comp_ground_polygon.write_string_field(1, "GroundPolygon");
+    comp_ground_polygon.write_varint_field(2, 980);
+    comp_ground_polygon.write_nested_field(110, gpc); // Component.GroundPolygonComponent
+
+    // ── GroundMeshComponent ──
+    // Matches the real game layout: SurfaceMesh (field 8, repeated — top + side
+    // walls), FrontMesh (field 9, non-indexed), LocalAabb (7), Color (10).
+    proto::Writer gmc;
+    gmc.write_nested_field(7, make_rectangle(left, bottom, right - left, top - bottom)); // LocalAabb
+    if (!top_v.empty())
+        gmc.write_nested_field(8, make_mesh(top_v, top_i, gm.top_texture));   // SurfaceMesh (top)
+    if (!side_v.empty())
+        gmc.write_nested_field(8, make_mesh(side_v, side_i, gm.bottom_texture)); // SurfaceMesh (side walls)
+    if (!face_v.empty())
+        gmc.write_nested_field(9, make_mesh(face_v, {}, gm.bottom_texture));  // FrontMesh (non-indexed)
+    gmc.write_nested_field(10, make_float_color(1, 1, 1, 1)); // Color
+    proto::Writer comp_ground_mesh;
+    comp_ground_mesh.write_string_field(1, "GroundMesh");
+    comp_ground_mesh.write_varint_field(2, 981);
+    comp_ground_mesh.write_nested_field(111, gmc); // Component.GroundMeshComponent
+
+    // ── GroundMeshGeneratorComponent ──
+    proto::Writer ggc;
+    ggc.write_varint_field(1, 980);  // GroundPolygonId
+    ggc.write_varint_field(2, 981);  // TargetMeshId
+    ggc.write_varint_field(3, 985);  // FrontTextureMappingId
+    ggc.write_varint_field(4, 984);  // SurfaceTextureMappingId
+    ggc.write_varint_field(5, 1291618994u); // RandomSeed
+    ggc.write_float_field(6, 0.0f);  // HorizNoise
+    ggc.write_varint_field(7, 1);    // MeshType
+    ggc.write_float_field(8, 80.0f); // SurfaceWidth
+    ggc.write_float_field(9, 25.0f); // HatHeight
+    ggc.write_float_field(10, 5.0f); // HatWidthOffset1
+    ggc.write_float_field(11, 5.0f); // HatWidthOffset2
+    proto::Writer comp_generator;
+    comp_generator.write_string_field(1, "GroundMeshGenerator");
+    comp_generator.write_varint_field(2, 982);
+    comp_generator.write_nested_field(112, ggc); // Component.GroundMeshGeneratorComponent
+
+    // ── CollisionShape (ShapeComponent polygon + CollisionShapeComponent) ──
+    proto::Writer shape;
+    shape.write_nested_field(3, poly); // ShapeComponent.Polygon
+    proto::Writer csc;
+    csc.write_varint_field(2, 1);                    // IsGround
+    csc.write_float_field(6, static_cast<float>(gm.min_depth)); // MinDepth
+    csc.write_float_field(7, static_cast<float>(gm.max_depth)); // MaxDepth
+    csc.write_varint_field(11, 1);                   // Enabled
+    proto::Writer comp_collision;
+    comp_collision.write_string_field(1, "CollisionShape");
+    comp_collision.write_varint_field(2, 983);
+    comp_collision.write_varint_field(4, 980); // ParentComponentIdentifier
+    comp_collision.write_nested_field(120, shape); // Component.ShapeComponent
+    comp_collision.write_nested_field(121, csc);   // Component.CollisionShapeComponent
+
+    // ── TextureMapping x2 (984 = surface, 985 = front) ──
+    proto::Writer tm_surface;
+    tm_surface.write_string_field(1, gm.top_texture);
+    tm_surface.write_float_field(2, 250.0f);
+    tm_surface.write_nested_field(3, make_vector2(0, 0));
+    proto::Writer comp_tm_surface;
+    comp_tm_surface.write_string_field(1, "TextureMapping");
+    comp_tm_surface.write_varint_field(2, 984);
+    comp_tm_surface.write_nested_field(113, tm_surface);
+
+    proto::Writer tm_front;
+    tm_front.write_string_field(1, gm.bottom_texture);
+    tm_front.write_float_field(2, 250.0f);
+    tm_front.write_nested_field(3, make_vector2(0, 0));
+    proto::Writer comp_tm_front;
+    comp_tm_front.write_string_field(1, "TextureMapping");
+    comp_tm_front.write_varint_field(2, 985);
+    comp_tm_front.write_nested_field(113, tm_front);
+
+    // ── Object ──
+    proto::Writer obj;
+    obj.write_string_field(1, "SceneObject");              // TemplateName
+    obj.write_string_field(2, identifier);                 // Identifier
+    obj.write_bytes_field(3, comp_ground_polygon.to_string()); // Component
+    obj.write_bytes_field(3, comp_ground_mesh.to_string());
+    obj.write_bytes_field(3, comp_generator.to_string());
+    obj.write_bytes_field(3, comp_collision.to_string());
+    obj.write_bytes_field(3, comp_tm_surface.to_string());
+    obj.write_bytes_field(3, comp_tm_front.to_string());
+    obj.write_nested_field(4, make_vector2(0, 0));         // Position
+    obj.write_float_field(5, static_cast<float>(depth));   // Depth
+    obj.write_float_field(6, 0.0f);                        // Rotation
+    obj.write_float_field(7, 1.0f);                        // Scaling
+    obj.write_nested_field(8, make_rectangle(left, bottom, right - left, top - bottom)); // LocalAabb
+    obj.write_varint_field(9, 0);                          // Hidden
+
+    // ── Scene{ Object } ──
+    proto::Writer scene;
+    scene.write_bytes_field(1, obj.to_string());
+    return scene.to_string();
 }
 
 } // namespace boulder

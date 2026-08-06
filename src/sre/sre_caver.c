@@ -190,6 +190,12 @@ void (*g_orig_SceneGrid_UpdateVisibleAreasWithCamera)(void* self, void* camera) 
 pfn_SwingableWeapon_SetGlowColor     g_SwingableWeapon_SetGlowColor     = 0;
 pfn_SwingableWeapon_SetGlowIntensity g_SwingableWeapon_SetGlowIntensity = 0;
 
+/* ModelComponent::setModelName — Mini.SetModelName */
+void (*g_sre_ModelComponent_setModelName)(void* component, SreString* name) = 0;
+
+/* EntityControllerComponent::SetMoveSpeed — Mini.SetObjectSpeed */
+void (*g_sre_EntityControllerComponent_SetMoveSpeed)(void* component, float speed) = 0;
+
 /* =========================================================================
  * Helper: call a no-arg function at guest address and return void*
  *

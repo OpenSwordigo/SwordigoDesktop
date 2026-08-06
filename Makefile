@@ -10,11 +10,11 @@
 ##   bin/libs/libswgfx.so      ← FBO scaler, Vulkan backend, video, SRT overlay
 ##   bin/libs/libswemu.so      ← ARM32/ARM64 ELF loader, emulators, JNI bridge
 ##   bin/libs/libswordfare.so  ← Swordfare overlay, launcher UI, save editor, mods
-##   libsre.so                 ← Guest ARM64 SRE (root, loaded by ELF loader)
+##   bin/libs/libsre.so        ← Guest ARM64 SRE (root, loaded by ELF loader)
 ##
 ## Usage:
 ##   make -j$(nproc)           # Full build
-##   make libsre.so            # Guest SRE only
+##   make bin/libs/libsre.so   # Guest SRE only
 ##   make bin/ruby             # Asset viewer only
 ##   make install-sre          # Deploy libsre.so to engine cache
 ##   make clean                # Remove build/ and bin/
@@ -78,8 +78,12 @@ RPATH_FLAGS := -Wl,-rpath,'$$ORIGIN/libs:$$ORIGIN:$$ORIGIN/../libs:$$ORIGIN/../s
 DYNARMIC_DIR   := deps/dynarmic
 DYNARMIC_BUILD := $(DYNARMIC_DIR)/build
 
-ALL_CXXFLAGS += -DUSE_DYNARMIC -I$(DYNARMIC_DIR)/src
-SO_CXXFLAGS  += -DUSE_DYNARMIC -I$(DYNARMIC_DIR)/src
+# SWORDIGO_HAS_DYNARMIC must be defined alongside USE_DYNARMIC: main.cpp
+# guards the JIT branch with #ifdef SWORDIGO_HAS_DYNARMIC. Defining only
+# USE_DYNARMIC made every Makefile build silently fall back to the Unicorn
+# interpreter (~50-100x slower) — "lags like hell".
+ALL_CXXFLAGS += -DUSE_DYNARMIC -DSWORDIGO_HAS_DYNARMIC -I$(DYNARMIC_DIR)/src
+SO_CXXFLAGS  += -DUSE_DYNARMIC -DSWORDIGO_HAS_DYNARMIC -I$(DYNARMIC_DIR)/src
 
 DYNARMIC_STATIC_LIBS := \
     -L$(DYNARMIC_BUILD)/src/dynarmic       -ldynarmic \
@@ -115,7 +119,8 @@ FFMPEG_STATIC_LIBS := \
 # ============================================================================
 CORE_CXX_SRCS := \
     src/platform/data_path.cpp \
-    src/platform/io_thread.cpp
+    src/platform/io_thread.cpp \
+    src/platform/embedded_assets.cpp
 
 CORE_C_SRCS := \
     src/android/log.c
@@ -124,6 +129,14 @@ CORE_CXX_OBJS := $(patsubst src/%.cpp, $(BUILD)/core/%.o, $(CORE_CXX_SRCS))
 CORE_C_OBJS   := $(patsubst src/%.c,   $(BUILD)/core/%.o, $(CORE_C_SRCS))
 CORE_OBJS     := $(CORE_CXX_OBJS) $(CORE_C_OBJS)
 CORE_DEPS     := $(CORE_OBJS:.o=.d)
+
+# embedded_assets.cpp is a 60MB generated TU of const byte arrays — compile it
+# at -O1 (down from -O3) to keep incremental rebuilds fast. Data output is
+# identical; only the trivial lookup functions get slightly less optimisation.
+$(BUILD)/core/platform/embedded_assets.o: src/platform/embedded_assets.cpp
+	@mkdir -p $(dir $@)
+	@echo "[CXX/core]  $< (no-opt: 10MB embedded assets)"
+	@$(CXX) $(SO_CXXFLAGS) -O1 -c $< -o $@
 
 $(BUILD)/core/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
@@ -212,9 +225,12 @@ $(LIB_DIR)/libswpod.so: $(POD_OBJS) | $(LIB_DIR)/libswcore.so
 #    filerift.cpp, scene_schemas.cpp, boulder.cpp + 28 Lua source files.
 #    Depends on: libswcore, libswfmt
 # ============================================================================
+# NOTE: scene_schemas.cpp intentionally lives ONLY in libswpod.so.
+# Defining av::g_schemas in two .so files made both register a destructor
+# for the (interposed) same object -> 'double free or corruption' at exit.
+# libfilerift.so resolves av::g_schemas at runtime from libswpod.so.
 FILERIFT_CXX_SRCS := \
     src/tools/filerift.cpp \
-    src/tools/scene_schemas.cpp \
     src/tools/boulder.cpp
 
 HOST_LUA_C_SRCS := \
@@ -431,8 +447,13 @@ RUBY_SRCS := \
     src/tools/av_renderer.cpp \
     src/tools/av_audio.cpp \
     src/tools/scene_loader.cpp \
+    src/tools/scene_workspace.cpp \
     src/tools/intellij.cpp \
-    src/tools/batch_converter.cpp
+    src/tools/batch_converter.cpp \
+    src/tools/gltf_export.cpp \
+    src/tools/gltf_import.cpp \
+    src/tools/pod_writer.cpp \
+    src/imgui/Guizmo/src/ImGuizmo.cpp
 
 RUBY_OBJS := $(patsubst src/%.cpp, $(BUILD)/ruby/%.o, $(RUBY_SRCS))
 RUBY_DEPS := $(RUBY_OBJS:.o=.d)
@@ -458,6 +479,31 @@ $(BIN_DIR)/ruby: $(RUBY_OBJS) | \
 	@echo "[AV]   bin/ruby  —  run with: ./bin/ruby"
 
 # ============================================================================
+# ── bin/scanscene ── Scene diagnostics CLI (unresolved templates / .scl libs)
+#    Compiles the scene toolchain sources directly so the scanner needs no GUI
+#    runtime; mirrors the link set used by the scene-loader unit tests.
+# ============================================================================
+SCANSCENE_SRCS := \
+    src/tools/scene_scanner.cpp \
+    src/tools/av_renderer.cpp \
+    src/tools/scene_loader.cpp \
+    src/tools/scene_schemas.cpp \
+    src/tools/pod_loader.cpp
+
+SCANSCENE_OBJS := $(patsubst src/%.cpp, $(BUILD)/scanscene/%.o, $(SCANSCENE_SRCS))
+
+$(BUILD)/scanscene/%.o: src/%.cpp
+	@mkdir -p $(dir $@)
+	@echo "[CXX/scanscene] $<"
+	@$(CXX) $(ALL_CXXFLAGS) -c $< -o $@
+
+$(BIN_DIR)/scanscene: $(SCANSCENE_OBJS)
+	@mkdir -p $(BIN_DIR)
+	@echo "[LINK] $@"
+	@$(CXX) -o $@ $^ $(ZLIB_LIBS) -lGL -lutil -lm
+	@echo "[SCAN] bin/scanscene — run with: ./bin/scanscene <scene.d|dir>..."
+
+# ============================================================================
 # ── libsre.so ── Guest ARM64 Swordigo Runtime Engine (cross-compiled AArch64)
 # ============================================================================
 SRE_LUA_SRCS := \
@@ -480,6 +526,7 @@ SRE_CORE_SRCS := \
     src/sre/sre_mini_api.c      src/sre/sre_vfs.c          src/sre/sre_lua_libs.c \
     src/sre/sre_pack_lua.c      src/sre/sre_raknet_c.c     src/sre/sre_mod.c          src/sre/sre_config.c \
     src/sre/sre_caver.c         src/sre/sre_features.c      src/sre/sre_scene_shifter.c \
+    src/sre/sre_ffi.c \
     src/sre/toml-c/toml.c \
     src/sre/luafilesystem/src/lfs.c \
     src/sre/luasocket/src/auxiliar.c  src/sre/luasocket/src/buffer.c \
@@ -518,28 +565,15 @@ $(BUILD)/sre/%.o: src/sre/%.S
 	@echo "[ASM/SRE]   $<"
 	@$(AARCH64_CC) $(SRE_SRE_CFLAGS) -c $< -o $@
 
-libsre.so: $(SRE_LUA_OBJS) $(SRE_CORE_OBJS)
+$(LIB_DIR)/libsre.so: $(SRE_LUA_OBJS) $(SRE_CORE_OBJS)
+	@mkdir -p $(LIB_DIR)
 	@echo "[SRE]  Linking libsre.so (ARM64 guest)"
 	@$(AARCH64_CC) -shared -fPIC -nostdlib -o $@ $^
-	@echo "[SRE]  Built libsre.so — loaded by ElfLoader64"
+	@echo "[SRE]  Built $(LIB_DIR)/libsre.so — loaded by ElfLoader64"
 
-# Deploy libsre.so to canonical engine path
-install-sre: libsre.so
-	@SRE_INSTALLED=0; \
-	while IFS= read -r dir; do \
-	    if [ -d "$$dir" ]; then \
-	        cp libsre.so "$$dir/libsre.so"; \
-	        echo "[SRE]  -> $$dir/"; \
-	        SRE_INSTALLED=$$((SRE_INSTALLED + 1)); \
-	    fi; \
-	done < <(find "$(HOME)/.local/share/swordigo-desktop/engine" \
-	             -type d -name "arm64-v8a" 2>/dev/null); \
-	if [ "$$SRE_INSTALLED" -eq 0 ]; then \
-	    mkdir -p "$(HOME)/.local/share/swordigo-desktop/engine/v1.4.12/arm64-v8a"; \
-	    cp libsre.so \
-	       "$(HOME)/.local/share/swordigo-desktop/engine/v1.4.12/arm64-v8a/libsre.so"; \
-	    echo "[SRE]  -> ~/.local/share/swordigo-desktop/engine/v1.4.12/arm64-v8a/ (fallback)"; \
-	fi
+# Deploy libsre.so (Removed, no longer needed)
+install-sre:
+	@echo "[SRE] install-sre is deprecated. libsre.so is now loaded from bin/libs/"
 
 # ============================================================================
 # Dependency auto-includes
@@ -556,21 +590,21 @@ ALL_DEPS := \
 # ============================================================================
 .DEFAULT_GOAL := all
 
-all: $(ALL_HOST_SO) $(BIN_DIR)/swordfare $(BIN_DIR)/ruby libsre.so
+all: $(ALL_HOST_SO) $(BIN_DIR)/swordfare $(BIN_DIR)/ruby $(BIN_DIR)/scanscene $(LIB_DIR)/libsre.so
 	@echo ""
 	@echo "====================================================="
 	@echo "  Swordfare Desktop — modular build complete"
 	@echo "  Executables : bin/swordfare  bin/ruby"
 	@echo "  Libraries   : bin/libs/*.so (7 distinct modules)"
-	@echo "  Guest SRE   : libsre.so (ARM64)"
+	@echo "  Guest SRE   : bin/libs/libsre.so (ARM64)"
 	@echo "  Run game    : ./run_swordigo.sh"
 	@echo "====================================================="
 
 clean:
-	rm -rf $(BUILD) $(BIN_DIR) libsre.so
+	rm -rf $(BUILD) $(BIN_DIR)
 	@echo "[clean] Done."
 
-.PHONY: all clean install-sre dynarmic-build dynarmic-clean ffmpeg-build ffmpeg-clean
+.PHONY: all clean install-sre dynarmic-build dynarmic-clean ffmpeg-build ffmpeg-clean embed-assets
 
 # ============================================================================
 # Dynarmic — build from source
@@ -635,3 +669,12 @@ ffmpeg-clean:
 	@echo "[FFMPEG] Cleaning local FFmpeg build..."
 	-@cd $(FFMPEG_DIR) && make distclean
 	rm -rf $(FFMPEG_BUILD)
+
+# ============================================================================
+# Embedded assets — regenerate src/platform/embedded_assets.{h,cpp} from
+# src/assets/ (permanent fix: launcher textures & fonts baked into the binary)
+# ============================================================================
+embed-assets:
+	@echo "[ASSETS] Regenerating embedded asset tables..."
+	python3 tools/embed_assets.py
+	@echo "[ASSETS] Done — rebuild with 'make -j\$$(nproc)' to relink."

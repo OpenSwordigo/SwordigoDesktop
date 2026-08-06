@@ -1,4 +1,4 @@
-# SwordigoDesktop & Swordigo Developement Kit (SDK)
+# SwordigoDesktop & Swordigo Runtime Engine (SRE)
 
 Standard Binary Compatibility Layer, ARM64 JIT Execution Runtime, and Software Development Kit for Linux.
 
@@ -118,6 +118,12 @@ make -j$(nproc)
 | **F8** | Pause / Resume CPU Emulation | Emulator Core |
 | **`** (Backtick) | Open Raijin Interactive Lua Debug Console | Developer Console |
 
+### Runtime stability status
+
+Previously reported Swordfare startup crashes caused by unresolved FFmpeg symbols in `libswgfx.so` are fixed in the current build. Scene transitions, launcher video startup, and Ruby asset resolution have also received dedicated hardening. If an older binary still exits with `undefined symbol: avformat_open_input`, rebuild all targets instead of reusing libraries from an earlier package.
+
+The Scene & Display Toolbox is available with **F11**. It includes responsive render/output presets for 4:3, 5:4, 16:9, 16:10, ultrawide, laptop, native Android, and low-performance resolutions, plus custom dimensions and exact fullscreen display modes.
+
 ---
 
 ## 6. Technical Documentation Index
@@ -130,7 +136,7 @@ All technical documentation, reverse-engineering analyses, and API specification
 * **[APIs & Subsystems](docs/apis_and_subsystems/)**: Native SRE hook reference (34 active hooks), Lua scripting catalog, GUI overlay APIs, VFS virtual filesystem.
 * **[Formats & Schemas](docs/formats_and_schemas/)**: PowerVR POD 3D model spec, PVR texture spec, Scene spec, Protobuf wire schema, Save file spec.
 * **[Modding & SwKiwi](docs/modding_and_swkiwi/)**: SwKiwi modloader architecture, RLSwordigo 7.0 reversing, modding guides, API audits.
-* **[Release Notes](docs/release_notes/)**: Version release notes from v1.0.0 through v8.0 Beta 1.
+* **[Release Notes](docs/release_notes/)**: Version release notes from v1.0.0 through v8.0 Beta 2.
 * **[Misc & Logs](docs/misc/)**: Diagnostic traces, platform compatibility matrices, build guides.
 
 ---

@@ -2038,14 +2038,6 @@ LaunchConfig show_launcher(BinarySelector& selector) {
 
                         if (selector.add_custom_instance(base_so, g_add_name, assets_dir_name)) {
                             if (g_add_use_sre) {
-                                std::string sre_src = get_user_data_dir() + "/engine/v1.4.12/arm64-v8a/libsre.so";
-                                std::string arch_dir = get_user_data_dir() + "/engine/custom-" + std::string(g_add_name) + "/arm64-v8a";
-                                if (fs::exists(sre_src)) {
-                                    try {
-                                        fs::copy_file(sre_src, arch_dir + "/libsre.so", fs::copy_options::overwrite_existing);
-                                    } catch (...) {}
-                                }
-
                                 selector.strip_sre_conflicts_from_last();
                             }
 

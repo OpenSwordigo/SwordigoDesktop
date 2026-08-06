@@ -59,6 +59,8 @@ static bool is_printable(const std::string& s) {
     return true;
 }
 
+static void parse_scene_waters(SceneData& scene);
+
 static bool ends_with_ci(const std::string& s, const std::string& suffix) {
     if (suffix.size() > s.size()) return false;
     auto it  = s.rbegin();
@@ -204,7 +206,7 @@ static std::string parse_mesh_material(const std::string& bytes) {
     return "";
 }
 
-static void parse_single_mesh(SceneObject& obj, const std::string& bytes) {
+static void parse_single_mesh(SceneObject& obj, const std::string& bytes, int src_field) {
     proto::Reader reader(bytes);
     proto::Field f;
 
@@ -217,6 +219,11 @@ static void parse_single_mesh(SceneObject& obj, const std::string& bytes) {
         else if (f.field_number == 50 && f.wire_type == proto::WIRE_LEN)    { vertex_data    = f.bytes_val; }
         else if (f.field_number == 51 && f.wire_type == proto::WIRE_LEN)    { index_data     = f.bytes_val; }
     }
+
+    // Remember the original serialized MeshData so a dirty mesh can be
+    // re-emitted with preserved sub-fields (material, etc.).  Stored after the
+    // validation checks below so the parallel vectors stay in sync with the
+    // parsed ground_meshes list.
 
     // main.js::addGroundMesh ignores MeshData metadata and treats field 50 as
     // a packed position3/normal3/uv2 stream. Follow it exactly: metadata in
@@ -262,6 +269,8 @@ static void parse_single_mesh(SceneObject& obj, const std::string& bytes) {
 
     obj.ground_meshes.push_back(std::move(pm));
     obj.ground_mesh_textures.push_back(texture_name);
+    obj.ground_mesh_raw.push_back(std::move(bytes));
+    obj.ground_mesh_fields.push_back(src_field);
 }
 
 static void parse_ground_mesh_component(SceneObject& obj, const SceneComponent& component) {
@@ -284,9 +293,9 @@ static void parse_ground_mesh_component(SceneObject& obj, const SceneComponent& 
                     else if (gm_f.field_number == 6) base_meshes.push_back(gm_f.bytes_val);
                 }
             }
-            for (const auto& mesh : front_meshes) parse_single_mesh(obj, mesh);
-            for (const auto& mesh : surface_meshes) parse_single_mesh(obj, mesh);
-            for (const auto& mesh : base_meshes) parse_single_mesh(obj, mesh);
+            for (const auto& mesh : front_meshes) parse_single_mesh(obj, mesh, 8);
+            for (const auto& mesh : surface_meshes) parse_single_mesh(obj, mesh, 9);
+            for (const auto& mesh : base_meshes) parse_single_mesh(obj, mesh, 6);
         }
     }
 }
@@ -393,13 +402,25 @@ static void resolve_object_render_data(SceneObject& obj) {
     obj.mesh_name.clear();
     obj.texture_name.clear();
     obj.background_name.clear();
-    obj.ground_meshes.clear();
-    obj.ground_mesh_textures.clear();
+    obj.is_spawn_point = false;
+    // When the object's ground meshes were edited in the SDK, keep the parsed
+    // (modified) mesh data instead of re-deriving it from the original raw
+    // component bytes — scene_refresh() is called during interactive edits.
+    const bool preserve_meshes = obj.ground_meshes_dirty && !obj.ground_meshes.empty();
+    if (!preserve_meshes) {
+        obj.ground_meshes.clear();
+        obj.ground_mesh_textures.clear();
+        obj.ground_mesh_raw.clear();
+        obj.ground_mesh_fields.clear();
+    }
     const auto& components = obj.resolved_components.empty() ? obj.components : obj.resolved_components;
     for (const auto& comp : components) {
         const std::string schema_name = component_schema_name(comp);
-        if (schema_name == "GroundMeshComponent")
+        if (schema_name == "GroundMeshComponent" && !preserve_meshes)
             parse_ground_mesh_component(obj, comp);
+
+        if (comp.type_name == "SpawnPoint")
+            obj.is_spawn_point = true;
 
         if (comp.type_name == "MeshRenderer" || comp.type_name == "SkinnedMeshRenderer")
             scan_for_asset_refs(comp.raw_data, obj.mesh_name, obj.texture_name);
@@ -410,10 +431,15 @@ static void resolve_object_render_data(SceneObject& obj) {
             obj.mesh_name = component_string_field(comp, 1);
 
         if (comp.type_name == "Background") {
-            std::string dummy_tex;
-            scan_for_asset_refs(comp.raw_data, obj.background_name, dummy_tex);
-            if (obj.texture_name.empty() && !dummy_tex.empty())
-                obj.texture_name = dummy_tex;
+            // BackgroundComponent stores TextureName in payload field 1 as a
+            // bare stem without extension (e.g. "graveyardback", matching
+            // graveyardback_2x.tex.png). scan_for_asset_refs only catches
+            // extensioned names, so read the schema field first.
+            obj.background_name = component_string_field(comp, 1);
+            if (obj.background_name.empty()) {
+                std::string dummy_tex;
+                scan_for_asset_refs(comp.raw_data, obj.background_name, dummy_tex);
+            }
         }
 
         if (obj.mesh_name.empty())
@@ -453,11 +479,81 @@ static std::vector<SceneTemplate> parse_object_library(const std::string& bytes)
     return templates;
 }
 
+// ObjectLibrary.ImportedLibrary (tag 3, repeated string): names of external
+// .scl files whose templates must be merged for object template resolution.
+static std::vector<std::string> parse_imported_library_names(const std::string& bytes) {
+    std::vector<std::string> names;
+    try {
+        proto::Reader library(bytes);
+        proto::Field field;
+        while (library.read_field(field)) {
+            if (field.field_number == 3 && field.wire_type == proto::WIRE_LEN)
+                names.emplace_back(field.bytes_val.data(), field.bytes_val.size());
+        }
+    } catch (...) {}
+    return names;
+}
+
+// Resolve ImportedLibrary references into external_libraries by loading each
+// <name>.scl from the scene directory / resources tree. Cached per load call;
+// called only from scene_load so interactive scene_refresh stays cheap.
+static void load_external_libraries(SceneData& scene) {
+    if (scene.filepath.empty()) return;
+    const fs::path scene_dir = fs::path(scene.filepath).parent_path();
+    const char* home = getenv("HOME");
+    const fs::path data_res = home
+        ? fs::path(home) / ".local/share/swordigo-desktop/assets/resources"
+        : fs::path();
+    const fs::path local_res = fs::path("assets") / "resources";
+
+    std::vector<fs::path> roots = {
+        scene_dir,
+        scene_dir / "resources",
+        scene_dir.parent_path(),
+        scene_dir.parent_path() / "resources",
+        data_res,
+        local_res
+    };
+
+    std::vector<std::string> wanted;
+    for (const auto& library : scene.object_libraries) {
+        for (auto& name : parse_imported_library_names(library))
+            if (!name.empty()) wanted.push_back(std::move(name));
+    }
+
+    for (const auto& name : wanted) {
+        const std::string filename = name + ".scl";
+        fs::path found;
+        for (const auto& root : roots) {
+            std::error_code ec;
+            fs::path candidate = root / filename;
+            if (fs::is_regular_file(candidate, ec)) { found = candidate; break; }
+        }
+        if (found.empty()) {
+            scene.missing_libraries.push_back(name);
+            std::cerr << "[scene_loader] warning: imported library '" << name
+                      << "' not found (" << filename << ")\n";
+            continue;
+        }
+        std::ifstream in(found, std::ios::binary);
+        if (!in) continue;
+        std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (!bytes.empty()) scene.external_libraries.push_back(std::move(bytes));
+    }
+}
+
 static void resolve_scene_templates(SceneData& scene) {
     std::unordered_map<std::string, SceneTemplate> templates;
     for (const auto& library : scene.object_libraries) {
         for (auto& item : parse_object_library(library))
             templates[item.name] = std::move(item);
+    }
+    // Merge templates from external .scl libraries (ImportedLibrary refs).
+    for (const auto& library : scene.external_libraries) {
+        for (auto& item : parse_object_library(library)) {
+            if (templates.find(item.name) == templates.end())
+                templates[item.name] = std::move(item);
+        }
     }
 
     for (auto& object : scene.objects) {
@@ -483,6 +579,131 @@ static void resolve_scene_templates(SceneData& scene) {
 }
 
 // ============================================================
+// GroundMesh re-encoding (vertex editing round-trip)
+//
+// GroundMesh component payload field number (Component schema: 890 >> 3).
+// ============================================================
+static constexpr uint32_t kGroundMeshPayload = 111;
+
+// Re-encode one MeshData message from the parsed PODMesh vertex/index data.
+// Field 1 (num_vertices), field 50 (interleaved pos/normal/uv stream) and
+// field 51 (uint16 index stream) are rewritten; every other sub-field
+// (material/texture mapping, metadata) is preserved verbatim from the
+// original serialized message.
+static std::string reencode_mesh_data(const std::string& original, const PODMesh& pm) {
+    // Interleaved stream: pos(3) + normal(3) + uv(2) = 32 bytes per vertex.
+    std::string vertex_data;
+    vertex_data.reserve(static_cast<size_t>(pm.num_vertices) * 32);
+    static const float kUp[3]    = {0.0f, 1.0f, 0.0f};
+    static const float kZero[2]  = {0.0f, 0.0f};
+    for (int i = 0; i < pm.num_vertices; ++i) {
+        const float* p = &pm.positions[static_cast<size_t>(i) * 3];
+        const bool has_n = static_cast<size_t>(i) * 3 + 2 < pm.normals.size();
+        const bool has_t = static_cast<size_t>(i) * 2 + 1 < pm.uvs.size();
+        const float* n = has_n ? &pm.normals[static_cast<size_t>(i) * 3] : kUp;
+        const float* t = has_t ? &pm.uvs[static_cast<size_t>(i) * 2] : kZero;
+        vertex_data.append(reinterpret_cast<const char*>(p), 12);
+        vertex_data.append(reinterpret_cast<const char*>(n), 12);
+        vertex_data.append(reinterpret_cast<const char*>(t), 8);
+    }
+
+    std::string index_data;
+    index_data.reserve(pm.indices.size() * 2);
+    for (uint32_t idx : pm.indices) {
+        uint16_t v = static_cast<uint16_t>(idx);
+        index_data.append(reinterpret_cast<const char*>(&v), 2);
+    }
+
+    proto::Writer w;
+    bool wrote_vertices = false;
+    bool wrote_indices  = false;
+    bool wrote_count    = false;
+    try {
+        proto::Reader reader(original);
+        proto::Field f;
+        while (reader.read_field(f)) {
+            if (f.field_number == 1 && f.wire_type == proto::WIRE_VARINT) {
+                w.write_varint_field(1, static_cast<uint64_t>(pm.num_vertices));
+                wrote_count = true;
+            } else if (f.field_number == 50 && f.wire_type == proto::WIRE_LEN) {
+                w.write_bytes_field(50, vertex_data);
+                wrote_vertices = true;
+            } else if (f.field_number == 51 && f.wire_type == proto::WIRE_LEN) {
+                w.write_bytes_field(51, index_data);
+                wrote_indices = true;
+            } else {
+                w.write_field(f);
+            }
+        }
+    } catch (...) {
+        std::cerr << "[scene_loader] warning: cannot re-encode dirty GroundMesh "
+                     "(malformed source); edit will not persist\n";
+        return original; // malformed original — refuse to touch it
+    }
+    // Append anything the original lacked (protobuf ordering is insignificant).
+    if (!wrote_count)    w.write_varint_field(1, static_cast<uint64_t>(pm.num_vertices));
+    if (!wrote_vertices) w.write_bytes_field(50, vertex_data);
+    if (!wrote_indices)  w.write_bytes_field(51, index_data);
+    return w.to_string();
+}
+
+// Rebuild the GroundMeshComponent payload message of a dirty object from its
+// parsed ground_meshes list, preserving all other component sub-fields and
+// matching each serialized child (fields 6/8/9) to the correct parsed mesh.
+static std::string rebuild_ground_mesh_component(const SceneObject& obj,
+                                                 const SceneComponent& component) {
+    const int payload = component_payload_field(component);
+    if (payload == 0) return component.raw_data;
+
+    // Per-child-field cursors into the parsed mesh list (parse order: front 8,
+    // surface 9, mesh 6 — but children may be interleaved in the wire data).
+    std::vector<size_t> field_cursor(64, 0);
+    std::vector<std::vector<size_t>> field_to_meshes(64);
+    for (size_t i = 0; i < obj.ground_meshes.size(); ++i) {
+        const int fld = (i < obj.ground_mesh_fields.size()) ? obj.ground_mesh_fields[i] : 0;
+        if (fld >= 0 && fld < 64) field_to_meshes[fld].push_back(i);
+    }
+
+    proto::Writer w;
+    try {
+        proto::Reader reader(component.raw_data);
+        proto::Field f;
+        while (reader.read_field(f)) {
+            if (f.field_number == static_cast<uint32_t>(payload) && f.wire_type == proto::WIRE_LEN) {
+                proto::Reader gm(f.bytes_val);
+                proto::Field g;
+                proto::Writer gw;
+                while (gm.read_field(g)) {
+                    const bool is_mesh_child = (g.field_number == 6 || g.field_number == 8 ||
+                                                g.field_number == 9) && g.wire_type == proto::WIRE_LEN;
+                    if (!is_mesh_child) {
+                        gw.write_field(g);
+                        continue;
+                    }
+                    const size_t fld = g.field_number;
+                    size_t pos = field_cursor[fld]++;
+                    if (pos < field_to_meshes[fld].size()) {
+                        const size_t mi = field_to_meshes[fld][pos];
+                        const std::string orig = (mi < obj.ground_mesh_raw.size())
+                            ? obj.ground_mesh_raw[mi] : g.bytes_val;
+                        gw.write_bytes_field(g.field_number,
+                                             reencode_mesh_data(orig, obj.ground_meshes[mi]));
+                    } else {
+                        gw.write_field(g);
+                    }
+                }
+                w.write_bytes_field(payload, gw.to_string());
+            } else {
+                w.write_field(f);
+            }
+        }
+    } catch (...) {
+        return component.raw_data;
+    }
+    return w.to_string();
+}
+
+// ============================================================
 // Serialize a SceneObject back to protobuf binary bytes.
 // Mirrors parse_object exactly: every field is written in the
 // same tag order so file diffs are minimal.
@@ -498,9 +719,16 @@ static std::string serialize_object(const SceneObject& obj) {
     if (!obj.name.empty())
         w.write_string_field(2, obj.name);
 
-    // Tag 3: Component[] — write raw bytes verbatim (preserves all sub-fields)
-    for (const auto& comp : obj.components)
-        w.write_bytes_field(3, comp.raw_data);
+    // Tag 3: Component[] — write raw bytes verbatim (preserves all sub-fields).
+    // Dirty GroundMesh components are re-encoded from the edited mesh data.
+    for (const auto& comp : obj.components) {
+        std::string data = comp.raw_data;
+        if (obj.ground_meshes_dirty && !obj.ground_meshes.empty() &&
+            component_payload_field(comp) == static_cast<int>(kGroundMeshPayload)) {
+            data = rebuild_ground_mesh_component(obj, comp);
+        }
+        w.write_bytes_field(3, data);
+    }
 
     // Tag 4: Position (Vector2 nested message)
     {
@@ -580,6 +808,57 @@ void scene_refresh(SceneData& scene) {
     resolve_scene_templates(scene);
     scene.object_count = static_cast<int>(scene.objects.size());
     compute_bounds(scene);
+    // Re-derive fluid sheets so SceneWater::object_index stays valid across
+    // object add/delete/move edits (parse_scene_waters is cheap — it only
+    // scans for WaterMesh components).
+    parse_scene_waters(scene);
+}
+
+void scene_mark_ground_mesh_dirty(SceneData& scene, size_t object_index) {
+    if (object_index >= scene.objects.size()) return;
+    scene.objects[object_index].ground_meshes_dirty = true;
+}
+
+// Rewrite the Material (field 10) sub-message of a serialized MeshData so its
+// texture reference (Material.field5 -> Texture.field1) becomes @p name.
+// Every other sub-field is preserved verbatim.
+static std::string rewrite_mesh_material(const std::string& original,
+                                         const std::string& texture_name) {
+    // Build the new Texture message: field 1 = resource string.
+    proto::Writer tex;
+    tex.write_string_field(1, texture_name);
+    // Build the new Material message: field 5 = Texture (LEN).
+    proto::Writer mat;
+    mat.write_bytes_field(5, tex.to_string());
+
+    proto::Writer w;
+    try {
+        proto::Reader reader(original);
+        proto::Field f;
+        while (reader.read_field(f)) {
+            if (f.field_number == 10 && f.wire_type == proto::WIRE_LEN) {
+                w.write_bytes_field(10, mat.to_string());
+            } else {
+                w.write_field(f);
+            }
+        }
+    } catch (...) {
+        return original; // malformed — leave untouched
+    }
+    return w.to_string();
+}
+
+bool scene_set_ground_mesh_texture(SceneObject& obj, size_t mesh_index,
+                                   const std::string& texture_name) {
+    if (mesh_index >= obj.ground_meshes.size()) return false;
+    if (mesh_index >= obj.ground_mesh_textures.size())
+        obj.ground_mesh_textures.resize(obj.ground_meshes.size());
+    obj.ground_mesh_textures[mesh_index] = texture_name;
+    if (mesh_index < obj.ground_mesh_raw.size())
+        obj.ground_mesh_raw[mesh_index] = rewrite_mesh_material(obj.ground_mesh_raw[mesh_index],
+                                                               texture_name);
+    obj.ground_meshes_dirty = true;
+    return true;
 }
 
 std::string scene_fresh_identifier(const SceneData& scene) {
@@ -856,8 +1135,211 @@ bool scene_set_program_source(std::string& program_data, const std::string& sour
 }
 
 // ============================================================
+// WaterMesh parsing
+//
+// WaterMeshComponent payload (114) -> { f1 BoundsShapeId (varint),
+// f2 TextureMappingId (varint), f3 FrontColor (FloatColor RGBA),
+// f4 SurfaceColor (FloatColor RGBA) }. The bounds shape is a component on
+// the same object whose type_id == BoundsShapeId (CollisionShape /
+// UtilityShape); its ShapeComponent payload (field 120) field 1 is the
+// Rectangle (x, y, w, h) that defines the fluid sheet. The texture mapping
+// (payload 113) field 1 names the texture (e.g. "water"), field 2 the tile
+// size, field 3 the offset — mirroring main.js PS() / WaterMeshComponent.
+// ============================================================
+
+// Read a FloatColor message (fixed32 fields 1-4 = RGBA) from bytes.
+static bool parse_float_color(const std::string& bytes, float out[4]) {
+    if (bytes.empty()) return false;
+    try {
+        proto::Reader reader(bytes);
+        proto::Field  f;
+        int idx = 0;
+        while (reader.read_field(f) && idx < 4) {
+            if (f.wire_type == proto::WIRE_I32) out[idx++] = f.float_val;
+        }
+        return idx >= 4;
+    } catch (...) {}
+    return false;
+}
+
+// Extract the Rectangle { x, y, w, h } from a ShapeComponent payload
+// (component with type_id == bounds_id). Returns false when missing.
+static bool read_shape_rectangle(const SceneObject& obj, int bounds_id, float rect[4]) {
+    const auto& comps = obj.resolved_components.empty() ? obj.components : obj.resolved_components;
+    for (const auto& comp : comps) {
+        if (comp.type_id != bounds_id) continue;
+        const int payload = component_payload_field(comp);
+        if (payload == 0) continue;
+        try {
+            proto::Reader wrapper(comp.raw_data);
+            proto::Field field;
+            while (wrapper.read_field(field)) {
+                if (field.field_number != static_cast<uint32_t>(payload) ||
+                    field.wire_type != proto::WIRE_LEN)
+                    continue;
+                proto::Reader shape(field.bytes_val);
+                proto::Field sf;
+                while (shape.read_field(sf)) {
+                    // ShapeComponent field 1 = Rectangle { x, y, w, h }.
+                    if (sf.field_number != 1 || sf.wire_type != proto::WIRE_LEN) continue;
+                    proto::Reader rc(sf.bytes_val);
+                    proto::Field rf;
+                    int idx = 0;
+                    while (rc.read_field(rf) && idx < 4) {
+                        if (rf.wire_type == proto::WIRE_I32) rect[idx++] = rf.float_val;
+                    }
+                    return idx >= 4;
+                }
+            }
+        } catch (...) {}
+    }
+    return false;
+}
+
+// Extract texture name / tile size / offset from a TextureMapping component
+// whose type_id == tex_id. Payload 113: f1 texture name, f2 tile size,
+// f3 offset { x, y }.
+static void read_texture_mapping(const SceneObject& obj, int tex_id,
+                                 std::string& out_name, float& out_tile,
+                                 float out_offset[2]) {
+    const auto& comps = obj.resolved_components.empty() ? obj.components : obj.resolved_components;
+    for (const auto& comp : comps) {
+        if (comp.type_id != tex_id) continue;
+        const int payload = component_payload_field(comp);
+        if (payload == 0) continue;
+        try {
+            proto::Reader wrapper(comp.raw_data);
+            proto::Field field;
+            while (wrapper.read_field(field)) {
+                if (field.field_number != static_cast<uint32_t>(payload) ||
+                    field.wire_type != proto::WIRE_LEN)
+                    continue;
+                proto::Reader tm(field.bytes_val);
+                proto::Field tf;
+                while (tm.read_field(tf)) {
+                    if (tf.field_number == 1 && tf.wire_type == proto::WIRE_LEN &&
+                        is_printable(tf.bytes_val)) {
+                        out_name = tf.bytes_val;
+                    } else if (tf.field_number == 2 && tf.wire_type == proto::WIRE_I32) {
+                        out_tile = tf.float_val;
+                    } else if (tf.field_number == 3 && tf.wire_type == proto::WIRE_LEN) {
+                        proto::Reader ofs(tf.bytes_val);
+                        proto::Field of;
+                        int oi = 0;
+                        while (ofs.read_field(of) && oi < 2) {
+                            if (of.wire_type == proto::WIRE_I32) out_offset[oi++] = of.float_val;
+                        }
+                    }
+                }
+                return;
+            }
+        } catch (...) {}
+    }
+}
+
+static void parse_scene_waters(SceneData& scene) {
+    scene.waters.clear();
+    for (size_t oi = 0; oi < scene.objects.size(); ++oi) {
+        const auto& obj = scene.objects[oi];
+        const auto& comps = obj.resolved_components.empty() ? obj.components : obj.resolved_components;
+        for (const auto& comp : comps) {
+            if (comp.type_name != "WaterMesh") continue;
+            const int payload = component_payload_field(comp);
+            if (payload == 0) continue;
+
+            int bounds_id = 0, tex_id = 0;
+            float front[4] = {0.5f, 0.7f, 1.0f, 0.7f};
+            float surface[4] = {0.7f, 0.9f, 1.0f, 0.7f};
+            try {
+                proto::Reader wrapper(comp.raw_data);
+                proto::Field field;
+                while (wrapper.read_field(field)) {
+                    if (field.field_number != static_cast<uint32_t>(payload) ||
+                        field.wire_type != proto::WIRE_LEN)
+                        continue;
+                    proto::Reader wm(field.bytes_val);
+                    proto::Field wf;
+                    while (wm.read_field(wf)) {
+                        if (wf.field_number == 1 && wf.wire_type == proto::WIRE_VARINT)
+                            bounds_id = (int)wf.varint_val;
+                        else if (wf.field_number == 2 && wf.wire_type == proto::WIRE_VARINT)
+                            tex_id = (int)wf.varint_val;
+                        else if (wf.field_number == 3 && wf.wire_type == proto::WIRE_LEN)
+                            parse_float_color(wf.bytes_val, front);
+                        else if (wf.field_number == 4 && wf.wire_type == proto::WIRE_LEN)
+                            parse_float_color(wf.bytes_val, surface);
+                    }
+                    break;
+                }
+            } catch (...) {}
+            if (bounds_id <= 0) continue;  // no shape -> cannot place the sheet
+
+            SceneData::SceneWater water;
+            water.object_index = (int)oi;
+            if (!read_shape_rectangle(obj, bounds_id, water.rect)) continue;
+            if (water.rect[2] <= 0.0f || water.rect[3] <= 0.0f) continue;
+            memcpy(water.front_color, front, sizeof(front));
+            memcpy(water.surface_color, surface, sizeof(surface));
+            read_texture_mapping(obj, tex_id, water.texture, water.tile_size, water.tex_offset);
+            if (water.tile_size <= 0.0f) water.tile_size = 64.0f;
+            scene.waters.push_back(std::move(water));
+        }
+    }
+    if (!scene.waters.empty())
+        std::cout << "[scene_loader] " << scene.waters.size() << " water mesh(es)\n";
+}
+
+// ============================================================
 // Public API — Load
 // ============================================================
+// Parse the raw SceneObjectGroup messages (top-level scene tag 4).
+// Wire fields (from the Ruby reference editor schema):
+//   tag  1 (LEN)    : Identifier       (group name)
+//   tag  2 (LEN)    : ObjectIdentifier (member object name, repeated)
+//   tag  3 (VARINT) : Hidden
+//   tag  3 (LEN)    : OnLoad (Program, preserved raw)
+//   tag 28 (VARINT) : CanBecomeActive
+//   tag 30 (VARINT) : Locked
+std::vector<SceneGroup> parse_scene_groups(const std::vector<std::string>& raw_groups) {
+    std::vector<SceneGroup> out;
+    out.reserve(raw_groups.size());
+    for (const auto& raw : raw_groups) {
+        SceneGroup g;
+        g.raw = raw;
+        try {
+            proto::Reader r(raw);
+            proto::Field f;
+            while (r.read_field(f)) {
+                switch (f.field_number) {
+                    case 1:
+                        if (f.wire_type == proto::WIRE_LEN)
+                            g.name.assign(f.bytes_val.data(), f.bytes_val.size());
+                        break;
+                    case 2:
+                        if (f.wire_type == proto::WIRE_LEN)
+                            g.members.emplace_back(f.bytes_val.data(), f.bytes_val.size());
+                        break;
+                    case 3:
+                        if (f.wire_type == proto::WIRE_VARINT)
+                            g.hidden = (f.varint_val != 0);
+                        break;
+                    case 30:
+                        if (f.wire_type == proto::WIRE_VARINT)
+                            g.locked = (f.varint_val != 0);
+                        break;
+                    default:
+                        break; // Preserved verbatim in g.raw.
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[scene_loader] warning: group parse failed: " << e.what() << "\n";
+        }
+        if (g.name.empty()) g.name = "<unnamed group>";
+        out.push_back(std::move(g));
+    }
+    return out;
+}
+
 SceneData scene_load(const std::string& path) {
     SceneData scene;
 
@@ -914,7 +1396,90 @@ SceneData scene_load(const std::string& path) {
         std::cerr << "[scene_loader] error: top-level parse failed: " << e.what() << "\n";
     }
 
+    // Resolve ImportedLibrary .scl references before template resolution.
+    // scene_refresh also derives render-time fluids (WaterMesh components)
+    // via parse_scene_waters, and re-runs it on every later object edit so
+    // SceneWater::object_index stays in sync.
+    load_external_libraries(scene);
+    scene.parsed_groups = parse_scene_groups(scene.groups);
     scene_refresh(scene);
+
+    // Collect render-time lights from Light components (never serialized).
+    // LightComponent payload (verified against OpenSwordigo arm32): embedded
+    // field 130 -> { f1 Type, f2 Intensity, f3 Color, f6 Offset, f7 Radius }.
+    scene.lights.clear();
+    for (const auto& obj : scene.objects) {
+        for (const auto& comp : obj.components) {
+            if (comp.type_name != "Light") continue;
+            SceneData::SceneLight light;
+            light.pos[0] = obj.pos_x; light.pos[1] = obj.pos_y; light.pos[2] = obj.pos_z;
+            try {
+                proto::Reader reader(comp.raw_data);
+                proto::Field  f;
+                while (reader.read_field(f)) {
+                    if (f.field_number != 130 || f.wire_type != proto::WIRE_LEN) continue;
+                    proto::Reader data(f.bytes_val);
+                    proto::Field  d;
+                    while (data.read_field(d)) {
+                        switch (d.field_number) {
+                            case 1: light.type = (int)d.as_int(); break;
+                            case 2: light.intensity = d.as_float(); break;
+                            case 3: {
+                                proto::Reader col(d.bytes_val);
+                                proto::Field cf;
+                                int ci = 0;
+                                while (col.read_field(cf) && ci < 3) {
+                                    if (cf.wire_type == proto::WIRE_I32)
+                                        light.color[ci++] = cf.as_float();
+                                    else if (cf.wire_type == proto::WIRE_I64)
+                                        light.color[ci++] = (float)cf.as_double();
+                                }
+                                break;
+                            }
+                            case 6: {
+                                proto::Reader ofs(d.bytes_val);
+                                proto::Field of;
+                                float off[3] = {0, 0, 0};
+                                int oi = 0;
+                                while (ofs.read_field(of) && oi < 3) {
+                                    if (of.wire_type == proto::WIRE_I32)
+                                        off[oi++] = of.as_float();
+                                    else if (of.wire_type == proto::WIRE_I64)
+                                        off[oi++] = (float)of.as_double();
+                                }
+                                light.pos[0] = obj.pos_x + off[0];
+                                light.pos[1] = obj.pos_y + off[1];
+                                light.pos[2] = obj.pos_z + off[2];
+                                break;
+                            }
+                            case 7: light.radius = d.as_float() * 3.0f; break;
+                        }
+                    }
+                    break;
+                }
+            } catch (...) {}
+            if (light.type == 1) continue;         // Ambient lights are baked into g_ambient
+            if (!(light.intensity > 0.0f)) continue;  // also rejects NaN
+            // Some components omit the color sub-message; fall back to warm white.
+            if (light.color[0] <= 0.0f && light.color[1] <= 0.0f && light.color[2] <= 0.0f) {
+                light.color[0] = 1.0f; light.color[1] = 0.92f; light.color[2] = 0.78f;
+            }
+            scene.lights.push_back(light);
+        }
+    }
+    // SimpleGlow components act as warm point lights (torches, fire, crystals).
+    for (const auto& obj : scene.objects) {
+        for (const auto& comp : obj.components) {
+            if (comp.type_name != "SimpleGlow") continue;
+            SceneData::SceneLight light;
+            light.type = 4;
+            light.intensity = 1.4f;
+            light.color[0] = 1.0f; light.color[1] = 0.72f; light.color[2] = 0.42f;
+            light.pos[0] = obj.pos_x; light.pos[1] = obj.pos_y; light.pos[2] = obj.pos_z;
+            light.radius = 260.0f;
+            scene.lights.push_back(light);
+        }
+    }
 
     std::cout << "[scene_loader] loaded " << scene.filename
               << ": " << scene.object_count << " objects"

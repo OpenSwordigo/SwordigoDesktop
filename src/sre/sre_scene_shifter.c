@@ -74,6 +74,10 @@ volatile int     g_sre_instant_scene_load_enabled = 0;  /* 1 = short-circuit nex
 /* --- Last result --- */
 char             g_sre_scene_shift_last_error[256] = {0};
 int              g_sre_scene_shift_active   = 0; /* 1 while forced load in flight */
+static int        g_sre_scene_shift_wait_frames = 0;
+
+/* Last SceneLoadingView created (defined in sre_scene_update.c) */
+extern volatile void* g_sre_last_slv;
 
 /* =========================================================================
  * ARM64 Offsets (v1.4.12, from nm -D libswordigo.so + IDA/Ghidra)
@@ -146,6 +150,16 @@ typedef void (*pfn_GotoLevel)(void* self, SreString* level_name, SreString* spaw
  *
  * Returns NULL if any pointer in the chain is invalid.
  * ========================================================================= */
+/* Plausibility check for guest object pointers. Live guest heap objects live in
+ * 0x20000000–0xDFFFFFFF (e.g. CaverShell DAT=0x20004208, hero=0x205a8380).
+ * Rejecting pointers outside this range prevents the chain from dereferencing
+ * stale/partially-freed memory — the normal-gateway crash the old code caused.
+ * (The load base itself lives below 0x20000000, so a text/.bss pointer never
+ * passes this test either.) */
+static int is_plausible_guest_obj(uint64_t p) {
+    return p >= 0x20000000ULL && p < 0xE0000000ULL;
+}
+
 static void* sre_get_active_gvc(void) {
     if (!g_swordigo_base) {
         fprintf(stderr, "[SRE/SceneShifter] GVC: g_swordigo_base=0\n");
@@ -158,31 +172,30 @@ static void* sre_get_active_gvc(void) {
     fprintf(stderr, "[SRE/SceneShifter] GVC chain: base=0x%llx slot=0x%llx shell=%p\n",
             (unsigned long long)g_swordigo_base,
             (unsigned long long)OFF_CaverShell_globalptr, shell);
-    if (!shell) {
-        fprintf(stderr, "[SRE/SceneShifter] CaverShell not yet initialized\n");
+    if (!shell || !is_plausible_guest_obj((uint64_t)(uintptr_t)shell)) {
+        fprintf(stderr, "[SRE/SceneShifter] CaverShell not yet initialized (shell=%p)\n", shell);
         return NULL;
     }
 
-    /* GUINavigationController* from CaverShell+0x98 */
+    /* GUINavigationController* from CaverShell+0x98 (px of the shared_ptr) */
     void** nav_slot = (void**)((char*)shell + CAVERSHELL_OFF_NAV_CTRL);
     void*  nav_ctrl = *nav_slot;
     fprintf(stderr, "[SRE/SceneShifter] GVC chain: shell+0x%x => nav_ctrl=%p\n",
             (unsigned)CAVERSHELL_OFF_NAV_CTRL, nav_ctrl);
-    if (!nav_ctrl) {
-        fprintf(stderr, "[SRE/SceneShifter] GUINavigationController is NULL\n");
+    if (!nav_ctrl || !is_plausible_guest_obj((uint64_t)(uintptr_t)nav_ctrl)) {
+        fprintf(stderr, "[SRE/SceneShifter] GUINavigationController invalid (nav_ctrl=%p)\n", nav_ctrl);
         return NULL;
     }
 
     /* Current view controller is GUINavigationController::currentViewController,
-     * whose shared_ptr px is at +0x50. The old code incorrectly described the
-     * shell field as a raw pointer, but InitView stores a boost::shared_ptr at
+     * whose shared_ptr px is at +0x50. InitView stores a boost::shared_ptr at
      * shell+0x98, so dereference its px field first. */
     void** gvc_slot = (void**)((char*)nav_ctrl + NAVCTRL_OFF_CURRENT_VC_PX);
     void*  gvc      = *gvc_slot;
     fprintf(stderr, "[SRE/SceneShifter] GVC chain: nav_ctrl+0x%x => gvc=%p\n",
             (unsigned)NAVCTRL_OFF_CURRENT_VC_PX, gvc);
-    if (!gvc) {
-        fprintf(stderr, "[SRE/SceneShifter] Current GUIViewController is NULL\n");
+    if (!gvc || !is_plausible_guest_obj((uint64_t)(uintptr_t)gvc)) {
+        fprintf(stderr, "[SRE/SceneShifter] Current GUIViewController invalid (gvc=%p)\n", gvc);
         return NULL;
     }
 
@@ -270,23 +283,65 @@ static int sre_scene_shifter_call_goto_level(const char* level_name,
 }
 
 /* =========================================================================
+ * sre_scene_shifter_wait_complete
+ * =========================================================================
+ * Shared completion step for BOTH gateways. Waits for the SceneLoadingView
+ * background load (created by GotoLevel → InitWithGameState, tracked in
+ * g_sre_last_slv) to finish, then pokes progress=1.0 so the loading screen
+ * completes deterministically.
+ *
+ * The OLD normal gateway returned to the frame loop immediately and let the
+ * loading screen render on its own — which crashed the game (stale VC vtable
+ * dispatch / matrix render corruption during the transition). Forcing the
+ * same proven completion the forced gateway uses fixes the crash.
+ * ========================================================================= */
+static void sre_scene_shifter_poll_complete(void) {
+    if (!g_sre_scene_shift_active) return;
+    g_sre_scene_shift_wait_frames++;
+
+    if (g_sre_last_slv) {
+        volatile int* is_complete =
+            (volatile int*)((char*)g_sre_last_slv + SLVIEW_OFF_LOAD_COMPLETE);
+        if (*is_complete) {
+            volatile float* progress =
+                (volatile float*)((char*)g_sre_last_slv + SLVIEW_OFF_PROGRESS);
+            *progress = 1.0f;
+            g_sre_scene_shift_active = 0;
+            g_sre_instant_scene_load_enabled = 0;
+            g_sre_scene_shift_wait_frames = 0;
+            snprintf(g_sre_scene_shift_last_error,
+                     sizeof(g_sre_scene_shift_last_error), "OK");
+            strncpy(g_sre_current_scene_name, g_sre_scene_shift_target, 127);
+            g_sre_current_scene_name[127] = '\0';
+            return;
+        }
+    }
+
+    if (g_sre_scene_shift_wait_frames > 3600) {
+        snprintf(g_sre_scene_shift_last_error,
+                 sizeof(g_sre_scene_shift_last_error), "Scene load timed out");
+        g_sre_scene_shift_active = 0;
+        g_sre_instant_scene_load_enabled = 0;
+        g_sre_scene_shift_wait_frames = 0;
+    }
+}
+
+/* =========================================================================
  * sre_scene_shifter_normal
- * Normal gateway — calls GotoLevel, shows loading screen as normal
+ * Normal gateway — calls GotoLevel and completes the transition inside the
+ * SRE call (loading screen is never left half-rendered, so it cannot crash).
  * ========================================================================= */
 int sre_scene_shifter_normal(const char* level_name, const char* spawn_point) {
     g_sre_instant_scene_load_enabled = 0;  /* Normal load: no instant-complete */
     g_sre_scene_shift_active         = 1;
+    g_sre_last_slv = NULL;                 /* discard stale SLV from previous loads */
+    g_sre_scene_shift_wait_frames = 0;
 
     int ok = sre_scene_shifter_call_goto_level(level_name, spawn_point);
     if (!ok) {
         g_sre_scene_shift_active = 0;
         fprintf(stderr, "[SRE/SceneShifter] Normal gateway FAILED: %s\n",
                 g_sre_scene_shift_last_error);
-    } else {
-        /* GotoLevel is synchronous; BackgroundLoad runs on a new thread.
-         * Reset active now so the GUI buttons re-enable. The loading
-         * screen itself handles UX feedback during the async load. */
-        g_sre_scene_shift_active = 0;
     }
     return ok;
 }
@@ -296,10 +351,10 @@ int sre_scene_shifter_normal(const char* level_name, const char* spawn_point) {
  * Forced gateway — arms the instant-load short-circuit, then calls GotoLevel
  * ========================================================================= */
 int sre_scene_shifter_forced(const char* level_name, const char* spawn_point) {
-    /* Arm the instant-complete hook BEFORE triggering the transition.
-     * The hook fires on the very first SceneLoadingView::Update() call. */
     g_sre_instant_scene_load_enabled = 1;
     g_sre_scene_shift_active         = 1;
+    g_sre_last_slv = NULL;
+    g_sre_scene_shift_wait_frames = 0;
 
     int ok = sre_scene_shifter_call_goto_level(level_name, spawn_point);
     if (!ok) {
@@ -307,13 +362,6 @@ int sre_scene_shifter_forced(const char* level_name, const char* spawn_point) {
         g_sre_scene_shift_active         = 0;
         fprintf(stderr, "[SRE/SceneShifter] Forced gateway FAILED: %s\n",
                 g_sre_scene_shift_last_error);
-    } else {
-        /* GotoLevel dispatched successfully. The SceneLoadingView::Update hook
-         * (if installed) will fire instant-complete on the first update tick.
-         * Clear flags here so the GUI never gets stuck in greyed-out state
-         * even if the hook didn't fire. */
-        g_sre_instant_scene_load_enabled = 0;
-        g_sre_scene_shift_active         = 0;
     }
     return ok;
 }
@@ -335,7 +383,16 @@ int sre_scene_shifter_forced(const char* level_name, const char* spawn_point) {
  * ========================================================================= */
 void sre_scene_shifter_tick(void) {
     g_sre_scene_shifter_poll_ticks++;
+    sre_scene_shifter_poll_complete();
     if (!g_sre_scene_shift_pending) return;
+
+    if (g_sre_scene_shift_active) {
+        snprintf(g_sre_scene_shift_last_error,
+                 sizeof(g_sre_scene_shift_last_error),
+                 "A scene load is already active");
+        g_sre_scene_shift_pending = 0;
+        return;
+    }
 
     int mode = g_sre_scene_shift_pending;
     g_sre_scene_shift_pending = 0;  /* clear first to prevent double-fire */
@@ -359,10 +416,11 @@ void sre_scene_shifter_tick(void) {
         sre_scene_shifter_normal(level, spawn);
     } else if (mode == 2) {
         sre_scene_shifter_forced(level, spawn);
+    } else {
+        snprintf(g_sre_scene_shift_last_error,
+                 sizeof(g_sre_scene_shift_last_error),
+                 "Invalid scene gateway mode: %d", mode);
     }
-    
-    strncpy(g_sre_current_scene_name, level, 127);
-    g_sre_current_scene_name[127] = '\0';
 }
 
 /* =========================================================================
@@ -395,7 +453,7 @@ static void scan_dir_for_scenes(const char* base, int depth) {
         snprintf(full, sizeof(full), "%s/%s", base, ent->d_name);
 
         struct stat st;
-        if (stat(full, &st) != 0) continue;
+        if (lstat(full, &st) != 0 || S_ISLNK(st.st_mode)) continue;
 
         if (S_ISDIR(st.st_mode)) {
             scan_dir_for_scenes(full, depth + 1);

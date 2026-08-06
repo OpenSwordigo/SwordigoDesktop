@@ -100,7 +100,7 @@ SreHookEntry sre_hook_table[] = {
      * SceneObjectGroup::FinishLoad additionally calls ProgramState::Execute on
      * attached Lua scripts immediately during scene load — any script error in the
      * original causes ProgramPanic → abort. Our wrapper catches it via setjmp. */
-    { 0,        "sre_SceneLoadingView_InitWithGameState" },
+    { 0x4358dc, "sre_SceneLoadingView_InitWithGameState" },
     { 0,        "sre_GameSceneController_InitWithScene"  },
     /* SceneLoadingView::Update AND AnimateIn — NOT hooked.
      *
@@ -347,6 +347,7 @@ SreHookEntry sre_hook_table[] = {
      * Hook the IMPL, not the PLT thunk (0x1fa880), so all callers are covered.
      */
     { 0x2fc030, "sre_Proto_SceneObject_Clear" },
+    { 0x2fe23c, "sre_Proto_SceneObject_Destroy" },
 
     /* ─── Proto::ObjectLibrary::Clear crash guard ──────────────────────────────
      * One level above SceneObject::Clear in the chain. IDA 0x2fd374 shows 3

@@ -1,0 +1,11 @@
+schema_version = "1.0.0"
+
+id = "swordigo_roundtrip"
+name = "Swordigo Round-Trip"
+version = "1.0.0"
+tagline = "Round-trip POD assets between Ruby and Blender"
+maintainer = "Swordigo Desktop Team"
+license = ["SPDX:GPL-3.0-or-later"]
+
+blender_version_min = "4.2.0"
+type = "add-on"

@@ -1991,11 +1991,14 @@ void* caver_getHero_impl(void) {
 
 void* caver_getHero_from_view(void* view) {
     if (!view) return (void*)0;
-    uint64_t gc = *(uint64_t*)((char*)view + 0xF8);
-    if (!gc) return (void*)0;
-    uint64_t sc = *(uint64_t*)((char*)gc + 0xC8); /* 0xC8 = GameSceneController* */
-    if (!sc) return (void*)0;
-    return (void*)*(uint64_t*)((char*)sc + 0xd8); /* active hero SceneObject* */
+    /* view is expected to be a GameSceneView* where +0xF0 = GameSceneController*.
+     * If this is a menu view or other type, +0xF0 may contain garbage.
+     * Basic validity: check the pointer looks like a heap address. */
+    uint64_t sc = *(uint64_t*)((char*)view + 0xF0); /* GameSceneController* */
+    if (!sc || sc < 0x10000) return (void*)0;
+    uint64_t hero = *(uint64_t*)((char*)sc + 0xd8); /* active hero SceneObject* */
+    if (!hero || hero < 0x10000) return (void*)0;
+    return (void*)hero;
 }
 
 void caver_getPosition_impl(void* obj, float* x, float* y, float* z) {

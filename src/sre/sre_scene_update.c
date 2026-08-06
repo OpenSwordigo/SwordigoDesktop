@@ -196,16 +196,57 @@ static void sp_addref(void* pn) {
     }
 }
 
+/* Valid vtable ranges for libswordigo.so guest objects (see sre_gui_nav.c).
+ * Used to stop scene-object destruction from branching into .dynstr or freed
+ * heap memory when a refcount block has been partially reclaimed. */
+static int sp_vtable_is_valid(uint64_t vtable) {
+    if (!vtable || (vtable & 7) != 0) return 0;
+    if (vtable >= 0x16b6a80ULL && vtable < 0x16DC000ULL) return 1; /* .data.rel.ro */
+    if (vtable >= 0x1583480ULL && vtable < 0x15A2000ULL) return 1; /* .rodata */
+    /* SRE relay-cave vtables (TrampolineMgr arena 0x3000000–0x3100000) */
+    if (vtable >= 0x3000000ULL && vtable < 0x3100000ULL) return 1;
+    return 0;
+}
+
+static int sp_code_is_valid(uint64_t fn) {
+    if (!fn || (fn & 3) != 0) return 0;
+    if (fn >= 0x1203e90ULL && fn < 0x1584000ULL) return 1;      /* .text */
+    if (fn >= 0x3000000ULL && fn < 0x3100000ULL) return 1;      /* relay arena */
+    if (fn >= 0x2000000ULL && fn < 0x2300000ULL) return 1;      /* libsre.so guest */
+    return 0;
+}
+
 static void sp_release(void* pn) {
     if (!pn) return;
     int64_t* use_count = (int64_t*)((char*)pn + 0x08);
     (*use_count)--;
     if (*use_count == 0) {
-        /* Call virtual dispose() — vtable[2] (offset 0x10) */
         uint64_t vtable = *(uint64_t*)pn;
+
+        /* SCENE-OBJECT DESTRUCTION GUARD: never call virtual dispose()/destroy()
+         * through a corrupt or stale vtable — that was a recurring source of
+         * NoExecuteFault crashes during scene unload (PC landing in .dynstr).
+         * If the vtable looks bad, zero the counts and leak the block instead
+         * of branching into garbage. */
+        if (!sp_vtable_is_valid(vtable)) {
+            fprintf(stderr, "[SRE/SceneObject] sp_release: corrupt vtable=0x%llx on refcount block %p — "
+                            "skipping dispose/destroy (counts zeroed)\n",
+                    (unsigned long long)vtable, pn);
+            *use_count = 0;
+            *(int64_t*)((char*)pn + 0x10) = 0;
+            return;
+        }
+
+        /* Call virtual dispose() — vtable[2] (offset 0x10) */
         typedef void (*fn_dispose)(void*);
         fn_dispose dispose = (fn_dispose)(*(uint64_t*)(vtable + 0x10));
-        dispose(pn);
+        if (sp_code_is_valid((uint64_t)(uintptr_t)dispose)) {
+            dispose(pn);
+        } else {
+            fprintf(stderr, "[SRE/SceneObject] sp_release: dispose fn 0x%llx invalid — skipped\n",
+                    (unsigned long long)(uintptr_t)dispose);
+        }
+
         /* Decrement weak_count */
         int64_t* weak_count = (int64_t*)((char*)pn + 0x10);
         (*weak_count)--;
@@ -213,7 +254,12 @@ static void sp_release(void* pn) {
             /* Call virtual destroy() — vtable[3] (offset 0x18) */
             typedef void (*fn_destroy)(void*);
             fn_destroy destroy = (fn_destroy)(*(uint64_t*)(vtable + 0x18));
-            destroy(pn);
+            if (sp_code_is_valid((uint64_t)(uintptr_t)destroy)) {
+                destroy(pn);
+            } else {
+                fprintf(stderr, "[SRE/SceneObject] sp_release: destroy fn 0x%llx invalid — skipped\n",
+                        (unsigned long long)(uintptr_t)destroy);
+            }
         }
     }
 }
@@ -250,6 +296,22 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
     
     /* Export gamestate pointer for host-side modding */
     g_sre_gamestate_ptr = (uint64_t)gamestate;
+
+    /* Poll current scene name from GameState (offset +0x158 contains std::string current_level) */
+    {
+        extern char g_sre_current_scene_name[128];
+        char* scene_name_ptr = *(char**)(gamestate + 0x158);
+        if (scene_name_ptr && (uint64_t)scene_name_ptr > 0x1000) { /* basic validity check */
+            if (scene_name_ptr[0] != '\0') {
+                /* sre_streq is safer than strcmp here, but let's just do a manual check or use strncmp */
+                extern int strncmp(const char*, const char*, size_t);
+                if (strncmp(g_sre_current_scene_name, scene_name_ptr, 127) != 0) {
+                    extern int snprintf(char *str, size_t size, const char *format, ...);
+                    snprintf(g_sre_current_scene_name, 128, "%s", scene_name_ptr);
+                }
+            }
+        }
+    }
 
     /* Synchronize global camera coordinates using hero position fallback disabled */
     if (ctrl_ptr != 0) {
@@ -461,22 +523,7 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
             uint64_t settings_btn = *(uint64_t*)((char*)overlay + 0x1C8);
             uint64_t mana_bar = *(uint64_t*)((char*)overlay + 0x1F8);
 
-            // Print diagnostic log for first few frames
-            static int print_count = 0;
-            if (print_count < 10) {
-                extern int printf(const char* format, ...);
-                printf("[SRE-HUD] overlay=0x%X hide=%d\n", (unsigned int)(uintptr_t)overlay, (int)hide);
-                if (settings_btn) {
-                    printf("  settings_btn=0x%X isHidden_before=%d\n", (unsigned int)settings_btn, (int)*(uint8_t*)(settings_btn + 0xE4));
-                }
-                if (spell_picker) {
-                    printf("  spell_picker=0x%X isHidden_before=%d\n", (unsigned int)spell_picker, (int)*(uint8_t*)(spell_picker + 0xE4));
-                }
-                if (mana_bar) {
-                    printf("  mana_bar=0x%X isHidden_before=%d\n", (unsigned int)mana_bar, (int)*(uint8_t*)(mana_bar + 0xE4));
-                }
-                print_count++;
-            }
+            // Diagnostic log removed to fix SRE-HUD spam
 
             // Force the settings button to remain visible
             if (settings_btn) {
@@ -569,6 +616,8 @@ do_effects:
 typedef void (*pfn_orig_SceneLoadingView_InitWithGameState)(void* self, void* state_ptr, void* map_node_ptr);
 pfn_orig_SceneLoadingView_InitWithGameState g_orig_SceneLoadingView_InitWithGameState = 0;
 
+volatile void* g_sre_last_slv = NULL;
+
 void sre_SceneLoadingView_InitWithGameState(void* self, void* state_ptr, void* map_node_ptr) {
     fprintf(stderr, "[SRE/Scene] SceneLoadingView::InitWithGameState starting (view=%p)...\n", self);
 
@@ -576,6 +625,7 @@ void sre_SceneLoadingView_InitWithGameState(void* self, void* state_ptr, void* m
      * This suppresses all lua_resume calls in ProgramState::Update for the
      * entire duration of scene loading, preventing mutex-under-longjmp deadlock. */
     g_sre_scene_loading = 1;
+    g_sre_last_slv = self;
 
     if (g_orig_SceneLoadingView_InitWithGameState) {
         g_orig_SceneLoadingView_InitWithGameState(self, state_ptr, map_node_ptr);
@@ -925,6 +975,8 @@ void sre_GameData_Clear(void* this_) {
 call_orig:
     if (g_orig_GameData_Clear)
         ((void(*)(void*))g_orig_GameData_Clear)(this_);
+    else if (g_swordigo_base)
+        ((void(*)(void*))(g_swordigo_base + 0x2e6d60))(this_);
 }
 
 /* =============================================================================
@@ -1025,6 +1077,8 @@ void sre_Proto_SceneObject_Clear(void* this_) {
     }
     if (g_orig_Proto_SceneObject_Clear)
         ((void(*)(void*))g_orig_Proto_SceneObject_Clear)(this_);
+    else if (g_swordigo_base)
+        ((void(*)(void*))(g_swordigo_base + 0x2fc030))(this_);
 }
 
 /* =============================================================================
@@ -1067,6 +1121,8 @@ void sre_Proto_ObjectLibrary_Clear(void* this_) {
     }
     if (g_orig_Proto_ObjectLibrary_Clear)
         ((void(*)(void*))g_orig_Proto_ObjectLibrary_Clear)(this_);
+    else if (g_swordigo_base)
+        ((void(*)(void*))(g_swordigo_base + 0x2fd374))(this_);
 }
 
 /* =============================================================================
@@ -1142,6 +1198,8 @@ void sre_Proto_SceneObject_Destroy(void* this_) {
 
     if (g_orig_Proto_SceneObject_Destroy)
         ((void(*)(void*))g_orig_Proto_SceneObject_Destroy)(this_);
+    else if (g_swordigo_base)
+        ((void(*)(void*))(g_swordigo_base + 0x2fe23c))(this_);
 }
 
 /* =============================================================================

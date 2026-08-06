@@ -9,6 +9,7 @@ extern "C" const char* sre_resolve_symbol(uint64_t addr);
 #include "platform/video_background.h"
 #include "platform/pvrtc_decoder.h"
 #include <iostream>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
@@ -3075,9 +3076,14 @@ void bridge_al_noop(void* emu_ptr) {
 // When g_display_active, these call real host OpenGL.
 // Guest memory pointers are translated via (memory + guest_offset).
 
-// Diagnostic: log GL calls on first 3 frames to debug black screen
+// Diagnostic: log GL calls on first 3 frames to debug black screen.
+// OFF by default — the per-call dump (printf + fflush per GL call) slowed
+// boot and flooded the terminal. Set SWORDIGO_GL_DIAG=1 to re-enable.
 int g_gl_diag_frame = 0;
-bool g_gl_diag_enabled = true;
+bool g_gl_diag_enabled = [] {
+    const char* e = getenv("SWORDIGO_GL_DIAG");
+    return e && e[0] == '1';
+}();
 #define GL_DIAG(...) do { if (g_gl_diag_enabled && g_gl_diag_frame < 3) { printf("[GL F%d] ", g_gl_diag_frame); printf(__VA_ARGS__); printf("\n"); fflush(stdout); } } while(0)
 #define TEX_LOG(...) do { if (g_gl_diag_enabled && g_gl_diag_frame < 3) { printf("[TEX F%d] ", g_gl_diag_frame); printf(__VA_ARGS__); printf("\n"); fflush(stdout); } } while(0)
 #define VERTEX_LOG(...) do { if (g_gl_diag_enabled && g_gl_diag_frame < 3) { printf("[VERTEX F%d] ", g_gl_diag_frame); printf(__VA_ARGS__); printf("\n"); fflush(stdout); } } while(0)

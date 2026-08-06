@@ -98,13 +98,44 @@ int      g_render_preset = 0; // 0=1080p, 1=720p, 2=540p, 3=Window
 // Safe to call from the frame loop (between drawApp calls).
 void apply_render_preset(int preset) {
     struct Preset { int w, h; const char* label; };
+    // Indices must match the GUI's ResPreset.idx values exactly.
     // Preset 3 uses current window size — filled in below.
-    static const Preset presets[4] = {
-        { 1920, 1080, "1080p" },
-        { 1280,  720, "720p"  },
-        {  960,  544, "540p"  },
-        {    0,    0, "Window" },
+    static const Preset presets[] = {
+        /* 0  */ { 1920, 1080, "1080p"          },
+        /* 1  */ { 1280,  720, "720p"           },
+        /* 2  */ {  960,  544, "540p (native)"  },
+        /* 3  */ {    0,    0, "Window"         },
+        /* 4  */ {    0,    0, "(reserved)"     },
+        /* 5  */ {    0,    0, "(reserved)"     },
+        /* 6  */ {    0,    0, "(reserved)"     },
+        /* 7  */ {    0,    0, "(reserved)"     },
+        /* 8  */ {    0,    0, "(reserved)"     },
+        /* 9  */ { 2560, 1440, "1440p"          },
+        /* 10 */ { 3840, 2160, "4K"             },
+        /* 11 */ { 1600,  900, "900p"           },
+        /* 12 */ { 1366,  768, "768p"           },
+        /* 13 */ { 1024,  600, "600p"           },
+        /* 14 */ {  854,  480, "480p"           },
+        /* 15 */ {  640,  360, "360p"           },
+        /* 16 */ {  426,  240, "240p"           },
+        /* 17 */ { 1920, 1200, "WUXGA 1920x1200"},
+        /* 18 */ { 1440,  900, "1440x900"       },
+        /* 19 */ { 1280,  800, "1280x800"       },
+        /* 20 */ { 3440, 1440, "UWQHD 3440x1440"},
+        /* 21 */ { 2560, 1080, "UWHD 2560x1080" },
+        /* 22 */ { 3840, 1600, "UWQHD+ 3840x1600"},
+        /* 23 */ { 2880, 1800, "Retina 2880x1800"},
+        /* 24 */ { 1680, 1050, "WSXGA+ 1680x1050"},
+        /* 25 */ { 1280, 1024, "SXGA 1280x1024" },
+        /* 26 */ { 1024,  768, "XGA 1024x768"   },
     };
+    static const int num_presets = (int)(sizeof(presets)/sizeof(presets[0]));
+
+    if (preset < 0 || preset >= num_presets) {
+        std::cout << "[RenderPreset] Unknown preset index " << preset << " — ignored\n";
+        return;
+    }
+
     extern int g_win_w, g_win_h;
     extern void fbo_destroy();
     extern bool fbo_init(int game_w, int game_h);
@@ -112,7 +143,7 @@ void apply_render_preset(int preset) {
 
     int new_w = presets[preset].w;
     int new_h = presets[preset].h;
-    if (preset == 3) { new_w = g_win_w; new_h = g_win_h; }
+    if (preset == 3) { new_w = g_win_w; new_h = g_win_h; }   // "Window" = match output
     if (new_w < 320) new_w = 320;
     if (new_h < 180) new_h = 180;
     // Align to even dimensions (required by some FBO formats)
@@ -1943,16 +1974,6 @@ void load_and_boot() {
                                 std::cout << "[Debug] " << (debug_visible ? "ON" : "OFF") << std::endl;
                                 break;
                             }
-                            if (event.key.key == SDLK_F4 && !event.key.repeat) {
-                                g_fbo_mode = static_cast<FBOScale>((static_cast<int>(g_fbo_mode) + 1) % 4);
-                                const char* m_name = "Unknown";
-                                if (g_fbo_mode == FBOScale::SHARP_BILINEAR) m_name = "Sharp-Bilinear";
-                                else if (g_fbo_mode == FBOScale::NEAREST) m_name = "Nearest";
-                                else if (g_fbo_mode == FBOScale::CRT_SCANLINE) m_name = "CRT Scanline";
-                                else if (g_fbo_mode == FBOScale::FSR) m_name = "FSR 1.0 (Edge-Adaptive)";
-                                std::cout << "[FBO] Scale mode changed to " << m_name << std::endl;
-                                break;
-                            }
                             if (event.key.key == SDLK_F12 && !event.key.repeat) {
                                 SDL_WindowFlags flags = SDL_GetWindowFlags(g_display_ptr->get_window());
                                 if (flags & SDL_WINDOW_FULLSCREEN) {
@@ -2044,10 +2065,6 @@ void load_and_boot() {
                             }
                             if (event.key.key == SDLK_F9 && !event.key.repeat) {
                                 mod_step_frame();
-                                break;
-                            }
-                            if (event.key.key == SDLK_F11 && !event.key.repeat) {
-                                g_swordfare_gui.toggle_mod_overlay();
                                 break;
                             }
                             if (event.key.key == SDLK_EQUALS && !event.key.repeat) {
@@ -2903,35 +2920,16 @@ void load_and_boot_arm64() {
         std::cerr << "  [SRE] Swordigo Runtime Engine — Checking..." << std::endl;
         std::cerr << "============================================" << std::endl;
 
-        // Derive libsre.so path from g_lib_name's directory
-        // e.g. "engine/v1.4.12/arm64-v8a/libswordigo.so" → "engine/v1.4.12/arm64-v8a/libsre.so"
-        std::string sre_rel = g_lib_name;
-        auto slash = sre_rel.rfind('/');
-        if (slash != std::string::npos) {
-            sre_rel = sre_rel.substr(0, slash + 1) + "libsre.so";
-        } else {
-            sre_rel = "libsre.so";
-        }
-        std::string sre_path = get_data_path(sre_rel);
-        std::cerr << "[SRE] Looking for: " << sre_rel << std::endl;
-        std::cerr << "[SRE] Resolved to: " << (sre_path.empty() ? "(empty)" : sre_path) << std::endl;
-        
-        // Fallback: try current directory
-        if (sre_path.empty() || access(sre_path.c_str(), F_OK) != 0) {
-            if (access("libsre.so", F_OK) == 0) {
+        std::string sre_path = "bin/libs/libsre.so";
+        if (access(sre_path.c_str(), F_OK) != 0) {
+            std::string alt_path = get_data_path("bin/libs/libsre.so");
+            if (!alt_path.empty() && access(alt_path.c_str(), F_OK) == 0) {
+                sre_path = alt_path;
+            } else if (access("libsre.so", F_OK) == 0) {
                 sre_path = "libsre.so";
             }
-        } else {
-            // Sync current directory's libsre.so to the instance directory
-            if (sre_path != "libsre.so" && access("libsre.so", F_OK) == 0) {
-                try {
-                    fs::copy_file("libsre.so", sre_path, fs::copy_options::overwrite_existing);
-                    std::cout << "[SRE] Synchronized: copied ./libsre.so -> " << sre_path << std::endl;
-                } catch (const std::exception& e) {
-                    std::cerr << "[SRE] Failed to sync ./libsre.so to " << sre_path << ": " << e.what() << std::endl;
-                }
-            }
         }
+
 
         if (!sre_path.empty() && access(sre_path.c_str(), F_OK) == 0) {
             std::cerr << "[SRE] FOUND: " << sre_path << std::endl;
@@ -3448,24 +3446,25 @@ void load_and_boot_arm64() {
                     // Three functions in the transition chain:
                     //   Update (0x303099), ViewControllerViewLoaded (0x3030bd), FinishTransition (0x303681)
                     struct GUINavRelay {
+                        uint64_t    nm_offset;
                         const char* engine_sym;
                         const char* sre_orig_sym;
                     };
                     const GUINavRelay nav_relays[] = {
-                        { "_ZN5Caver23GUINavigationController6UpdateEf",
+                        { 0x49923c, "_ZN5Caver23GUINavigationController6UpdateEf",
                           "g_orig_GUINavigationController_Update" },
-                        { "_ZN5Caver23GUINavigationController24ViewControllerViewLoadedEPNS_17GUIViewControllerE",
+                        { 0x499288, "_ZN5Caver23GUINavigationController24ViewControllerViewLoadedEPNS_17GUIViewControllerE",
                           "g_orig_GUINavigationController_VCLoaded" },
-                        { "_ZN5Caver23GUINavigationController32FinishTransitionToViewControllerERKN5boost10shared_ptrINS_17GUIViewControllerEEEPvPNS_8GUIEventE",
+                        { 0x49a42c, "_ZN5Caver23GUINavigationController32FinishTransitionToViewControllerERKN5boost10shared_ptrINS_17GUIViewControllerEEEPvPNS_8GUIEventE",
                           "g_orig_GUINavigationController_Finish" },
-                        { "_ZN5Caver24OrbitControllerComponent12FollowObjectERKN5boost13intrusive_ptrINS_11SceneObjectEEE",
+                        { 0, "_ZN5Caver24OrbitControllerComponent12FollowObjectERKN5boost13intrusive_ptrINS_11SceneObjectEEE",
                           "g_orig_OrbitController_FollowObject" },
-                        { "_ZN5Caver20HeroEquipmentManager17ApplyArmorTrinketERKN5boost10shared_ptrINS_4ItemEEE",
+                        { 0, "_ZN5Caver20HeroEquipmentManager17ApplyArmorTrinketERKN5boost10shared_ptrINS_4ItemEEE",
                           "g_orig_HeroEquipmentManager_ApplyArmorTrinket" },
-                        { "_ZN5Caver20HeroEquipmentManager18ApplyWeaponTrinketERKN5boost10shared_ptrINS_4ItemEEE",
+                        { 0, "_ZN5Caver20HeroEquipmentManager18ApplyWeaponTrinketERKN5boost10shared_ptrINS_4ItemEEE",
                           "g_orig_HeroEquipmentManager_ApplyWeaponTrinket" },
                         /* GameData::Clear crash guard — nm 0x2e6d60 arm64-v8a */
-                        { "_ZN5Caver5Proto8GameData5ClearEv",
+                        { 0x2e6d60, "_ZN5Caver5Proto8GameData5ClearEv",
                           "g_orig_GameData_Clear" },
                         /* Proto::SceneObject::Clear crash guard — nm 0x2fc030
                          * Confirmed crash path (live log LR=0x12fe290):
@@ -3475,12 +3474,12 @@ void load_and_boot_arm64() {
                          *   → PC = 0x47bfda9034ff4 (ARM64 STP instruction bytes)
                          *   → Dynarmic NoExecuteFault → game freeze.
                          * Our hook caps this+40 (count) before delegating. */
-                        { "_ZN5Caver5Proto11SceneObject5ClearEv",
+                        { 0x2fc030, "_ZN5Caver5Proto11SceneObject5ClearEv",
                           "g_orig_Proto_SceneObject_Clear" },
                         /* Proto::SceneObject D1/D2 destructor — nm 0x2fe23c.
                          * Separate from Clear(): it directly dispatches component
                          * vtable[1] during scene teardown and needs its own guard. */
-                        { "_ZN5Caver5Proto11SceneObjectD1Ev",
+                        { 0x2fe23c, "_ZN5Caver5Proto11SceneObjectD1Ev",
                           "g_orig_Proto_SceneObject_Destroy" },
                         /* ComponentOutletBase::Connect vtable safety guard
                          * nm arm64-v8a 0x247c48: _ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE
@@ -3488,39 +3487,39 @@ void load_and_boot_arm64() {
                          * from heap allocator free-list link → PC jumps to kernel space →
                          * Dynarmic NoExecuteFault. Our hook validates vtable[1] and vtable[4]
                          * before dispatching. Bail = return 0 (same as 'no identifier' path). */
-                        { "_ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE",
+                        { 0x247c48, "_ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE",
                           "g_orig_ComponentOutletBase_Connect" },
                         /* Proto::ObjectLibrary::Clear crash guard — nm 0x2fd374
                          * Belt-and-suspenders: guards 3 vtable-dispatch loops
                          * one level above SceneObject::Clear in the chain. */
-                        { "_ZN5Caver5Proto13ObjectLibrary5ClearEv",
+                        { 0x2fd374, "_ZN5Caver5Proto13ObjectLibrary5ClearEv",
                           "g_orig_Proto_ObjectLibrary_Clear" },
                         /* Scene::FinishLoad relay — nm arm64 0x4642a8
                          * Called by sre_Scene_FinishLoad under setjmp recovery.
                          * Without this, g_orig_Scene_FinishLoad=0 → silent no-op
                          * → no SceneObjects initialized → freeze on first frame. */
-                        { "_ZN5Caver5Scene10FinishLoadEv",
+                        { 0x4642a8, "_ZN5Caver5Scene10FinishLoadEv",
                           "g_orig_Scene_FinishLoad" },
                         /* SceneObject::FinishLoad relay — nm arm64 0x470ec4
                          * The primary crash source: vtable[9] dispatch on corrupt
                          * component ptr → PC=0x10771ac (.dynstr) → Dynarmic halt.
                          * sre_SceneObject_FinishLoad wraps the call with setjmp so
                          * the exception is caught before force-returning to raw LR. */
-                        { "_ZN5Caver11SceneObject10FinishLoadEv",
+                        { 0x470ec4, "_ZN5Caver11SceneObject10FinishLoadEv",
                           "g_orig_SceneObject_FinishLoad" },
                         /* SceneObjectGroup::FinishLoad relay — nm arm64 0x475498
                          * IDA at 0x475498: calls ProgramState::Execute on attached
                          * Lua scripts immediately during scene load. Without the relay,
                          * g_orig_SceneObjectGroup_FinishLoad=0 → silent no-op → group
                          * scripts never run → objects in scripted groups never initialize. */
-                        { "_ZN5Caver16SceneObjectGroup10FinishLoadEv",
+                        { 0x475498, "_ZN5Caver16SceneObjectGroup10FinishLoadEv",
                           "g_orig_SceneObjectGroup_FinishLoad" },
                         /* RegisterProgramLibrary relay — nm arm64 0x4c0f18
                          * sre_RegisterProgramLibrary wraps this to intercept mod
                          * library registrations. Without the relay, g_orig=0 and
                          * vanilla Lua library registration is silently skipped:
                          * all built-in Caver Lua APIs (DB, Scene, etc.) never load. */
-                        { "_ZN5Caver21RegisterProgramLibraryERKSsPFvPNS_12ProgramStateEE",
+                        { 0x4c0f18, "_ZN5Caver21RegisterProgramLibraryERKSsPFvPNS_12ProgramStateEE",
                           "g_orig_RegisterProgramLibrary" },
                         /* NOTE: g_orig_RenderingContext_C1 is NOT in nav_relays.
                          * It is handled by gui_relays[] below using copy_and_relocate,
@@ -3529,6 +3528,9 @@ void load_and_boot_arm64() {
                     };
                     for (const auto& nr : nav_relays) {
                         uint64_t fn_vaddr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, nr.engine_sym);
+                        if (!fn_vaddr && nr.nm_offset != 0) {
+                            fn_vaddr = load_addr + nr.nm_offset;
+                        }
                         if (!fn_vaddr) {
                             std::cerr << "[SRE] WARNING: GUINav relay not found: " << nr.engine_sym << std::endl;
                             continue;
@@ -3773,7 +3775,11 @@ void load_and_boot_arm64() {
                         { "g_sre_CharController_FinishCasting", "_ZN5Caver23CharControllerComponent13FinishCastingEv" },
                         { "g_sre_CharController_CanSwing", "_ZN5Caver23CharControllerComponent8CanSwingEv" },
                         { "g_sre_GameSceneController_CanCastSkill", "_ZN5Caver19GameSceneController12CanCastSkillERKN5boost10shared_ptrINS_5SkillEEE" },
-                        { "g_sre_GameSceneView_HideCinematicSkipButton", "_ZN5Caver13GameSceneView23HideCinematicSkipButtonEb" }
+                        { "g_sre_GameSceneView_HideCinematicSkipButton", "_ZN5Caver13GameSceneView23HideCinematicSkipButtonEb" },
+                        /* Mini.SetModelName — ModelComponent::setModelName(component, std::string&) */
+                        { "g_sre_ModelComponent_setModelName", "_ZN5Caver14ModelComponent12setModelNameERKSs" },
+                        /* Mini.SetObjectSpeed — EntityControllerComponent::SetMoveSpeed(component, float) */
+                        { "g_sre_EntityControllerComponent_SetMoveSpeed", "_ZN5Caver25EntityControllerComponent12SetMoveSpeedEf" }
                     };
 
                     int fn_resolved = 0;
@@ -4504,7 +4510,7 @@ void load_and_boot_arm64() {
             std::cerr << "  Without it, atomic spin loops and threading" << std::endl;
             std::cerr << "  issues WILL cause hangs and crashes." << std::endl;
             std::cerr << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" << std::endl;
-            std::cerr << "[SRE] Expected at: " << sre_rel << std::endl;
+            std::cerr << "[SRE] Expected at: bin/libs/libsre.so" << std::endl;
             std::cerr << "[SRE] Also tried:  ./libsre.so (current dir)" << std::endl;
             std::cerr << "[SRE] Fix: run './run_swordigo.sh' to build and install libsre.so" << std::endl;
             std::cerr << "============================================\n" << std::endl;
@@ -6031,16 +6037,6 @@ void load_and_boot_arm64() {
                                 g_swordfare_gui.toggle_visible();
                                 break;
                             }
-                            if (event.key.key == SDLK_F4 && !event.key.repeat) {
-                                g_fbo_mode = static_cast<FBOScale>((static_cast<int>(g_fbo_mode) + 1) % 4);
-                                const char* m_name = "Unknown";
-                                if (g_fbo_mode == FBOScale::SHARP_BILINEAR) m_name = "Sharp-Bilinear";
-                                else if (g_fbo_mode == FBOScale::NEAREST) m_name = "Nearest";
-                                else if (g_fbo_mode == FBOScale::CRT_SCANLINE) m_name = "CRT Scanline";
-                                else if (g_fbo_mode == FBOScale::FSR) m_name = "FSR 1.0 (Edge-Adaptive)";
-                                std::cout << "[FBO] Scale mode changed to " << m_name << std::endl;
-                                break;
-                            }
                             if (event.key.key == SDLK_F5 && !event.key.repeat) { cam_toggle(); break; }
                             if (event.key.key == SDLK_M && !event.key.repeat) {
                                 if (g_cam_active) {
@@ -6116,10 +6112,6 @@ void load_and_boot_arm64() {
                                     SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
                                     std::cout << "[Display] Fullscreen " << fw << "x" << fh << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
                                 }
-                                break;
-                            }
-                            if (event.key.key == SDLK_F11 && !event.key.repeat) {
-                                g_swordfare_gui.toggle_mod_overlay();
                                 break;
                             }
                             // N — Time of Day cycle: Day → Afternoon → Night → Day
@@ -6728,7 +6720,12 @@ int main(int argc, char* argv[]) {
             std::string out_path = (i + 2 < argc) ? argv[i + 2] : eng_path + "/manifest.json";
             BinarySelector gen;
             gen.generate_manifest(eng_path, out_path);
-            return 0;
+            // Clean exit — stop the background IO thread, then skip static
+            // destruction (see the game-path exit note below).
+            io_thread_stop();
+            std::cout.flush();
+            std::cerr.flush();
+            std::quick_exit(0);
         }
     }
     
@@ -6827,7 +6824,16 @@ int main(int argc, char* argv[]) {
                 std::cout << "[Main] Launch cancelled by user" << std::endl;
                 // Save any instances created during this session
                 g_binary_selector.save_user_instances(user_instances_path);
-                return 0;
+                // Clean shutdown — same policy as the game-path exit below:
+                // stop the background IO thread first, then quick_exit so we
+                // never run unsafe static destructors. A plain return 0 here
+                // ran __cxa_finalize while the IO thread was still alive,
+                // causing a 'double free or corruption' in libswcore's global
+                // destructors on every launcher window close.
+                io_thread_stop();
+                std::cout.flush();
+                std::cerr.flush();
+                std::quick_exit(0);
             }
              g_graphics_api = lconf.graphics_api;
              g_lib_name = lconf.selected_binary;

@@ -1,9 +1,29 @@
 // VULKAN_BACKEND compile guard now required — see init_vulkan below
 #include "platform/display.h"
 #include "platform/data_path.h"
+#include "platform/embedded_assets.h"
 #include <iostream>
 #include "platform/gl_inc.h"
 #include <SDL3_image/SDL_image.h>
+
+// Load the launcher icon from the binary's embedded assets (permanent fix —
+// works even when deb/rpm packaging drops the launcher/ asset directory).
+static SDL_Surface* load_embedded_icon() {
+    const unsigned char* data = nullptr;
+    size_t size = 0;
+    if (!embedded_asset("icon_gnome.png", &data, &size) &&
+        !embedded_asset("launcer_icon.png", &data, &size))
+        return nullptr;
+    int w = 0, h = 0;
+    unsigned char* px = nullptr;
+    if (!asset_decode_image(data, size, &px, &w, &h)) return nullptr;
+    SDL_Surface* surf = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_ABGR8888, px, w * 4);
+    if (!surf) { asset_image_free(px); return nullptr; }
+    SDL_Surface* copy = SDL_DuplicateSurface(surf);
+    SDL_DestroySurface(surf);
+    asset_image_free(px);
+    return copy;
+}
 
 Display::Display() {}
 
@@ -68,26 +88,28 @@ bool Display::init(int w, int h, const std::string& title) {
     std::cout << "[Display] GL Vendor:   " << glGetString(GL_VENDOR) << std::endl;
     std::cout << "[Display] GL Renderer: " << glGetString(GL_RENDERER) << std::endl;
     std::cout << "[Display] GL Version:  " << glGetString(GL_VERSION) << std::endl;
-    // Set window icon from icon_gnome.png
+    // Set window icon — embedded first (permanent), then disk fallbacks
     {
-        // Try via get_data_path (handles AppImage, RPM, DEB, dev)
-        std::string icon_via_data = get_data_path("src/assets/icon_gnome.png");
-        const char* icon_paths[] = {
-            icon_via_data.c_str(),
-            "src/assets/icon_gnome.png",
-            "/usr/share/icons/hicolor/128x128/apps/swordigo-desktop.png",
-            "/usr/share/pixmaps/swordigo-desktop.png",
-            nullptr
-        };
-        SDL_Surface* icon = nullptr;
-        for (int i = 0; icon_paths[i]; i++) {
-            icon = IMG_Load(icon_paths[i]);
-            if (icon) break;
+        SDL_Surface* icon = load_embedded_icon();
+        if (icon) std::cout << "[Display] Window icon set (embedded)" << std::endl;
+        else {
+            // Try via get_data_path (handles AppImage, RPM, DEB, dev)
+            std::string icon_via_data = get_data_path("src/assets/icon_gnome.png");
+            const char* icon_paths[] = {
+                icon_via_data.c_str(),
+                "src/assets/icon_gnome.png",
+                "/usr/share/icons/hicolor/128x128/apps/swordigo-desktop.png",
+                "/usr/share/pixmaps/swordigo-desktop.png",
+                nullptr
+            };
+            for (int i = 0; icon_paths[i]; i++) {
+                icon = IMG_Load(icon_paths[i]);
+                if (icon) { std::cout << "[Display] Window icon set (disk)" << std::endl; break; }
+            }
         }
         if (icon) {
             SDL_SetWindowIcon(window, icon);
             SDL_DestroySurface(icon);
-            std::cout << "[Display] Window icon set" << std::endl;
         } else {
             std::cerr << "[Display] Could not load icon: " << SDL_GetError() << std::endl;
         }
@@ -131,25 +153,27 @@ bool Display::init_vulkan(int w, int h, const std::string& title) {
 
     std::cout << "[Display] Vulkan window created: " << width << "x" << height << std::endl;
 
-    // Set window icon from icon_gnome.png
+    // Set window icon — embedded first (permanent), then disk fallbacks
     {
-        std::string icon_via_data = get_data_path("src/assets/icon_gnome.png");
-        const char* icon_paths[] = {
-            icon_via_data.c_str(),
-            "src/assets/icon_gnome.png",
-            "/usr/share/icons/hicolor/128x128/apps/swordigo-desktop.png",
-            "/usr/share/pixmaps/swordigo-desktop.png",
-            nullptr
-        };
-        SDL_Surface* icon = nullptr;
-        for (int i = 0; icon_paths[i]; i++) {
-            icon = IMG_Load(icon_paths[i]);
-            if (icon) break;
+        SDL_Surface* icon = load_embedded_icon();
+        if (icon) std::cout << "[Display] Vulkan window icon set (embedded)" << std::endl;
+        else {
+            std::string icon_via_data = get_data_path("src/assets/icon_gnome.png");
+            const char* icon_paths[] = {
+                icon_via_data.c_str(),
+                "src/assets/icon_gnome.png",
+                "/usr/share/icons/hicolor/128x128/apps/swordigo-desktop.png",
+                "/usr/share/pixmaps/swordigo-desktop.png",
+                nullptr
+            };
+            for (int i = 0; icon_paths[i]; i++) {
+                icon = IMG_Load(icon_paths[i]);
+                if (icon) break;
+            }
         }
         if (icon) {
             SDL_SetWindowIcon(window, icon);
             SDL_DestroySurface(icon);
-            std::cout << "[Display] Window icon set" << std::endl;
         } else {
             std::cerr << "[Display] Could not load icon: " << SDL_GetError() << std::endl;
         }

@@ -67,6 +67,7 @@ extern void* (*g_SceneObject_ComponentWithInterface)(void* obj, void* interface)
 extern void* EntityComponent_Interface;
 extern void* HealthComponent_Interface;
 extern float sre_health_get_hp(void* comp);
+extern void sre_health_set_hp(void* hc, float hp);
 
 extern volatile int g_sre_scene_shift_pending;
 extern char g_sre_scene_shift_target[128];
@@ -603,9 +604,10 @@ void sre_raknet_lan_sync_update(void* game_scene_view) {
     /* 4. Receive Remote Packets */
     char recv_buf[512];
     struct sockaddr_in src_addr;
-    socklen_t addr_len = sizeof(src_addr);
+    int max_recv = 64; /* cap per-frame to avoid stalling on packet flood */
 
-    while (1) {
+    while (max_recv-- > 0) {
+        socklen_t addr_len = sizeof(src_addr); /* must reset each iteration */
         ssize_t n = recvfrom(g_sre_raknet_peer_instance.sockfd, recv_buf, sizeof(recv_buf), 0,
                              (struct sockaddr*)&src_addr, &addr_len);
         if (n <= 0) break;
@@ -652,6 +654,10 @@ void sre_raknet_lan_sync_update(void* game_scene_view) {
             } else {
                 printf("[SRE-Net] Peer %d entered scene '%s'.\n", peer_idx, new_scene);
             }
+            if (strcmp(g_sre_current_scene_name, new_scene) != 0) {
+                /* If peer is no longer in our scene, their ghost is invalid */
+                g_peers[peer_idx].hero_ghost = NULL;
+            }
         } else if (pkt_id == SRE_NET_PLAYER_SYNC && n >= 18) {
             // Only process state sync if peer is in same scene
             if (strcmp(g_peers[peer_idx].scene_name, g_sre_current_scene_name) == 0) {
@@ -664,12 +670,12 @@ void sre_raknet_lan_sync_update(void* game_scene_view) {
                     memcpy(&ry, recv_buf + 6, 4);
                     memcpy(&rz, recv_buf + 10, 4);
                     uint8_t facing = (uint8_t)recv_buf[14];
-                    // hp = recv_buf[15]; (Could apply later)
+                    uint8_t hp = (uint8_t)recv_buf[15];
 
                     if (rx != 0.0f || ry != 0.0f) {
                         if (!g_sre_CreateHeroObjectAt) {
                             extern uint64_t g_swordigo_base;
-                            g_sre_CreateHeroObjectAt = (void*)(g_swordigo_base + 0x34a6bc);
+                            g_sre_CreateHeroObjectAt = (void*)(g_swordigo_base + 0x348e94);
                         }
                         if (!g_peers[peer_idx].hero_ghost && g_sre_CreateHeroObjectAt && game_scene_view) {
                             void* sc = *(void**)((char*)game_scene_view + 0xF0);
@@ -686,9 +692,15 @@ void sre_raknet_lan_sync_update(void* game_scene_view) {
 
                         if (g_peers[peer_idx].hero_ghost) {
                             caver_setPosition_impl(g_peers[peer_idx].hero_ghost, rx, ry, rz);
-                            if (g_SceneObject_ComponentWithInterface && EntityComponent_Interface) {
-                                void* comp = g_SceneObject_ComponentWithInterface(g_peers[peer_idx].hero_ghost, EntityComponent_Interface);
-                                if (comp) *(int*)((char*)comp + 0x70) = (int)facing;
+                            if (g_SceneObject_ComponentWithInterface) {
+                                if (EntityComponent_Interface) {
+                                    void* comp = g_SceneObject_ComponentWithInterface(g_peers[peer_idx].hero_ghost, EntityComponent_Interface);
+                                    if (comp) *(int*)((char*)comp + 0x70) = (int)facing;
+                                }
+                                if (HealthComponent_Interface) {
+                                    void* comp = g_SceneObject_ComponentWithInterface(g_peers[peer_idx].hero_ghost, HealthComponent_Interface);
+                                    if (comp) sre_health_set_hp(comp, (float)hp);
+                                }
                             }
                         }
                     }

@@ -14,6 +14,7 @@
 
 #include "platform/swordfare_gui.h"
 #include "platform/IconsFontAwesome6.h"
+#include "platform/embedded_assets.h"
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_sdl3.h"
 #include "imgui/backends/imgui_impl_opengl3.h"
@@ -181,6 +182,35 @@ void SwordfareGUI::apply_swordfare_theme() {
 // init / shutdown
 // ---------------------------------------------------------------------------
 
+// =============================================================================
+// Remaster texture helpers — load launcher UI artwork from the embedded assets
+// (permanent: works even when deb/rpm packaging drops the launcher/ folder).
+// =============================================================================
+static GLuint swordfare_load_embedded_texture(const char* name, int* out_w = nullptr, int* out_h = nullptr) {
+    const unsigned char* data = nullptr;
+    size_t size = 0;
+    if (!embedded_asset(name, &data, &size)) {
+        const char* slash = strrchr(name, '/');
+        if (slash) embedded_asset(slash + 1, &data, &size);
+    }
+    if (!data || size < 8) return 0;
+    int w = 0, h = 0;
+    unsigned char* px = nullptr;
+    if (!asset_decode_image(data, size, &px, &w, &h)) return 0;
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    asset_image_free(px);
+    return tex;
+}
+
 void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
     if (m_initialized) return;
 
@@ -317,7 +347,47 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
         }
     }
 
-    if (!main_font_path.empty()) {
+    // ── Embedded fonts FIRST (permanent fix — baked into the binary) ──
+    const unsigned char* emb_main = nullptr;    size_t emb_main_size = 0;
+    const unsigned char* emb_button = nullptr;  size_t emb_button_size = 0;
+    const unsigned char* emb_fa = nullptr;      size_t emb_fa_size = 0;
+    const char* emb_main_names[] = {
+        "fonts/MegalopolisExtra-Regular.otf", "fonts/Redaction10-Regular.otf",
+        "fonts/Inter-Regular.ttf",
+    };
+    for (const char* n : emb_main_names)
+        if (embedded_asset(n, &emb_main, &emb_main_size)) break;
+    const char* emb_button_names[] = {
+        "fonts/MegalopolisExtra-Regular.otf", "fonts/Redaction10-Bold.otf",
+        "fonts/Inter-Regular.ttf",
+    };
+    for (const char* n : emb_button_names)
+        if (embedded_asset(n, &emb_button, &emb_button_size)) break;
+    if (!embedded_asset("fonts/fa-solid-900.ttf", &emb_fa, &emb_fa_size))
+        embedded_asset("fonts/fa-solid-900.otf", &emb_fa, &emb_fa_size);
+
+    if (emb_main && emb_main_size > 0) {
+        float main_font_size = 14.0f * dpi_scale;
+        // Embedded fonts are static .rodata — the atlas must NOT free() them.
+        ImFontConfig emb_cfg;
+        emb_cfg.FontDataOwnedByAtlas = false;
+        m_font_main = io.Fonts->AddFontFromMemoryTTF((void*)emb_main, (int)emb_main_size,
+                                                     main_font_size, &emb_cfg);
+
+        // Merge FontAwesome into main font
+        if (m_font_main && emb_fa && emb_fa_size > 0) {
+            static const ImWchar icon_ranges[] = { ICON_FA_MIN, ICON_FA_MAX, 0 };
+            ImFontConfig icon_cfg;
+            icon_cfg.MergeMode = true;
+            icon_cfg.PixelSnapH = true;
+            icon_cfg.GlyphMinAdvanceX = main_font_size;
+            icon_cfg.GlyphOffset = ImVec2(0, 1);
+            icon_cfg.FontDataOwnedByAtlas = false;
+            io.Fonts->AddFontFromMemoryTTF((void*)emb_fa, (int)emb_fa_size,
+                                           main_font_size * 0.85f, &icon_cfg, icon_ranges);
+        }
+        std::cout << "[SwordfareGUI] Embedded main font loaded" << std::endl;
+    } else if (!main_font_path.empty()) {
         float main_font_size = 14.0f * dpi_scale;
         m_font_main = io.Fonts->AddFontFromFileTTF(main_font_path.c_str(), main_font_size);
 
@@ -335,7 +405,26 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
         m_font_main = io.Fonts->AddFontDefault();
     }
 
-    if (!button_font_path.empty()) {
+    if (emb_button && emb_button_size > 0) {
+        float button_font_size = 20.0f * dpi_scale;
+        ImFontConfig emb_btn_cfg;
+        emb_btn_cfg.FontDataOwnedByAtlas = false;
+        m_font_button = io.Fonts->AddFontFromMemoryTTF((void*)emb_button, (int)emb_button_size,
+                                                       button_font_size, &emb_btn_cfg);
+
+        // Merge FontAwesome into button font
+        if (m_font_button && emb_fa && emb_fa_size > 0) {
+            static const ImWchar icon_ranges[] = { ICON_FA_MIN, ICON_FA_MAX, 0 };
+            ImFontConfig icon_cfg;
+            icon_cfg.MergeMode = true;
+            icon_cfg.PixelSnapH = true;
+            icon_cfg.GlyphMinAdvanceX = button_font_size;
+            icon_cfg.GlyphOffset = ImVec2(0, 2);
+            icon_cfg.FontDataOwnedByAtlas = false;
+            io.Fonts->AddFontFromMemoryTTF((void*)emb_fa, (int)emb_fa_size,
+                                           button_font_size * 0.85f, &icon_cfg, icon_ranges);
+        }
+    } else if (!button_font_path.empty()) {
         float button_font_size = 20.0f * dpi_scale;
         m_font_button = io.Fonts->AddFontFromFileTTF(button_font_path.c_str(), button_font_size);
 
@@ -364,6 +453,41 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
 
     ImGui_ImplSDL3_InitForOpenGL(window, gl_ctx);
     ImGui_ImplOpenGL3_Init("#version 330 core");
+
+    // ── Remaster: load launcher artwork from embedded assets (GL path only) ──
+    m_tex_overlay_bg = swordfare_load_embedded_texture("launcher_bg.png",
+                                                        &m_tex_overlay_bg_w, &m_tex_overlay_bg_h);
+    if (!m_tex_overlay_bg)
+        m_tex_overlay_bg = swordfare_load_embedded_texture("ui_panel.png",
+                                                           &m_tex_overlay_bg_w, &m_tex_overlay_bg_h);
+    m_tex_swordigo_icon = swordfare_load_embedded_texture("icons/swordigo_default.png",
+                                                          &m_tex_swordigo_icon_w, &m_tex_swordigo_icon_h);
+    if (!m_tex_swordigo_icon)
+        m_tex_swordigo_icon = swordfare_load_embedded_texture("icon_app.png",
+                                                              &m_tex_swordigo_icon_w, &m_tex_swordigo_icon_h);
+    if (m_tex_overlay_bg)
+        std::cout << "[SwordfareGUI] Remaster background texture loaded ("
+                  << m_tex_overlay_bg_w << "x" << m_tex_overlay_bg_h << ")" << std::endl;
+    if (m_tex_swordigo_icon)
+        std::cout << "[SwordfareGUI] Remaster icon texture loaded ("
+                  << m_tex_swordigo_icon_w << "x" << m_tex_swordigo_icon_h << ")" << std::endl;
+
+    // ── Remaster: game UI artwork (buttons, panels, item icons) ──
+    m_tex_btn_wide = swordfare_load_embedded_texture("icons/ui_button_wide.png",
+                                                     &m_tex_btn_wide_w, &m_tex_btn_wide_h);
+    m_tex_panel    = swordfare_load_embedded_texture("icons/ui_panel.png",
+                                                     &m_tex_panel_w, &m_tex_panel_h);
+    const char* item_names[4] = {
+        "icons/game/item_brasssword.png",
+        "icons/game/item_firetrinket.png",
+        "icons/game/item_icetrinket.png",
+        "icons/game/overlayitem_healingpotion.png",
+    };
+    for (int i = 0; i < 4; i++)
+        m_tex_items[i] = swordfare_load_embedded_texture(item_names[i],
+                                                         &m_tex_items_w[i], &m_tex_items_h[i]);
+    if (m_tex_btn_wide || m_tex_panel || m_tex_items[0])
+        std::cout << "[SwordfareGUI] Remaster game-art textures loaded (button/panel/items)" << std::endl;
 
     m_initialized = true;
 }
@@ -434,25 +558,56 @@ void SwordfareGUI::init_vulkan(SDL_Window* window, VulkanBackend* vk_backend) {
         "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf"
     });
 
-    // Load fonts (same logic as init)
+    // ── Embedded fonts FIRST (permanent fix) ──
+    const unsigned char* emb_main = nullptr;    size_t emb_main_size = 0;
+    const unsigned char* emb_button = nullptr;  size_t emb_button_size = 0;
+    const unsigned char* emb_fa = nullptr;      size_t emb_fa_size = 0;
+    const char* emb_main_names[] = {
+        "fonts/MegalopolisExtra-Regular.otf", "fonts/Redaction10-Regular.otf",
+        "fonts/Inter-Regular.ttf",
+    };
+    for (const char* n : emb_main_names)
+        if (embedded_asset(n, &emb_main, &emb_main_size)) break;
+    const char* emb_button_names[] = {
+        "fonts/MegalopolisExtra-Regular.otf", "fonts/Redaction10-Bold.otf",
+        "fonts/Inter-Regular.ttf",
+    };
+    for (const char* n : emb_button_names)
+        if (embedded_asset(n, &emb_button, &emb_button_size)) break;
+    if (!embedded_asset("fonts/fa-solid-900.ttf", &emb_fa, &emb_fa_size))
+        embedded_asset("fonts/fa-solid-900.otf", &emb_fa, &emb_fa_size);
+
+    // Load fonts (same logic as init — embedded first, disk fallback)
+    // Embedded fonts are static .rodata — the atlas must never free() them.
+    ImFontConfig emb_main_cfg;
+    emb_main_cfg.FontDataOwnedByAtlas = false;
+    ImFontConfig emb_btn_cfg;
+    emb_btn_cfg.FontDataOwnedByAtlas = false;
     auto merge_fa = [&](float size) {
-        if (fa_path.empty()) return;
         static const ImWchar icon_ranges[] = { ICON_FA_MIN, ICON_FA_MAX, 0 };
         ImFontConfig cfg;
         cfg.MergeMode = true; cfg.PixelSnapH = true;
         cfg.GlyphMinAdvanceX = size; cfg.GlyphOffset = ImVec2(0, 1);
-        io.Fonts->AddFontFromFileTTF(fa_path.c_str(), size * 0.85f, &cfg, icon_ranges);
+        cfg.FontDataOwnedByAtlas = false;
+        if (emb_fa && emb_fa_size > 0)
+            io.Fonts->AddFontFromMemoryTTF((void*)emb_fa, (int)emb_fa_size, size * 0.85f, &cfg, icon_ranges);
+        else if (!fa_path.empty())
+            io.Fonts->AddFontFromFileTTF(fa_path.c_str(), size * 0.85f, &cfg, icon_ranges);
     };
 
     float main_sz   = 14.0f * dpi_scale;
     float button_sz = 20.0f * dpi_scale;
-    m_font_main   = !main_font_path.empty()
-                        ? io.Fonts->AddFontFromFileTTF(main_font_path.c_str(), main_sz)
-                        : io.Fonts->AddFontDefault();
+    m_font_main   = (emb_main && emb_main_size > 0)
+                        ? io.Fonts->AddFontFromMemoryTTF((void*)emb_main, (int)emb_main_size, main_sz, &emb_main_cfg)
+                        : (!main_font_path.empty()
+                            ? io.Fonts->AddFontFromFileTTF(main_font_path.c_str(), main_sz)
+                            : io.Fonts->AddFontDefault());
     if (m_font_main) merge_fa(main_sz);
-    m_font_button = !button_font_path.empty()
-                        ? io.Fonts->AddFontFromFileTTF(button_font_path.c_str(), button_sz)
-                        : io.Fonts->AddFontDefault();
+    m_font_button = (emb_button && emb_button_size > 0)
+                        ? io.Fonts->AddFontFromMemoryTTF((void*)emb_button, (int)emb_button_size, button_sz, &emb_btn_cfg)
+                        : (!button_font_path.empty()
+                            ? io.Fonts->AddFontFromFileTTF(button_font_path.c_str(), button_sz)
+                            : io.Fonts->AddFontDefault());
     if (m_font_button) merge_fa(button_sz);
 
     apply_swordfare_theme();
@@ -536,6 +691,15 @@ void SwordfareGUI::shutdown() {
     }
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext(static_cast<ImGuiContext*>(m_imgui_ctx));
+
+    // Release remaster textures (GL path only)
+    if (m_tex_overlay_bg)    { glDeleteTextures(1, &m_tex_overlay_bg);    m_tex_overlay_bg = 0; }
+    if (m_tex_swordigo_icon) { glDeleteTextures(1, &m_tex_swordigo_icon); m_tex_swordigo_icon = 0; }
+    if (m_tex_btn_wide)      { glDeleteTextures(1, &m_tex_btn_wide);      m_tex_btn_wide = 0; }
+    if (m_tex_panel)         { glDeleteTextures(1, &m_tex_panel);         m_tex_panel = 0; }
+    for (int i = 0; i < 4; i++)
+        if (m_tex_items[i])  { glDeleteTextures(1, &m_tex_items[i]);      m_tex_items[i] = 0; }
+
     m_imgui_ctx   = nullptr;
     m_initialized = false;
 }
@@ -554,8 +718,16 @@ bool SwordfareGUI::process_event(const SDL_Event& event) {
     // Global overlays must remain toggleable even while ImGui captures input.
     if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
         event.key.key == SDLK_F11) {
-        toggle_mod_overlay();
+        toggle_scene_toolbox();
         return true;
+    }
+
+    // Function keys remain application-level shortcuts even while a menu has
+    // keyboard focus, so every overlay can always be closed with its hotkey.
+    if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+        event.key.scancode >= SDL_SCANCODE_F1 &&
+        event.key.scancode <= SDL_SCANCODE_F12) {
+        return false;
     }
 
     // Capture keyboard input for every visible ImGui surface, not only debug.
@@ -708,9 +880,21 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
         ImGuiWindowFlags_NoResize   |
         ImGuiWindowFlags_NoScrollbar;
 
-    if (!ImGui::Begin("  Swordfare Debug  [F3]", nullptr, wflags)) {
+    if (!ImGui::Begin(ICON_FA_GAUGE_HIGH "  Performance  [F3]", nullptr, wflags)) {
         ImGui::End();
         return;
+    }
+
+    // ── Remaster: game icon badge next to the debug title ──
+    if (m_tex_swordigo_icon) {
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        float badge = 20.0f;
+        ImGui::GetWindowDrawList()->AddImage(
+            (ImTextureID)(intptr_t)m_tex_swordigo_icon,
+            p0, ImVec2(p0.x + badge, p0.y + badge),
+            ImVec2(0, 0), ImVec2(1, 1));
+        ImGui::Dummy(ImVec2(badge + 6.0f, badge));
+        ImGui::SameLine();
     }
 
     // -- Mini Header: FPS + Expand Button --
@@ -1011,6 +1195,8 @@ struct SreOverlaySlot {
 void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_ptr, bool globally_hidden) {
     m_last_buttons_ptr = guest_buttons_ptr;
     m_last_overlays_ptr = guest_overlays_ptr;
+    m_buttons_globally_hidden = globally_hidden;
+    g_sre_overlay_blocking = false;
     
     // Diagnostic log
     static int log_ticks = 0;
@@ -1213,8 +1399,11 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
 
         // Compute sizes, accounting for overlay scale
         float o_scale = parent_ovr ? parent_ovr->scale_factor : 1.0f;
-        float pw = vp_w * btn.w * btn.scale_x * o_scale;
-        float ph = vp_h * btn.h * btn.scale_y * o_scale;
+        // Kiwi sizes controls from the shorter viewport side while positions
+        // remain normalized to the full viewport.
+        float square_base = std::min(vp_w, vp_h);
+        float pw = square_base * btn.w * btn.scale_x * o_scale;
+        float ph = square_base * btn.h * btn.scale_y * o_scale;
         float bx, by;
 
         if (parent_ovr) {
@@ -1322,6 +1511,7 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
 
         // Input state machine
         if (btn.clickable) {
+            bool completed_drag = btn.dragging != 0;
             if (pressing) {
                 btn.pressed = 1;
                 if (btn.movable && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
@@ -1372,7 +1562,9 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
                 }
             }
 
-            if (clicked) {
+            // A drag release is not a click. This preserves Kiwi's polling
+            // API without the Android listener bug that consumed all taps.
+            if (clicked && !completed_drag) {
                 btn.released = 1;
                 std::cout << "[SRE GUI] ImGui Click: '" << btn.label << "' (slot " << i << ")\n";
             }
@@ -1394,10 +1586,8 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
     float win_w = io.DisplaySize.x;
     float win_h = io.DisplaySize.y;
 
-    float panel_w = win_w * 0.70f;
-    float panel_h = win_h * 0.75f;
-    if (panel_w < 640.0f) panel_w = win_w * 0.95f;
-    if (panel_h < 420.0f) panel_h = win_h * 0.95f;
+    float panel_w = std::min(win_w - 32.0f, 1120.0f);
+    float panel_h = std::min(win_h - 32.0f, 760.0f);
 
     ImGui::SetNextWindowPos(ImVec2((win_w - panel_w) / 2.0f, (win_h - panel_h) / 2.0f), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(panel_w, panel_h), ImGuiCond_Always);
@@ -1416,12 +1606,57 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                              ImGuiWindowFlags_NoSavedSettings;
 
     bool open = true;
-    if (ImGui::Begin("Swordiforge Engine & Mod Launcher", &open, flags)) {
-        ImGui::PushFont(static_cast<ImFont*>(m_font_button));
-        ImGui::TextColored(ImVec4(0.000f, 0.850f, 1.000f, 1.00f), "SWORDIFORGE MOD STORE & LAUNCHER");
-        ImGui::PopFont();
-        ImGui::Text("v7.5 — PC Mod Ecosystem & SRE Runtime Environment");
-        ImGui::Separator();
+    const char* window_title = m_f11_overlay_active
+        ? ICON_FA_MAP "  Swordfare Scene & Display Toolbox  [F11]"
+        : ICON_FA_CUBE "  Swordfare Mod Hub  [F4]";
+    if (ImGui::Begin(window_title, &open, flags)) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 wpos = ImGui::GetWindowPos();
+        ImVec2 wsz = ImGui::GetWindowSize();
+
+        // ── Remaster: backdrop artwork + readability fade ──
+        if (m_tex_overlay_bg) {
+            dl->AddImage((ImTextureID)(intptr_t)m_tex_overlay_bg,
+                         wpos, ImVec2(wpos.x + wsz.x, wpos.y + wsz.y),
+                         ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, 16));
+            dl->AddRectFilledMultiColor(wpos, ImVec2(wpos.x + wsz.x, wpos.y + wsz.y),
+                                        IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
+                                        IM_COL32(22, 27, 34, 240), IM_COL32(22, 27, 34, 240));
+        }
+
+        // ── Remaster: header banner with launcher icon artwork ──
+        {
+            const float banner_h = 66.0f;
+            const ImVec2 b0 = wpos;
+            const ImVec2 b1(wpos.x + wsz.x, wpos.y + banner_h);
+            dl->AddRectFilledMultiColor(b0, b1,
+                                        IM_COL32(28, 36, 50, 255), IM_COL32(52, 26, 36, 255),
+                                        IM_COL32(52, 26, 36, 255), IM_COL32(28, 36, 50, 255));
+            dl->AddLine(ImVec2(b0.x, b1.y - 1), ImVec2(b1.x, b1.y - 1),
+                        IM_COL32(233, 69, 96, 110), 1.5f);
+
+            const float icon_size = 42.0f;
+            ImVec2 icon_pos(b0.x + 18.0f, b0.y + (banner_h - icon_size) * 0.5f);
+            if (m_tex_swordigo_icon) {
+                dl->AddImage((ImTextureID)(intptr_t)m_tex_swordigo_icon,
+                             icon_pos, ImVec2(icon_pos.x + icon_size, icon_pos.y + icon_size));
+            } else {
+                dl->AddText(static_cast<ImFont*>(m_font_button), 20.0f,
+                            ImVec2(icon_pos.x + 6, icon_pos.y + 8),
+                            IM_COL32(233, 69, 96, 255), ICON_FA_CUBE);
+            }
+
+            ImFont* title_font = static_cast<ImFont*>(m_font_button);
+            const float title_size = title_font ? ImGui::GetFontSize() : 20.0f;
+            dl->AddText(title_font, title_size,
+                        ImVec2(b0.x + 76.0f, b0.y + 12.0f), IM_COL32(82, 206, 255, 255),
+                        m_f11_overlay_active ? "SCENE & DISPLAY TOOLBOX" : "SWORDFARE MOD HUB");
+            dl->AddText(ImVec2(b0.x + 78.0f, b0.y + 41.0f), IM_COL32(172, 182, 197, 220),
+                        m_f11_overlay_active
+                            ? "Scene Shifter, render resolution, output and post-processing"
+                            : "SRE runtime, saves, diagnostics and mod compatibility");
+            ImGui::SetCursorPos(ImVec2(0, banner_h + 6));
+        }
         ImGui::Spacing();
 
         if (m_status_timer > 0.0f) {
@@ -1443,17 +1678,53 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                     ImGui::TextColored(ImVec4(0.914f, 0.271f, 0.376f, 1.0f), "Instructions:");
                     ImGui::BulletText("Toggle Debug Launcher: [F1]");
                     ImGui::BulletText("Toggle In-Game Controls Config: [F2]");
-                    ImGui::BulletText("Toggle This Mod Loader Overlay: [F4] or mod button");
-                    ImGui::BulletText("Toggle Save & Stats Editor Tab: [F11]");
+                    ImGui::BulletText("Toggle the Mod Hub: [F4]");
+                    ImGui::BulletText("Toggle Scene & Display Toolbox: [F11]");
                     ImGui::BulletText("Modify game speed using [-] and [0] keys.");
                     ImGui::PopTextWrapPos();
+
+                    // ── Remaster: item showcase strip from the game's own art ──
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+                    static const char* item_labels[4] = {
+                        "Brass Sword", "Fire Trinket", "Ice Trinket", "Healing Potion"
+                    };
+                    float item_w = (ImGui::GetContentRegionAvail().x - 30.0f) / 4.0f;
+                    if (item_w < 90.0f) item_w = 90.0f;
+                    for (int i = 0; i < 4; i++) {
+                        if (i > 0) ImGui::SameLine(0, 10);
+                        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.09f, 0.12f, 0.70f));
+                        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+                        ImGui::BeginChild(("##item" + std::to_string(i)).c_str(), ImVec2(item_w, 100), ImGuiChildFlags_Borders);
+                        if (m_tex_items[i] && m_tex_items_h[i] > 0) {
+                            float disp_h = 60.0f;
+                            float disp_w = disp_h * (float)m_tex_items_w[i] / (float)m_tex_items_h[i];
+                            if (disp_w > item_w - 16.0f) {
+                                disp_w = item_w - 16.0f;
+                                disp_h = disp_w * (float)m_tex_items_h[i] / (float)m_tex_items_w[i];
+                            }
+                            ImGui::SetCursorPos(ImVec2((item_w - disp_w) * 0.5f, 6.0f));
+                            ImGui::Image((ImTextureID)(intptr_t)m_tex_items[i], ImVec2(disp_w, disp_h));
+                        } else {
+                            ImGui::SetCursorPos(ImVec2((item_w - 20.0f) * 0.5f, 18.0f));
+                            ImGui::TextColored(ImVec4(0.914f, 0.271f, 0.376f, 0.6f), ICON_FA_CUBE);
+                        }
+                        ImGui::SetCursorPosX(std::max(0.0f, (item_w - ImGui::CalcTextSize(item_labels[i]).x) * 0.5f));
+                        ImGui::TextDisabled("%s", item_labels[i]);
+                        ImGui::EndChild();
+                        ImGui::PopStyleVar();
+                        ImGui::PopStyleColor();
+                    }
                 }
                 ImGui::EndChild();
                 ImGui::PopStyleColor();
                 ImGui::EndTabItem();
             }
 
-            if (ImGui::BeginTabItem(ICON_FA_GEAR " Options")) {
+            ImGuiTabItemFlags opt_flags = ImGuiTabItemFlags_None;
+            if (m_overlay_forced_tab == 1) { opt_flags |= ImGuiTabItemFlags_SetSelected; m_overlay_forced_tab = -1; }
+            if (ImGui::BeginTabItem(ICON_FA_GEAR " Options", nullptr, opt_flags)) {
                 ImGui::Spacing();
                 extern void apply_render_preset(int preset);
                 extern int  g_render_preset;
@@ -1464,6 +1735,14 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
 
                 ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.09f, 0.12f, 0.5f));
                 if (ImGui::BeginChild("##options_child", ImVec2(0, 0), true)) {
+                    // ── Remaster: faint game-panel artwork behind the controls ──
+                    if (m_tex_panel) {
+                        ImDrawList* cdl = ImGui::GetWindowDrawList();
+                        ImVec2 c0 = ImGui::GetWindowPos();
+                        ImVec2 c1(c0.x + ImGui::GetWindowWidth(), c0.y + ImGui::GetWindowHeight());
+                        cdl->AddImage((ImTextureID)(intptr_t)m_tex_panel, c0, c1,
+                                      ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, 14));
+                    }
 
                     // ── RENDER RESOLUTION ──────────────────────────────────────────────
                     ImGui::TextColored(ImVec4(0.00f, 0.85f, 1.00f, 1.0f), ICON_FA_DISPLAY "  RENDER RESOLUTION");
@@ -1491,22 +1770,33 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                         { "WUXGA   (1920 x 1200)", "16:10 — slightly taller than 1080p",                       17,  1920, 1200 },
                         { "1440x900 (1440 x  900)", "Older widescreen laptop",                                 18,  1440,  900 },
                         { "1280x800 (1280 x  800)", "iPad-like — 16:10",                                       19,  1280,  800 },
+                        { "UWQHD   (3440 x 1440)", "21:9 ultrawide",                                            20,  3440, 1440 },
+                        { "UWHD    (2560 x 1080)", "21:9 ultrawide Full HD",                                    21,  2560, 1080 },
+                        { "UWQHD+  (3840 x 1600)", "24:10 ultrawide workstation",                              22,  3840, 1600 },
+                        { "Retina  (2880 x 1800)", "16:10 high-density laptop",                                23,  2880, 1800 },
+                        { "WSXGA+  (1680 x 1050)", "16:10 desktop and laptop",                                 24,  1680, 1050 },
+                        { "SXGA    (1280 x 1024)", "5:4 legacy display",                                        25,  1280, 1024 },
+                        { "XGA     (1024 x  768)", "4:3 legacy display",                                        26,  1024,  768 },
                         { "Window  (match output)",  "1:1 pixel mapping — no upscaling",                        3,     0,    0 },
                     };
                     static const int render_preset_count = (int)(sizeof(render_presets)/sizeof(render_presets[0]));
 
-                    // 3-column preset grid
+                    const float preset_gap = 6.0f;
+                    const int preset_cols = std::max(1, std::min(3,
+                        (int)((ImGui::GetContentRegionAvail().x + preset_gap) / 250.0f)));
+                    const float preset_w = (ImGui::GetContentRegionAvail().x -
+                                            preset_gap * (preset_cols - 1)) / preset_cols;
                     for (int pi = 0; pi < render_preset_count; pi++) {
                         const ResPreset& pr = render_presets[pi];
                         bool selected = (g_render_preset == pr.idx);
-                        if (pi % 3 != 0) ImGui::SameLine(0, 6);
+                        if (pi % preset_cols != 0) ImGui::SameLine(0, preset_gap);
                         if (selected) {
                             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.18f, 0.52f, 0.18f, 1.0f));
                             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.65f, 0.22f, 1.0f));
                             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.14f, 0.42f, 0.14f, 1.0f));
                         }
                         ImGui::PushID(100 + pi);
-                        if (ImGui::Button(pr.label, ImVec2(250, 30))) {
+                        if (ImGui::Button(pr.label, ImVec2(preset_w, 30))) {
                             apply_render_preset(pr.idx);
                             m_status_msg = std::string("Render res: ") + pr.label;
                             m_status_timer = 3.0f;
@@ -1551,12 +1841,21 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                     static const OutPreset out_presets[] = {
                         { "3840x2160 (4K)",  3840, 2160 }, { "2560x1440 (2K)",  2560, 1440 },
                         { "1920x1080",        1920, 1080 }, { "1600x900",         1600,  900 },
-                        { "1280x720",         1280,  720 }, { "960x544 (native)",  960,  544 },
+                        { "1366x768",         1366,  768 }, { "1280x720",         1280,  720 },
+                        { "3440x1440 (21:9)", 3440, 1440 }, { "2560x1080 (21:9)", 2560, 1080 },
+                        { "1920x1200 (16:10)",1920, 1200 }, { "1680x1050 (16:10)",1680, 1050 },
+                        { "1440x900 (16:10)", 1440,  900 }, { "1280x800 (16:10)", 1280,  800 },
+                        { "1280x1024 (5:4)",  1280, 1024 }, { "1024x768 (4:3)",   1024,  768 },
+                        { "960x544 (native)",  960,  544 }, { "854x480",            854,  480 },
                     };
-                    for (int oi = 0; oi < 6; oi++) {
-                        if (oi % 3 != 0) ImGui::SameLine(0, 6);
+                    const int out_count = (int)(sizeof(out_presets) / sizeof(out_presets[0]));
+                    const int out_cols = std::max(1, std::min(3,
+                        (int)((ImGui::GetContentRegionAvail().x + 6.0f) / 210.0f)));
+                    const float out_w = (ImGui::GetContentRegionAvail().x - 6.0f * (out_cols - 1)) / out_cols;
+                    for (int oi = 0; oi < out_count; oi++) {
+                        if (oi % out_cols != 0) ImGui::SameLine(0, 6);
                         ImGui::PushID(200 + oi);
-                        if (ImGui::Button(out_presets[oi].label, ImVec2(210, 30))) {
+                        if (ImGui::Button(out_presets[oi].label, ImVec2(out_w, 30))) {
                             if (m_window) {
                                 SDL_SetWindowSize(m_window, out_presets[oi].w, out_presets[oi].h);
                                 m_status_msg = std::string("Output: ") + out_presets[oi].label;
@@ -1580,6 +1879,141 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                             m_status_msg = "Output: " + std::to_string(custom_ow) + "x" + std::to_string(custom_oh);
                             m_status_timer = 3.0f;
                         }
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    // ── DISPLAY / FULLSCREEN ───────────────────────────────────────────
+                    ImGui::TextColored(ImVec4(0.00f, 0.85f, 1.00f, 1.0f), ICON_FA_DISPLAY "  DISPLAY MODE");
+                    ImGui::TextDisabled("Fullscreen, VSync and display refresh rate.");
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    if (m_window) {
+                        bool is_fs = (SDL_GetWindowFlags(m_window) & SDL_WINDOW_FULLSCREEN) != 0;
+                        // Display info
+                        int disp_id = SDL_GetDisplayForWindow(m_window);
+                        if (disp_id) {
+                            const SDL_DisplayMode* dm = SDL_GetCurrentDisplayMode(disp_id);
+                            if (dm) {
+                                ImGui::Text("Display %d  \u2014  ", disp_id);
+                                ImGui::SameLine();
+                                ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f),
+                                                   "%d x %d @ %d Hz%s",
+                                                   dm->w, dm->h, dm->refresh_rate,
+                                                   is_fs ? "  (fullscreen)" : "  (windowed)");
+                            }
+                        }
+                        ImGui::Spacing();
+
+                        // Fullscreen toggle
+                        if (ImGui::Button(is_fs ? "  Exit Fullscreen" : "  Enter Fullscreen",
+                                          ImVec2(210, 0))) {
+                            SDL_SetWindowFullscreen(m_window, !is_fs);
+                            // Sync host window state so FBO/game view follow
+                            int fw, fh;
+                            SDL_GetWindowSize(m_window, &fw, &fh);
+                            extern int g_win_w, g_win_h;
+                            extern int g_draw_w, g_draw_h;
+                            g_win_w = fw; g_win_h = fh;
+                            SDL_GetWindowSizeInPixels(m_window, &g_draw_w, &g_draw_h);
+                            m_status_msg = is_fs ? "Windowed mode" : "Fullscreen";
+                            m_status_timer = 2.0f;
+                        }
+                        ImGui::SameLine(0, 10);
+                        if (ImGui::Button(ICON_FA_ARROWS_ROTATE "  Restore 16:9", ImVec2(150, 0))) {
+                            int cw, ch;
+                            SDL_GetWindowSize(m_window, &cw, &ch);
+                            // Fit the current window into a 16:9 box at the same width
+                            int nh = (int)(cw * 9.0f / 16.0f);
+                            SDL_SetWindowSize(m_window, cw, nh);
+                            m_status_msg = "Aspect restored to 16:9";
+                            m_status_timer = 2.0f;
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Resizes the window to a clean 16:9 ratio at the current width.");
+
+                        ImGui::Spacing();
+
+                        // ── Fullscreen display modes (professional: exact res × refresh) ──
+                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                                           ICON_FA_GAUGE_HIGH "  Fullscreen mode:");
+                        {
+                            int mode_count = 0;
+                            SDL_DisplayMode** modes = SDL_GetFullscreenDisplayModes(disp_id, &mode_count);
+                            static int sel_mode = -1;
+                            std::vector<std::string> mode_labels;
+                            mode_labels.push_back("Default (native)");
+                            int cur_mode = 0;
+                            const SDL_DisplayMode* cur_dm = SDL_GetCurrentDisplayMode(disp_id);
+                            for (int i = 0; i < mode_count; i++) {
+                                char buf[64];
+                                snprintf(buf, sizeof(buf), "%d x %d @ %d Hz",
+                                         modes[i]->w, modes[i]->h, modes[i]->refresh_rate);
+                                mode_labels.push_back(buf);
+                                if (cur_dm && modes[i]->w == cur_dm->w && modes[i]->h == cur_dm->h &&
+                                    modes[i]->refresh_rate == cur_dm->refresh_rate)
+                                    cur_mode = i + 1;
+                            }
+                            if (sel_mode < 0 || sel_mode >= (int)mode_labels.size()) sel_mode = cur_mode;
+                            ImGui::SetNextItemWidth(300);
+                            if (ImGui::BeginCombo("##fsmode", mode_labels[sel_mode].c_str())) {
+                                for (int i = 0; i < (int)mode_labels.size(); i++) {
+                                    bool selected = (sel_mode == i);
+                                    if (ImGui::Selectable(mode_labels[i].c_str(), selected)) {
+                                        sel_mode = i;
+                                        if (i == 0)
+                                            SDL_SetWindowFullscreenMode(m_window, nullptr);
+                                        else if (i - 1 < mode_count)
+                                            SDL_SetWindowFullscreenMode(m_window, modes[i - 1]);
+                                        SDL_SetWindowFullscreen(m_window, true);
+                                        int fw, fh;
+                                        SDL_GetWindowSize(m_window, &fw, &fh);
+                                        extern int g_win_w, g_win_h;
+                                        extern int g_draw_w, g_draw_h;
+                                        g_win_w = fw; g_win_h = fh;
+                                        SDL_GetWindowSizeInPixels(m_window, &g_draw_w, &g_draw_h);
+                                        m_status_msg = mode_labels[i];
+                                        m_status_timer = 2.0f;
+                                    }
+                                }
+                                ImGui::EndCombo();
+                            }
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Pick the exact resolution and refresh rate used in fullscreen.");
+                        }
+
+                        ImGui::Spacing();
+
+                        // VSync toggle (OpenGL swap interval; Vulkan keeps its own queue)
+                        int vsync_interval = 0;
+                        SDL_GL_GetSwapInterval(&vsync_interval);
+                        bool vsync_on = (vsync_interval != 0);
+                        if (ImGui::Checkbox(ICON_FA_GAUGE_HIGH "  VSync (cap FPS to refresh)", &vsync_on)) {
+                            SDL_GL_SetSwapInterval(vsync_on ? 1 : 0);
+                            m_status_msg = vsync_on ? "VSync ON" : "VSync OFF";
+                            m_status_timer = 2.0f;
+                        }
+
+                        // Aspect ratio label of current output
+                        {
+                            int cw, ch;
+                            SDL_GetWindowSize(m_window, &cw, &ch);
+                            if (cw > 0 && ch > 0) {
+                                float ar = (float)cw / (float)ch;
+                                const char* ar_name = "other";
+                                if      (fabsf(ar - 16.0f / 9.0f) < 0.02f) ar_name = "16:9";
+                                else if (fabsf(ar - 16.0f / 10.0f) < 0.02f) ar_name = "16:10";
+                                else if (fabsf(ar - 4.0f / 3.0f)  < 0.02f) ar_name = "4:3";
+                                else if (fabsf(ar - 21.0f / 9.0f) < 0.02f) ar_name = "21:9 ultrawide";
+                                ImGui::TextDisabled("Aspect: %s  (%.3f)\nRender: %d x %d",
+                                                    ar_name, ar, GAME_W, GAME_H);
+                            }
+                        }
+                    } else {
+                        ImGui::TextDisabled("(no window available)");
                     }
 
                     ImGui::Spacing();
@@ -1746,7 +2180,12 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
             // Scans mod + vanilla directories for .scene files and provides
             // Normal (loading screen) and Forced (instant) teleport gateways.
             // ─────────────────────────────────────────────────────────────────
-            if (ImGui::BeginTabItem(ICON_FA_MAP " Scene Shifter")) {
+            ImGuiTabItemFlags scene_flags = ImGuiTabItemFlags_None;
+            if (m_overlay_forced_tab == 2) {
+                scene_flags |= ImGuiTabItemFlags_SetSelected;
+                m_overlay_forced_tab = -1;
+            }
+            if (ImGui::BeginTabItem(ICON_FA_MAP " Scene Shifter", nullptr, scene_flags)) {
                 static bool   scene_list_loaded = false;
                 static int    selected_scene     = -1;
                 static char   spawn_buf[64]      = "start";
@@ -1915,12 +2354,36 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
 
                 if (!can_tp) ImGui::BeginDisabled();
 
+                // ── Remaster: gateway buttons with the game's button artwork ──
+                const float gw_h = ImGui::GetFrameHeight();
+                const ImVec2 gw_sz(220.0f, gw_h);
+                auto draw_game_button = [&](ImVec4 fallback, ImVec4 hover, ImVec4 active,
+                                            ImU32 tint, const char* label, ImVec2 sz) -> bool {
+                    ImVec2 bp = ImGui::GetCursorScreenPos();
+                    if (m_tex_btn_wide) {
+                        ImGui::GetWindowDrawList()->AddImage(
+                            (ImTextureID)(intptr_t)m_tex_btn_wide,
+                            bp, ImVec2(bp.x + sz.x, bp.y + sz.y),
+                            ImVec2(0, 0), ImVec2(1, 1), tint);
+                        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0, 0, 0, 0));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1, 1, 1, 0.12f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1, 1, 1, 0.20f));
+                    } else {
+                        ImGui::PushStyleColor(ImGuiCol_Button,        fallback);
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hover);
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  active);
+                    }
+                    bool clicked = ImGui::Button(label, sz);
+                    ImGui::PopStyleColor(3);
+                    return clicked;
+                };
+
                 // Normal Gateway — standard loading screen transition
-                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.15f, 0.45f, 0.15f, 0.85f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.6f,  0.2f,  1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.3f, 0.75f, 0.3f,  1.0f));
-                bool do_normal = ImGui::Button(ICON_FA_PLAY " Normal Gateway", ImVec2(220.0f, 0));
-                ImGui::PopStyleColor(3);
+                bool do_normal = draw_game_button(ImVec4(0.15f, 0.45f, 0.15f, 0.85f),
+                                                  ImVec4(0.2f, 0.6f,  0.2f,  1.0f),
+                                                  ImVec4(0.3f, 0.75f, 0.3f,  1.0f),
+                                                  IM_COL32(255, 255, 255, 190),
+                                                  ICON_FA_PLAY " Normal Gateway", gw_sz);
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("Calls GotoLevel() \u2192 shows loading screen.\n"
                                       "Standard transition, identical to entering a portal.");
@@ -1928,11 +2391,11 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                 ImGui::SameLine(0, 12.0f);
 
                 // Forced Gateway — instant 0-frame load
-                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.5f, 0.15f, 0.15f, 0.85f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.2f,  0.2f,  1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.9f, 0.3f,  0.3f,  1.0f));
-                bool do_forced = ImGui::Button(ICON_FA_BOLT " Forced Gateway", ImVec2(220.0f, 0));
-                ImGui::PopStyleColor(3);
+                bool do_forced = draw_game_button(ImVec4(0.5f, 0.15f, 0.15f, 0.85f),
+                                                  ImVec4(0.7f, 0.2f,  0.2f,  1.0f),
+                                                  ImVec4(0.9f, 0.3f,  0.3f,  1.0f),
+                                                  IM_COL32(255, 210, 210, 200),
+                                                  ICON_FA_BOLT " Forced Gateway", gw_sz);
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("Calls GotoLevel() for instant scene transition.\n"
                                       "Fast teleport gateway.");
@@ -2003,6 +2466,7 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
     ImGui::End();
     if (!open) {
         m_mod_overlay_visible = false;
+        m_f11_overlay_active = false;
     }
 
     ImGui::PopStyleColor(4);
@@ -2018,10 +2482,8 @@ bool SwordfareGUI::is_input_blocked(float mx, float my) {
 
     // 1. If companion mod overlay is open and mouse is inside it, block input
     if (m_mod_overlay_visible) {
-        float panel_w = win_w * 0.70f;
-        float panel_h = win_h * 0.75f;
-        if (panel_w < 640.0f) panel_w = win_w * 0.95f;
-        if (panel_h < 420.0f) panel_h = win_h * 0.95f;
+        float panel_w = std::min(win_w - 32.0f, 1120.0f);
+        float panel_h = std::min(win_h - 32.0f, 760.0f);
         float px = (win_w - panel_w) / 2.0f;
         float py = (win_h - panel_h) / 2.0f;
         if (mx >= px && mx <= px + panel_w && my >= py && my <= py + panel_h) {
@@ -2029,7 +2491,7 @@ bool SwordfareGUI::is_input_blocked(float mx, float my) {
         }
     }
 
-    if (!m_last_buttons_ptr) return false;
+    if (!m_last_buttons_ptr || m_buttons_globally_hidden) return false;
 
     extern int GAME_W, GAME_H;
     float game_asp = (float)GAME_W / (float)GAME_H;
@@ -2080,8 +2542,9 @@ bool SwordfareGUI::is_input_blocked(float mx, float my) {
                 if (parent_ovr && (parent_ovr->hidden || !parent_ovr->active)) continue;
             }
 
-            float pw = vp_w * btn.w * btn.scale_x;
-            float ph = vp_h * btn.h * btn.scale_y;
+            float square_base = std::min(vp_w, vp_h);
+            float pw = square_base * btn.w * btn.scale_x;
+            float ph = square_base * btn.h * btn.scale_y;
             float bx, by;
 
             if (parent_ovr) {
@@ -2690,12 +3153,13 @@ void SwordfareGUI::draw_help_panel(bool* p_open, float top_offset) {
         {"F1",  "Toggle this header / command overlay"},
         {"F2",  "Controls Editor (drag to reposition buttons)"},
         {"F3",  "Debug overlay (FPS, draw calls, player stats)"},
-        {"F4",  "Cycle scaling modes"},
+        {"F4",  "Toggle the SRE mod hub"},
         {"F5",  "Camera override toggle"},
         {"F6",  "Cycle PostFX presets"},
         {"F7",  "Toggle video background playback"},
         {"F8",  "Pause / Resume"},
         {"F10", "Toggle native on-screen controls"},
+        {"F11", "Scene Shifter and display toolbox"},
         {"F12", "Fullscreen toggle"},
         {"\\",  "Toggle keyboard typing mode"},
     };
@@ -3385,7 +3849,7 @@ void SwordfareGUI::draw_lua_console() {
             } else {
                 // dim for banner/info lines vs normal output
                 bool is_banner = (m_console_history.size() > 1 &&
-                                  &e == &m_console_history[0] || &e == &m_console_history[1]);
+                                  (&e == &m_console_history[0] || &e == &m_console_history[1]));
                 ImGui::TextColored(is_banner ? col_meta : col_out, "%s", e.text.c_str());
             }
         }
@@ -3793,4 +4257,3 @@ void SwordfareGUI::tcp_server_loop() {
         }
     }
 }
-

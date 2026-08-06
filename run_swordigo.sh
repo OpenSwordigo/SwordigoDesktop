@@ -36,20 +36,6 @@ if [ ! -x "$ROOT_DIR/bin/swordfare" ]; then
     echo "Swordfare is not built. Run: ./run_swordigo.sh --build" >&2
     exit 1
 fi
-if [ -f "$ROOT_DIR/libsre.so" ]; then
-    SRE_INSTALLED=0
-    while IFS= read -r dir; do
-        if [ -d "$dir" ]; then
-            cp "$ROOT_DIR/libsre.so" "$dir/libsre.so"
-            SRE_INSTALLED=$((SRE_INSTALLED + 1))
-        fi
-    done < <(find "$HOME/.local/share/swordigo-desktop/engine" -type d -name arm64-v8a 2>/dev/null)
-    if [ "$SRE_INSTALLED" -eq 0 ]; then
-        ENGINE_DIR="$HOME/.local/share/swordigo-desktop/engine/v1.4.12/arm64-v8a"
-        mkdir -p "$ENGINE_DIR"
-        cp "$ROOT_DIR/libsre.so" "$ENGINE_DIR/libsre.so"
-    fi
-fi
 if [ -f "$ROOT_DIR/engine/manifest.json" ]; then mkdir -p "$HOME/.local/share/swordigo-desktop/engine"; cp "$ROOT_DIR/engine/manifest.json" "$HOME/.local/share/swordigo-desktop/engine/manifest.json"; fi
 export LD_LIBRARY_PATH="$ROOT_DIR/bin/libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec "$ROOT_DIR/bin/swordfare" "${ARGS[@]}"

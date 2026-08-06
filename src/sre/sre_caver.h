@@ -170,7 +170,13 @@ static inline void* sre_scene_object_component(const SceneObject* obj, void* ifa
 typedef void (*pfn_CreateHeroObjectAt)(void*, void*, int, int);
 extern pfn_CreateHeroObjectAt g_sre_CreateHeroObjectAt;
 
+/* ModelComponent::setModelName(component, SreString* name)
+ * Symbol: _ZN5Caver14ModelComponent12setModelNameERKSs  @ 0x224024 (v1.4.12 ARM64) */
+extern void (*g_sre_ModelComponent_setModelName)(void* component, SreString* name);
 
+/* EntityControllerComponent::SetMoveSpeed(component, float speed)
+ * Symbol: _ZN5Caver25EntityControllerComponent12SetMoveSpeedEf  @ 0x26bb54 (v1.4.12 ARM64) */
+extern void (*g_sre_EntityControllerComponent_SetMoveSpeed)(void* component, float speed);
 
 /* =========================================================================
  * ProgramState::FromLuaState function pointer
