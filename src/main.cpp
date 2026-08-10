@@ -1,7 +1,8 @@
 // Force rebuild: PostFXState struct changed in fbo_scaler.h
+#include "wincompat/posix.h"
+#include "platform/os_external.h"
 #ifndef _WIN32
 #include <unistd.h>
-#include <sys/mman.h>
 #else
 #include <process.h>
 #include <windows.h>
@@ -20,18 +21,20 @@ namespace fs = std::filesystem;
 #include "jni/jni_layer_arm64.h"
 #include "jni/jni_bridge.h"
 #include "jni/jni_bridge_arm64.h"
-#include <unicorn/unicorn.h>
+#include "platform/unicorn_dyn.h"
 #include "platform/emulator.h"
 #include "platform/emulator_arm64.h"
 #include "platform/i_emulator_arm64.h"
 #ifdef SWORDIGO_HAS_DYNARMIC
 #include "platform/emulator_dynarmic64.h"
+#include "platform/emulator_dynarmic32.h"
 #endif
 #include "srehost/srehost_abi.h"   // ProHook Phase 1: SVC #0x5352 gateway
 #include "platform/display.h"
 #include "platform/openswordigo_host.h"
 #include "android/asset_manager.h"
 extern "C" void asset_manager_init_arm32(const char* base_path);
+extern "C" void sre_guest_heap_drain_deferred(void);  // jni_bridge_arm64.cpp — drains guest deferred-free list (leak guard)
 #include "game/camera_override.h"
 #include "game/mod_tools.h"
 #include "platform/rgc.h"
@@ -62,6 +65,12 @@ extern int g_win_w;
 extern int g_win_h;
 extern int g_draw_w;  // Physical drawable pixels (for glViewport / FBO)
 extern int g_draw_h;
+
+#if defined(_MSC_VER)
+extern "C" float g_host_hero_pos[3];
+#else
+extern float g_host_hero_pos[3];
+#endif
 
 // --- Global Context ---
 uint8_t* g_guest_memory = nullptr;
@@ -184,12 +193,24 @@ Emulator* g_emulator = nullptr;
 so_module_arm64 g_main_mod_64;
 so_module_arm64 g_sre_mod;
 ElfLoaderArm64* g_loader_64 = nullptr;
+
+// Normalize host paths to forward slashes before writing them into guest VFS
+// globals. The guest SRE code does literal '/' string matching (e.g.
+// strstr(base, "/assets"), MiniPath "/Files/", "/Cache/" prefixes) and builds
+// paths by concatenating with '/'. Windows backslash paths (C:\\Users\...)
+// silently break every one of those checks, which on Windows manifests as
+// scene-load asset misses -> black screen. Windows fopen/fs accept '/' natively.
+static std::string sre_normalize_vfs_path(const std::string& p) {
+    std::string out = p;
+    for (auto& c : out) if (c == '\\') c = '/';
+    return out;
+}
 JniBridge64 g_bridge_64;
 IEmulatorArm64* g_emulator_64 = nullptr;
 
 // Architecture flag — set during boot based on selected binary
 bool g_is_arm64 = false;
-bool g_use_dynarmic = false;  // Set via --engine=dynarmic
+bool g_use_dynarmic = true;   // Dynarmic JIT is the permanent default backend
 bool g_use_sre = true;        // Set via launcher or --no-sre
 bool g_advanced_redstell_opts = false; // Advanced Redstell Optimisations (off by default)
 uint64_t g_sre_profile_addr = 0;
@@ -211,8 +232,10 @@ uint64_t g_sre_profile_addr = 0;
 //   sre_longjmp(g_sre_render_recovery_jmp, 2) to skip the broken frame and
 //   return control to the game loop cleanly.
 // =========================================================================
-uint64_t g_sre_text_base = 0;   // guest VA of .text start
-uint64_t g_sre_text_end  = 0;   // guest VA of .text end
+uint64_t g_sre_text_base = 0;          // libswordigo executable segment start
+uint64_t g_sre_text_end  = 0;          // libswordigo executable segment end
+uint64_t g_sre_runtime_text_base = 0;  // libsre executable segment start
+uint64_t g_sre_runtime_text_end  = 0;  // libsre executable segment end
 int      g_sre_render_recovery_active = 0;
 void*    g_sre_render_recovery_jmp    = nullptr;
 uint64_t g_sre_vfs_profile_addr = 0;
@@ -296,6 +319,7 @@ uint64_t g_sre_hero_pos_z_addr = 0;
 static uint64_t g_sre_cam_x_addr = 0;
 static uint64_t g_sre_cam_y_addr = 0;
 static uint64_t g_sre_cam_z_addr = 0;
+static uint64_t g_sre_z_walk_axis_addr = 0;
 
 // SRE Background Renderer — guest addresses
 static uint64_t bg_mode_addr = 0;       // Guest addr of g_sre_bg_mode
@@ -657,9 +681,9 @@ void init_all() {
     // new uint8_t[N] leaves garbage that causes 0xFFFFFFFF... in uninitialized
     // stack/BSS areas, creating corrupt 64-bit pointers on ARM64.
     // Allocate 4GB guest memory via mmap so we cover the 0xFF000000 bridge region safely.
-    g_guest_memory = (uint8_t*)mmap(nullptr, 0x100000000ULL, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (g_guest_memory == MAP_FAILED) {
-        std::cerr << "FATAL: Failed to allocate 4GB guest memory via mmap" << std::endl;
+    g_guest_memory = (uint8_t*)os_external::reserve_large_region(0x100000000ULL);
+    if (!g_guest_memory) {
+        std::cerr << "FATAL: Failed to allocate 4GB guest memory (mmap/VirtualAlloc)" << std::endl;
         exit(1);
     }
 
@@ -1089,7 +1113,18 @@ void load_and_boot() {
     std::cout << "[Loader] Game binary ready (all symbols bridged)." << std::endl;
 
     // Initialize Emulator AFTER memory is prepared
-    g_emulator = new Emulator(g_guest_memory, GUEST_MEM_SIZE);
+    // ARM32 backend selection: Dynarmic (A32 JIT) is the permanent default for
+    // ARM32 instances too; Unicorn (TCG) remains as --engine=unicorn fallback.
+#ifdef SWORDIGO_HAS_DYNARMIC
+    if (g_use_dynarmic) {
+        g_emulator = new EmulatorDynarmic32(g_guest_memory, GUEST_MEM_SIZE);
+        std::cout << "[Engine] ARM32 backend: Dynarmic (A32 JIT)" << std::endl;
+    } else
+#endif
+    {
+        g_emulator = new Emulator(g_guest_memory, GUEST_MEM_SIZE);
+        std::cout << "[Engine] ARM32 backend: Unicorn (TCG)" << std::endl;
+    }
     g_emulator->set_bridge(&g_bridge);
 
     // Run dynamic initializers (.init_array)
@@ -1152,12 +1187,14 @@ void load_and_boot() {
     // and well above loaded modules (0x01000000 - 0x02200000).
     uint32_t path_ptr = 0x10000000;
     uint32_t files_dir = path_ptr;
-    strncpy((char*)(g_guest_memory + files_dir), g_save_dir.c_str(), 255);
+    std::string files_dir_norm = sre_normalize_vfs_path(g_save_dir);
+    strncpy((char*)(g_guest_memory + files_dir), files_dir_norm.c_str(), 255);
     ((char*)(g_guest_memory + files_dir))[255] = '\0';
     path_ptr += 256;
     
     uint32_t cache_dir = path_ptr;
-    strncpy((char*)(g_guest_memory + cache_dir), g_cache_dir.c_str(), 255);
+    std::string cache_dir_norm = sre_normalize_vfs_path(g_cache_dir);
+    strncpy((char*)(g_guest_memory + cache_dir), cache_dir_norm.c_str(), 255);
     ((char*)(g_guest_memory + cache_dir))[255] = '\0';
     path_ptr += 256;
 
@@ -1462,7 +1499,7 @@ void load_and_boot() {
                     arg_strs.push_back(g_assets_dir);
                     for (auto& s : arg_strs) args.push_back(&s[0]);
                     args.push_back(nullptr);
-                    execv("/proc/self/exe", args.data());
+                    os_external::restart_process(arg_strs);
                     exit(1);
                 }
             }
@@ -1825,6 +1862,10 @@ void load_and_boot() {
                     RedstellGC::instance().process_main_thread_deletions();
                     g_display_ptr->swap();
                 }
+                // Reclaim stale deferred guest frees every frame, on BOTH render paths
+                // (RL mod leak guard — the deferred-free list only drains on guest
+                // malloc, so free-heavy workloads need a frame-driven drain).
+                sre_guest_heap_drain_deferred();
                 
                 // Auto-toggle SDL text input when game requests it
                 if (g_text_input_active && !g_text_input_was_active) {
@@ -2101,8 +2142,7 @@ void load_and_boot() {
                                 } else if (event.key.key == SDLK_V) {
                                     handled_virtual = simulate_virtual_key("Armory", is_down);
                                 // NOTE: K is the attack/swing key — do NOT intercept it for SRE overlays.
-                                } else if (event.key.key == SDLK_S) {
-                                    handled_virtual = simulate_virtual_key("Settings", is_down);
+                                // NOTE: W/S are reserved for world-depth movement in desktop WASD controls.
                                 } else if (event.key.key == SDLK_P) {
                                     handled_virtual = simulate_virtual_key("+ Keybind", is_down);
                                 }
@@ -2188,6 +2228,10 @@ void load_and_boot() {
                                     }
                                 }
                                 if (controls_hidden) {
+                                    break;
+                                }
+
+                                if (event.key.key == SDLK_W || event.key.key == SDLK_S) {
                                     break;
                                 }
 
@@ -2672,6 +2716,14 @@ void load_and_boot_arm64() {
         g_emulator_64 = new EmulatorArm64(g_guest_memory, GUEST_MEM_SIZE);
 #endif
     } else {
+        if (!unicorn_backend_available()) {
+            std::cerr << "\n[Main] ERROR: Unicorn backend requested but is not available.\n"
+                      << "[Main]   " << unicorn_backend_error() << "\n"
+                      << "[Main]   Install Unicorn Engine (e.g. libunicorn-dev) and rebuild, or\n"
+                      << "[Main]   drop libunicorn.so / unicorn.dll next to the app, then run with\n"
+                      << "[Main]   --engine=dynarmic (or select Dynarmic in the launcher).\n" << std::endl;
+            exit(1);
+        }
         g_emulator_64 = new EmulatorArm64(g_guest_memory, GUEST_MEM_SIZE);
     }
     std::cout << "[Engine] Using " << g_emulator_64->engine_name() << " backend" << std::endl;
@@ -2952,7 +3004,32 @@ void load_and_boot_arm64() {
                 // Resolve imports (malloc, free, memcpy, strlen, etc.) through bridge
                 g_loader_64->resolve_all_to_bridge(&g_sre_mod, &g_bridge_64, GUEST_GLOBALS_BASE);
 
+                // Record the exact executable range. Exception recovery must never
+                // accept writable libsre data merely because it is inside the broad
+                // 0x02000000 module allocation.
+                g_sre_runtime_text_base = g_sre_mod.text_base;
+                g_sre_runtime_text_end = g_sre_mod.text_base + g_sre_mod.text_size;
 
+                // SRE's recovery stack contains saved guest SP/LR values. Deferred
+                // pthreads run as nested independent CPU contexts in Dynarmic, so
+                // the backend snapshots this process-global guest state around each
+                // deferred thread to prevent cross-context longjmp corruption.
+                {
+                    uint64_t depth_addr = g_loader_64->get_symbol_vaddr(
+                        &g_sre_mod, "g_sre_recovery_depth");
+                    uint64_t stack_addr = g_loader_64->get_symbol_vaddr(
+                        &g_sre_mod, "g_sre_recovery_stack");
+                    uint64_t bytes_addr = g_loader_64->get_symbol_vaddr(
+                        &g_sre_mod, "g_sre_recovery_stack_bytes");
+                    uint32_t stack_bytes = 0;
+                    if (bytes_addr && bytes_addr + sizeof(stack_bytes) <= GUEST_MEM_SIZE) {
+                        std::memcpy(&stack_bytes,
+                                    g_guest_memory + bytes_addr,
+                                    sizeof(stack_bytes));
+                    }
+                    g_emulator_64->configure_recovery_context(
+                        depth_addr, stack_addr, stack_bytes);
+                }
 
                 // ---- VFS pre-init ----
                 // Write VFS path globals and activate BEFORE sre_init so that
@@ -2964,7 +3041,8 @@ void load_and_boot_arm64() {
                     auto vfs_write_str = [&](const char* sym, const std::string& val, int maxlen) {
                         uint64_t a = g_loader_64->get_symbol_vaddr(&g_sre_mod, sym);
                         if (!a) return;
-                        strncpy((char*)(gm + a), val.c_str(), maxlen - 1);
+                        std::string norm = sre_normalize_vfs_path(val);
+                        strncpy((char*)(gm + a), norm.c_str(), maxlen - 1);
                         ((char*)(gm + a))[maxlen - 1] = '\0';
                     };
                     auto vfs_write_int = [&](const char* sym, int val) {
@@ -4356,6 +4434,7 @@ void load_and_boot_arm64() {
                 g_sre_cam_x_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_x");
                 g_sre_cam_y_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_y");
                 g_sre_cam_z_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_z");
+                g_sre_z_walk_axis_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_z_walk_axis");
 
                 std::cout << "[SRE] Music: load_name=0x" << std::hex << sre_music_load_name_addr
                           << " load_pending=0x" << sre_music_load_pending_addr
@@ -4440,14 +4519,16 @@ void load_and_boot_arm64() {
                     auto write_vfs_path = [&](const char* sym, const std::string& path) {
                         uint64_t addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, sym);
                         if (addr) {
-                            strncpy((char*)(g_guest_memory + addr), path.c_str(), 511);
+                            std::string norm = sre_normalize_vfs_path(path);
+                            strncpy((char*)(g_guest_memory + addr), norm.c_str(), 511);
                             ((char*)(g_guest_memory + addr))[511] = '\0';
-                            std::cout << "[SRE] VFS " << sym << " = " << path << std::endl;
+                            std::cout << "[SRE] VFS " << sym << " = " << norm << std::endl;
                         }
                     };
                     std::string data_base = get_data_path("");
-                    // Remove trailing slash if present
-                    if (!data_base.empty() && data_base.back() == '/')
+                    // Remove trailing separator if present (both '/' and '\\' —
+                    // Windows get_data_path may end with a backslash)
+                    while (!data_base.empty() && (data_base.back() == '/' || data_base.back() == '\\'))
                         data_base.pop_back();
                     
                     write_vfs_path("g_sre_vfs_path_external", data_base + "/external");
@@ -4455,12 +4536,16 @@ void load_and_boot_arm64() {
                     write_vfs_path("g_sre_vfs_path_cache",    g_cache_dir);
                     write_vfs_path("g_sre_vfs_path_assets",   get_data_path(g_assets_dir));
                     
-                    // Create required directories if missing
+                    // Create required directories if missing (std::filesystem is
+                    // portable — POSIX mkdir(path, mode) has no Windows equivalent;
+                    // error_code overload keeps the old mkdir's silent-failure
+                    // semantics instead of throwing filesystem_error on boot).
                     std::string ext_dir = data_base + "/external";
-                    mkdir(ext_dir.c_str(), 0755);
-                    mkdir(g_save_dir.c_str(), 0755);
-                    mkdir((g_save_dir + "/Documents").c_str(), 0755);
-                    mkdir(g_cache_dir.c_str(), 0755);
+                    std::error_code ec;
+                    fs::create_directories(ext_dir, ec);
+                    fs::create_directories(g_save_dir, ec);
+                    fs::create_directories(g_save_dir + "/Documents", ec);
+                    fs::create_directories(g_cache_dir, ec);
                     
                     // Populate guest profile ID globals with the active save UUID.
                     // g_sre_mod_profile_id → Mini.GetProfileID()
@@ -4599,12 +4684,14 @@ void load_and_boot_arm64() {
     // and well above loaded modules (0x01000000 - 0x02200000).
     uint32_t path_ptr = 0x10000000;
     uint32_t files_dir = path_ptr;
-    strncpy((char*)(g_guest_memory + files_dir), g_save_dir.c_str(), 255);
+    std::string files_dir_norm = sre_normalize_vfs_path(g_save_dir);
+    strncpy((char*)(g_guest_memory + files_dir), files_dir_norm.c_str(), 255);
     ((char*)(g_guest_memory + files_dir))[255] = '\0';
     path_ptr += 256;
     
     uint32_t cache_dir = path_ptr;
-    strncpy((char*)(g_guest_memory + cache_dir), g_cache_dir.c_str(), 255);
+    std::string cache_dir_norm = sre_normalize_vfs_path(g_cache_dir);
+    strncpy((char*)(g_guest_memory + cache_dir), cache_dir_norm.c_str(), 255);
     ((char*)(g_guest_memory + cache_dir))[255] = '\0';
     path_ptr += 256;
 
@@ -4836,6 +4923,8 @@ void load_and_boot_arm64() {
         bool key_left = false;
         bool key_right = false;
         bool key_jump = false;
+        bool key_z_forward = false;
+        bool key_z_backward = false;
         bool key_attack = false;
         bool key_magic = false;
         bool key_use_item = false;
@@ -4961,6 +5050,22 @@ void load_and_boot_arm64() {
             }
 
             float game_dt = dt_seconds * g_game_speed;
+            if (g_sre_z_walk_axis_addr && g_guest_memory) {
+                extern bool g_sre_overlay_blocking;
+                const bool z_input_blocked = g_sre_overlay_blocking || g_typing_mode ||
+                    g_swordfare_gui.is_lua_console_open() || g_text_input_active ||
+                    g_sre_controls_disabled;
+                const bool* held_keys = SDL_GetKeyboardState(nullptr);
+                if (z_input_blocked || !held_keys) {
+                    key_z_forward = false;
+                    key_z_backward = false;
+                } else {
+                    key_z_forward = held_keys[SDL_SCANCODE_W];
+                    key_z_backward = held_keys[SDL_SCANCODE_S];
+                }
+                float z_axis = (key_z_forward ? 1.0f : 0.0f) - (key_z_backward ? 1.0f : 0.0f);
+                *(float*)(g_guest_memory + g_sre_z_walk_axis_addr) = z_axis;
+            }
             uint32_t dt_hex;
             memcpy(&dt_hex, &game_dt, 4);
 
@@ -5035,6 +5140,16 @@ void load_and_boot_arm64() {
                             uint64_t frame_ticks = *(volatile uint64_t*)(g_guest_memory + sre_frame_ticks_addr);
                             uint64_t shell_ticks = *(volatile uint64_t*)(g_guest_memory + sre_shell_ticks_addr);
                             uint64_t poll_ticks = *(volatile uint64_t*)(g_guest_memory + sre_scene_poll_ticks_addr);
+                            uint64_t world_drive = 0;
+                            {
+                                static uint64_t s_wd_addr = 0;
+                                static bool s_wd_resolved = false;
+                                if (!s_wd_resolved && g_loader_64) {
+                                    s_wd_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_world_drive_count");
+                                    s_wd_resolved = true;
+                                }
+                                if (s_wd_addr) world_drive = *(volatile uint64_t*)(g_guest_memory + s_wd_addr);
+                            }
                             uint64_t guest_poll_ticks = poll_ticks >= host_scene_poll_calls
                                 ? poll_ticks - host_scene_poll_calls : 0;
                             std::cout << "[SRE/FrameDiag] host_frame=" << completed_frames
@@ -5044,6 +5159,7 @@ void load_and_boot_arm64() {
                                       << " scene_poll_total=" << poll_ticks
                                       << " scene_poll_guest=" << guest_poll_ticks
                                       << " scene_poll_fallback=" << host_scene_poll_calls
+                                      << " world_drive=" << world_drive
                                       << std::endl;
                             s_diag_frame = completed_frames;
                         } else if (completed_frames == 0 &&
@@ -5341,7 +5457,6 @@ void load_and_boot_arm64() {
                      */
 
                     // Handshake: copy guest hero position to host global for shader lighting
-                    extern float g_host_hero_pos[3];
                     g_host_hero_pos[0] = g_sre_hero_pos_x_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_x_addr) : 0.0f;
                     g_host_hero_pos[1] = g_sre_hero_pos_y_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_y_addr) : 0.0f;
                     g_host_hero_pos[2] = g_sre_hero_pos_z_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_z_addr) : 0.0f;
@@ -5866,6 +5981,10 @@ void load_and_boot_arm64() {
                     RedstellGC::instance().process_main_thread_deletions();
                     g_display_ptr->swap();
                 }
+                // Reclaim stale deferred guest frees every frame, on BOTH render paths
+                // (RL mod leak guard — the deferred-free list only drains on guest
+                // malloc, so free-heavy workloads need a frame-driven drain).
+                sre_guest_heap_drain_deferred();
 
                 // ========= Frame rate limiter =========
                 // The original game ran at 30fps with VSync. Without a frame cap,
@@ -6238,8 +6357,6 @@ void load_and_boot_arm64() {
                                     handled_virtual = simulate_virtual_key("Armory", is_down);
                                 // NOTE: K is the attack/swing key — do NOT intercept it for SRE overlays.
                                 // SRE overlay "Keybinds" button must be clicked with mouse instead.
-                                } else if (event.key.key == SDLK_S) {
-                                    handled_virtual = simulate_virtual_key("Settings", is_down);
                                 } else if (event.key.key == SDLK_P) {
                                     handled_virtual = simulate_virtual_key("+ Keybind", is_down);
                                 }
@@ -6668,6 +6785,7 @@ int g_saved_argc = 0;
 int main(int argc, char* argv[]) {
     g_saved_argc = argc;
     g_saved_argv = argv;
+    os_external::set_dev_working_dir(); // Windows: chdir to repo root so src/assets resolves
     // Check for --headless flag
     bool headless = false;
     bool use_openswordigo = false;
@@ -6691,6 +6809,10 @@ int main(int argc, char* argv[]) {
         if (strcmp(argv[i], "--engine=dynarmic") == 0 || strcmp(argv[i], "--dynarmic") == 0) {
             g_use_dynarmic = true;
             std::cout << "[Main] Engine: Dynarmic JIT" << std::endl;
+        }
+        if (strcmp(argv[i], "--engine=unicorn") == 0 || strcmp(argv[i], "--unicorn") == 0) {
+            g_use_dynarmic = false;
+            std::cout << "[Main] Engine: Unicorn (TCG)" << std::endl;
         }
         if (strcmp(argv[i], "--sre") == 0) {
             g_use_sre = true;
@@ -6731,8 +6853,12 @@ int main(int argc, char* argv[]) {
     
     // Set up user-writable directory paths
 #ifdef _WIN32
-    std::string appdata = getenv("LOCALAPPDATA") ? getenv("LOCALAPPDATA") : ".";
-    std::string base_dir = appdata + "/swordigo-desktop";
+    // Use the same app-data root as the launcher (get_user_data_dir / APPDATA),
+    // so instance.ini files and setup placed in ..\Roaming\swordigo-desktop are
+    // found by both the boot scan and the launcher.
+    std::string base_dir = get_user_data_dir();
+    while (!base_dir.empty() && (base_dir.back() == '/' || base_dir.back() == '\\'))
+        base_dir.pop_back();
 #else
     std::string home_dir = getenv("HOME") ? getenv("HOME") : ".";
     std::string xdg_data = getenv("XDG_DATA_HOME") ? getenv("XDG_DATA_HOME") : (home_dir + "/.local/share");

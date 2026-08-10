@@ -6,6 +6,7 @@
 #include <vector>
 #include <iostream>
 #include <memory>
+#include <cstring>
 
 // Forward declare Dynarmic types (avoid including heavy headers in .h)
 namespace Dynarmic { namespace A64 { class Jit; } }
@@ -62,18 +63,13 @@ public:
                   << start_routine << " arg=0x" << arg << std::dec << std::endl;
     }
 
-    void run_pending_threads() override {
-        while (!pending_threads.empty()) {
-            DeferredThread t = pending_threads.front();
-            pending_threads.erase(pending_threads.begin());
-            std::cout << "[Thread64/Dyn] Running deferred thread func=0x" << std::hex
-                      << t.start_routine << " arg=0x" << t.arg << std::dec << std::endl;
-            call(t.start_routine, {t.arg});
-            std::cout << "[Thread64/Dyn] Deferred thread completed." << std::endl;
-        }
-    }
+    void run_pending_threads() override;
 
     bool has_pending_threads() const override { return !pending_threads.empty(); }
+
+    void configure_recovery_context(uint64_t depth_addr,
+                                    uint64_t stack_addr,
+                                    uint32_t stack_bytes) override;
 
     void protect_memory(uint64_t addr, uint64_t size, uint32_t perms) override;
 
@@ -103,6 +99,13 @@ private:
 
     // TPIDR_EL0 storage (Dynarmic needs a pointer to this)
     uint64_t tpidr_el0_value = 0;
+
+    // Guest addresses of libsre's process-global setjmp recovery state.
+    // Deferred guest threads are independent CPU contexts, so this state is
+    // snapshotted and cleared while each one runs.
+    uint64_t recovery_depth_addr = 0;
+    uint64_t recovery_stack_addr = 0;
+    uint32_t recovery_stack_bytes = 0;
 };
 
 #endif

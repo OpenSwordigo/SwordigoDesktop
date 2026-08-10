@@ -35,6 +35,7 @@ extern "C" const char* sre_resolve_symbol(uint64_t addr);
 #include <cstdio>
 #include <unordered_map>
 #include <deque>
+#include "wincompat/posix.h"
 #include <unordered_set>
 #include <map>
 #include <sstream>
@@ -42,7 +43,6 @@ extern "C" const char* sre_resolve_symbol(uint64_t addr);
 #include <sys/stat.h>
 #ifndef _WIN32
 #include <dirent.h>
-#endif
 #include <sys/time.h>
 #include <sched.h>
 #include <sys/socket.h>
@@ -51,6 +51,8 @@ extern "C" const char* sre_resolve_symbol(uint64_t addr);
 #include <netdb.h>
 #include <fcntl.h>
 #include <strings.h>
+#include <unistd.h>
+#endif
 #include "platform/draw_batcher.h"
 #include <filesystem>
 namespace fs = std::filesystem;
@@ -58,7 +60,6 @@ namespace fs = std::filesystem;
 #include <mpg123.h>
 #include <algorithm>
 #include <time.h>
-#include <unistd.h>
 #include <thread>
 #include "platform/rgc.h"
 #include "platform/fbo_scaler.h"
@@ -68,6 +69,7 @@ extern so_module_arm64 g_sre_mod;
 extern so_module_arm64 g_main_mod_64;
 extern uint8_t* g_guest_memory;
 #include <cerrno>
+#ifndef _WIN32
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -77,6 +79,7 @@ extern uint8_t* g_guest_memory;
 #include <poll.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
+#endif
 #ifndef GL_GLEXT_PROTOTYPES
 #define GL_GLEXT_PROTOTYPES 1
 #endif
@@ -237,14 +240,36 @@ struct DeferredBlock {
     uint32_t addr;
     uint32_t size;
     uint64_t alloc_index;
+    uint64_t free_ms;   // wall-clock ms when the block was deferred (time-based drain)
 };
 static uint32_t g_guest_heap_ptr = 0x20000000; // Start heap at 512MB
 static std::unordered_map<uint32_t, uint32_t> g_guest_allocs;
 static std::unordered_set<uint32_t> g_tracked_allocs;
-static std::vector<DeferredBlock> g_deferred_free_list_vector; // Original TVPG container
-static std::deque<DeferredBlock> g_deferred_free_list;
+static std::deque<DeferredBlock> g_deferred_free_list;  // single container for BOTH configs (O(1) pop_front)
 static uint64_t g_alloc_counter = 0;
 static std::mutex g_heap_mutex;
+
+// Wall-clock milliseconds (steady clock) — used by the time-based deferred-free drain.
+static uint64_t now_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000u);
+}
+
+// A deferred free is safe to reclaim when EITHER:
+//   (a) at least DEFERRED_FREE_ALLOC_MARGIN allocations have happened since it was
+//       freed (original counter-based safety margin for JIT-register staleness), OR
+//   (b) it was freed more than DEFERRED_FREE_TIME_MS wall-clock ago. The time fallback
+//       guarantees the list CANNOT grow unboundedly when the guest frees in bulk but
+//       allocates infrequently (the RL mod's scene teardown pattern caused a 384MB+
+//       growth of this list — an 'insane' leak plus O(n) erase stalls).
+#define DEFERRED_FREE_ALLOC_MARGIN 5000
+#define DEFERRED_FREE_TIME_MS      500   // generous margin; JIT staleness window is microseconds
+
+static inline bool deferred_block_safe(const DeferredBlock& db, uint64_t now) {
+    return (g_alloc_counter - db.alloc_index > DEFERRED_FREE_ALLOC_MARGIN) ||
+           (now - db.free_ms > DEFERRED_FREE_TIME_MS);
+}
 
 // Fastbins: O(1) allocator for small blocks (size <= 1024, in multiples of 8 bytes)
 // 128 buckets: index = (size - 1) / 8. Free blocks form a singly linked list in guest memory.
@@ -345,11 +370,12 @@ static uint32_t host_malloc_locked(uint32_t size) {
     // === TVPG Original Config Allocator ===
     if (!g_advanced_redstell_opts) {
         // Drain deferred list (oldest-first, stop at first not-yet-safe block)
-        while (!g_deferred_free_list_vector.empty()) {
-            const auto& db = g_deferred_free_list_vector.front();
-            if (g_alloc_counter - db.alloc_index > 5000) {
+        uint64_t now = now_ms();
+        while (!g_deferred_free_list.empty()) {
+            const auto& db = g_deferred_free_list.front();
+            if (deferred_block_safe(db, now)) {
                 add_free_block_locked(db.addr, db.size);
-                g_deferred_free_list_vector.erase(g_deferred_free_list_vector.begin());
+                g_deferred_free_list.pop_front();
             } else {
                 break;
             }
@@ -374,10 +400,11 @@ static uint32_t host_malloc_locked(uint32_t size) {
         return addr;
     }
 
-    // === SRE Config Allocator — drain at 500-alloc safety margin ===
+    // === SRE Config Allocator — drain at 500-alloc safety margin (plus time fallback) ===
+    uint64_t now = now_ms();
     while (!g_deferred_free_list.empty()) {
         const auto& db = g_deferred_free_list.front();
-        if (g_alloc_counter - db.alloc_index > 500) {
+        if ((g_alloc_counter - db.alloc_index > 500) || (now - db.free_ms > DEFERRED_FREE_TIME_MS)) {
             add_free_block_locked(db.addr, db.size);
             g_deferred_free_list.pop_front();
         } else {
@@ -417,15 +444,8 @@ static void host_free_locked(uint32_t ptr) {
         db.addr = ptr;
         db.size = (size + 7) & ~7;
         db.alloc_index = g_alloc_counter;
+        db.free_ms = now_ms();
         
-        // === TVPG Original Config Free ===
-        if (!g_advanced_redstell_opts) {
-            g_deferred_free_list_vector.push_back(db);
-            g_guest_allocs.erase(ptr);
-            return;
-        }
-
-        // === SRE Config Free ===
         g_deferred_free_list.push_back(db);
         g_guest_allocs.erase(ptr);
     }
@@ -434,6 +454,23 @@ static void host_free_locked(uint32_t ptr) {
 extern "C" void rgc_reclaim_guest_memory(uint64_t addr) {
     std::lock_guard<std::mutex> lock(g_heap_mutex);
     host_free_locked((uint32_t)addr);
+}
+
+// Host frame-loop drain: reclaim every deferred free older than the time margin,
+// even if no new guest malloc has happened recently (free-heavy workloads like
+// RL mod scene teardown would otherwise grow the deferred list unboundedly).
+extern "C" void sre_guest_heap_drain_deferred(void) {
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
+    uint64_t now = now_ms();
+    while (!g_deferred_free_list.empty()) {
+        const auto& db = g_deferred_free_list.front();
+        if (deferred_block_safe(db, now)) {
+            add_free_block_locked(db.addr, db.size);
+            g_deferred_free_list.pop_front();
+        } else {
+            break;
+        }
+    }
 }
 
 extern "C" uint32_t get_guest_heap_size_64() {
@@ -4011,7 +4048,11 @@ static void bridge_localtime_r(void* emu_ptr) {
         tm_guest[8] = t.tm_isdst;
         // Android's struct tm also has tm_gmtoff (long) and tm_zone (char*)
         // at offsets 9*4=36 and 36+8=44 — zero them for safety
+#if defined(_WIN32)
+        *(int64_t*)(tm_guest + 9) = 0;   // MSVC struct tm has no tm_gmtoff
+#else
         *(int64_t*)(tm_guest + 9) = t.tm_gmtoff;
+#endif
         *(uint64_t*)(tm_guest + 11) = 0; // tm_zone = NULL
     }
     
@@ -4563,6 +4604,17 @@ static void bridge_fstat(void* emu_ptr) {
         *(uint32_t*)(memory + statbuf_g + 28) = host_stat.st_gid;
         *(uint64_t*)(memory + statbuf_g + 32) = host_stat.st_rdev;
         *(uint64_t*)(memory + statbuf_g + 48) = host_stat.st_size;
+#if defined(_WIN32)
+        /* MSVC struct stat lacks st_blksize/st_blocks/*tim (sec/nsec) fields. */
+        *(uint32_t*)(memory + statbuf_g + 56) = 4096;
+        *(uint64_t*)(memory + statbuf_g + 64) = (uint64_t)(host_stat.st_size / 512);
+        *(uint64_t*)(memory + statbuf_g + 72) = (uint64_t)host_stat.st_atime;
+        *(uint64_t*)(memory + statbuf_g + 80) = 0;
+        *(uint64_t*)(memory + statbuf_g + 88) = (uint64_t)host_stat.st_mtime;
+        *(uint64_t*)(memory + statbuf_g + 96) = 0;
+        *(uint64_t*)(memory + statbuf_g + 104) = (uint64_t)host_stat.st_ctime;
+        *(uint64_t*)(memory + statbuf_g + 112) = 0;
+#else
         *(uint32_t*)(memory + statbuf_g + 56) = host_stat.st_blksize;
         *(uint64_t*)(memory + statbuf_g + 64) = host_stat.st_blocks;
         *(uint64_t*)(memory + statbuf_g + 72) = host_stat.st_atim.tv_sec;
@@ -4571,6 +4623,7 @@ static void bridge_fstat(void* emu_ptr) {
         *(uint64_t*)(memory + statbuf_g + 96) = host_stat.st_mtim.tv_nsec;
         *(uint64_t*)(memory + statbuf_g + 104) = host_stat.st_ctim.tv_sec;
         *(uint64_t*)(memory + statbuf_g + 112) = host_stat.st_ctim.tv_nsec;
+#endif
     }
     emu->set_reg(0, ret);
 }
@@ -8311,7 +8364,7 @@ static void bridge_send(void* emu_ptr) {
     size_t len = emu->get_reg(2);
     int flags = emu->get_reg(3);
     const void* buf = buf_g ? (const void*)(emu->get_memory_base() + buf_g) : nullptr;
-    ssize_t ret = send(sockfd, buf, len, flags);
+    ssize_t ret = send(sockfd, (const char*)buf, (int)len, flags);
     emu->set_reg(0, ret);
 }
 
@@ -8322,7 +8375,7 @@ static void bridge_recv(void* emu_ptr) {
     size_t len = emu->get_reg(2);
     int flags = emu->get_reg(3);
     void* buf = buf_g ? (void*)(emu->get_memory_base() + buf_g) : nullptr;
-    ssize_t ret = recv(sockfd, buf, len, flags);
+    ssize_t ret = recv(sockfd, (char*)buf, (int)len, flags);
     emu->set_reg(0, ret);
 }
 
@@ -8336,7 +8389,7 @@ static void bridge_sendto(void* emu_ptr) {
     socklen_t addrlen = emu->get_reg(5);
     const void* buf = buf_g ? (const void*)(emu->get_memory_base() + buf_g) : nullptr;
     const struct sockaddr* dest = dest_g ? (const struct sockaddr*)(emu->get_memory_base() + dest_g) : nullptr;
-    ssize_t ret = sendto(sockfd, buf, len, flags, dest, addrlen);
+    ssize_t ret = sendto(sockfd, (const char*)buf, (int)len, flags, dest, (int)addrlen);
     emu->set_reg(0, ret);
 }
 
@@ -8351,7 +8404,7 @@ static void bridge_recvfrom(void* emu_ptr) {
     void* buf = buf_g ? (void*)(emu->get_memory_base() + buf_g) : nullptr;
     struct sockaddr* src = src_g ? (struct sockaddr*)(emu->get_memory_base() + src_g) : nullptr;
     socklen_t* addrlen = addrlen_g ? (socklen_t*)(emu->get_memory_base() + addrlen_g) : nullptr;
-    ssize_t ret = recvfrom(sockfd, buf, len, flags, src, addrlen);
+    ssize_t ret = recvfrom(sockfd, (char*)buf, (int)len, flags, src, (socklen_t*)addrlen);
     emu->set_reg(0, ret);
 }
 
@@ -8363,7 +8416,7 @@ static void bridge_setsockopt(void* emu_ptr) {
     uint64_t optval_g = emu->get_reg(3);
     socklen_t optlen = emu->get_reg(4);
     const void* optval = optval_g ? (const void*)(emu->get_memory_base() + optval_g) : nullptr;
-    int ret = setsockopt(sockfd, level, optname, optval, optlen);
+    int ret = setsockopt(sockfd, level, optname, (const char*)optval, (int)optlen);
     emu->set_reg(0, ret);
 }
 
@@ -8376,7 +8429,7 @@ static void bridge_getsockopt(void* emu_ptr) {
     uint64_t optlen_g = emu->get_reg(4);
     void* optval = optval_g ? (void*)(emu->get_memory_base() + optval_g) : nullptr;
     socklen_t* optlen = optlen_g ? (socklen_t*)(emu->get_memory_base() + optlen_g) : nullptr;
-    int ret = getsockopt(sockfd, level, optname, optval, optlen);
+    int ret = getsockopt(sockfd, level, optname, (char*)optval, (socklen_t*)optlen);
     emu->set_reg(0, ret);
 }
 

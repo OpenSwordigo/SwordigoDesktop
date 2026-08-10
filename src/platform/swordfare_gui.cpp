@@ -12,6 +12,18 @@
 //     with TODO so they're easy to find.
 // =============================================================================
 
+#if defined(_WIN32) && !defined(__MINGW32__)
+// Winsock must precede <windows.h>; swordfare_gui.h -> gl_inc.h pulls it.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include "platform/swordfare_gui.h"
 #include "platform/IconsFontAwesome6.h"
 #include "platform/embedded_assets.h"
@@ -25,6 +37,7 @@
 #include "imgui/backends/imgui_impl_vulkan.h"
 #endif
 #include "platform/rgc.h"
+#include "platform/os_external.h"
 
 #include <cstring>
 #include "display.h"
@@ -34,15 +47,29 @@
 
 #include <iostream>
 #include <fstream>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <cmath>
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
+#else
+typedef SSIZE_T ssize_t;
+#ifndef SHUT_RD
+#define SHUT_RD   0
+#define SHUT_WR   1
+#define SHUT_RDWR 2
+#endif
+/* This TU only ever reads/writes/closes sockets (free-function shims, so
+   std::ofstream::close()/write() members are untouched). */
+inline int close(SOCKET s)                       { return closesocket(s); }
+inline int read(int s, void *b, size_t n)        { return recv((SOCKET)s, (char *)b, (int)n, 0); }
+inline int write(int s, const void *b, size_t n) { return send((SOCKET)s, (const char *)b, (int)n, 0); }
+#endif
+#include <cmath>
 
 bool g_sre_overlay_blocking = false;
 
@@ -52,17 +79,17 @@ extern "C" uint32_t get_guest_heap_size_32();
 
 // Weak fallback definitions for SRE Scene Shifter symbols (resolved from guest space at runtime)
 extern "C" {
-    __attribute__((weak)) int    g_sre_scene_list_count = 0;
-    __attribute__((weak)) char   g_sre_scene_list[256][128] = {{0}};
-    __attribute__((weak)) volatile int   g_sre_scene_shift_pending = 0;
-    __attribute__((weak)) char   g_sre_scene_shift_target[128] = {0};
-    __attribute__((weak)) char   g_sre_scene_shift_spawn[64] = "start";
-    __attribute__((weak)) char   g_sre_scene_shift_last_error[256] = {0};
-    __attribute__((weak)) volatile int   g_sre_scene_shift_active = 0;
-    __attribute__((weak)) char   g_sre_current_scene_name[128] = {0};
-    __attribute__((weak)) void   sre_scene_shifter_scan_scenes(void) {}
+    SWORDIGO_WEAK int    g_sre_scene_list_count = 0;
+    SWORDIGO_WEAK char   g_sre_scene_list[256][128] = {{0}};
+    SWORDIGO_WEAK volatile int   g_sre_scene_shift_pending = 0;
+    SWORDIGO_WEAK char   g_sre_scene_shift_target[128] = {0};
+    SWORDIGO_WEAK char   g_sre_scene_shift_spawn[64] = "start";
+    SWORDIGO_WEAK char   g_sre_scene_shift_last_error[256] = {0};
+    SWORDIGO_WEAK volatile int   g_sre_scene_shift_active = 0;
+    SWORDIGO_WEAK char   g_sre_current_scene_name[128] = {0};
+    SWORDIGO_WEAK void   sre_scene_shifter_scan_scenes(void) {}
     // AnimateIn hook trampoline pointer — set by host after relay install
-    __attribute__((weak)) void*  g_orig_SceneLoadingView_AnimateIn = NULL;
+    SWORDIGO_WEAK void*  g_orig_SceneLoadingView_AnimateIn = NULL;
 }
 
 // ---------------------------------------------------------------------------
@@ -247,8 +274,7 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
 
     // Find font files
     std::string main_font_path, button_font_path, fa_path;
-    const char* home_val = getenv("HOME");
-    std::string home_dir = home_val ? home_val : "";
+    std::string home_dir = os_external::home_dir();
 
     std::vector<std::string> main_font_candidates = {
         "src/assets/fonts/MegalopolisExtra-Regular.otf",
@@ -522,8 +548,7 @@ void SwordfareGUI::init_vulkan(SDL_Window* window, VulkanBackend* vk_backend) {
     float layout_scale = (wh >= 1440) ? 1.5f : (wh >= 1080) ? 1.25f : 1.0f;
 
     // Font candidates — same search paths as init()
-    const char* home_val = getenv("HOME");
-    std::string home_dir = home_val ? home_val : "";
+    std::string home_dir = os_external::home_dir();
 
     auto find_font = [&](std::vector<std::string> candidates) -> std::string {
         if (!home_dir.empty()) {
@@ -2880,8 +2905,8 @@ void SwordfareGUI::draw_lua_script_editor() {
         ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.08f, 0.22f, 0.52f, 1.00f));
         
         if (ImGui::Button(" " ICON_FA_FLOPPY_DISK " Save Script ")) {
-            const char* home = std::getenv("HOME");
-            if (home) {
+            std::string home = os_external::home_dir();
+            if (!home.empty()) {
                 std::filesystem::path save_dir = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts";
                 std::error_code ec;
                 std::filesystem::create_directories(save_dir, ec);
@@ -2929,8 +2954,8 @@ void SwordfareGUI::draw_lua_script_editor() {
                 m_script_editor_status_color[0] = 0.9f; m_script_editor_status_color[1] = 0.2f; m_script_editor_status_color[2] = 0.2f;
             } else {
                 // Syntax OK, proceed to save
-                const char* home = std::getenv("HOME");
-                if (home) {
+                std::string home = os_external::home_dir();
+                if (!home.empty()) {
                     std::filesystem::path save_dir = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts";
                     std::error_code ec;
                     std::filesystem::create_directories(save_dir, ec);
@@ -2995,8 +3020,8 @@ void SwordfareGUI::draw_lua_script_manager() {
         
         if (ImGui::Button("Refresh")) {
             m_script_list.clear();
-            const char* home = std::getenv("HOME");
-            if (home) {
+            std::string home = os_external::home_dir();
+            if (!home.empty()) {
                 std::filesystem::path save_dir = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts";
                 std::error_code ec;
                 if (std::filesystem::exists(save_dir, ec)) {
@@ -3050,8 +3075,8 @@ void SwordfareGUI::draw_lua_script_manager() {
             ImGui::SameLine(ImGui::GetWindowWidth() - 150.0f);
             
             if (ImGui::Button("Edit")) {
-                const char* home = std::getenv("HOME");
-                if (home) {
+                std::string home = os_external::home_dir();
+                if (!home.empty()) {
                     std::filesystem::path file_path = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts" / script.filename;
                     std::ifstream in(file_path);
                     if (in.is_open()) {
@@ -3064,8 +3089,8 @@ void SwordfareGUI::draw_lua_script_manager() {
             }
             ImGui::SameLine();
             if (ImGui::Button("Run")) {
-                const char* home = std::getenv("HOME");
-                if (home) {
+                std::string home = os_external::home_dir();
+                if (!home.empty()) {
                     std::filesystem::path file_path = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts" / script.filename;
                     std::ifstream in(file_path);
                     if (in.is_open()) {
@@ -3950,7 +3975,7 @@ void SwordfareGUI::start_tcp_server(int port) {
     }
 
     int opt = 1;
-    setsockopt(m_tcp_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(m_tcp_server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 
     sockaddr_in address{};
     address.sin_family = AF_INET;

@@ -45,6 +45,11 @@ bool ray_plane_y(const float origin[3], const float dir[3], float plane_y, float
 /// Build the object world matrix (T * Rz(rot) * S) — mirrors the renderer.
 void object_world_matrix(const av::SceneObject& obj, float out[16]);
 
+/// Render matrix = object_world_matrix + the ModelComponent's baked Y-rotation
+/// (main.js addModel rotation.y). Use for draw passes; keep object_world_matrix
+/// for gizmo/picking so editing stays stable.
+void object_render_matrix(const av::SceneObject& obj, float out[16]);
+
 /// Flat-shade normals + recompute the AABB of an edited ground mesh.
 void recompute_ground_mesh_geometry(av::PODMesh& pm);
 
@@ -84,6 +89,23 @@ bool pick_ground_mesh_edge(const av::PODMesh& pm, const float obj_mat[16],
                            const av::Camera& cam, int w, int h,
                            const ImVec2& viewport_pos, const ImVec2& mouse,
                            int& out_v0, int& out_v1);
+
+// ============================================================================
+// Mesh normals
+// ============================================================================
+
+/// Compute smooth (area-weighted, normalized) vertex normals from positions +
+/// indices. When @p indices is empty the vertex stream is treated as a plain
+/// triangle list (3 vertices per triangle).
+///
+/// Fills @p out_normals with 3 floats per vertex and returns the number of
+/// vertices processed (0 on empty/invalid input). Callers upload these when a
+/// mesh carries no baked normals — otherwise the renderer lights every
+/// surface as Y-up, which is what makes stone read flat and walls lose their
+/// form.
+int compute_smooth_normals(const std::vector<float>& positions,
+                           const std::vector<uint32_t>& indices,
+                           std::vector<float>& out_normals);
 
 // ============================================================================
 // Object picking (screen-space, touch friendly)

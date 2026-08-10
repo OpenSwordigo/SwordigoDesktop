@@ -10,14 +10,10 @@
 #include <map>
 #include <cstdlib>
 #include <cctype>
+#include <vector>
+#include <zlib.h>
 
 namespace fs = std::filesystem;
-
-static std::string shell_quote(const std::string& value) {
-    std::string quoted = "'";
-    for (char c : value) quoted += c == '\'' ? "'\\''" : std::string(1, c);
-    return quoted + "'";
-}
 
 static std::string safe_instance_name(const std::string& name) {
     std::string result;
@@ -27,6 +23,140 @@ static std::string safe_instance_name(const std::string& name) {
     }
     while (!result.empty() && result.back() == '-') result.pop_back();
     return result.empty() ? "Imported-APK" : result;
+}
+
+// ============================================================================
+// Bundled miniature ZIP extractor (no external `unzip`/`7z` dependency).
+//
+// Used by APK import. Reads only what an APK needs: the `assets/*` tree and
+// native libraries `lib/<abi>/*.so`, decoding stored (method 0) and deflate
+// (method 8) entries with zlib. Central-directory driven, with the local file
+// header located so the data offset is always correct.
+// ============================================================================
+
+namespace {
+
+inline uint16_t le16(const uint8_t* p) { return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
+inline uint32_t le32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+bool want_apk_entry(const std::string& name) {
+    if (name.empty() || name.back() == '/') return false; // directories
+    if (name.rfind("assets/", 0) == 0) return true;
+    if (name.rfind("lib/", 0) == 0) {
+        // lib/<abi>/<lib>*.so
+        const size_t second = name.find('/', 4);
+        if (second != std::string::npos) {
+            const std::string abi = name.substr(4, second - 4);
+            if ((abi == "armeabi-v7a" || abi == "arm64-v8a") &&
+                name.size() > 3 && name.compare(name.size() - 3, 3, ".so") == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+bool inflate_entry(const uint8_t* in, size_t in_len, std::vector<uint8_t>& out) {
+    z_stream zs;
+    std::memset(&zs, 0, sizeof(zs));
+    if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) return false;
+    zs.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(in));
+    zs.avail_in = (uInt)in_len;
+    zs.next_out = out.data();
+    zs.avail_out = (uInt)out.size();
+    int rc = inflate(&zs, Z_FINISH);
+    inflateEnd(&zs);
+    return rc == Z_STREAM_END || (rc == Z_OK && zs.avail_out == 0);
+}
+
+} // namespace
+
+// Extract assets/* and lib/<abi>/*.so from `apk_path` into `dest`. Returns
+// false (with *err set) on any error. Safe against Zip-bomb-ish sizes.
+static bool extract_apk_zip(const std::string& apk_path, const fs::path& dest, std::string* err) {
+    using u8 = uint8_t;
+    std::ifstream f(apk_path, std::ios::binary);
+    if (!f) { if (err) *err = "cannot open APK"; return false; }
+
+    f.seekg(0, std::ios::end);
+    const std::streamoff file_size = f.tellg();
+    if (file_size < 22) { if (err) *err = "file too small to be a ZIP"; return false; }
+
+    // Locate End Of Central Directory within the last 64 KiB + 22 bytes.
+    const std::streamoff win_len = std::min<std::streamoff>(file_size, 22 + 65535);
+    f.seekg(file_size - win_len);
+    std::vector<u8> tail((size_t)win_len);
+    if (win_len > 0) f.read(reinterpret_cast<char*>(tail.data()), win_len);
+
+    std::streamoff eocd = -1;
+    for (std::streamoff i = win_len - 22; i >= 0; --i) {
+        if (tail[(size_t)i] == 0x50 && tail[(size_t)i + 1] == 0x4b &&
+            tail[(size_t)i + 2] == 0x05 && tail[(size_t)i + 3] == 0x06) { eocd = i; break; }
+    }
+    if (eocd < 0) { if (err) *err = "ZIP end-of-central-directory not found"; return false; }
+
+    const u8* e = tail.data() + eocd;
+    const uint32_t entry_count = le16(e + 10);
+    const uint32_t cd_offset   = le32(e + 16);
+
+    f.seekg(cd_offset);
+    for (uint32_t n = 0; n < entry_count; ++n) {
+        u8 hdr[46];
+        f.read(reinterpret_cast<char*>(hdr), 46);
+        if (!f || le32(hdr) != 0x02014b50) { if (err) *err = "bad central-directory entry"; return false; }
+        const uint16_t method    = le16(hdr + 10);
+        const uint32_t comp_size = le32(hdr + 20);
+        const uint32_t uncomp    = le32(hdr + 24);
+        const uint16_t name_len  = le16(hdr + 28);
+        const uint16_t extra_len = le16(hdr + 30);
+        const uint32_t local_off = le32(hdr + 42);
+        std::string name((size_t)name_len, '\0');
+        if (name_len) f.read(&name[0], name_len);
+        if (f.gcount() != name_len) { if (err) *err = "truncated central-directory name"; return false; }
+        f.seekg(extra_len, std::ios::cur); // skip central extra
+        f.seekg(std::streamoff(le16(hdr + 32)), std::ios::cur); // skip central comment
+
+        if (!want_apk_entry(name)) continue;
+        if (uncomp > (512u << 20)) { if (err) *err = "entry too large"; return false; }
+
+        // Locate compressed payload: local header + 30 + name + extra.
+        f.seekg(local_off);
+        u8 lh[30];
+        f.read(reinterpret_cast<char*>(lh), 30);
+        if (f.gcount() != 30 || le32(lh) != 0x04034b50) { if (err) *err = "bad local file header"; return false; }
+        const std::streamoff data_off = local_off + 30 + le16(lh + 26) + le16(lh + 28);
+
+        std::vector<uint8_t> in((size_t)comp_size);
+        if (comp_size) {
+            f.seekg(data_off);
+            f.read(reinterpret_cast<char*>(in.data()), comp_size);
+            if (f.gcount() != comp_size) { if (err) *err = "truncated entry data"; return false; }
+        }
+
+        std::vector<uint8_t> out((size_t)uncomp);
+        if (method == 0) {          // stored
+            if (comp_size != uncomp) { if (err) *err = "size mismatch"; return false; }
+            out = in;
+        } else if (method == 8) {   // deflate
+            if (!inflate_entry(in.data(), in.size(), out)) { if (err) *err = "inflate failed"; return false; }
+        } else {
+            if (err) *err = "unsupported compression method";
+            return false;
+        }
+
+        // Write under dest, preventing traversal.
+        std::string cleaned;
+        for (char c : name) cleaned += (c == '\\') ? '/' : c;
+        while (cleaned.rfind("../", 0) == 0) cleaned.erase(0, 3);
+        const fs::path target = dest / fs::path(cleaned);
+        std::error_code ec;
+        fs::create_directories(target.parent_path(), ec);
+        std::ofstream w(target, std::ios::binary | std::ios::trunc);
+        if (!w) { if (err) *err = "cannot write " + target.string(); return false; }
+        w.write(reinterpret_cast<const char*>(out.data()), (std::streamsize)out.size());
+    }
+    return true;
 }
 
 // ============================================================================
@@ -650,8 +780,6 @@ bool BinarySelector::import_apk_instance(const std::string& apk_path, const std:
     };
     if (!fs::is_regular_file(apk_path)) return fail("APK file does not exist");
     if (data_dir.empty()) return fail("Launcher data directory is not configured");
-    if (std::system("command -v unzip >/dev/null 2>&1") != 0)
-        return fail("The 'unzip' utility is required to import APK files");
 
     const std::string slug = safe_instance_name(name);
     const std::string version_dir = "apk-" + slug;
@@ -664,12 +792,12 @@ bool BinarySelector::import_apk_instance(const std::string& apk_path, const std:
         fs::remove_all(temp);
         fs::create_directories(temp);
         // APKs also contain large DEX/resource tables that Swordigo Desktop
-        // never consumes. Extract only game assets and native libraries.
-        const std::string command = "unzip -qq " + shell_quote(apk_path) +
-            " 'assets/*' 'lib/*/*.so' -d " + shell_quote(temp.string());
-        if (std::system(command.c_str()) != 0) {
+        // never consumes. Extract only game assets and native libraries with
+        // the bundled ZIP reader (no external unzip/7z required).
+        std::string zip_err;
+        if (!extract_apk_zip(apk_path, temp, &zip_err)) {
             fs::remove_all(temp);
-            return fail("Failed to extract APK (invalid or unsupported archive)");
+            return fail(zip_err.empty() ? "Failed to extract APK (invalid or unsupported archive)" : zip_err);
         }
         const fs::path extracted_assets = temp / "assets";
         if (!fs::is_directory(extracted_assets / "resources")) {

@@ -7,8 +7,61 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 namespace swk {
+
+// ============================================================================
+// Mesh normals
+// ============================================================================
+
+int compute_smooth_normals(const std::vector<float>& positions,
+                           const std::vector<uint32_t>& indices,
+                           std::vector<float>& out_normals) {
+    const size_t vcount = positions.size() / 3;
+    if (vcount == 0) {
+        out_normals.clear();
+        return 0;
+    }
+    out_normals.assign(vcount * 3, 0.0f);
+
+    // Iterate triangles: indexed stream, or positions-as-triangle-list.
+    const size_t tri_count =
+        indices.empty() ? (vcount / 3) : (indices.size() / 3);
+    for (size_t t = 0; t < tri_count; ++t) {
+        const size_t i0 = indices.empty() ? t * 3 + 0 : indices[t * 3 + 0];
+        const size_t i1 = indices.empty() ? t * 3 + 1 : indices[t * 3 + 1];
+        const size_t i2 = indices.empty() ? t * 3 + 2 : indices[t * 3 + 2];
+        if (i0 >= vcount || i1 >= vcount || i2 >= vcount) continue;
+        const float* a = &positions[i0 * 3];
+        const float* b = &positions[i1 * 3];
+        const float* c = &positions[i2 * 3];
+        // Edge vectors
+        float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+        float e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+        // Face normal = e1 × e2 (area-weighted)
+        float nx = e1[1] * e2[2] - e1[2] * e2[1];
+        float ny = e1[2] * e2[0] - e1[0] * e2[2];
+        float nz = e1[0] * e2[1] - e1[1] * e2[0];
+        // Skip degenerate triangles (zero area → zero normal contribution).
+        if (nx == 0.0f && ny == 0.0f && nz == 0.0f) continue;
+        out_normals[i0 * 3 + 0] += nx; out_normals[i0 * 3 + 1] += ny; out_normals[i0 * 3 + 2] += nz;
+        out_normals[i1 * 3 + 0] += nx; out_normals[i1 * 3 + 1] += ny; out_normals[i1 * 3 + 2] += nz;
+        out_normals[i2 * 3 + 0] += nx; out_normals[i2 * 3 + 1] += ny; out_normals[i2 * 3 + 2] += nz;
+    }
+
+    // Normalize per vertex; keep zero for orphaned vertices (harmless).
+    for (size_t i = 0; i < vcount; ++i) {
+        float* n = &out_normals[i * 3];
+        const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (len > 1e-12f) {
+            n[0] /= len; n[1] /= len; n[2] /= len;
+        } else {
+            n[0] = 0.0f; n[1] = 1.0f; n[2] = 0.0f;   // Y-up fallback
+        }
+    }
+    return (int)vcount;
+}
 
 static constexpr float kPi = 3.14159265358979323846f;
 
@@ -31,9 +84,14 @@ void camera_basis(const av::Camera& cam, float right[3], float up[3], float forw
     const float fl = std::sqrt(forward[0]*forward[0] + forward[1]*forward[1] + forward[2]*forward[2]);
     if (fl > 0.0f) { forward[0] /= fl; forward[1] /= fl; forward[2] /= fl; }
 
-    right[0] = forward[2];
+    // Right = forward x world-up, matching mat4_look_at's side vector in
+    // camera_get_view_matrix (and cursor_focal_point / the RMB-pan block). The
+    // previous sign here was flipped, which mirrored every screen_ray: dragging
+    // a vertex in the 2D editor flew it to the opposite side of the polygon,
+    // and screen-space Move dragged objects opposite to the mouse.
+    right[0] = -forward[2];
     right[1] = 0.0f;
-    right[2] = -forward[0];
+    right[2] =  forward[0];
     const float rl = std::sqrt(right[0]*right[0] + right[2]*right[2]);
     if (rl > 0.0f) { right[0] /= rl; right[2] /= rl; }
 
@@ -107,6 +165,21 @@ void object_world_matrix(const av::SceneObject& obj, float out[16]) {
     S[10] = obj.scale_z * obj.template_scaling;
     av::mat4_multiply(temp, T, R);
     av::mat4_multiply(out, temp, S);
+}
+
+// Render matrix: object_world_matrix + the ModelComponent's baked Y-rotation
+// (main.js addModel applies it as rotation.y on a wrapper holding the model).
+// Applied in model space, before the scene object's own Z-spin, so doors and
+// props face their mesh side in-game instead of toward the viewer. The gizmo
+// / picking paths keep using object_world_matrix (unrotated) so editing stays
+// stable.
+void object_render_matrix(const av::SceneObject& obj, float out[16]) {
+    object_world_matrix(obj, out);
+    if (!obj.has_model_y_rotation) return;
+    float RY[16], temp[16];
+    av::mat4_rotate_y(RY, obj.model_y_rotation * 180.0f / kPi);
+    av::mat4_multiply(temp, out, RY);   // post-multiply: model-space rotation
+    std::memcpy(out, temp, 16 * sizeof(float));
 }
 
 void recompute_ground_mesh_geometry(av::PODMesh& pm) {

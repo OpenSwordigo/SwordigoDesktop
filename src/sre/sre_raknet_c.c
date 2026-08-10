@@ -63,11 +63,13 @@ extern void caver_getPosition_impl(void* obj, float* x, float* y, float* z);
 extern void caver_setPosition_impl(void* obj, float x, float y, float z);
 extern void (*g_sre_CreateHeroObjectAt)(void* sc, void* pos, int facing_dir, int add_to_scene);
 
-extern void* (*g_SceneObject_ComponentWithInterface)(void* obj, void* interface);
-extern void* EntityComponent_Interface;
-extern void* HealthComponent_Interface;
-extern float sre_health_get_hp(void* comp);
-extern void sre_health_set_hp(void* hc, float hp);
+/* g_SceneObject_ComponentWithInterface, EntityComponent_Interface, HealthComponent_Interface,
+ * and the sre_health_get_hp / sre_health_set_hp static inline accessors are all declared in
+ * sre_caver.h (included below). Declaring them as bare extern here left the health symbols
+ * UNDEFINED in libsre.so (static inline never emits a definition), so every call resolved via
+ * the bridge PLT stub -> "[Bridge64] !! UNHANDLED" flooding. Include the header instead so
+ * each translation unit gets the inline definition and the exact typedefs. */
+#include "sre_caver.h"
 
 extern volatile int g_sre_scene_shift_pending;
 extern char g_sre_scene_shift_target[128];

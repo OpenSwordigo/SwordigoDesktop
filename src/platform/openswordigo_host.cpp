@@ -3,9 +3,9 @@
 #include "platform/pvr_loader.h"
 #include "tools/pod_loader.h"
 #include "tools/scene_loader.h"
+#include "platform/os_external.h"
 
 #include <SDL3/SDL.h>
-#include <dlfcn.h>
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -42,6 +42,12 @@ struct OpenSwordigoConfig {
                              const float** positions, int* position_count, const float** normals,
                              int* normal_count, const float** uvs, int* uv_count,
                              const uint32_t** indices, int* index_count, const char** texture_name);
+    int (*scene_spawn_point)(void* scene, int object_index, int* facing,
+                             float* offset_x, float* offset_y, float* offset_z);
+    int (*scene_model_transform)(void* scene, int object_index, float* origin,
+                                 float* axis, float* angle, float* speed);
+    int (*scene_portal)(void* scene, int object_index, const char** destination,
+                        const char** spawn_point, int* tap_to_enter);
 };
 
 struct OpenSwordigoRuntime;
@@ -54,10 +60,11 @@ using DestroyFn = void (*)(OpenSwordigoRuntime*);
 
 template <typename T>
 T load_symbol(void* library, const char* name) {
-    dlerror();
-    auto symbol = reinterpret_cast<T>(dlsym(library, name));
-    if (const char* error = dlerror()) {
-        std::cerr << "[OpenSwordigo/Host] Missing symbol " << name << ": " << error << '\n';
+    os_external::library_error();
+    auto symbol = reinterpret_cast<T>(os_external::find_symbol(library, name));
+    if (!symbol) {
+        std::cerr << "[OpenSwordigo/Host] Missing symbol " << name << ": "
+                  << os_external::library_error() << '\n';
         return nullptr;
     }
     return symbol;
@@ -234,13 +241,54 @@ int native_scene_ground_mesh(void* handle, int object_index, int mesh_index,
     return 1;
 }
 
+int native_scene_spawn_point(void* handle, int object_index, int* facing,
+                             float* offset_x, float* offset_y, float* offset_z) {
+    if (!handle || object_index < 0) return 0;
+    auto* scene = static_cast<av::SceneData*>(handle);
+    if (object_index >= static_cast<int>(scene->objects.size())) return 0;
+    const auto& object = scene->objects[object_index];
+    if (!object.is_spawn_point) return 0;
+    if (facing) *facing = object.spawn_facing;
+    if (offset_x) *offset_x = object.spawn_offset[0];
+    if (offset_y) *offset_y = object.spawn_offset[1];
+    if (offset_z) *offset_z = object.spawn_offset[2];
+    return 1;
+}
+
+int native_scene_model_transform(void* handle, int object_index, float* origin,
+                                 float* axis, float* angle, float* speed) {
+    if (!handle || object_index < 0) return 0;
+    auto* scene = static_cast<av::SceneData*>(handle);
+    if (object_index >= static_cast<int>(scene->objects.size())) return 0;
+    const auto& object = scene->objects[object_index];
+    if (!object.has_model_transform) return 0;
+    if (origin) std::copy_n(object.model_transform_origin, 3, origin);
+    if (axis) std::copy_n(object.model_transform_axis, 3, axis);
+    if (angle) *angle = object.model_transform_angle;
+    if (speed) *speed = object.model_transform_speed;
+    return 1;
+}
+
+int native_scene_portal(void* handle, int object_index, const char** destination,
+                        const char** spawn_point, int* tap_to_enter) {
+    if (!handle || object_index < 0) return 0;
+    auto* scene = static_cast<av::SceneData*>(handle);
+    if (object_index >= static_cast<int>(scene->objects.size())) return 0;
+    const auto& object = scene->objects[object_index];
+    if (!object.is_portal) return 0;
+    if (destination) *destination = object.portal_destination.c_str();
+    if (spawn_point) *spawn_point = object.portal_spawn_point.c_str();
+    if (tap_to_enter) *tap_to_enter = object.portal_tap_to_enter ? 1 : 0;
+    return 1;
+}
+
 } // namespace
 
 int run_openswordigo(Display& display, const OpenSwordigoLaunchOptions& options) {
-    void* library = dlopen(options.library_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    void* library = os_external::load_library(options.library_path);
     if (!library) {
         std::cerr << "[OpenSwordigo/Host] Failed to load " << options.library_path
-                  << ": " << dlerror() << '\n';
+                  << ": " << os_external::library_error() << '\n';
         return 1;
     }
 
@@ -251,7 +299,7 @@ int run_openswordigo(Display& display, const OpenSwordigoLaunchOptions& options)
     KeyFn key = load_symbol<KeyFn>(library, "openswordigo_key");
     DestroyFn destroy = load_symbol<DestroyFn>(library, "openswordigo_destroy");
     if (!create || !update || !render || !mouse || !key || !destroy) {
-        dlclose(library);
+        os_external::close_library(library);
         return 1;
     }
 
@@ -263,13 +311,14 @@ int run_openswordigo(Display& display, const OpenSwordigoLaunchOptions& options)
         load_native_texture, read_native_asset, free_native_asset,
         load_native_model, free_native_model, native_model_mesh_count, native_model_mesh,
         load_native_scene, free_native_scene, native_scene_object_count, native_scene_object,
-        native_scene_ground_mesh_count, native_scene_ground_mesh
+         native_scene_ground_mesh_count, native_scene_ground_mesh, native_scene_spawn_point,
+         native_scene_model_transform, native_scene_portal
     };
     g_native_assets_root = options.assets_root;
     OpenSwordigoRuntime* runtime = create(&config);
     if (!runtime) {
         std::cerr << "[OpenSwordigo/Host] Native runtime initialization failed\n";
-        dlclose(library);
+        os_external::close_library(library);
         return 1;
     }
 
@@ -327,6 +376,6 @@ int run_openswordigo(Display& display, const OpenSwordigoLaunchOptions& options)
     }
 
     destroy(runtime);
-    dlclose(library);
+    os_external::close_library(library);
     return 0;
 }

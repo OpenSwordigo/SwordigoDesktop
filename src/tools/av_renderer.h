@@ -42,6 +42,19 @@ struct GPUMesh {
     unsigned int ebo = 0;
     int index_count  = 0;
     unsigned int texture_id = 0;    // 0 = no texture bound
+
+    // Orientation of the texture upload. Swordigo containers (.tex.png/.pvr)
+    // and (after the 2026-08 normalization) all plain images are uploaded
+    // bottom-origin (v = 0 = bottom of the image, the game convention).
+    // DCC-style importers (FBX / glTF, whose authored UVs have v = 0 at the
+    // top) set this so the model shader flips V at sample time — fixing the
+    // "FBX textures mapped upside-down" bug without touching POD assets.
+    bool flip_uv_v = false;
+
+    // PBR vertex layout info (set by upload_mesh_ex).
+    bool has_tangents = false;   // tangent vec4 attribute present (PBR layout)
+    bool has_skinning = false;   // joint/weight vec4 attributes present
+    int  stride_floats = 8;      // interleaved floats per vertex
 };
 
 // ============================================================================
@@ -74,8 +87,29 @@ GPUMesh upload_mesh(const float* positions, const float* normals, const float* u
 void update_mesh_vertices(const GPUMesh& mesh, const float* positions,
                           const float* normals, const float* uvs, int num_verts);
 
+/// Stride-aware update for PBR-layout meshes (tangent/joint/weight attributes
+/// preserved). Pass nullptr for any stream that should keep its old values.
+void update_mesh_vertices_ex(const GPUMesh& mesh, const float* positions,
+                             const float* normals, const float* uvs,
+                             const float* tangents4, const float* joints4,
+                             const float* weights4, int num_verts);
+
 /// Delete GPU resources for a mesh.  Zeros the handle fields.
 void free_mesh(GPUMesh& mesh);
+
+/// Upload geometry with optional tangent (vec4) and skinning (vec4 joint /
+/// vec4 weight) attributes — the vertex layout the PBR renderer consumes.
+/// Interleaved layouts: [pos3 nrm3 uv2] (+ tan4) (+ joint4 weight4).
+/// When @p tangents4 is null the PBR program degrades to vertex-normal
+/// shading; when @p joints4/weights4 are null the mesh is rigid.
+/// @p flip_uv_v flips V at sample time (see GPUMesh::flip_uv_v).
+GPUMesh upload_mesh_ex(const float* positions, const float* normals, const float* uvs,
+                       const float* tangents4, const float* joints4, const float* weights4,
+                       int num_verts, const uint32_t* indices, int num_indices,
+                       bool flip_uv_v);
+
+/// Toggle V-flipping on an already-uploaded mesh (no GL calls).
+void set_mesh_flip_uv(GPUMesh& mesh, bool flip);
 
 // ============================================================================
 // FBO management
@@ -125,6 +159,13 @@ void set_point_lights(const float pos[][3], const float col[][3],
 /// Reset point lights to none (editor-only previews).
 void clear_point_lights();
 
+/// Upload scene directional lights (up to 4). When count == 0 the renderer
+/// falls back to the single g_light_dir/g_light_color editor preview light.
+void set_directional_lights(const float dir[][3], const float col[][3], int count);
+
+/// Reset directional lights to none (use editor preview light).
+void clear_directional_lights();
+
 /// Render a camera-facing additive glow sprite (billboard) at a world position.
 /// Used for torch/fire/emissive glows that feed the PostFX bloom bright-pass.
 /// @param pos    World position [x,y,z]
@@ -133,8 +174,20 @@ void clear_point_lights();
 void render_glow_sprite(const float pos[3], const float color[3], float size);
 
 /// Convenience: render glow sprites for every point light uploaded via
-/// set_point_lights().
+/// set_point_lights(). The sprites are compact emitter markers (screen-sized
+/// billboards at the source) whose bright cores feed the bloom bright-pass.
 void render_point_light_glows();
+
+/// Editor debug overlay: draw an influence-radius ring + small emitter cross
+/// at every uploaded point light. Visualized separately from the real
+/// illumination so the marker never reads as the light itself.
+void render_light_debug();
+
+/// Render a soft ground-aligned contact shadow (dark ellipse) at @p pos.
+/// Scaled by the two radii, rotated on the Y axis, drawn multiplicatively so
+/// it darkens whatever is beneath it (ground / water).
+void render_shadow_blob(const float pos[3], float width_radius, float depth_radius,
+                        float rot_y, const float color[3]);
 
 /// One water/fluid sheet (parsed from WaterMeshComponent + shape rectangle).
 /// @p rect       Fluid sheet rectangle [x, y, w, h] in object-local coords.
@@ -168,6 +221,17 @@ void render_water_sheet(const WaterSheetData& ws, const float* model_matrix,
 /// @param far      Distance where fog is fully opaque
 void set_depth_fog(bool enabled, const float color[3], float near_dist, float far_dist);
 
+/// Set viewport diagnostics for the model shader (applies to every render_mesh
+/// call until changed). Both are off by default.
+/// @param flat_shade    true  -> skip the whole lighting equation: texture /
+///                      material color straight to screen ("is the texture
+///                      dark, or is the lighting wrong?" check).
+/// @param debug_normals true  -> render world-space normals as color
+///                      (RGB = N*0.5+0.5). Inverted / missing normals become
+///                      obvious (walls facing away show purple-blue instead of
+///                      their surface tint). Ignored while flat_shade is on.
+void set_view_flags(bool flat_shade, bool debug_normals);
+
 /// Render debug line segments, two xyz points per segment.
 void render_lines(const float* positions, int vertex_count, const float color[4],
                   const float* model_matrix = nullptr, float width = 1.0f);
@@ -189,6 +253,82 @@ void render_background_quad(unsigned int texture_id, const float* model_matrix);
 void end_3d();
 
 // ============================================================================
+// PBR renderer — vendored algorithms from zauonlok/renderer (MIT, Zhou Le)
+//   · GGX distribution / Smith visibility / Schlick+F90 Fresnel
+//   · metallic-roughness AND specular-glossiness workflows
+//   · tangent-space normal mapping (TBN, aTangent.w handedness)
+//   · image-based lighting: split-sum (prefiltered env cubemap + BRDF LUT)
+//   · directional shadow mapping (light-VP depth pass + N·L-biased compare)
+//   · ACES tone mapping
+// Reference sources live in src/render/zauonlok/ (see its README).
+// ============================================================================
+
+struct PBRMaterial {
+    // Base color (RGBA). alpha < 1 blends; alpha < uAlphaCutoff discards.
+    float base_color[4] = {1, 1, 1, 1};
+    float metalness  = 0.0f;    // metallic-roughness workflow
+    float roughness  = 0.6f;    // metallic-roughness workflow
+    float occlusion  = 1.0f;    // ambient-occlusion multiplier
+    float emission[3] = {0, 0, 0};
+
+    // Textures (0 = none). All bottom-origin (game convention).
+    unsigned int basecolor_tex = 0;
+    unsigned int metalness_tex = 0;
+    unsigned int roughness_tex = 0;
+    unsigned int normal_tex    = 0;
+    unsigned int occlusion_tex = 0;
+    unsigned int emission_tex  = 0;
+
+    // 0 = metallic-roughness, 1 = specular-glossiness (diffuse + specular
+    // factors; the fragment shader converts glossiness → roughness).
+    int workflow = 0;
+    // Specular-glossiness inputs (workflow == 1).
+    float specular[3]  = {0.04f, 0.04f, 0.04f};
+    float glossiness   = 0.6f;
+    unsigned int specular_tex = 0;
+    unsigned int glossiness_tex = 0;
+};
+
+/// GPU joint matrices for vertex-shader skinning in the PBR program.
+/// @p matrices is a flat [count * 16] column-major array; count is clamped
+/// to 256 (uJoints uniform array — sized for renderer-master .ani rigs like
+/// the 235-joint assassin). Default (count 0) = rigid mesh.
+void pbr_set_joint_matrices(const float* matrices, int count);
+
+/// IBL environment: a mip-mapped cubemap (prefiltered radiance; the
+/// roughness LOD is picked by the shader) plus the procedural split-sum
+/// BRDF LUT generated at renderer_init. Pass 0 to disable IBL.
+/// @p intensity scales the environment contribution (1.0 = neutral).
+void pbr_set_environment(unsigned int env_cubemap, float intensity);
+
+/// Adjust the IBL contribution without replacing the environment cubemap
+/// (the procedural sky built at renderer_init is used until one is supplied).
+void pbr_set_env_intensity(float intensity);
+
+/// Directional shadow mapping: light-space view/proj matrices + the depth
+/// texture rendered by the shadow pass. Shadows are sampled by the PBR
+/// program with the vendor's N·L-scaled bias.
+void pbr_set_shadow(const float light_view[16], const float light_proj[16],
+                    unsigned int shadow_depth_tex);
+void pbr_enable_shadows(bool on);
+
+/// Render a mesh with the PBR program (tangent/joint-aware).
+/// @p model_matrix 4x4 column-major model transform (identity if null).
+void pbr_render_mesh(const GPUMesh& mesh, const float* model_matrix,
+                     const PBRMaterial& mat, bool wireframe = false);
+
+/// Shadow pass: render the scene's depth from the directional light's point
+/// of view into a depth texture, then pbr_render_mesh samples it. Create the
+/// FBO once (create_shadow_fbo), then per frame:
+///   av::begin_shadow_pass(fbo, w, h);
+///   av::shadow_render_mesh(mesh, model_matrix);  // one per opaque mesh
+///   av::end_shadow_pass();
+unsigned int create_shadow_fbo(int width, int height, unsigned int* out_depth_tex);
+void begin_shadow_pass(unsigned int fbo, int w, int h);
+void end_shadow_pass();
+void shadow_render_mesh(const GPUMesh& mesh, const float* model_matrix);
+
+// ============================================================================
 // Post-processing (bloom / depth-of-field / HD grade / vignette / grain)
 // ============================================================================
 
@@ -202,9 +342,11 @@ struct PostFXParams {
     float exposure    = 1.0f;
 
     // Bloom: bright-pass extract, downsample, separable 9-tap gaussian blur.
+    // Default profile is Swordigo-faithful: restrained bloom so torch cores
+    // glow without washing the level into haze.
     bool  bloom           = true;
-    float bloom_strength  = 0.30f;
-    float bloom_threshold = 0.85f;
+    float bloom_strength  = 0.22f;
+    float bloom_threshold = 0.95f;
 
     // Depth of field: CoC blur driven by the FBO depth texture. `dof_focus` is
     // the in-focus distance from the camera (world units).
@@ -213,19 +355,21 @@ struct PostFXParams {
     float dof_scale  = 2.5f;
 
     // Cinematic color grade (applied after tone mapping).
+    // Default profile: vanilla-like — readable shadows, restrained saturation,
+    // a hint of warmth. PostFX finishes the lighting, never compensates for it.
     bool  color_grade = true;
-    float saturation  = 1.10f;
-    float contrast    = 1.06f;
-    float brightness  = 0.02f;
-    float warmth      = 0.0f;   // -1..1, warm(+)/cool(-) tint
+    float saturation  = 1.05f;
+    float contrast    = 1.04f;
+    float brightness  = 0.03f;
+    float warmth      = 0.05f;  // -1..1, warm(+)/cool(-) tint
 
     // Unsharp-mask sharpen / crispness.
     bool  sharpen        = true;
-    float sharpen_amount = 0.35f;
+    float sharpen_amount = 0.30f;
 
     // Vignette.
     bool  vignette         = true;
-    float vignette_strength = 0.30f;
+    float vignette_strength = 0.22f;
 
     // Animated film grain.
     bool  grain        = false;
@@ -247,7 +391,19 @@ void postfx_shutdown();
 // Global lighting parameters (can be adjusted by GUI)
 extern float g_light_dir[3];
 extern float g_light_color[3];
-extern float g_ambient_color[3];
+extern float g_fill_color[3];          // cool fill from the opposite side
+extern float g_rim_strength;           // camera-opposed edge light (0..~1)
+extern float g_spec_strength;          // subtle Blinn-Phong sheen (0..~1)
+extern float g_ambient_color[3];       // hemisphere sky fill
+/// Vendor .scn light scales: `punctual` modulates the directional sun
+/// (g_light_color), `ambient` the hemisphere fill (g_ambient_color / ground).
+/// Both default to 1.0; the .scn preview saves/restores them around itself.
+extern float g_light_scale;
+extern float g_ambient_scale;
+// Hemisphere ground fill (bounced ambient): surfaces facing down — platform
+// undersides, ceilings, wall bases — fall toward this darker value instead of
+// the sky fill, keeping corners readable without crushed blacks.
+extern float g_ambient_ground_color[3];
 extern float g_clear_color[3];
 
 // ============================================================================

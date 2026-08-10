@@ -1,7 +1,7 @@
 #include "emulator.h"
+#include "unicorn_dyn.h"
 #include <iostream>
 #include <cstring>
-#include <unicorn/unicorn.h>
 
 // Forward declarations from game/camera_override.cpp
 extern uint32_t g_cam_ctrl_ptr;
@@ -134,6 +134,12 @@ static void hook_mana_update(uc_engine *uc, uint64_t address, uint32_t size, voi
 Emulator::Emulator(uint8_t* guest_mem, uint32_t mem_size) 
     : memory(guest_mem), size(mem_size), bridge(nullptr), uc(nullptr) {
     
+    if (!unicorn_backend_available()) {
+        std::cerr << "ARM32 requires the Unicorn backend, which is unavailable: "
+                  << unicorn_backend_error() << std::endl;
+        return;
+    }
+
     uc_err err = uc_open(UC_ARCH_ARM, UC_MODE_ARM, (uc_engine**)&uc);
     if (err) {
         std::cerr << "Failed on uc_open() with error returned: " << err << std::endl;
@@ -367,6 +373,10 @@ uint32_t Emulator::get_lr() {
 uint32_t Emulator::get_bridge_base() { return 0xFF000000; }
 
 void Emulator::run(uint32_t start_pc) {
+    if (!uc) {
+        std::cerr << "[Emulator] run() called but Unicorn engine is not available" << std::endl;
+        return;
+    }
     uint32_t magic_lr = 0xE0000000;
     set_reg(14, magic_lr);
     

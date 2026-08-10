@@ -96,7 +96,7 @@ void InputConfig::load_defaults() {
 
     // Action buttons (right side)
     add("jump",  913, 132, 45,
-        SDL_SCANCODE_SPACE, SDL_SCANCODE_W, 12,
+        SDL_SCANCODE_SPACE, 0, 12,
         SDL_GAMEPAD_BUTTON_SOUTH);
 
     add("attack", 794, 110, 40,
@@ -224,6 +224,13 @@ void InputConfig::load(const std::string& path) {
 
     if (have_section) {
         buttons.push_back(current);
+    }
+
+    // W is reserved for world-depth movement in desktop WASD controls.
+    for (auto& btn : buttons) {
+        if (btn.name == "jump" && btn.sdl_scancode_alt == SDL_SCANCODE_W) {
+            btn.sdl_scancode_alt = 0;
+        }
     }
 
     file.close();

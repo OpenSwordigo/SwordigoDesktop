@@ -9,6 +9,8 @@
 #include <iomanip>
 #include <cstring>
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
 
 extern "C" {
 #include <lua.h>
@@ -1006,13 +1008,9 @@ static const FieldSchema* find_field(const std::string& parent_msg_type, uint32_
         }
     }
 
-    // 3. Try global fallbacks
-    auto it_all = schemas.find("All");
-    if (it_all != schemas.end()) {
-        for (const auto& fs : it_all->second) {
-            if (fs.field_number == field_number) return &fs;
-        }
-    }
+    // "All" is a real FileRift root type, not a fallback schema. Field
+    // numbers overlap heavily between Swordigo messages, so consulting it for
+    // another class can silently rename and reinterpret unknown fields.
     return nullptr;
 }
 
@@ -1041,14 +1039,22 @@ static const FieldSchema* find_field_by_name(const std::string& parent_msg_type,
         }
     }
 
-    // 3. Try global fallbacks
-    auto it_all = schemas.find("All");
-    if (it_all != schemas.end()) {
-        for (const auto& fs : it_all->second) {
-            if (fs.name == name) return &fs;
-        }
-    }
     return nullptr;
+}
+
+static std::string root_class_for_filetype(const std::string& filetype) {
+    if (filetype == "fr") return "All";
+    if (filetype == "scene") return "Scene";
+    if (filetype == "scl") return "ObjectLibrary";
+    if (filetype == "gdata") return "GameData";
+    if (filetype == "gopt") return "GameOptions";
+    if (filetype == "gplayer") return "PlayerProfile";
+    if (filetype == "gstate") return "GameState";
+    if (filetype == "scmap") return "Map";
+    if (filetype == "sounds") return "SoundLibrary";
+    if (filetype == "fnt") return "Font";
+    if (filetype == "atlas") return "Texture";
+    throw std::invalid_argument("unsupported FileRift file type: " + filetype);
 }
 
 static std::string escape_bytes(const std::string& s) {
@@ -1097,12 +1103,37 @@ static std::string unescape_bytes(const std::string& s) {
     return out;
 }
 
+static std::string unknown_tag_name(uint32_t field_number, proto::WireType wire_type) {
+    const char* suffix = "unknown";
+    if (wire_type == proto::WIRE_VARINT) suffix = "varint";
+    else if (wire_type == proto::WIRE_I64) suffix = "i64";
+    else if (wire_type == proto::WIRE_LEN) suffix = "len";
+    else if (wire_type == proto::WIRE_I32) suffix = "i32";
+    return "Tag_" + std::to_string(field_number) + "_" + suffix;
+}
+
 static void decode_message(const std::string& bytes, const std::string& classname, int indent, std::stringstream& out) {
     std::string tabs(indent * 4, ' ');
     try {
         proto::Reader reader(bytes);
         proto::Field f;
+        bool preserve_compile = false;
+        std::string preserved_degrees;
         while (reader.read_field(f)) {
+            // FileRift preservation records live outside the game schemas.
+            if (f.field_number == 513 && f.wire_type == proto::WIRE_LEN) {
+                out << tabs << f.bytes_val << "\n";
+                continue;
+            }
+            if (f.field_number == 514 && f.wire_type == proto::WIRE_VARINT) {
+                preserve_compile = true;
+                continue;
+            }
+            if (f.field_number == 515 && f.wire_type == proto::WIRE_LEN) {
+                preserved_degrees = f.bytes_val;
+                continue;
+            }
+
             const FieldSchema* fs = find_field(classname, f.field_number);
             std::string tagname;
             std::string sub_classname;
@@ -1110,7 +1141,7 @@ static void decode_message(const std::string& bytes, const std::string& classnam
                 tagname = fs->name;
                 sub_classname = fs->classname;
             } else {
-                tagname = "Tag_" + std::to_string(f.field_number);
+                tagname = unknown_tag_name(f.field_number, f.wire_type);
             }
 
             out << tabs << tagname;
@@ -1120,18 +1151,26 @@ static void decode_message(const std::string& bytes, const std::string& classnam
                     out << "{\n";
                     decode_message(f.bytes_val, sub_classname, indent + 1, out);
                     out << tabs << "}\n";
+                } else if (preserve_compile) {
+                    out << " : @compile\n";
                 } else if (tagname == "String") {
-                    out << " : $\n" << f.bytes_val << "\n" << tabs << "$end\n";
+                    std::string body = f.bytes_val;
+                    if (!body.empty() && body.front() == '\n') body.erase(body.begin());
+                    out << " : $\n" << body << "\n$end\n";
                 } else {
                     out << " : " << escape_bytes(f.bytes_val) << "\n";
                 }
             } else if (f.wire_type == proto::WIRE_VARINT) {
                 out << " : " << f.varint_val << "\n";
             } else if (f.wire_type == proto::WIRE_I32) {
-                out << " : " << f.float_val << "\n";
+                if (!preserved_degrees.empty()) out << " : " << preserved_degrees << "d\n";
+                else out << " : " << std::setprecision(std::numeric_limits<float>::max_digits10) << f.float_val << "\n";
             } else if (f.wire_type == proto::WIRE_I64) {
-                out << " : " << f.double_val << "\n";
+                if (!preserved_degrees.empty()) out << " : " << preserved_degrees << "d\n";
+                else out << " : " << std::setprecision(std::numeric_limits<double>::max_digits10) << f.double_val << "\n";
             }
+            preserve_compile = false;
+            preserved_degrees.clear();
         }
     } catch (const std::exception& e) {
         out << tabs << "# [Decode Error: " << e.what() << "]\n";
@@ -1139,162 +1178,234 @@ static void decode_message(const std::string& bytes, const std::string& classnam
 }
 
 std::string decode_protobuf(const std::string& bytes, const std::string& filetype) {
-    std::string root_class = "Scene";
-    if (filetype == "scl") root_class = "ObjectLibrary";
-    else if (filetype == "gdata") root_class = "GameData";
-    else if (filetype == "gopt") root_class = "GameOptions";
-    else if (filetype == "gplayer") root_class = "PlayerProfile";
-    else if (filetype == "gstate") root_class = "GameState";
-    else if (filetype == "scmap") root_class = "Map";
-    else if (filetype == "sounds") root_class = "SoundLibrary";
-    else if (filetype == "fnt") root_class = "Font";
-    else if (filetype == "atlas") root_class = "Texture";
+    const std::string root_class = root_class_for_filetype(filetype);
 
     std::stringstream out;
-    out << "# FileRift decoded Swordigo file type: " << filetype << "\n\n";
+    out << "## FileRift decoded Swordigo file type: " << filetype << "\n\n";
     decode_message(bytes, root_class, 0, out);
     return out.str();
 }
 
-static std::vector<std::string> lex(const std::string& text) {
-    std::vector<std::string> tokens;
+struct MarkupToken {
+    std::string text;
+    size_t line = 1;
+};
+
+static std::vector<MarkupToken> lex(const std::string& text) {
+    std::vector<MarkupToken> tokens;
     std::string token;
+    size_t token_line = 1;
+    size_t line = 1;
     bool in_s_quote = false;
     bool in_d_quote = false;
     bool in_lua = false;
     bool in_comment = false;
-    
+
+    auto push = [&](std::string value, size_t at_line) {
+        if (!value.empty()) tokens.push_back({std::move(value), at_line});
+    };
+    auto flush = [&]() {
+        if (!token.empty()) {
+            push(token, token_line);
+            token.clear();
+        }
+    };
+
     for (size_t i = 0; i < text.size(); ++i) {
         char c = text[i];
-        
+
         if (in_comment) {
             if (c == '\n') {
                 in_comment = false;
-                tokens.push_back("<newline>");
+                ++line;
             }
             continue;
         }
-        
+
         if (in_lua) {
             if (i + 4 <= text.size() && text.substr(i, 4) == "$end") {
-                tokens.push_back(token);
+                push(token, token_line);
                 token.clear();
-                tokens.push_back("$end");
+                push("$end", line);
                 in_lua = false;
                 i += 3;
             } else {
                 token += c;
+                if (c == '\n') ++line;
             }
             continue;
         }
-        
+
         if (in_s_quote) {
-            if (c == '\'' && (i == 0 || text[i-1] != '\\')) {
+            token += c;
+            size_t slash_count = 0;
+            for (size_t j = i; j > 0 && text[j - 1] == '\\'; --j) ++slash_count;
+            if (c == '\'' && (slash_count & 1u) == 0) {
                 in_s_quote = false;
-                tokens.push_back("'" + token + "'");
+                push(token, token_line);
                 token.clear();
-            } else {
-                token += c;
             }
+            if (c == '\n') ++line;
             continue;
         }
-        
+
         if (in_d_quote) {
-            if (c == '"' && (i == 0 || text[i-1] != '\\')) {
+            token += c;
+            size_t slash_count = 0;
+            for (size_t j = i; j > 0 && text[j - 1] == '\\'; --j) ++slash_count;
+            if (c == '"' && (slash_count & 1u) == 0) {
                 in_d_quote = false;
-                tokens.push_back("\"" + token + "\"");
+                push(token, token_line);
                 token.clear();
-            } else {
-                token += c;
             }
+            if (c == '\n') ++line;
             continue;
         }
-        
-        if (c == '#') {
-            in_comment = true;
+
+        const bool dash_comment = c == '-' && i + 1 < text.size() && text[i + 1] == '-';
+        const bool slash_comment = c == '/' && i + 1 < text.size() && text[i + 1] == '/';
+        if (c == '#' || dash_comment || slash_comment) {
+            flush();
+            const size_t marker_size = (dash_comment || slash_comment) ? 2 : 1;
+            const size_t comment_start = i;
+            const size_t content_start = i + marker_size;
+            const size_t end = text.find('\n', content_start);
+            const bool explicitly_unpreserved = content_start < text.size() && text[content_start] == c;
+            if (!explicitly_unpreserved)
+                push("@@comment:" + text.substr(comment_start, (end == std::string::npos ? text.size() : end) - comment_start), line);
+            if (end == std::string::npos) break;
+            i = end;
+            ++line;
             continue;
         }
-        
+
         if (c == '$') {
+            flush();
+            push("$", line);
             in_lua = true;
+            token_line = line;
             continue;
         }
-        
-        if (c == '\'' && !in_d_quote) {
+
+        if (c == '\'') {
+            flush();
             in_s_quote = true;
+            token = "'";
+            token_line = line;
             continue;
         }
-        
-        if (c == '"' && !in_s_quote) {
+        if (c == '"') {
+            flush();
             in_d_quote = true;
+            token = "\"";
+            token_line = line;
             continue;
         }
-        
-        if (c == '{' || c == '}' || c == ':') {
-            if (!token.empty()) {
-                tokens.push_back(token);
-                token.clear();
-            }
-            tokens.push_back(std::string(1, c));
+
+        if (c == '{' || c == '}' || c == ':' || c == '=') {
+            flush();
+            push(std::string(1, c), line);
             continue;
         }
-        
-        if (isspace(c)) {
-            if (!token.empty()) {
-                tokens.push_back(token);
-                token.clear();
-            }
-            if (c == '\n') {
-                tokens.push_back("<newline>");
-            }
+        if (c == ',' || c == ';') {
+            flush();
             continue;
         }
-        
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            flush();
+            if (c == '\n') ++line;
+            continue;
+        }
+        if (token.empty()) token_line = line;
         token += c;
     }
-    
-    if (!token.empty()) {
-        tokens.push_back(token);
-    }
-    
+    if (in_s_quote || in_d_quote) throw std::runtime_error("FileRift line " + std::to_string(token_line) + ": unterminated string");
+    if (in_lua) throw std::runtime_error("FileRift line " + std::to_string(token_line) + ": missing $end");
+    flush();
     return tokens;
 }
 
-static std::string recode_message(const std::vector<std::string>& tokens, size_t& idx, const std::string& classname) {
+static bool parse_unknown_tag(const std::string& name, uint32_t& field_number, proto::WireType& wire_type) {
+    if (name.rfind("Tag_", 0) != 0) return false;
+    const size_t suffix = name.find('_', 4);
+    const std::string number = name.substr(4, suffix == std::string::npos ? std::string::npos : suffix - 4);
+    if (number.empty() || !std::all_of(number.begin(), number.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)); })) return false;
+    unsigned long parsed = 0;
+    try {
+        parsed = std::stoul(number);
+    } catch (...) {
+        return false;
+    }
+    if (parsed == 0 || parsed > 0x1fffffffu) return false;
+    field_number = static_cast<uint32_t>(parsed);
+    if (suffix == std::string::npos) return true;
+    const std::string type = name.substr(suffix + 1);
+    if (type == "varint") wire_type = proto::WIRE_VARINT;
+    else if (type == "i64") wire_type = proto::WIRE_I64;
+    else if (type == "len") wire_type = proto::WIRE_LEN;
+    else if (type == "i32") wire_type = proto::WIRE_I32;
+    else return false;
+    return true;
+}
+
+static double parse_real(const MarkupToken& token) {
+    std::string value = token.text;
+    bool degrees = !value.empty() && value.back() == 'd';
+    if (degrees) value.pop_back();
+    size_t consumed = 0;
+    double result;
+    try { result = std::stod(value, &consumed); }
+    catch (...) { throw std::runtime_error("FileRift line " + std::to_string(token.line) + ": expected number, got '" + token.text + "'"); }
+    if (consumed != value.size() || !std::isfinite(result))
+        throw std::runtime_error("FileRift line " + std::to_string(token.line) + ": invalid number '" + token.text + "'");
+    return degrees ? result * (3.14159265358979323846 / 180.0) : result;
+}
+
+static uint64_t parse_integer(const MarkupToken& token) {
+    if (token.text.empty() || !std::all_of(token.text.begin(), token.text.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)); }))
+        throw std::runtime_error("FileRift line " + std::to_string(token.line) + ": expected non-negative integer, got '" + token.text + "'");
+    size_t consumed = 0;
+    try {
+        const uint64_t value = std::stoull(token.text, &consumed);
+        if (consumed == token.text.size()) return value;
+    } catch (...) {}
+    throw std::runtime_error("FileRift line " + std::to_string(token.line) + ": integer out of range");
+}
+
+static std::string recode_message(const std::vector<MarkupToken>& tokens, size_t& idx, const std::string& classname, std::string& last_chunk) {
     proto::Writer writer;
-    
+
     while (idx < tokens.size()) {
-        const std::string& t = tokens[idx];
+        const MarkupToken tag_token = tokens[idx];
+        const std::string& t = tag_token.text;
         if (t == "}") {
             break;
         }
-        if (t == "<newline>" || t == ":" || t == "{") {
-            idx++;
+        if (t.rfind("@@comment:", 0) == 0) {
+            writer.write_bytes_field(513, t.substr(10));
+            ++idx;
             continue;
         }
-        
+        if (t == ":" || t == "=" || t == "{")
+            throw std::runtime_error("FileRift line " + std::to_string(tag_token.line) + ": expected tag, got '" + t + "'");
+        if (t == "@stop") break;
+        if (t == "@line") { ++idx; continue; }
+
         std::string tagname = t;
         idx++;
-        
-        if (idx < tokens.size() && tokens[idx] == ":") {
+        if (idx < tokens.size() && (tokens[idx].text == ":" || tokens[idx].text == "=")) {
             idx++;
         }
-        
-        if (idx >= tokens.size()) break;
-        
-        std::string val_tok = tokens[idx];
-        
+        if (idx >= tokens.size())
+            throw std::runtime_error("FileRift line " + std::to_string(tag_token.line) + ": missing value for " + tagname);
+
+        const MarkupToken val_token = tokens[idx];
+        const std::string& val_tok = val_token.text;
         uint32_t f_num = 0;
         proto::WireType w_type = proto::WIRE_LEN;
         std::string sub_classname;
-        
-        if (tagname.rfind("Tag_", 0) == 0) {
-            f_num = std::stoul(tagname.substr(4));
-            if (val_tok == "{") w_type = proto::WIRE_LEN;
-            else if (val_tok.front() == '\'' || val_tok.front() == '"') w_type = proto::WIRE_LEN;
-            else if (val_tok.find('.') != std::string::npos) w_type = proto::WIRE_I32;
-            else w_type = proto::WIRE_VARINT;
-        } else {
+
+        if (!parse_unknown_tag(tagname, f_num, w_type)) {
             const FieldSchema* fs = find_field_by_name(classname, tagname);
             if (fs) {
                 f_num = fs->field_number;
@@ -1302,53 +1413,64 @@ static std::string recode_message(const std::vector<std::string>& tokens, size_t
                 sub_classname = fs->classname;
             }
         }
-        
-        if (f_num == 0) {
-            idx++;
-            continue;
-        }
-        
+        if (f_num == 0)
+            throw std::runtime_error("FileRift line " + std::to_string(tag_token.line) + ": tag '" + tagname + "' is not valid in " + classname);
+
         if (val_tok == "{") {
+            if (w_type != proto::WIRE_LEN || sub_classname.empty())
+                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": tag '" + tagname + "' is not a message");
             idx++; // skip '{'
-            std::string sub_bytes = recode_message(tokens, idx, sub_classname);
-            if (idx < tokens.size() && tokens[idx] == "}") {
+            std::string sub_bytes = recode_message(tokens, idx, sub_classname, last_chunk);
+            if (idx < tokens.size() && tokens[idx].text == "}") {
                 idx++; // skip '}'
-            }
+            } else throw std::runtime_error("FileRift line " + std::to_string(tag_token.line) + ": missing closing brace for " + tagname);
             writer.write_bytes_field(f_num, sub_bytes);
-        } else if (val_tok.front() == '\'' || val_tok.front() == '"') {
+        } else if (!val_tok.empty() && (val_tok.front() == '\'' || val_tok.front() == '"')) {
+            if (w_type != proto::WIRE_LEN)
+                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": tag '" + tagname + "' does not accept a string");
             std::string unescaped = unescape_bytes(val_tok);
             writer.write_bytes_field(f_num, unescaped);
             idx++;
         } else if (val_tok == "$") {
+            if (w_type != proto::WIRE_LEN)
+                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": Lua chunk requires a length-delimited field");
             idx++; // skip '$'
-            std::string lua_source;
-            while (idx < tokens.size() && tokens[idx] != "$end") {
-                if (tokens[idx] == "<newline>") lua_source += "\n";
-                else lua_source += tokens[idx] + " ";
-                idx++;
-            }
-            if (idx < tokens.size() && tokens[idx] == "$end") {
-                idx++; // skip '$end'
-            }
-            std::string bytecode = compile_lua_to_bytecode(lua_source);
-            if (!bytecode.empty()) {
-                writer.write_bytes_field(1, bytecode);
-            } else {
-                writer.write_bytes_field(1, lua_source);
-            }
-            writer.write_bytes_field(2, "");
+            if (idx >= tokens.size() || tokens[idx].text == "$end") last_chunk.clear();
+            else { last_chunk = tokens[idx].text; ++idx; }
+            if (idx >= tokens.size() || tokens[idx].text != "$end")
+                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": missing $end");
+            ++idx;
+            // normalize: the '$end' terminator is emitted on its own line by
+            // the decoder, so drop the single trailing '\n' that precedes it
+            // (mirrors reference recode lexeme[:-6]). Keeps decode->recode
+            // round-trips at a fixed point instead of growing a newline each
+            // cycle.
+            if (!last_chunk.empty() && last_chunk.back() == '\n')
+                last_chunk.pop_back();
+            writer.write_bytes_field(f_num, last_chunk);
+        } else if (val_tok == "@compile" || val_tok == "@comp") {
+            if (w_type != proto::WIRE_LEN)
+                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": @compile requires a bytes field");
+            if (last_chunk.empty())
+                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": @compile has no preceding Lua chunk");
+            const std::string bytecode = compile_lua_to_bytecode(last_chunk);
+            if (bytecode.empty())
+                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": Lua compilation failed");
+            writer.write_varint_field(514, 0);
+            writer.write_bytes_field(f_num, bytecode);
+            ++idx;
         } else {
+            const bool degrees = !val_tok.empty() && val_tok.back() == 'd' &&
+                                 (w_type == proto::WIRE_I32 || w_type == proto::WIRE_I64);
+            if (degrees) writer.write_bytes_field(515, val_tok.substr(0, val_tok.size() - 1));
             if (w_type == proto::WIRE_VARINT) {
-                uint64_t val = std::stoull(val_tok);
-                writer.write_varint_field(f_num, val);
+                writer.write_varint_field(f_num, parse_integer(val_token));
             } else if (w_type == proto::WIRE_I32) {
-                float val = std::stof(val_tok);
-                writer.write_float_field(f_num, val);
+                writer.write_float_field(f_num, static_cast<float>(parse_real(val_token)));
             } else if (w_type == proto::WIRE_I64) {
-                double val = std::stod(val_tok);
-                writer.write_double_field(f_num, val);
+                writer.write_double_field(f_num, parse_real(val_token));
             } else {
-                writer.write_bytes_field(f_num, val_tok);
+                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": expected quoted string for " + tagname);
             }
             idx++;
         }
@@ -1358,20 +1480,14 @@ static std::string recode_message(const std::vector<std::string>& tokens, size_t
 }
 
 std::string recode_markup(const std::string& text, const std::string& filetype) {
-    std::string root_class = "Scene";
-    if (filetype == "scl") root_class = "ObjectLibrary";
-    else if (filetype == "gdata") root_class = "GameData";
-    else if (filetype == "gopt") root_class = "GameOptions";
-    else if (filetype == "gplayer") root_class = "PlayerProfile";
-    else if (filetype == "gstate") root_class = "GameState";
-    else if (filetype == "scmap") root_class = "Map";
-    else if (filetype == "sounds") root_class = "SoundLibrary";
-    else if (filetype == "fnt") root_class = "Font";
-    else if (filetype == "atlas") root_class = "Texture";
-
-    std::vector<std::string> tokens = lex(text);
+    const std::string root_class = root_class_for_filetype(filetype);
+    const std::vector<MarkupToken> tokens = lex(text);
     size_t idx = 0;
-    return recode_message(tokens, idx, root_class);
+    std::string last_chunk;
+    const std::string result = recode_message(tokens, idx, root_class, last_chunk);
+    if (idx < tokens.size() && tokens[idx].text == "}")
+        throw std::runtime_error("FileRift line " + std::to_string(tokens[idx].line) + ": unmatched closing brace");
+    return result;
 }
 
 std::string extract_lua_generic(const std::string& bytes) {

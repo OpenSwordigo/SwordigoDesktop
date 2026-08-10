@@ -148,15 +148,22 @@ extern int pthread_mutex_init(void *mutex, const void *attr);
 
 #define PTHREAD_MUTEX_RECURSIVE_TYPE 1
 
+/* Portable alignment specifier (GNU attribute vs. MSVC __declspec) */
+#if defined(_MSC_VER)
+#define LUAI_MUTEX_ALIGNED __declspec(align(8))
+#else
+#define LUAI_MUTEX_ALIGNED __attribute__((aligned(8)))
+#endif
+
 /* Aligned storage for pthread_mutex_t (48 bytes on 64-bit Linux) */
-static __attribute__((aligned(8))) char g_lua_mutex_storage[48];
+static LUAI_MUTEX_ALIGNED char g_lua_mutex_storage[48];
 void *g_lua_mutex_ptr = &g_lua_mutex_storage;
 
 LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud) {
   static int mutex_initialized = 0;
   if (!mutex_initialized) {
     /* Aligned storage for pthread_mutexattr_t (8 bytes on 64-bit Linux) */
-    __attribute__((aligned(8))) char attr_storage[8];
+    LUAI_MUTEX_ALIGNED char attr_storage[8];
     pthread_mutexattr_init(&attr_storage);
     pthread_mutexattr_settype(&attr_storage, PTHREAD_MUTEX_RECURSIVE_TYPE);
     pthread_mutex_init(&g_lua_mutex_storage, &attr_storage);

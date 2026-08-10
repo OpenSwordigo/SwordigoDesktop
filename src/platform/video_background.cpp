@@ -17,17 +17,18 @@
 #include <cstdio>
 #include <chrono>
 
-extern "C" {
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
-#include <libswscale/swscale.h>
-}
-
 // Define global void fill color
 VoidFillColor g_void_fill_color;
 bool g_video_background_enabled = false; // Vanilla by default
 
 extern std::string g_instance_assets_dir;
+
+#if SWORDIGO_USE_FFMPEG
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+}
 
 namespace VideoBackground {
 
@@ -620,3 +621,19 @@ namespace VideoBackground {
 extern "C" void reset_void_fill_color() {
     g_void_fill_color.active = false;
 }
+
+#else // !SWORDIGO_USE_FFMPEG
+
+// No FFmpeg available: keep the stable public interface as no-op stubs so the
+// rest of the host (jni_bridge, main.cpp) links unchanged.
+namespace VideoBackground {
+    void register_texture_maybe(uint32_t, const std::string&, int, int, const void*, uint32_t, uint32_t) {}
+    void update_texture_maybe(uint32_t) {}
+    void cleanup() {}
+}
+
+extern "C" void reset_void_fill_color() {
+    g_void_fill_color.active = false;
+}
+
+#endif // SWORDIGO_USE_FFMPEG

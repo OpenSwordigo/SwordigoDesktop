@@ -378,6 +378,7 @@ LaunchConfig show_launcher(BinarySelector& selector) {
     SDL_GLContext ctx = SDL_GL_CreateContext(win);
     if (!ctx) { SDL_DestroyWindow(win); return cfg; }
     SDL_GL_SetSwapInterval(1);
+    sword_init_gl_after();
 
     // Load launcher textures
     std::string assets_base = get_data_path("src/assets");

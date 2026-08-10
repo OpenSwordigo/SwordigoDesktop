@@ -30,8 +30,10 @@ extern void* g_sre_render_recovery_jmp;
 
 // Text-segment bounds exported from main.cpp (populated after ELF load).
 // Used for render-guard PC validation (crash report 03 fix).
-extern uint64_t g_sre_text_base;  // guest VA of .text start (e.g. 0x1203e90)
-extern uint64_t g_sre_text_end;   // guest VA of .text end   (e.g. 0x1584000)
+extern uint64_t g_sre_text_base;          // libswordigo executable segment start
+extern uint64_t g_sre_text_end;           // libswordigo executable segment end
+extern uint64_t g_sre_runtime_text_base;  // libsre executable segment start
+extern uint64_t g_sre_runtime_text_end;   // libsre executable segment end
 
 // ============================================================================
 // is_valid_exec_pc — Crash-Report-03 render-guard PC validator
@@ -46,6 +48,18 @@ extern uint64_t g_sre_text_end;   // guest VA of .text end   (e.g. 0x1584000)
 // Returns false for the corrupted LR pattern from crash-report-03:
 //   0x12fd3d9 — 1 byte into alignment padding, NOT 4-aligned → caught here.
 // ============================================================================
+static inline bool is_known_executable_pc(uint64_t pc) {
+    if (pc & 3u) return false;
+    if (pc >= 0xE0000000ULL && pc < 0xE0001000ULL) return true;
+    if (pc >= 0xFF000000ULL && pc < 0xFF100000ULL) return true;
+    if (g_sre_text_base && g_sre_text_end &&
+        pc >= g_sre_text_base && pc < g_sre_text_end) return true;
+    if (g_sre_runtime_text_base && g_sre_runtime_text_end &&
+        pc >= g_sre_runtime_text_base && pc < g_sre_runtime_text_end) return true;
+    if (pc >= 0x3000000ULL && pc < 0x3100000ULL) return true;
+    return false;
+}
+
 static inline bool is_valid_exec_pc(uint64_t pc) {
     // Magic sentinel / bridge regions are always valid
     if (pc >= 0xE0000000ULL && pc < 0xE0001000ULL) return true;
@@ -1122,11 +1136,13 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
             uint64_t lr = jit->GetRegister(30);
             std::cerr << "[Dynarmic] Halt (UserDefined2) at 0x" << std::hex << curr_pc
                       << " — force returning to LR=0x" << lr << std::dec << std::endl;
-            if (lr >= 0x1000000ULL && lr < 0x3000000ULL) {
+            if (is_known_executable_pc(lr)) {
                 jit->SetPC(lr);
                 jit->SetRegister(0, 0);
                 continue;
             }
+            std::cerr << "[Dynarmic] Refusing exception return to non-executable LR=0x"
+                      << std::hex << lr << std::dec << std::endl;
             set_faulted(true);
             break;
         }
@@ -1287,6 +1303,86 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
     if (!quiet_mode) {
         uint64_t final_pc = jit->GetPC();
         std::cout << "[Dynarmic] Function stopped at PC=0x" << std::hex << final_pc << std::dec << std::endl;
+    }
+}
+
+void EmulatorDynarmic64::configure_recovery_context(uint64_t depth_addr,
+                                                      uint64_t stack_addr,
+                                                      uint32_t stack_bytes) {
+    const bool valid = depth_addr != 0 && stack_addr != 0 && stack_bytes != 0 &&
+                       depth_addr + sizeof(int32_t) <= mem_size &&
+                       stack_addr + stack_bytes <= mem_size;
+    if (!valid) {
+        recovery_depth_addr = 0;
+        recovery_stack_addr = 0;
+        recovery_stack_bytes = 0;
+        std::cerr << "[Thread64/Dyn] SRE recovery-context isolation unavailable: invalid guest layout"
+                  << std::endl;
+        return;
+    }
+
+    recovery_depth_addr = depth_addr;
+    recovery_stack_addr = stack_addr;
+    recovery_stack_bytes = stack_bytes;
+    std::cout << "[Thread64/Dyn] SRE recovery-context isolation active (depth=0x"
+              << std::hex << depth_addr << " stack=0x" << stack_addr
+              << std::dec << " bytes=" << stack_bytes << ")" << std::endl;
+}
+
+void EmulatorDynarmic64::run_pending_threads() {
+    while (!pending_threads.empty()) {
+        DeferredThread t = pending_threads.front();
+        pending_threads.erase(pending_threads.begin());
+
+        std::vector<uint8_t> saved_recovery_stack;
+        int32_t saved_recovery_depth = 0;
+        const bool isolate_recovery = recovery_depth_addr != 0 &&
+                                      recovery_stack_addr != 0 &&
+                                      recovery_stack_bytes != 0;
+        if (isolate_recovery) {
+            saved_recovery_stack.resize(recovery_stack_bytes);
+            std::memcpy(saved_recovery_stack.data(),
+                        memory + recovery_stack_addr,
+                        recovery_stack_bytes);
+            std::memcpy(&saved_recovery_depth,
+                        memory + recovery_depth_addr,
+                        sizeof(saved_recovery_depth));
+
+            // A deferred pthread is an independent guest stack. It must begin
+            // with no checkpoints from the interrupted CPU context, and it
+            // must not overwrite those checkpoints while it runs.
+            const int32_t empty_depth = 0;
+            std::memcpy(memory + recovery_depth_addr, &empty_depth, sizeof(empty_depth));
+            std::memset(memory + recovery_stack_addr, 0, recovery_stack_bytes);
+        }
+
+        std::cout << "[Thread64/Dyn] Running deferred thread func=0x" << std::hex
+                  << t.start_routine << " arg=0x" << t.arg << std::dec << std::endl;
+        call(t.start_routine, {t.arg});
+
+        if (isolate_recovery) {
+            int32_t deferred_depth = 0;
+            std::memcpy(&deferred_depth,
+                        memory + recovery_depth_addr,
+                        sizeof(deferred_depth));
+            if (deferred_depth != 0) {
+                std::cerr << "[Thread64/Dyn] Deferred thread exited with "
+                          << deferred_depth
+                          << " live SRE recovery checkpoint(s); discarding thread-local state"
+                          << std::endl;
+            }
+
+            // Restore bytes before publishing the outer depth, so an observer
+            // can never select a partially restored checkpoint.
+            std::memcpy(memory + recovery_stack_addr,
+                        saved_recovery_stack.data(),
+                        recovery_stack_bytes);
+            std::memcpy(memory + recovery_depth_addr,
+                        &saved_recovery_depth,
+                        sizeof(saved_recovery_depth));
+        }
+
+        std::cout << "[Thread64/Dyn] Deferred thread completed." << std::endl;
     }
 }
 

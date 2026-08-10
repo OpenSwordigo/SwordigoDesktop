@@ -65,6 +65,17 @@ public:
     virtual void run_pending_threads() = 0;
     virtual bool has_pending_threads() const = 0;
 
+    // Independent deferred guest threads must not share stack-based longjmp
+    // checkpoints with the interrupted guest context. Backends that support
+    // nested execution can use these addresses to isolate that state.
+    virtual void configure_recovery_context(uint64_t depth_addr,
+                                            uint64_t stack_addr,
+                                            uint32_t stack_bytes) {
+        (void)depth_addr;
+        (void)stack_addr;
+        (void)stack_bytes;
+    }
+
     // --- Debugging ---
     virtual void record_pc(uint64_t pc) = 0;
     virtual void print_trace() = 0;

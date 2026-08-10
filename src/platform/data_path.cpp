@@ -1,4 +1,5 @@
 #include "platform/data_path.h"
+#include "platform/os_external.h"
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -83,7 +84,7 @@ std::string get_system_data_dir() {
     return s_system_data_dir_cache;
 }
 
-__attribute__((weak)) std::string g_save_dir;
+SWORDIGO_WEAK std::string g_save_dir;
 
 std::string get_vfs_save_dir(const std::string& custom_base) {
     std::string base = custom_base;
@@ -208,21 +209,26 @@ std::string get_data_path(const std::string& relative_path) {
         if (fs::exists(path)) return path;
     }
 
-#ifndef _WIN32
-    // 5. Relative to binary location
+    // 5. Relative to binary location (also dev root with src/assets on Windows)
     {
-        char exe_buf[4096];
-        ssize_t len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
-        if (len > 0) {
-            exe_buf[len] = '\0';
-            fs::path exe_dir = fs::path(exe_buf).parent_path();
-            std::string path = (exe_dir / relative_path).string();
+        std::string dev_root = os_external::dev_root_dir();
+        if (!dev_root.empty()) {
+            std::string root = dev_root;
+            if (root.back() != '/' && root.back() != '\\') root += "/";
+            std::string path = root + relative_path;
             if (fs::exists(path)) return path;
-            path = (exe_dir.parent_path() / relative_path).string();
+        }
+        std::string exe_dir = os_external::exe_dir();
+        if (!exe_dir.empty()) {
+            fs::path exe_dir_p(exe_dir);
+            std::string path = (exe_dir_p / relative_path).string();
+            if (fs::exists(path)) return path;
+            path = (exe_dir_p.parent_path() / relative_path).string();
             if (fs::exists(path)) return path;
         }
     }
 
+#ifndef _WIN32
     // 6. System install paths (read-only fallback)
     {
         std::string sys_dir = get_system_data_dir();
@@ -333,6 +339,27 @@ extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_p
     }
 
     std::string path(original_path);
+
+#ifdef _WIN32
+    // The guest receives an absolute host filesystem path from JNI
+    // (getFilesDir/getDataDir, see main.cpp setFilesDir) and hands those
+    // directly to fopen. Windows absolute paths (C:\... or \\server\share)
+    // must pass through untouched; the match logic below only understands
+    // '/'-rooted POSIX paths and would otherwise re-prefix the data base,
+    // producing "<base>/C:\..." and failing every asset open.
+    if (path.size() >= 3 && ((path[0] >= 'A' && path[0] <= 'Z') ||
+                            (path[0] >= 'a' && path[0] <= 'z')) &&
+        path[1] == ':' && (path[2] == '/' || path[2] == '\\')) {
+        strncpy(out_resolved_path, original_path, max_len - 1);
+        out_resolved_path[max_len - 1] = '\0';
+        return true;
+    }
+    if (path.rfind("\\\\", 0) == 0) {  // UNC path
+        strncpy(out_resolved_path, original_path, max_len - 1);
+        out_resolved_path[max_len - 1] = '\0';
+        return true;
+    }
+#endif
 
     // If the path is absolute, check if it contains virtual resource folders
     bool is_absolute = (path[0] == '/');

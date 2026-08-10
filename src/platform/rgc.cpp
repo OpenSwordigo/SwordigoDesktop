@@ -240,13 +240,38 @@ std::string RedstellGC::resolve_symbol(uint64_t address) {
 }
 
 thread_local std::vector<RedstellGC::RgcEvent> tl_write_queue;
+thread_local uint64_t tl_last_flush_us = 0;  // monotonic us of the last auto-flush
+
 extern bool g_advanced_redstell_opts;
+
+// Bounds the thread-local event queue even when the host frame loop is not
+// running (e.g. the main thread is stuck inside the guest emulator during a
+// long scene load). Without this, every guest malloc/calloc/realloc pushes an
+// RgcEvent and the queue grows without bound — the RL mod's allocation pattern
+// grew it past 384 MB (an "insane" memory leak) until the OOM killer fired.
+void RedstellGC::auto_flush_tl_queue() {
+    if (tl_write_queue.empty()) return;
+    // Cheap size bound first (no clock call in the hot path).
+    if (tl_write_queue.size() >= 4096) {
+        flush_thread_local_queues();
+        return;
+    }
+    // Only pay for the clock when we actually need the time comparison.
+    auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (now - tl_last_flush_us > 50000) {
+        flush_thread_local_queues();
+        tl_last_flush_us = now;
+    }
+}
 
 void RedstellGC::track_alloc(uint64_t addr, size_t size, uint64_t lr, const char* reason, RgcResourceType type) {
     if (g_sre_mod.base_addr == 0 || addr == 0) return;
     tl_write_queue.push_back({RgcEvent::ALLOC, addr, size, lr, type, reason});
     if (std::this_thread::get_id() != m_main_thread_id) {
         flush_thread_local_queues();
+    } else {
+        auto_flush_tl_queue();
     }
 }
 
@@ -255,6 +280,8 @@ void RedstellGC::track_free(uint64_t addr, uint64_t lr) {
     tl_write_queue.push_back({RgcEvent::FREE, addr, 0, lr, RgcResourceType::MEMORY, nullptr});
     if (std::this_thread::get_id() != m_main_thread_id) {
         flush_thread_local_queues();
+    } else {
+        auto_flush_tl_queue();
     }
 }
 

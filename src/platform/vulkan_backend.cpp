@@ -9,6 +9,9 @@
 //   - Pipeline caching by state hash
 
 #define VK_NO_PROTOTYPES
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include "vulkan_backend.h"
 #include "fbo_scaler.h"
 #include "swordfare_gui.h"

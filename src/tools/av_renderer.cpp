@@ -10,15 +10,17 @@
 
 // Enable GL extension prototypes BEFORE any GL includes
 #define GL_GLEXT_PROTOTYPES 1
-#include <GL/gl.h>
+#include "platform/gl_inc.h"
 #include <GL/glext.h>
 
 #include "av_renderer.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace av {
@@ -35,8 +37,20 @@ static constexpr float DEG2RAD = PI / 180.0f;
 // top-vs-side distinction so platforms read as lit on top and shaded below.
 float g_light_dir[3]   = { 0.35f,  0.85f,  0.39f };  // mostly-down sun
 float g_light_color[3] = { 1.05f,  0.92f,  0.72f };  // warm golden
-float g_ambient_color[3]     = { 0.16f,   0.17f,   0.22f };  // dark cool cave fill
+// Cool fill from the opposite side of the key — keeps undersides and the
+// side of the player away from the key readable instead of dead black.
+float g_fill_color[3]  = { 0.30f,  0.38f,  0.55f };
+float g_rim_strength   = 0.32f;   // camera-opposed edge light (silhouette pop)
+float g_spec_strength  = 0.06f;   // subtle Blinn-Phong sheen on materials
+float g_ambient_color[3]     = { 0.19f,   0.20f,   0.25f };  // cool sky fill
+float g_ambient_ground_color[3] = { 0.09f, 0.095f, 0.14f };  // dark ground fill
 float g_clear_color[3]       = { 0.055f,  0.058f,  0.08f };
+// Vendor .scn light scales (renderer-master semantics): the scene's
+// `punctual` factor modulates the directional sun, `ambient` the hemisphere
+// fill. Both default to 1.0 so non-vendor previews are untouched; the
+// .scn loader saves/restores these around the preview.
+float g_light_scale   = 1.0f;
+float g_ambient_scale = 1.0f;
 
 // ============================================================================
 // Shader sources — GLSL 330 core
@@ -76,9 +90,16 @@ uniform sampler2D uTexture;
 uniform bool  uHasTexture;
 uniform vec3  uLightDir;        // normalized direction TO the light
 uniform vec3  uLightColor;      // directional light color
-uniform vec3  uAmbient;         // ambient light color
+uniform vec3  uAmbient;         // ambient light color (sky / up-facing fill)
+uniform vec3  uAmbientGround;   // hemisphere ground fill (bounced ambient)
 uniform vec4  uMatColor;        // material base color (when untextured)
 uniform float uAlpha;           // overall alpha multiplier
+uniform bool  uFlatShade;       // diagnostics: bypass lighting (texture \u00d7 material)
+uniform bool  uDebugNormals;    // diagnostics: color = N*0.5+0.5 (orientation check)
+uniform bool  uFlipV;           // DCC-style UVs (v=0 top) on bottom-origin textures
+uniform vec3  uFillColor;       // cool fill light (opposite side of the key)
+uniform float uRimStrength;     // camera-opposed edge light
+uniform float uSpecStrength;    // Blinn-Phong sheen amount
 uniform vec3  uCamPos;          // camera position (for point lights)
 uniform bool  uFogEnabled;
 uniform vec3  uFogColor;        // atmospheric depth-darkening tint
@@ -91,22 +112,103 @@ uniform vec3   uLightPos[MAX_POINT_LIGHTS];
 uniform vec3   uLightCol[MAX_POINT_LIGHTS];
 uniform float  uLightRadius[MAX_POINT_LIGHTS];
 
+#define MAX_DIR_LIGHTS 4
+uniform int   uDirLightCount;
+uniform vec3  uDirLightDir[MAX_DIR_LIGHTS];
+uniform vec3  uDirLightCol[MAX_DIR_LIGHTS];
+
 out vec4 FragColor;
 
 void main() {
-    vec4  base = uHasTexture ? texture(uTexture, vUV) : uMatColor;
+    // v = 0 is the BOTTOM of uploaded textures (game convention). DCC
+    // importers (FBX/glTF previews) set uFlipV so their v=0-top UVs sample
+    // the top of the image instead — fixing the flipped FBX texture bug.
+    vec2  sampUV = vec2(vUV.x, uFlipV ? 1.0 - vUV.y : vUV.y);
+    vec4  base = uHasTexture ? texture(uTexture, sampUV) : uMatColor;
     vec3  N    = normalize(vNormal);
-    float NdotL = max(dot(N, uLightDir), 0.0);
-    vec3  lit   = base.rgb * (uAmbient + uLightColor * NdotL);
 
-    // Point lights (warm torch/fire glow) with smooth distance falloff.
+    // Diagnostics: render world-space normals as color. Inverted / missing
+    // normals become obvious (a wall whose normal points INTO the surface
+    // shows purple/blue instead of its surface tint) — the "black wood"
+    // smoking gun from the lighting bug reports.
+    if (uDebugNormals) {
+        FragColor = vec4(N * 0.5 + 0.5, 1.0);
+        return;
+    }
+    // Diagnostics: flat texture view — no lighting at all. Separates "the
+    // texture itself is dark" from "the lighting equation is wrong".
+    if (uFlatShade) {
+        FragColor = vec4(base.rgb, base.a * uAlpha);
+        return;
+    }
+
+    // ── Ambient: hemisphere sky/ground fill with a hard floor so nothing
+    //    ever crushes to black (the "black wood" / "black hero" symptom).
+    float hemi = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3  amb  = max(mix(uAmbientGround, uAmbient, hemi), vec3(0.07));
+
+    // Epsilon guards normalize() against a vertex sitting exactly at the
+    // camera (NaN would poison the rim term → black pixels).
+    vec3 V = normalize(uCamPos - vWorldPos + vec3(1e-4));
+
+    // Soft half-Lambert preserves Swordigo's readable silhouettes while every
+    // directional component follows one coherent lighting equation.
+    vec3 keyDir = (uDirLightCount == 0) ? normalize(uLightDir)
+                                        : normalize(uDirLightDir[0]);
+    vec3 keyCol = (uDirLightCount == 0) ? uLightColor : uDirLightCol[0];
+    float ndl   = dot(N, keyDir);
+    float wrap  = clamp((ndl + 0.22) / 1.22, 0.0, 1.0);
+    vec3  key   = keyCol * (wrap * wrap * 1.28);
+
+    // ── Fill light: cool light from the opposite side of the key. This is
+    //    the classic three-point setup — it gives walls/players shape on the
+    //    side the key can't reach and prevents dead-black undersides.
+    vec3 fillDir = normalize(-keyDir * 0.55 + vec3(0.0, 0.5, 0.0));
+    vec3 fill    = uFillColor * clamp(dot(N, fillDir), 0.0, 1.0) * 0.6;
+
+    // ── Rim light (camera-opposed): brightens the silhouette edge, making
+    //    the hero and geometry pop against the background.
+    float rim  = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 3.0) * uRimStrength;
+    vec3  rimL = keyCol * rim;
+
+    // ── Subtle Blinn-Phong sheen: a soft highlight that gives materials a
+    //    polished (but not glossy-plastic) read.
+    vec3  H    = normalize(keyDir + V);
+    float spec = pow(max(dot(N, H), 0.0), 24.0) * uSpecStrength;
+
+    vec3 lit = base.rgb * (amb + key + fill + rimL) + keyCol * spec;
+    for (int i = 1; i < max(uDirLightCount, 0); ++i) {
+        vec3 L = normalize(uDirLightDir[i]);
+        float d = clamp((dot(N, L) + 0.14) / 1.14, 0.0, 1.0);
+        vec3 H2 = normalize(L + V);
+        float s = pow(max(dot(N, H2), 0.0), 24.0) * uSpecStrength;
+        lit += base.rgb * uDirLightCol[i] * d * d + uDirLightCol[i] * s;
+    }
+
+    // Point lights (warm torch / fire / SimpleGlow): compact LOCALIZED sources.
+    // The inverse-square-ish core concentrates illumination around the emitter
+    // and the soft knee transitions to zero just past the influence radius —
+    // no giant uniform blob, no hard cutoff ring. Intensity is baked into
+    // uLightCol by the host (color * intensity), and N·L keeps surfaces
+    // responding by their orientation: floors light up, walls catch the side,
+    // away-facing faces stay shaded.
     for (int i = 0; i < uLightCount; ++i) {
         vec3  toL   = uLightPos[i] - vWorldPos;
         float dist  = length(toL);
         float r     = max(uLightRadius[i], 0.001);
-        float atten = 1.0 - smoothstep(0.0, r, dist);
-        float diff  = max(dot(N, normalize(toL)), 0.0);
-        lit += base.rgb * uLightCol[i] * diff * atten * 2.0;
+        float norm  = dist / r;
+        // Original-style constant/linear attenuation with a smooth finite
+        // support window: no hard radius ring and zero energy outside it.
+        float window = clamp(1.0 - pow(norm, 4.0), 0.0, 1.0);
+        window *= window;
+        float atten = window / (1.0 + 1.6 * norm + 1.8 * norm * norm);
+        // Epsilon keeps normalize() from producing NaN when a vertex sits
+        // exactly at the light position (inside the emitter core).
+        vec3 L = normalize(toL + vec3(1e-4));
+        float diff = clamp((dot(N, L) + 0.08) / 1.08, 0.0, 1.0);
+        vec3 Hp = normalize(L + V);
+        float pointSpec = pow(max(dot(N, Hp), 0.0), 32.0) * uSpecStrength;
+        lit += (base.rgb * diff + pointSpec) * uLightCol[i] * atten;
     }
 
     // Atmospheric depth fog: distant geometry darkens toward the cave tint,
@@ -121,6 +223,334 @@ void main() {
     }
 
     FragColor = vec4(lit, base.a * uAlpha);
+}
+)GLSL";
+
+// ============================================================================
+// PBR shaders — vendored algorithms from zauonlok/renderer (MIT, Zhou Le)
+//   · GGX distribution, Smith visibility, Schlick+F90 Fresnel
+//   · metallic-roughness + specular-glossiness workflows
+//   · tangent-space normal mapping (TBN, tangent.w handedness)
+//   · image-based lighting: split-sum (prefiltered cubemap + BRDF LUT)
+//   · directional shadow mapping (light-VP compare with N·L-scaled bias)
+//   · ACES tone mapping
+// See src/render/zauonlok/ for the authoritative C reference sources.
+// ============================================================================
+
+static const char* PBR_VS = R"GLSL(
+#version 330 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNorm;
+layout(location=2) in vec2 aUV;
+layout(location=3) in vec4 aTangent;   // xyz tangent, w handedness
+layout(location=4) in vec4 aJoint;      // skinning (JOINTS_0, float) — optional
+layout(location=5) in vec4 aWeight;     // skinning (WEIGHTS_0) — optional
+
+uniform mat4 uMVP;
+uniform mat4 uModel;
+uniform mat3 uNormalMat;
+uniform mat4 uLightVPMatrix;
+uniform bool uFlipV;
+uniform bool uHasTangent;
+uniform int  uJointCount;
+uniform mat4 uJoints[256];
+
+out vec3 vWorldPos;
+out vec3 vNormal;
+out vec3 vTangent;
+out vec3 vBitangent;
+out vec2 vUV;
+out vec4 vDepthPos;
+
+void main() {
+    vec4 pos = vec4(aPos, 1.0);
+    vec3 nrm = aNorm;
+    if (uJointCount > 0) {
+        // 4-bone skinning in model space (vendor: mat4_combine of joint mats)
+        mat4 skin = mat4(0.0);
+        float js[4] = float[4](aJoint.x, aJoint.y, aJoint.z, aJoint.w);
+        float ws[4] = float[4](aWeight.x, aWeight.y, aWeight.z, aWeight.w);
+        for (int k = 0; k < 4; ++k) {
+            if (js[k] >= 0.0 && js[k] < 256.0 && ws[k] > 0.0)
+                skin += uJoints[int(js[k])] * ws[k];
+        }
+        pos = skin * pos;
+        nrm = mat3(skin) * nrm;
+    }
+    vec4 world = uModel * pos;
+    vWorldPos = world.xyz;
+    vNormal = normalize(uNormalMat * nrm);
+    // Guard against degenerate tangents (a CPU skin update may pass null
+    // tangent streams, leaving zeroes that would NaN normalize()).
+    if (uHasTangent && dot(aTangent.xyz, aTangent.xyz) > 1e-8) {
+        vTangent = normalize(uNormalMat * aTangent.xyz);
+        vBitangent = cross(vNormal, vTangent) * aTangent.w;
+    } else {
+        vTangent = vec3(1.0, 0.0, 0.0);
+        vBitangent = vec3(0.0, 0.0, 1.0);
+    }
+    vUV = vec2(aUV.x, uFlipV ? 1.0 - aUV.y : aUV.y);
+    vDepthPos = uLightVPMatrix * world;
+    gl_Position = uMVP * pos;
+}
+)GLSL";
+
+static const char* PBR_FS = R"GLSL(
+#version 330 core
+in vec3 vWorldPos;
+ in vec3 vNormal;
+in vec3 vTangent;
+in vec3 vBitangent;
+in vec2 vUV;
+in vec4 vDepthPos;
+
+uniform vec3  uCamPos;
+uniform bool  uHasBasecolor;
+uniform bool  uHasMetalness;
+uniform bool  uHasRoughness;
+uniform bool  uHasNormalMap;
+uniform bool  uHasOcclusion;
+uniform bool  uHasEmission;
+uniform bool  uHasSpecular;
+uniform bool  uHasGlossiness;
+uniform sampler2D uBasecolorTex;   // unit 0
+uniform sampler2D uMetalnessTex;   // unit 1
+uniform sampler2D uRoughnessTex;   // unit 2
+uniform sampler2D uNormalTex;      // unit 3
+uniform sampler2D uOcclusionTex;   // unit 4
+uniform sampler2D uEmissionTex;    // unit 5
+uniform sampler2D uSpecularTex;    // unit 6
+uniform sampler2D uGlossinessTex;  // unit 7
+uniform samplerCube uEnvMap;       // unit 8 (prefiltered mip chain)
+uniform sampler2D uBRDF_LUT;       // unit 9 (split-sum LUT)
+uniform sampler2D uShadowMap;      // unit 10 (directional depth)
+uniform vec4  uBasecolorFactor;
+uniform float uMetalnessFactor;
+uniform float uRoughnessFactor;
+uniform vec3  uSpecularFactor;
+uniform float uGlossinessFactor;
+uniform float uOcclusion;
+uniform vec3  uEmission;
+uniform int   uWorkflow;           // 0 = metallic-roughness, 1 = specular-glossiness
+uniform float uAlphaCutoff;        // > 0 enables alpha test
+uniform bool  uHasEnv;
+uniform float uEnvIntensity;
+uniform int   uEnvMaxMip;
+uniform bool  uShadowEnabled;
+uniform mat4  uLightVPMatrix;
+
+uniform vec3  uLightDir;
+uniform vec3  uLightColor;
+uniform vec3  uAmbient;
+uniform vec3  uAmbientGround;
+#define MAX_POINT_LIGHTS 16
+uniform int    uLightCount;
+uniform vec3   uLightPos[MAX_POINT_LIGHTS];
+uniform vec3   uLightCol[MAX_POINT_LIGHTS];
+uniform float  uLightRadius[MAX_POINT_LIGHTS];
+#define MAX_DIR_LIGHTS 4
+uniform int   uDirLightCount;
+uniform vec3  uDirLightDir[MAX_DIR_LIGHTS];
+uniform vec3  uDirLightCol[MAX_DIR_LIGHTS];
+
+out vec4 FragColor;
+
+const float PI = 3.14159265359;
+
+// ── vendor get_distribution(): GGX / Trowbridge-Reitz NDF ──
+float distribution_ggx(float n_dot_h, float alpha2) {
+    float n_dot_h_2 = n_dot_h * n_dot_h;
+    float f = n_dot_h_2 * (alpha2 - 1.0) + 1.0;
+    return alpha2 / (PI * f * f);
+}
+
+// ── vendor get_visibility(): Smith GGX (folded /4·NdotV·NdotL) ──
+float visibility_smith(float n_dot_v, float n_dot_l, float alpha2) {
+    float n_dot_v_2 = n_dot_v * n_dot_v;
+    float n_dot_l_2 = n_dot_l * n_dot_l;
+    float ggx_v = n_dot_l * sqrt(n_dot_v_2 * (1.0 - alpha2) + alpha2);
+    float ggx_l = n_dot_v * sqrt(n_dot_l_2 * (1.0 - alpha2) + alpha2);
+    return 0.5 / (ggx_v + ggx_l);
+}
+
+// ── vendor get_fresnel(): Schlick with F90 (max component * 50) ──
+vec3 fresnel_schlick(float v_dot_h, vec3 fresnel0) {
+    float f = pow(1.0 - v_dot_h, 5.0);
+    float f90 = clamp(max(max(fresnel0.r, fresnel0.g), fresnel0.b) * 50.0, 0.0, 1.0);
+    return fresnel0 + (vec3(f90) - fresnel0) * f;
+}
+
+// ── vendor get_ibl_shade(): split-sum diffuse + specular ──
+vec3 ibl_shade(vec3 N, vec3 V, vec3 diffuse_color, vec3 specular_color,
+               float roughness, float occlusion) {
+    vec3 diffuse_light = texture(uEnvMap, N).rgb;
+    vec3 diffuse_shade = diffuse_light * diffuse_color * occlusion;
+
+    float n_dot_v = clamp(dot(N, V), 0.0, 1.0);
+    vec2 lut = texture(uBRDF_LUT, vec2(n_dot_v, roughness)).rg;
+    vec3 R = reflect(-V, N);
+    float lod = roughness * float(uEnvMaxMip);
+    vec3 specular_light = textureLod(uEnvMap, R, lod).rgb;
+    vec3 specular_shade = specular_light * (specular_color * lut.x + lut.y);
+    return diffuse_shade + specular_shade;
+}
+
+// ── vendor get_normal_dir(): tangent-space normal mapping ──
+vec3 get_normal_dir(vec3 normal_dir) {
+    if (uHasNormalMap) {
+        vec3 tn = texture(uNormalTex, vUV).xyz * 2.0 - 1.0;
+        return normalize(vTangent * tn.x + vBitangent * tn.y + normal_dir * tn.z);
+    }
+    return normal_dir;
+}
+
+// ── vendor is_in_shadow(): depth compare with N·L-scaled bias ──
+bool is_in_shadow(vec3 depth_pos, float n_dot_l) {
+    vec2 uv = depth_pos.xy * 0.5 + 0.5;
+    float d = depth_pos.z * 0.5 + 0.5;
+    float bias = max(0.05 * (1.0 - n_dot_l), 0.005);
+    float closest = texture(uShadowMap, uv).r;
+    return (d - bias) > closest;
+}
+
+struct Material {
+    vec3 diffuse;
+    vec3 specular;
+    float alpha;
+    float roughness;
+    float occlusion;
+    vec3 emission;
+};
+
+// ── vendor get_pbrm_material() / get_pbrs_material() ──
+Material decode_material() {
+    vec3 basecolor = uBasecolorFactor.rgb;
+    float alpha = uBasecolorFactor.a;
+    if (uHasBasecolor) {
+        vec4 s = texture(uBasecolorTex, vUV);
+        basecolor *= s.rgb;
+        alpha *= s.a;
+    }
+    float metalness = uMetalnessFactor;
+    if (uHasMetalness) metalness *= texture(uMetalnessTex, vUV).r;
+    float roughness = uRoughnessFactor;
+    if (uHasRoughness) roughness *= texture(uRoughnessTex, vUV).r;
+
+    Material m;
+    m.alpha = alpha;
+    m.roughness = clamp(roughness, 0.045, 1.0);
+    m.occlusion = 1.0;
+    m.emission = uEmission;
+    if (uHasOcclusion) m.occlusion = texture(uOcclusionTex, vUV).r;
+    if (uHasEmission) m.emission = texture(uEmissionTex, vUV).rgb;
+
+    if (uWorkflow == 0) {
+        // metallic-roughness: diffuse = base·(1−F0)·(1−metalness), spec = lerp(F0, base, metalness)
+        vec3 F0 = vec3(0.04);
+        m.diffuse = basecolor * (1.0 - 0.04) * (1.0 - metalness);
+        m.specular = mix(F0, basecolor, metalness);
+    } else {
+        // specular-glossiness: diffuse = base·(1−max(spec)), roughness = 1−glossiness
+        vec3 spec = uSpecularFactor;
+        if (uHasSpecular) spec *= texture(uSpecularTex, vUV).rgb;
+        float glossiness = uGlossinessFactor;
+        if (uHasGlossiness) glossiness *= texture(uGlossinessTex, vUV).r;
+        float maxc = max(max(spec.r, spec.g), spec.b);
+        m.diffuse = basecolor * (1.0 - maxc);
+        m.specular = spec;
+        m.roughness = clamp(1.0 - glossiness, 0.045, 1.0);
+    }
+    return m;
+}
+
+void main() {
+    Material m = decode_material();
+    if (uAlphaCutoff > 0.0 && m.alpha < uAlphaCutoff) discard;
+
+    vec3 N = get_normal_dir(normalize(vNormal));
+    vec3 V = normalize(uCamPos - vWorldPos + vec3(1e-4));
+    float n_dot_v = max(dot(N, V), 0.0);
+    float alpha2 = m.roughness * m.roughness;
+
+    // Environment (IBL split-sum) + emission first.
+    vec3 color = m.emission;
+    if (uHasEnv) color += ibl_shade(N, V, m.diffuse, m.specular, m.roughness, m.occlusion) * uEnvIntensity;
+
+    // Key directional light (fallback to editor preview light).
+    vec3 keyDir = (uDirLightCount == 0) ? normalize(uLightDir) : normalize(uDirLightDir[0]);
+    vec3 keyCol = (uDirLightCount == 0) ? uLightColor : uDirLightCol[0];
+    float n_dot_l = max(dot(N, keyDir), 0.0);
+    if (n_dot_l > 0.0) {
+        vec3 H = normalize(keyDir + V);
+        float D = distribution_ggx(max(dot(N, H), 0.0), alpha2);
+        float G = visibility_smith(n_dot_v, n_dot_l, alpha2);
+        vec3 F = fresnel_schlick(max(dot(V, H), 0.0), m.specular);
+        float shadow = (uShadowEnabled && is_in_shadow(vDepthPos.xyz / vDepthPos.w, n_dot_l)) ? 0.0 : 1.0;
+        color += (m.diffuse / PI + D * G * F) * keyCol * n_dot_l * shadow;
+    }
+
+    // Extra directional lights.
+    for (int i = 1; i < uDirLightCount; ++i) {
+        vec3 L = normalize(uDirLightDir[i]);
+        float ndl = max(dot(N, L), 0.0);
+        if (ndl <= 0.0) continue;
+        vec3 H = normalize(L + V);
+        float D = distribution_ggx(max(dot(N, H), 0.0), alpha2);
+        float G = visibility_smith(n_dot_v, ndl, alpha2);
+        vec3 F = fresnel_schlick(max(dot(V, H), 0.0), m.specular);
+        color += (m.diffuse / PI + D * G * F) * uDirLightCol[i] * ndl;
+    }
+
+    // Point lights (torch/fire — compact localized sources).
+    for (int i = 0; i < uLightCount; ++i) {
+        vec3 toL = uLightPos[i] - vWorldPos;
+        float dist = length(toL);
+        float r = max(uLightRadius[i], 0.001);
+        float norm = dist / r;
+        float window = clamp(1.0 - pow(norm, 4.0), 0.0, 1.0);
+        window *= window;
+        float atten = window / (1.0 + 1.6 * norm + 1.8 * norm * norm);
+        vec3 L = normalize(toL + vec3(1e-4));
+        float ndl = max(dot(N, L), 0.0);
+        if (ndl <= 0.0) continue;
+        vec3 H = normalize(L + V);
+        float D = distribution_ggx(max(dot(N, H), 0.0), alpha2);
+        float G = visibility_smith(n_dot_v, ndl, alpha2);
+        vec3 F = fresnel_schlick(max(dot(V, H), 0.0), m.specular);
+        color += (m.diffuse / PI + D * G * F) * uLightCol[i] * ndl * atten;
+    }
+
+    // Hemisphere ambient (sky/ground fill) — same feel as the model shader.
+    float hemi = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 amb = max(mix(uAmbientGround, uAmbient, hemi), vec3(0.02));
+    color += m.diffuse * amb * m.occlusion;
+
+    // ACES filmic tone mapping (Krzysztof Narkowicz; vendor README reference).
+    color = clamp(color, 0.0, 1e4);
+    color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
+
+    FragColor = vec4(color, m.alpha);
+}
+)GLSL";
+
+// ── Directional shadow-map depth pass ──
+static const char* SHADOW_VS = R"GLSL(
+#version 330 core
+layout(location=0) in vec3 aPos;
+
+uniform mat4 uLightVP;
+uniform mat4 uModel;
+
+void main() {
+    gl_Position = uLightVP * uModel * vec4(aPos, 1.0);
+}
+)GLSL";
+
+static const char* SHADOW_FS = R"GLSL(
+#version 330 core
+out vec4 FragColor;
+void main() {
+    FragColor = vec4(1.0);
 }
 )GLSL";
 
@@ -145,24 +575,51 @@ static const char* GRID_FS = R"GLSL(
 #version 330 core
 in vec3 vWorldPos;
 
-uniform float uGridSize;
-uniform vec4  uGridColor;
+uniform float uGridSize;  // fade outer radius (world units)
+uniform vec4  uGridColor; // base grid color (rgb) + global alpha
+uniform float uScale;     // world units per screen pixel at the grid plane
 
 out vec4 FragColor;
 
-void main() {
-    // Distance-based fade from center
-    float dist = length(vWorldPos.xz);
-    float fade = 1.0 - smoothstep(uGridSize * 0.65, uGridSize, dist);
+// Distance (world units) from a coordinate to its nearest grid line of a
+// given spacing. 1-2-5 adaptive spacing keeps the grid crisp at any zoom.
+float distToLine(float pos, float step)
+{
+    return abs(abs(pos) - round(pos / step) * step);
+}
 
-    // One world-unit minor grid, with thicker ten-unit major lines.
-    vec2 minorCoord = abs(fract(vWorldPos.xz) - 0.5);
-    vec2 majorCoord = abs(fract(vWorldPos.xz / 10.0) - 0.5);
-    float minorLine = 1.0 - smoothstep(0.46, 0.49, max(minorCoord.x, minorCoord.y));
-    float majorLine = 1.0 - smoothstep(0.47, 0.495, max(majorCoord.x, majorCoord.y));
-    float line = max(minorLine * 0.45, majorLine);
+void main()
+{
+    vec2 g = vWorldPos.xz;
+    float dist = length(g);
+    float fade = 1.0 - smoothstep(uGridSize * 0.55, uGridSize, dist);
 
-    FragColor = vec4(uGridColor.rgb, uGridColor.a * line * fade);
+    // Target ~80px between parallel lines, snapped to a clean 1-2-5 step.
+    float s = max(uScale, 1e-4);
+    float target = s * 80.0;
+    float decade = pow(10.0, floor(log(target) / log(10.0)));
+    float norm = target / decade;
+    float major = (norm < 2.0 ? 2.0 : norm < 5.0 ? 5.0 : 10.0) * decade;
+    float minor = major / 5.0;
+
+    // Per-pixel anti-aliased line alpha (1.0px minor, ~1.7px major).
+    float pxMinor = min(distToLine(g.x, minor), distToLine(g.y, minor)) / s;
+    float pxMajor = min(distToLine(g.x, major), distToLine(g.y, major)) / s;
+    float minorA  = 1.0 - smoothstep(0.55, 1.35, pxMinor);
+    float majorA  = 1.0 - smoothstep(0.55, 1.75, pxMajor);
+    float line    = max(majorA, minorA * 0.45);
+
+    // Axis emphasis: the zero lines are drawn thicker and brighter.
+    float axX = 1.0 - smoothstep(0.6, 2.0, abs(g.x) / s);
+    float axZ = 1.0 - smoothstep(0.6, 2.0, abs(g.y) / s);
+    float axis = max(axX, axZ);
+
+    vec3 col = uGridColor.rgb;
+    vec3 axisCol = min(vec3(1.0), uGridColor.rgb * 1.35 + vec3(0.06));
+    col = mix(col, axisCol, axis * 0.9);
+
+    float alpha = uGridColor.a * max(line, axis) * fade;
+    FragColor = vec4(col, alpha);
 }
 )GLSL";
 
@@ -304,6 +761,7 @@ static GLint s_loc_has_tex    = -1;
 static GLint s_loc_light_dir  = -1;
 static GLint s_loc_light_col  = -1;
 static GLint s_loc_ambient    = -1;
+static GLint s_loc_amb_ground = -1;
 static GLint s_loc_mat_color  = -1;
 static GLint s_loc_alpha      = -1;
 static GLint s_loc_cam_pos    = -1;
@@ -311,10 +769,52 @@ static GLint s_loc_light_cnt  = -1;
 static GLint s_loc_light_pos  = -1;
 static GLint s_loc_light_cols = -1;
 static GLint s_loc_light_rad  = -1;
+static GLint s_loc_dir_cnt    = -1;
+static GLint s_loc_dir_dir    = -1;
+static GLint s_loc_dir_col    = -1;
 static GLint s_loc_fog_en     = -1;
 static GLint s_loc_fog_col    = -1;
 static GLint s_loc_fog_near   = -1;
 static GLint s_loc_fog_far    = -1;
+static GLint s_loc_flat_shade = -1;
+static GLint s_loc_dbg_normals = -1;
+static GLint s_loc_fill_col  = -1;
+static GLint s_loc_rim_str   = -1;
+static GLint s_loc_spec_str  = -1;
+static GLint s_loc_flip_v    = -1;
+
+// ── PBR program state (vendored algorithms, see src/render/zauonlok) ──
+struct PBRProg {
+    GLuint prog = 0;
+    GLint mvp = -1, model = -1, nmat = -1, light_vp = -1, flip_v = -1, has_tan = -1,
+          joint_cnt = -1, joints = -1, cam_pos = -1,
+          base_f = -1, metal_f = -1, rough_f = -1, spec_f = -1, gloss_f = -1,
+          occ = -1, emiss = -1, workflow = -1, alpha_cutoff = -1,
+          has_base = -1, has_metal = -1, has_rough = -1, has_nmap = -1,
+          has_occ = -1, has_emiss = -1, has_spec = -1, has_gloss = -1,
+          env_has = -1, env_int = -1, env_mip = -1, shadow_en = -1,
+          light_dir = -1, light_col = -1, ambient = -1, amb_ground = -1,
+          light_cnt = -1, light_pos = -1, light_cols = -1, light_rad = -1,
+          dir_cnt = -1, dir_dir = -1, dir_col = -1;
+} s_pbr;
+
+// Directional shadow-map depth pass
+static GLuint s_shadow_prog = 0;
+static GLint  s_shadow_loc_vp = -1, s_shadow_loc_model = -1;
+
+// PBR runtime state
+static float  s_pbr_joints[256 * 16];  // column-major joint matrices (GPU skinning)
+static int    s_pbr_joint_count = 0;
+static GLuint s_pbr_env_cubemap = 0;   // prefiltered radiance cubemap (mip chain)
+static float  s_pbr_env_intensity = 1.0f;
+static GLuint s_pbr_brdf_lut = 0;      // split-sum BRDF LUT (generated at init)
+static float  s_shadow_light_vp[16];   // light proj * view (column-major)
+static bool   s_shadow_enabled = false;
+static GLuint s_shadow_depth_tex = 0;
+static GLint  s_shadow_saved_viewport[4] = {0, 0, 0, 0};
+static GLuint s_shadow_saved_fbo = 0;
+static bool   s_shadow_saved_blend = false;
+static bool   s_shadow_saved_scissor = false;
 
 // Depth fog state (set per-frame; disabled by default so model previews stay clear)
 static bool   s_fog_enabled = false;
@@ -322,17 +822,33 @@ static float  s_fog_color[3] = {0.05f, 0.06f, 0.09f};  // dark cave tint
 static float  s_fog_near = 400.0f;
 static float  s_fog_far  = 1400.0f;
 
+// Viewport diagnostics (see set_view_flags)
+static bool   s_flat_shade = false;
+static bool   s_debug_normals = false;
+
 // Scene point lights uploaded per-frame (positions in world space).
+static constexpr int MAX_DIR_LIGHTS = 4;   // must match GLSL MAX_DIR_LIGHTS
 static float s_point_light_pos[16][3]  = {{0}};
 static float s_point_light_col[16][3]  = {{0}};
 static float s_point_light_radius[16]  = {0};
 static int   s_point_light_count = 0;
+
+// Scene directional lights uploaded per-frame (up to MAX_DIR_LIGHTS).
+static float s_dir_light_dir[MAX_DIR_LIGHTS][3] = {{0}};
+static float s_dir_light_col[MAX_DIR_LIGHTS][3] = {{0}};
+static int   s_dir_light_count = 0;
 
 // Grid shader uniform locations
 static GLint s_loc_grid_mvp   = -1;
 static GLint s_loc_grid_model = -1;
 static GLint s_loc_grid_size  = -1;
 static GLint s_loc_grid_color = -1;
+static GLint s_loc_grid_scale = -1;
+
+// Viewport height (px) + projection vertical focal factor f = 1/tan(fov/2),
+// used to convert world units to screen pixels on the grid plane.
+static float s_grid_viewport_h = 1.0f;
+static float s_grid_proj_f     = 1.0f;
 
 // Grid geometry (a simple XZ quad — large enough, faded at edges)
 static GLuint s_grid_vao = 0;
@@ -567,6 +1083,22 @@ bool mat4_inverse(float out[16], const float m[16]) {
 // Internal helpers — shader compilation
 // ============================================================================
 
+static void dump_shader_source(const char* label, const char* src) {
+    fprintf(stderr, "----- [av_renderer] %s source -----\n", label);
+    int lineno = 1;
+    size_t start = 0;
+    for (size_t i = 0; ; ++i) {
+        if (src[i] == '\n' || src[i] == '\0') {
+            fprintf(stderr, "%4d | ", lineno);
+            fwrite(src + start, 1, i - start, stderr);
+            fputc('\n', stderr);
+            ++lineno;
+            if (src[i] == '\0') break;
+            start = i + 1;
+        }
+    }
+}
+
 static GLuint compile_shader(GLenum type, const char* src) {
     GLuint id = glCreateShader(type);
     glShaderSource(id, 1, &src, nullptr);
@@ -578,6 +1110,7 @@ static GLuint compile_shader(GLenum type, const char* src) {
         char log[1024];
         glGetShaderInfoLog(id, sizeof(log), nullptr, log);
         fprintf(stderr, "[av_renderer] Shader compile error:\n%s\n", log);
+        dump_shader_source(type == GL_VERTEX_SHADER ? "vertex" : "fragment", src);
         glDeleteShader(id);
         return 0;
     }
@@ -615,6 +1148,141 @@ static GLuint build_program(const char* vs_src, const char* fs_src) {
     glDeleteShader(vs);
     glDeleteShader(fs);
     return prog;
+}
+
+// ============================================================================
+// PBR helpers — split-sum BRDF LUT + procedural default environment
+// ============================================================================
+
+// Generate the standard GGX split-sum BRDF LUT (256×256 RG16F in an RGBA8
+// texture): channel R accumulates the F0=1 specular scale, channel G the
+// (1−F0) bias — the classic Karis 2013 "Real Shading in Unreal Engine 4"
+// integration. Sampled by the PBR program at (NdotV, roughness).
+static GLuint generate_brdf_lut() {
+    const int S = 256;
+    const int SAMPLES = 512;   // 512×256×256 ≈ 34M iterations; 1024 gains nothing visually
+    std::vector<float> lut(S * S * 2, 0.0f);
+
+    auto radical_inverse_vdc = [](unsigned bits) -> float {
+        bits = (bits << 16u) | (bits >> 16u);
+        bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+        bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+        bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+        bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+        return float(bits) * 2.3283064365386963e-10f;
+    };
+    auto hammersley = [&](int i) -> std::pair<float, float> {
+        return { float(i) / float(SAMPLES), radical_inverse_vdc((unsigned)i) };
+    };
+    // Importance-sample the GGX NDF; returns H in tangent space (N = +Z).
+    auto importance_sample_ggx = [](float xi1, float xi2, float a2) -> std::array<float, 3> {
+        float phi = 2.0f * PI * xi1;
+        float cos_theta = sqrtf(std::max(0.0f, (1.0f - xi2) / (1.0f + (a2 - 1.0f) * xi2)));
+        float sin_theta = sqrtf(std::max(0.0f, 1.0f - cos_theta * cos_theta));
+        return { sin_theta * cosf(phi), sin_theta * sinf(phi), cos_theta };
+    };
+
+    for (int y = 0; y < S; ++y) {
+        float roughness = (y + 0.5f) / S;
+        float a = roughness * roughness;
+        float a2 = a * a;
+        for (int x = 0; x < S; ++x) {
+            float n_dot_v = (x + 0.5f) / S;
+            float Vz = sqrtf(std::max(0.0f, 1.0f - n_dot_v * n_dot_v));
+            float Vx = 1.0f, Vy = 0.0f;
+            float A = 0.0f, B = 0.0f;
+            for (int i = 0; i < SAMPLES; ++i) {
+                auto [u1, u2] = hammersley(i);
+                auto H = importance_sample_ggx(u1, u2, a2);
+                // Reflect V about H: L = 2·(V·H)·H − V
+                float v_dot_h = Vx * H[0] + Vy * H[1] + Vz * H[2];
+                float Lx = 2.0f * v_dot_h * H[0] - Vx;
+                float Ly = 2.0f * v_dot_h * H[1] - Vy;
+                float Lz = 2.0f * v_dot_h * H[2] - Vz;
+                float n_dot_l = Lz;
+                float n_dot_h = H[2];
+                if (n_dot_l <= 0.0f || n_dot_h <= 0.0f) continue;
+                // Smith G1 (same GGX alpha2) with the 4·NdotV·NdotL folding.
+                float g1v = 2.0f * n_dot_v / (n_dot_v + sqrtf(a2 + (1.0f - a2) * n_dot_v * n_dot_v));
+                float g1l = 2.0f * n_dot_l / (n_dot_l + sqrtf(a2 + (1.0f - a2) * n_dot_l * n_dot_l));
+                float g_vis = g1v * g1l * v_dot_h / (n_dot_h * n_dot_v);
+                float fc = powf(1.0f - v_dot_h, 5.0f);
+                A += (1.0f - fc) * g_vis;   // F0=1 response
+                B += fc * g_vis;             // F0=0 response
+            }
+            size_t o = ((size_t)y * S + (size_t)x) * 2;
+            lut[o + 0] = A / float(SAMPLES);
+            lut[o + 1] = B / float(SAMPLES);
+        }
+    }
+
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG16F, S, S, 0, GL_RG, GL_FLOAT, lut.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
+}
+
+// Procedural default environment: a soft studio gradient cubemap (warm sky
+// above, cool ground below) with mip chains, so image-based lighting is
+// visible in PBR previews before a real HDR environment is supplied.
+static GLuint create_default_env_cubemap() {
+    const int S = 64;
+    std::vector<uint8_t> face(S * S * 4);
+    GLuint cube = 0;
+    glGenTextures(1, &cube);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
+    for (int f = 0; f < 6; ++f) {
+        GLenum target = GL_TEXTURE_CUBE_MAP_POSITIVE_X + f;
+        for (int y = 0; y < S; ++y) {
+            for (int x = 0; x < S; ++x) {
+                // Reconstruct a direction for this texel so the gradient is
+                // consistent across faces (rough sky/ground/ground-floor).
+                float u = (x + 0.5f) / S * 2.0f - 1.0f;
+                float v = (y + 0.5f) / S * 2.0f - 1.0f;
+                float dx = 0, dy = 0, dz = 0;
+                switch (f) {
+                    case 0: dx =  1.0f; dy = -v; dz = -u; break;  // +X
+                    case 1: dx = -1.0f; dy = -v; dz =  u; break;  // -X
+                    case 2: dx =  u; dy =  1.0f; dz =  v; break;  // +Y (up)
+                    case 3: dx =  u; dy = -1.0f; dz = -v; break;  // -Y (down)
+                    case 4: dx =  u; dy = -v; dz =  1.0f; break;  // +Z
+                    default: dx = -u; dy = -v; dz = -1.0f; break; // -Z
+                }
+                float len = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (len > 1e-6f) { dx /= len; dy /= len; dz /= len; }
+                float up = std::clamp(dy * 0.5f + 0.5f, 0.0f, 1.0f);
+                // sky: pale warm blue · horizon: light cream · ground: muted olive
+                float sky_r = 0.55f, sky_g = 0.66f, sky_b = 0.82f;
+                float hor_r = 0.95f, hor_g = 0.88f, hor_b = 0.78f;
+                float gnd_r = 0.22f, gnd_g = 0.20f, gnd_b = 0.16f;
+                float t = powf(up, 0.55f);
+                auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
+                float r = lerp(lerp(gnd_r, hor_r, up), sky_r, t);
+                float g = lerp(lerp(gnd_g, hor_g, up), sky_g, t);
+                float b = lerp(lerp(gnd_b, hor_b, up), sky_b, t);
+                size_t o = ((size_t)y * S + (size_t)x) * 4;
+                face[o + 0] = (uint8_t)(r * 255.0f);
+                face[o + 1] = (uint8_t)(g * 255.0f);
+                face[o + 2] = (uint8_t)(b * 255.0f);
+                face[o + 3] = 255;
+            }
+        }
+        glTexImage2D(target, 0, GL_RGBA8, S, S, 0, GL_RGBA, GL_UNSIGNED_BYTE, face.data());
+    }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+    return cube;
 }
 
 // ============================================================================
@@ -674,34 +1342,123 @@ bool renderer_init() {
     s_loc_light_dir = glGetUniformLocation(s_model_prog, "uLightDir");
     s_loc_light_col = glGetUniformLocation(s_model_prog, "uLightColor");
     s_loc_ambient   = glGetUniformLocation(s_model_prog, "uAmbient");
+    s_loc_amb_ground= glGetUniformLocation(s_model_prog, "uAmbientGround");
     s_loc_mat_color = glGetUniformLocation(s_model_prog, "uMatColor");
     s_loc_cam_pos   = glGetUniformLocation(s_model_prog, "uCamPos");
     s_loc_light_cnt = glGetUniformLocation(s_model_prog, "uLightCount");
     s_loc_light_pos = glGetUniformLocation(s_model_prog, "uLightPos[0]");
     s_loc_light_cols= glGetUniformLocation(s_model_prog, "uLightCol[0]");
     s_loc_light_rad = glGetUniformLocation(s_model_prog, "uLightRadius[0]");
+    s_loc_dir_cnt   = glGetUniformLocation(s_model_prog, "uDirLightCount");
+    s_loc_dir_dir   = glGetUniformLocation(s_model_prog, "uDirLightDir[0]");
+    s_loc_dir_col   = glGetUniformLocation(s_model_prog, "uDirLightCol[0]");
     s_loc_fog_en    = glGetUniformLocation(s_model_prog, "uFogEnabled");
     s_loc_fog_col   = glGetUniformLocation(s_model_prog, "uFogColor");
     s_loc_fog_near  = glGetUniformLocation(s_model_prog, "uFogNear");
     s_loc_fog_far   = glGetUniformLocation(s_model_prog, "uFogFar");
     s_loc_alpha     = glGetUniformLocation(s_model_prog, "uAlpha");
+    s_loc_flat_shade = glGetUniformLocation(s_model_prog, "uFlatShade");
+    s_loc_dbg_normals = glGetUniformLocation(s_model_prog, "uDebugNormals");
+    s_loc_fill_col  = glGetUniformLocation(s_model_prog, "uFillColor");
+    s_loc_rim_str   = glGetUniformLocation(s_model_prog, "uRimStrength");
+    s_loc_spec_str  = glGetUniformLocation(s_model_prog, "uSpecStrength");
+    s_loc_flip_v    = glGetUniformLocation(s_model_prog, "uFlipV");
 
-    // --- Grid program ---
-    s_grid_prog = build_program(GRID_VS, GRID_FS);
-    if (!s_grid_prog) {
-        fprintf(stderr, "[av_renderer] Failed to build grid shader program.\n");
-        glDeleteProgram(s_model_prog);
-        s_model_prog = 0;
-        return false;
+    // --- PBR program (vendored algorithms from zauonlok/renderer, MIT) ---
+    // Non-fatal: if the PBR program fails to build, the legacy model path
+    // keeps working and pbr_render_mesh() simply no-ops.
+    s_pbr.prog = build_program(PBR_VS, PBR_FS);
+    if (s_pbr.prog) {
+        s_pbr.mvp         = glGetUniformLocation(s_pbr.prog, "uMVP");
+        s_pbr.model       = glGetUniformLocation(s_pbr.prog, "uModel");
+        s_pbr.nmat        = glGetUniformLocation(s_pbr.prog, "uNormalMat");
+        s_pbr.light_vp    = glGetUniformLocation(s_pbr.prog, "uLightVPMatrix");
+        s_pbr.flip_v      = glGetUniformLocation(s_pbr.prog, "uFlipV");
+        s_pbr.has_tan     = glGetUniformLocation(s_pbr.prog, "uHasTangent");
+        s_pbr.joint_cnt   = glGetUniformLocation(s_pbr.prog, "uJointCount");
+        s_pbr.joints      = glGetUniformLocation(s_pbr.prog, "uJoints[0]");
+        s_pbr.cam_pos     = glGetUniformLocation(s_pbr.prog, "uCamPos");
+        s_pbr.base_f      = glGetUniformLocation(s_pbr.prog, "uBasecolorFactor");
+        s_pbr.metal_f     = glGetUniformLocation(s_pbr.prog, "uMetalnessFactor");
+        s_pbr.rough_f     = glGetUniformLocation(s_pbr.prog, "uRoughnessFactor");
+        s_pbr.spec_f      = glGetUniformLocation(s_pbr.prog, "uSpecularFactor");
+        s_pbr.gloss_f     = glGetUniformLocation(s_pbr.prog, "uGlossinessFactor");
+        s_pbr.occ         = glGetUniformLocation(s_pbr.prog, "uOcclusion");
+        s_pbr.emiss       = glGetUniformLocation(s_pbr.prog, "uEmission");
+        s_pbr.workflow    = glGetUniformLocation(s_pbr.prog, "uWorkflow");
+        s_pbr.alpha_cutoff= glGetUniformLocation(s_pbr.prog, "uAlphaCutoff");
+        s_pbr.has_base    = glGetUniformLocation(s_pbr.prog, "uHasBasecolor");
+        s_pbr.has_metal   = glGetUniformLocation(s_pbr.prog, "uHasMetalness");
+        s_pbr.has_rough   = glGetUniformLocation(s_pbr.prog, "uHasRoughness");
+        s_pbr.has_nmap    = glGetUniformLocation(s_pbr.prog, "uHasNormalMap");
+        s_pbr.has_occ     = glGetUniformLocation(s_pbr.prog, "uHasOcclusion");
+        s_pbr.has_emiss   = glGetUniformLocation(s_pbr.prog, "uHasEmission");
+        s_pbr.has_spec    = glGetUniformLocation(s_pbr.prog, "uHasSpecular");
+        s_pbr.has_gloss   = glGetUniformLocation(s_pbr.prog, "uHasGlossiness");
+        s_pbr.env_has     = glGetUniformLocation(s_pbr.prog, "uHasEnv");
+        s_pbr.env_int     = glGetUniformLocation(s_pbr.prog, "uEnvIntensity");
+        s_pbr.env_mip     = glGetUniformLocation(s_pbr.prog, "uEnvMaxMip");
+        s_pbr.shadow_en   = glGetUniformLocation(s_pbr.prog, "uShadowEnabled");
+        s_pbr.light_dir   = glGetUniformLocation(s_pbr.prog, "uLightDir");
+        s_pbr.light_col   = glGetUniformLocation(s_pbr.prog, "uLightColor");
+        s_pbr.ambient     = glGetUniformLocation(s_pbr.prog, "uAmbient");
+        s_pbr.amb_ground  = glGetUniformLocation(s_pbr.prog, "uAmbientGround");
+        s_pbr.light_cnt   = glGetUniformLocation(s_pbr.prog, "uLightCount");
+        s_pbr.light_pos   = glGetUniformLocation(s_pbr.prog, "uLightPos[0]");
+        s_pbr.light_cols  = glGetUniformLocation(s_pbr.prog, "uLightCol[0]");
+        s_pbr.light_rad   = glGetUniformLocation(s_pbr.prog, "uLightRadius[0]");
+        s_pbr.dir_cnt     = glGetUniformLocation(s_pbr.prog, "uDirLightCount");
+        s_pbr.dir_dir     = glGetUniformLocation(s_pbr.prog, "uDirLightDir[0]");
+        s_pbr.dir_col     = glGetUniformLocation(s_pbr.prog, "uDirLightCol[0]");
+
+        // Bind texture units once (they never change).
+        glUseProgram(s_pbr.prog);
+        glUniform1i(glGetUniformLocation(s_pbr.prog, "uBasecolorTex"), 0);
+        glUniform1i(glGetUniformLocation(s_pbr.prog, "uMetalnessTex"), 1);
+        glUniform1i(glGetUniformLocation(s_pbr.prog, "uRoughnessTex"), 2);
+        glUniform1i(glGetUniformLocation(s_pbr.prog, "uNormalTex"), 3);
+        glUniform1i(glGetUniformLocation(s_pbr.prog, "uOcclusionTex"), 4);
+        glUniform1i(glGetUniformLocation(s_pbr.prog, "uEmissionTex"), 5);
+        glUniform1i(glGetUniformLocation(s_pbr.prog, "uSpecularTex"), 6);
+        glUniform1i(glGetUniformLocation(s_pbr.prog, "uGlossinessTex"), 7);
+        glUniform1i(glGetUniformLocation(s_pbr.prog, "uEnvMap"), 8);
+        glUniform1i(glGetUniformLocation(s_pbr.prog, "uBRDF_LUT"), 9);
+        glUniform1i(glGetUniformLocation(s_pbr.prog, "uShadowMap"), 10);
+        glUseProgram(0);
+
+        s_pbr_brdf_lut = generate_brdf_lut();
+        s_pbr_env_cubemap = create_default_env_cubemap();
+        fprintf(stderr, "[av_renderer] PBR program ready (BRDF LUT=%u, env=%u).\n",
+                s_pbr_brdf_lut, s_pbr_env_cubemap);
+    } else {
+        fprintf(stderr, "[av_renderer] [warn] PBR program failed to build; PBR preview disabled.\n");
     }
 
-    s_loc_grid_mvp   = glGetUniformLocation(s_grid_prog, "uMVP");
-    s_loc_grid_model = glGetUniformLocation(s_grid_prog, "uModel");
-    s_loc_grid_size  = glGetUniformLocation(s_grid_prog, "uGridSize");
-    s_loc_grid_color = glGetUniformLocation(s_grid_prog, "uGridColor");
+    // --- Directional shadow-map depth pass ---
+    s_shadow_prog = build_program(SHADOW_VS, SHADOW_FS);
+    if (s_shadow_prog) {
+        s_shadow_loc_vp    = glGetUniformLocation(s_shadow_prog, "uLightVP");
+        s_shadow_loc_model = glGetUniformLocation(s_shadow_prog, "uModel");
+    }
 
-    // --- Grid geometry ---
-    create_grid_geometry();
+    // --- Grid program ---
+    // The grid is editor decoration only. If it fails to compile, we log a
+    // warning and continue: the model/scene renderer must never be taken down
+    // by a broken grid shader. render_grid/render_grid_xy already guard on
+    // s_grid_prog being non-zero, so a disabled grid is harmless.
+    s_grid_prog = build_program(GRID_VS, GRID_FS);
+    if (!s_grid_prog) {
+        fprintf(stderr, "[av_renderer] [warn] Grid shader failed to build; grid is disabled (model/scene rendering continues).\n");
+    } else {
+        s_loc_grid_mvp   = glGetUniformLocation(s_grid_prog, "uMVP");
+        s_loc_grid_model = glGetUniformLocation(s_grid_prog, "uModel");
+        s_loc_grid_size  = glGetUniformLocation(s_grid_prog, "uGridSize");
+        s_loc_grid_color = glGetUniformLocation(s_grid_prog, "uGridColor");
+        s_loc_grid_scale = glGetUniformLocation(s_grid_prog, "uScale");
+
+        // --- Grid geometry ---
+        create_grid_geometry();
+    }
 
     // --- Background quad geometry (unit quad ±1 on X/Y, UV 0..1) ---
     s_bg_prog = build_program(BG_VS, BG_FS);
@@ -833,6 +1590,11 @@ void renderer_shutdown() {
     if (s_water_vbo)  { glDeleteBuffers(1, &s_water_vbo); s_water_vbo = 0; }
     if (s_water_ebo)  { glDeleteBuffers(1, &s_water_ebo); s_water_ebo = 0; }
 
+    if (s_pbr.prog)        { glDeleteProgram(s_pbr.prog);        s_pbr.prog = 0; }
+    if (s_shadow_prog)     { glDeleteProgram(s_shadow_prog);     s_shadow_prog = 0; }
+    if (s_pbr_brdf_lut)    { glDeleteTextures(1, &s_pbr_brdf_lut);    s_pbr_brdf_lut = 0; }
+    if (s_pbr_env_cubemap) { glDeleteTextures(1, &s_pbr_env_cubemap); s_pbr_env_cubemap = 0; }
+
     postfx_shutdown();
 }
 
@@ -842,43 +1604,54 @@ void renderer_shutdown() {
 
 GPUMesh upload_mesh(const float* positions, const float* normals, const float* uvs,
                     int num_verts, const uint32_t* indices, int num_indices) {
+    return upload_mesh_ex(positions, normals, uvs, nullptr, nullptr, nullptr,
+                          num_verts, indices, num_indices, false);
+}
+
+GPUMesh upload_mesh_ex(const float* positions, const float* normals, const float* uvs,
+                       const float* tangents4, const float* joints4, const float* weights4,
+                       int num_verts, const uint32_t* indices, int num_indices,
+                       bool flip_uv_v) {
     GPUMesh mesh{};
     if (!positions || num_verts <= 0) return mesh;
 
-    // Interleaved layout: [pos3][norm3][uv2] = 8 floats per vertex
-    const int stride_floats = 3 + 3 + 2;  // 32 bytes
-    std::vector<float> buf(num_verts * stride_floats);
+    mesh.flip_uv_v = flip_uv_v;
+    mesh.has_tangents = (tangents4 != nullptr);
+    mesh.has_skinning = (joints4 != nullptr && weights4 != nullptr);
+
+    // Interleaved layouts:
+    //   base     [pos3][nrm3][uv2]              = 8  floats
+    //   +tangent [pos3][nrm3][uv2][tan4]        = 12 floats
+    //   +skin    [pos3][nrm3][uv2][tan4][j4][w4] = 20 floats
+    const int stride_floats = 8 + (mesh.has_tangents ? 4 : 0) + (mesh.has_skinning ? 8 : 0);
+    mesh.stride_floats = stride_floats;
+    std::vector<float> buf(static_cast<size_t>(num_verts) * stride_floats);
 
     for (int i = 0; i < num_verts; i++) {
-        float* dst = &buf[i * stride_floats];
-
-        // Position (always present)
-        dst[0] = positions[i * 3 + 0];
-        dst[1] = positions[i * 3 + 1];
-        dst[2] = positions[i * 3 + 2];
-
-        // Normal (default to Y-up if missing)
-        if (normals) {
-            dst[3] = normals[i * 3 + 0];
-            dst[4] = normals[i * 3 + 1];
-            dst[5] = normals[i * 3 + 2];
-        } else {
-            dst[3] = 0.0f; dst[4] = 1.0f; dst[5] = 0.0f;
+        float* dst = &buf[static_cast<size_t>(i) * stride_floats];
+        int o = 0;
+        dst[o++] = positions[i * 3 + 0];
+        dst[o++] = positions[i * 3 + 1];
+        dst[o++] = positions[i * 3 + 2];
+        if (normals) { dst[o++] = normals[i * 3 + 0]; dst[o++] = normals[i * 3 + 1]; dst[o++] = normals[i * 3 + 2]; }
+        else { dst[o++] = 0.0f; dst[o++] = 1.0f; dst[o++] = 0.0f; }
+        if (uvs) { dst[o++] = uvs[i * 2 + 0]; dst[o++] = uvs[i * 2 + 1]; }
+        else { dst[o++] = 0.0f; dst[o++] = 0.0f; }
+        if (mesh.has_tangents) {
+            dst[o++] = tangents4[i * 4 + 0];
+            dst[o++] = tangents4[i * 4 + 1];
+            dst[o++] = tangents4[i * 4 + 2];
+            dst[o++] = tangents4[i * 4 + 3];
         }
-
-        // UV (default to 0,0 if missing)
-        if (uvs) {
-            dst[6] = uvs[i * 2 + 0];
-            dst[7] = uvs[i * 2 + 1];
-        } else {
-            dst[6] = 0.0f; dst[7] = 0.0f;
+        if (mesh.has_skinning) {
+            for (int k = 0; k < 4; ++k) dst[o++] = joints4[i * 4 + k];
+            for (int k = 0; k < 4; ++k) dst[o++] = weights4[i * 4 + k];
         }
     }
 
     glGenVertexArrays(1, &mesh.vao);
     glBindVertexArray(mesh.vao);
 
-    // VBO — interleaved vertex data
     glGenBuffers(1, &mesh.vbo);
     glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
     glBufferData(GL_ARRAY_BUFFER,
@@ -888,18 +1661,26 @@ GPUMesh upload_mesh(const float* positions, const float* normals, const float* u
 
     // location 0 = aPos (vec3)
     glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride,
-                          (void*)(0));
-
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, (void*)(0));
     // location 1 = aNorm (vec3)
     glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride,
-                          (void*)(3 * sizeof(float)));
-
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, (void*)(3 * sizeof(float)));
     // location 2 = aUV (vec2)
     glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride,
-                          (void*)(6 * sizeof(float)));
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, (void*)(6 * sizeof(float)));
+    // location 3 = aTangent (vec4)
+    if (mesh.has_tangents) {
+        glEnableVertexAttribArray(3);
+        glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride, (void*)(8 * sizeof(float)));
+    }
+    // location 4/5 = aJoint / aWeight (vec4)
+    if (mesh.has_skinning) {
+        const int so = 8 + (mesh.has_tangents ? 4 : 0);
+        glEnableVertexAttribArray(4);
+        glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, stride, (void*)(so * sizeof(float)));
+        glEnableVertexAttribArray(5);
+        glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, stride, (void*)((so + 4) * sizeof(float)));
+    }
 
     // EBO — index buffer (optional)
     if (indices && num_indices > 0) {
@@ -916,6 +1697,10 @@ GPUMesh upload_mesh(const float* positions, const float* normals, const float* u
     return mesh;
 }
 
+void set_mesh_flip_uv(GPUMesh& mesh, bool flip) {
+    mesh.flip_uv_v = flip;
+}
+
 void update_mesh_vertices(const GPUMesh& mesh, const float* positions,
                           const float* normals, const float* uvs, int num_verts) {
     if (!mesh.vbo || !positions || num_verts <= 0) return;
@@ -928,6 +1713,42 @@ void update_mesh_vertices(const GPUMesh& mesh, const float* positions,
         else { dst[3] = 0; dst[4] = 1; dst[5] = 0; }
         if (uvs) std::memcpy(dst + 6, uvs + i * 2, 2 * sizeof(float));
         else { dst[6] = dst[7] = 0; }
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, data.size() * sizeof(float), data.data());
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+/// Stride-aware vertex update for PBR-layout meshes (tangent/joint/weight
+/// attributes preserved across CPU skinning updates). Pass nullptr for any
+/// stream that should keep its previously uploaded values.
+void update_mesh_vertices_ex(const GPUMesh& mesh, const float* positions,
+                             const float* normals, const float* uvs,
+                             const float* tangents4, const float* joints4,
+                             const float* weights4, int num_verts) {
+    if (!mesh.vbo || !positions || num_verts <= 0) return;
+    const int stride_floats = mesh.stride_floats;
+    std::vector<float> data(static_cast<size_t>(num_verts) * stride_floats);
+    for (int i = 0; i < num_verts; ++i) {
+        float* dst = &data[static_cast<size_t>(i) * stride_floats];
+        int o = 0;
+        dst[o++] = positions[i * 3 + 0];
+        dst[o++] = positions[i * 3 + 1];
+        dst[o++] = positions[i * 3 + 2];
+        if (normals) { dst[o++] = normals[i * 3 + 0]; dst[o++] = normals[i * 3 + 1]; dst[o++] = normals[i * 3 + 2]; }
+        else { dst[o++] = 0; dst[o++] = 1; dst[o++] = 0; }
+        if (uvs) { dst[o++] = uvs[i * 2 + 0]; dst[o++] = uvs[i * 2 + 1]; }
+        else { dst[o++] = 0; dst[o++] = 0; }
+        if (mesh.has_tangents) {
+            if (tangents4) for (int k = 0; k < 4; ++k) dst[o++] = tangents4[i * 4 + k];
+            else o += 4;
+        }
+        if (mesh.has_skinning) {
+            if (joints4)   for (int k = 0; k < 4; ++k) dst[o++] = joints4[i * 4 + k];
+            else o += 4;
+            if (weights4)  for (int k = 0; k < 4; ++k) dst[o++] = weights4[i * 4 + k];
+            else o += 4;
+        }
     }
     glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
     glBufferSubData(GL_ARRAY_BUFFER, 0, data.size() * sizeof(float), data.data());
@@ -1054,6 +1875,22 @@ void clear_point_lights() {
     s_point_light_count = 0;
 }
 
+void set_directional_lights(const float dir[][3], const float col[][3], int count) {
+    s_dir_light_count = count < 0 ? 0 : (count > MAX_DIR_LIGHTS ? MAX_DIR_LIGHTS : count);
+    for (int i = 0; i < s_dir_light_count; ++i) {
+        s_dir_light_dir[i][0] = dir[i][0];
+        s_dir_light_dir[i][1] = dir[i][1];
+        s_dir_light_dir[i][2] = dir[i][2];
+        s_dir_light_col[i][0] = col[i][0];
+        s_dir_light_col[i][1] = col[i][1];
+        s_dir_light_col[i][2] = col[i][2];
+    }
+}
+
+void clear_directional_lights() {
+    s_dir_light_count = 0;
+}
+
 void set_depth_fog(bool enabled, const float color[3], float near_dist, float far_dist) {
     s_fog_enabled = enabled;
     if (color) {
@@ -1065,7 +1902,18 @@ void set_depth_fog(bool enabled, const float color[3], float near_dist, float fa
     s_fog_far  = far_dist;
 }
 
+void set_view_flags(bool flat_shade, bool debug_normals) {
+    s_flat_shade = flat_shade;
+    s_debug_normals = debug_normals;
+}
+
 void begin_3d(unsigned int fbo, int w, int h, const Camera& cam) {
+    // Every pass starts with the diagnostics OFF — the scene visualizer opts
+    // into flat/normal view after its begin_3d, so POD previews, thumbnails
+    // and the GM preview can never inherit stale flags.
+    s_flat_shade = false;
+    s_debug_normals = false;
+
     // Save current state for restore in end_3d
     glGetIntegerv(GL_VIEWPORT, s_saved_viewport);
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, (GLint*)&s_saved_fbo);
@@ -1092,6 +1940,8 @@ void begin_3d(unsigned int fbo, int w, int h, const Camera& cam) {
     camera_get_view_matrix(cam, s_view);
     camera_get_projection(cam, aspect, s_proj);
     mat4_multiply(s_vp, s_proj, s_view);
+    s_grid_viewport_h = (float)(h > 0 ? h : 1);
+    s_grid_proj_f     = s_proj[5]; // 1 / tan(fov/2)
 
     // Camera eye position for point-light calculations (inverse view translate).
     s_cam_eye[0] = cam.target[0] + cam.distance * cosf(cam.pitch * 3.14159265358979323846f / 180.0f) * sinf(cam.yaw * 3.14159265358979323846f / 180.0f);
@@ -1102,6 +1952,13 @@ void begin_3d(unsigned int fbo, int w, int h, const Camera& cam) {
 void render_mesh(const GPUMesh& mesh, const float* model_matrix,
                  const float color[4], bool wireframe) {
     if (!mesh.vao || !s_model_prog) return;
+
+    // GL state is global and other passes (contact shadow blobs, glows) can
+    // leave a modified blend function behind — pin ours explicitly so an
+    // opaque mesh can never be rendered through a multiplicative blend (which
+    // turns it black).
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     // Default model = identity
     float model[16];
@@ -1130,10 +1987,33 @@ void render_mesh(const GPUMesh& mesh, const float* model_matrix,
     glUniformMatrix3fv(s_loc_normalmat, 1, GL_FALSE, nmat);
 
     glUniform3fv(s_loc_light_dir, 1, g_light_dir);
-    glUniform3fv(s_loc_light_col, 1, g_light_color);
-    glUniform3fv(s_loc_ambient,   1, g_ambient_color);
+    float lcol[3] = { g_light_color[0] * g_light_scale,
+                      g_light_color[1] * g_light_scale,
+                      g_light_color[2] * g_light_scale };
+    float amb[3] = { g_ambient_color[0] * g_ambient_scale,
+                     g_ambient_color[1] * g_ambient_scale,
+                     g_ambient_color[2] * g_ambient_scale };
+    float ambg[3] = { g_ambient_ground_color[0] * g_ambient_scale,
+                      g_ambient_ground_color[1] * g_ambient_scale,
+                      g_ambient_ground_color[2] * g_ambient_scale };
+    glUniform3fv(s_loc_light_col, 1, lcol);
+    glUniform3fv(s_loc_fill_col,  1, g_fill_color);
+    glUniform1f(s_loc_rim_str,   g_rim_strength);
+    glUniform1f(s_loc_spec_str,  g_spec_strength);
+    glUniform3fv(s_loc_ambient,   1, amb);
+    glUniform3fv(s_loc_amb_ground, 1, ambg);
     glUniform4fv(s_loc_mat_color, 1, col);
     glUniform1f(s_loc_alpha,      col[3]);
+    glUniform1i(s_loc_flat_shade, s_flat_shade ? 1 : 0);
+    glUniform1i(s_loc_dbg_normals, s_debug_normals ? 1 : 0);
+
+    // Directional light array (scene override). When empty the single
+    // editor preview directional (g_light_dir/color) above is used.
+    glUniform1i(s_loc_dir_cnt, s_dir_light_count);
+    if (s_dir_light_count > 0) {
+        glUniform3fv(s_loc_dir_dir, s_dir_light_count, &s_dir_light_dir[0][0]);
+        glUniform3fv(s_loc_dir_col, s_dir_light_count, &s_dir_light_col[0][0]);
+    }
 
     // Point lights + camera position for local warm illumination.
     glUniform1i(s_loc_light_cnt, s_point_light_count);
@@ -1159,6 +2039,9 @@ void render_mesh(const GPUMesh& mesh, const float* model_matrix,
         glUniform1i(s_loc_texture, 0);
     }
 
+    // DCC importers (FBX/glTF) sample bottom-origin textures with v=0-top UVs.
+    glUniform1i(s_loc_flip_v, mesh.flip_uv_v ? 1 : 0);
+
     // Draw
     glBindVertexArray(mesh.vao);
 
@@ -1181,6 +2064,221 @@ void render_mesh(const GPUMesh& mesh, const float* model_matrix,
 
     glBindVertexArray(0);
     glUseProgram(0);
+}
+
+// ============================================================================
+// PBR renderer — vendored algorithms from zauonlok/renderer (MIT, Zhou Le)
+// Reference sources: src/render/zauonlok/ (pbr_shader.c, maths.c)
+// ============================================================================
+
+void pbr_set_joint_matrices(const float* matrices, int count) {
+    count = count < 0 ? 0 : (count > 256 ? 256 : count);
+    if (matrices && count > 0) {
+        std::memcpy(s_pbr_joints, matrices, sizeof(float) * 16 * count);
+    }
+    s_pbr_joint_count = count;
+}
+
+void pbr_set_environment(unsigned int env_cubemap, float intensity) {
+    s_pbr_env_cubemap = env_cubemap;
+    s_pbr_env_intensity = intensity > 0.0f ? intensity : 0.0f;
+}
+
+void pbr_set_env_intensity(float intensity) {
+    s_pbr_env_intensity = intensity > 0.0f ? intensity : 0.0f;
+}
+
+void pbr_set_shadow(const float light_view[16], const float light_proj[16],
+                    unsigned int shadow_depth_tex) {
+    // Light clip matrix = light_proj * light_view (column-major).
+    mat4_multiply(s_shadow_light_vp, light_proj, light_view);
+    s_shadow_depth_tex = shadow_depth_tex;
+}
+
+void pbr_enable_shadows(bool on) {
+    s_shadow_enabled = on;
+}
+
+void pbr_render_mesh(const GPUMesh& mesh, const float* model_matrix,
+                     const PBRMaterial& mat, bool wireframe) {
+    if (!mesh.vao || !s_pbr.prog) return;
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    float model[16];
+    if (model_matrix) std::memcpy(model, model_matrix, 16 * sizeof(float));
+    else mat4_identity(model);
+    float mvp[16], nmat[9];
+    mat4_multiply(mvp, s_vp, model);
+    mat4_normal_matrix(nmat, model);
+
+    glUseProgram(s_pbr.prog);
+
+    glUniformMatrix4fv(s_pbr.mvp,      1, GL_FALSE, mvp);
+    glUniformMatrix4fv(s_pbr.model,    1, GL_FALSE, model);
+    glUniformMatrix3fv(s_pbr.nmat,     1, GL_FALSE, nmat);
+    glUniformMatrix4fv(s_pbr.light_vp, 1, GL_FALSE, s_shadow_light_vp);
+    glUniform1i(s_pbr.flip_v,   mesh.flip_uv_v ? 1 : 0);
+    glUniform1i(s_pbr.has_tan,  mesh.has_tangents ? 1 : 0);
+    // Only skin meshes that actually carry joint attributes (a stale global
+    // count must never make the VS read undefined aJoint/aWeight values).
+    glUniform1i(s_pbr.joint_cnt, mesh.has_skinning ? s_pbr_joint_count : 0);
+    if (s_pbr_joint_count > 0)
+        glUniformMatrix4fv(s_pbr.joints, s_pbr_joint_count, GL_FALSE, s_pbr_joints);
+    glUniform3fv(s_pbr.cam_pos, 1, s_cam_eye);
+
+    glUniform4fv(s_pbr.base_f, 1, mat.base_color);
+    glUniform1f(s_pbr.metal_f, mat.metalness);
+    glUniform1f(s_pbr.rough_f, mat.roughness);
+    glUniform3fv(s_pbr.spec_f, 1, mat.specular);
+    glUniform1f(s_pbr.gloss_f, mat.glossiness);
+    glUniform1f(s_pbr.occ, mat.occlusion);
+    glUniform3fv(s_pbr.emiss, 1, mat.emission);
+    glUniform1i(s_pbr.workflow, mat.workflow);
+    glUniform1f(s_pbr.alpha_cutoff, 0.0f);   // 0 = alpha test disabled (blend instead)
+
+    // Shared light state (same arrays the legacy model path uses).
+    glUniform3fv(s_pbr.light_dir, 1, g_light_dir);
+    float lcol[3] = { g_light_color[0] * g_light_scale,
+                      g_light_color[1] * g_light_scale,
+                      g_light_color[2] * g_light_scale };
+    float amb[3] = { g_ambient_color[0] * g_ambient_scale,
+                     g_ambient_color[1] * g_ambient_scale,
+                     g_ambient_color[2] * g_ambient_scale };
+    float ambg[3] = { g_ambient_ground_color[0] * g_ambient_scale,
+                      g_ambient_ground_color[1] * g_ambient_scale,
+                      g_ambient_ground_color[2] * g_ambient_scale };
+    glUniform3fv(s_pbr.light_col, 1, lcol);
+    glUniform3fv(s_pbr.ambient,   1, amb);
+    glUniform3fv(s_pbr.amb_ground, 1, ambg);
+    glUniform1i(s_pbr.dir_cnt, s_dir_light_count);
+    if (s_dir_light_count > 0) {
+        glUniform3fv(s_pbr.dir_dir, s_dir_light_count, &s_dir_light_dir[0][0]);
+        glUniform3fv(s_pbr.dir_col, s_dir_light_count, &s_dir_light_col[0][0]);
+    }
+    glUniform1i(s_pbr.light_cnt, s_point_light_count);
+    if (s_point_light_count > 0) {
+        glUniform3fv(s_pbr.light_pos,  s_point_light_count, &s_point_light_pos[0][0]);
+        glUniform3fv(s_pbr.light_cols, s_point_light_count, &s_point_light_col[0][0]);
+        glUniform1fv(s_pbr.light_rad,  s_point_light_count, s_point_light_radius);
+    }
+
+    // IBL environment + BRDF LUT + shadow map.
+    glUniform1i(s_pbr.env_has, (s_pbr_env_cubemap != 0) ? 1 : 0);
+    glUniform1f(s_pbr.env_int, s_pbr_env_intensity);
+    glUniform1i(s_pbr.env_mip, 6);   // default env is 64px (LOD 0..6)
+    glUniform1i(s_pbr.shadow_en, (s_shadow_enabled && s_shadow_depth_tex) ? 1 : 0);
+
+    // Material textures (units 0..7), env (8), BRDF LUT (9), shadow (10).
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, mat.basecolor_tex ? mat.basecolor_tex : mesh.texture_id);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, mat.metalness_tex);
+    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, mat.roughness_tex);
+    glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, mat.normal_tex);
+    glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, mat.occlusion_tex);
+    glActiveTexture(GL_TEXTURE5); glBindTexture(GL_TEXTURE_2D, mat.emission_tex);
+    glActiveTexture(GL_TEXTURE6); glBindTexture(GL_TEXTURE_2D, mat.specular_tex);
+    glActiveTexture(GL_TEXTURE7); glBindTexture(GL_TEXTURE_2D, mat.glossiness_tex);
+    glActiveTexture(GL_TEXTURE8); glBindTexture(GL_TEXTURE_CUBE_MAP, s_pbr_env_cubemap);
+    glActiveTexture(GL_TEXTURE9); glBindTexture(GL_TEXTURE_2D, s_pbr_brdf_lut);
+    glActiveTexture(GL_TEXTURE10); glBindTexture(GL_TEXTURE_2D, s_shadow_depth_tex);
+    glActiveTexture(GL_TEXTURE0);
+
+    glUniform1i(s_pbr.has_base,  (mat.basecolor_tex || mesh.texture_id) ? 1 : 0);
+    glUniform1i(s_pbr.has_metal, mat.metalness_tex ? 1 : 0);
+    glUniform1i(s_pbr.has_rough, mat.roughness_tex ? 1 : 0);
+    glUniform1i(s_pbr.has_nmap,  mat.normal_tex ? 1 : 0);
+    glUniform1i(s_pbr.has_occ,   mat.occlusion_tex ? 1 : 0);
+    glUniform1i(s_pbr.has_emiss, mat.emission_tex ? 1 : 0);
+    glUniform1i(s_pbr.has_spec,  mat.specular_tex ? 1 : 0);
+    glUniform1i(s_pbr.has_gloss, mat.glossiness_tex ? 1 : 0);
+
+    glBindVertexArray(mesh.vao);
+    if (wireframe) {
+        glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+        glDisable(GL_CULL_FACE);
+    }
+    if (mesh.ebo) {
+        glDrawElements(GL_TRIANGLES, mesh.index_count, GL_UNSIGNED_INT, nullptr);
+    } else {
+        glDrawArrays(GL_TRIANGLES, 0, mesh.index_count);
+    }
+    if (wireframe) {
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        glDisable(GL_CULL_FACE);
+    }
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
+// ── Directional shadow-map pass ──
+
+unsigned int create_shadow_fbo(int width, int height, unsigned int* out_depth_tex) {
+    GLuint fbo = 0, depth = 0;
+    glGenFramebuffers(1, &fbo);
+    glGenTextures(1, &depth);
+    glBindTexture(GL_TEXTURE_2D, depth);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, width, height, 0,
+                 GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth, 0);
+    glDrawBuffer(GL_NONE);
+    glReadBuffer(GL_NONE);
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        glDeleteTextures(1, &depth);
+        glDeleteFramebuffers(1, &fbo);
+        fprintf(stderr, "[av_renderer] shadow FBO incomplete (0x%x).\n", status);
+        return 0;
+    }
+    if (out_depth_tex) *out_depth_tex = depth;
+    return fbo;
+}
+
+void begin_shadow_pass(unsigned int fbo, int w, int h) {
+    if (!s_shadow_prog) return;
+    glGetIntegerv(GL_VIEWPORT, s_shadow_saved_viewport);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, (GLint*)&s_shadow_saved_fbo);
+    s_shadow_saved_blend   = (glIsEnabled(GL_BLEND) != GL_FALSE);
+    s_shadow_saved_scissor = (glIsEnabled(GL_SCISSOR_TEST) != GL_FALSE);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, w, h);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glUseProgram(s_shadow_prog);
+    glUniformMatrix4fv(s_shadow_loc_vp, 1, GL_FALSE, s_shadow_light_vp);
+}
+
+void end_shadow_pass() {
+    glUseProgram(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, s_shadow_saved_fbo);
+    glViewport(s_shadow_saved_viewport[0], s_shadow_saved_viewport[1],
+               s_shadow_saved_viewport[2], s_shadow_saved_viewport[3]);
+    if (s_shadow_saved_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (s_shadow_saved_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+}
+
+void shadow_render_mesh(const GPUMesh& mesh, const float* model_matrix) {
+    if (!mesh.vao || !s_shadow_prog) return;
+    float model[16];
+    if (model_matrix) std::memcpy(model, model_matrix, 16 * sizeof(float));
+    else mat4_identity(model);
+    glUniformMatrix4fv(s_shadow_loc_model, 1, GL_FALSE, model);
+    glBindVertexArray(mesh.vao);
+    if (mesh.ebo) {
+        glDrawElements(GL_TRIANGLES, mesh.index_count, GL_UNSIGNED_INT, nullptr);
+    } else {
+        glDrawArrays(GL_TRIANGLES, 0, mesh.index_count);
+    }
+    glBindVertexArray(0);
 }
 
 void render_lines(const float* positions, int vertex_count, const float color[4],
@@ -1209,7 +2307,8 @@ void render_lines(const float* positions, int vertex_count, const float color[4]
     glUniformMatrix4fv(s_loc_mvp, 1, GL_FALSE, mvp); glUniformMatrix4fv(s_loc_model, 1, GL_FALSE, model);
     glUniformMatrix3fv(s_loc_normalmat, 1, GL_FALSE, normal);
     glUniform1i(s_loc_has_tex, 0); glUniform4fv(s_loc_mat_color, 1, color); glUniform1f(s_loc_alpha, color[3]);
-    glUniform3f(s_loc_light_dir, 0, 0, 0); glUniform3f(s_loc_light_col, 0, 0, 0); glUniform3f(s_loc_ambient, 1, 1, 1);
+    glUniform3f(s_loc_light_dir, 0, 0, 0); glUniform3f(s_loc_light_col, 0, 0, 0);
+    glUniform3f(s_loc_ambient, 1, 1, 1); glUniform3f(s_loc_amb_ground, 1, 1, 1);
     glLineWidth(width); glDrawArrays(GL_LINES, 0, vertex_count); glLineWidth(1.0f);
     glBindVertexArray(0); glDeleteBuffers(1, &vbo); glDeleteVertexArrays(1, &vao); glUseProgram(0);
 }
@@ -1235,6 +2334,10 @@ void render_grid(float size, float y_level) {
     glUniformMatrix4fv(s_loc_grid_model, 1, GL_FALSE, model);
     glUniform1f(s_loc_grid_size, size);
     glUniform4f(s_loc_grid_color, 0.4f, 0.4f, 0.5f, 0.5f);
+    // World-units-per-pixel on the plane: makes line spacing adaptive to zoom.
+    const float plane_dist = fabsf(s_cam_eye[1] - y_level);
+    const float wpp = (2.0f * plane_dist) / (s_grid_proj_f * s_grid_viewport_h);
+    if (s_loc_grid_scale >= 0) glUniform1f(s_loc_grid_scale, wpp);
 
     // Grid is translucent — disable depth write, keep depth test
     glDepthMask(GL_FALSE);
@@ -1423,13 +2526,106 @@ void render_water_sheet(const WaterSheetData& ws, const float* model_matrix,
 void render_point_light_glows() {
     for (int i = 0; i < s_point_light_count; ++i) {
         float bright[3] = {
-            s_point_light_col[i][0] * 1.8f + 0.12f,
-            s_point_light_col[i][1] * 1.8f + 0.12f,
-            s_point_light_col[i][2] * 1.8f + 0.12f,
+            s_point_light_col[i][0] * 1.5f + 0.10f,
+            s_point_light_col[i][1] * 1.5f + 0.10f,
+            s_point_light_col[i][2] * 1.5f + 0.10f,
         };
-        const float size = std::max(14.0f, s_point_light_radius[i] * 0.22f);
+        // Compact emitter marker: the sprite size tracks the camera distance
+        // (roughly constant on screen) so the light reads as a small billboard
+        // AT the source — NOT as a scaled copy of the (large) influence
+        // radius. The bright core still feeds the PostFX bloom bright-pass.
+        const float dx = s_point_light_pos[i][0] - s_cam_eye[0];
+        const float dy = s_point_light_pos[i][1] - s_cam_eye[1];
+        const float dz = s_point_light_pos[i][2] - s_cam_eye[2];
+        const float cam_dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+        const float size = std::min(std::max(cam_dist * 0.045f, 6.0f), 30.0f);
         render_glow_sprite(s_point_light_pos[i], bright, size);
     }
+}
+
+void render_light_debug() {
+    if (s_point_light_count <= 0) return;
+    // Editor-oriented debug overlay: a small emitter axis marker plus the
+    // influence-radius ring at every uploaded point light. Separate from the
+    // actual illumination — the ring never "is" the light.
+    const int kSegs = 48;
+    std::vector<float> segs;
+    for (int i = 0; i < s_point_light_count; ++i) {
+        const float r  = std::max(s_point_light_radius[i], 1.0f);
+        const float cx = s_point_light_pos[i][0];
+        const float cy = s_point_light_pos[i][1];
+        const float cz = s_point_light_pos[i][2];
+        segs.clear();
+        for (int k = 0; k < kSegs; ++k) {
+            const float a0 = (float)k / kSegs * 2.0f * PI;
+            const float a1 = (float)(k + 1) / kSegs * 2.0f * PI;
+            segs.push_back(cx + std::cos(a0) * r); segs.push_back(cy); segs.push_back(cz + std::sin(a0) * r);
+            segs.push_back(cx + std::cos(a1) * r); segs.push_back(cy); segs.push_back(cz + std::sin(a1) * r);
+        }
+        // Vertical emitter axis: a small cross through the source position.
+        segs.push_back(cx); segs.push_back(cy - r * 0.30f); segs.push_back(cz);
+        segs.push_back(cx); segs.push_back(cy + r * 0.30f); segs.push_back(cz);
+        segs.push_back(cx - r * 0.30f); segs.push_back(cy); segs.push_back(cz);
+        segs.push_back(cx + r * 0.30f); segs.push_back(cy); segs.push_back(cz);
+
+        float col[4] = {
+            s_point_light_col[i][0] * 0.7f + 0.20f,
+            s_point_light_col[i][1] * 0.7f + 0.20f,
+            s_point_light_col[i][2] * 0.7f + 0.20f,
+            0.45f,
+        };
+        render_lines(segs.data(), (int)(segs.size() / 3), col, nullptr, 1.0f);
+    }
+}
+
+void render_shadow_blob(const float pos[3], float width_radius, float depth_radius,
+                        float rot_y, const float color[3]) {
+    if (!s_glow_prog || !s_glow_vao) return;
+
+    // Ground-aligned ellipse: scale the unit quad by the two radii, then
+    // flatten it onto the ground plane (Y up), rotated by the object Y-rot.
+    const float wx = width_radius;
+    const float wz = depth_radius;
+    const float c = std::cos(rot_y), s = std::sin(rot_y);
+    float M[16] = {0};
+    M[0]  = wx * c;  M[4] = -wz * s;  M[8]  = 0.0f;  M[12] = pos[0];
+    M[1]  = 0.0f;    M[5] =  0.0f;    M[9]  = 0.0f;  M[13] = pos[1];
+    M[2]  = wx * s;  M[6] =  wz * c;  M[10] = 0.0f;  M[14] = pos[2];
+    M[3]  = 0.0f;    M[7] =  0.0f;    M[11] = 0.0f;  M[15] = 1.0f;
+
+    float mvp[16];
+    mat4_multiply(mvp, s_vp, M);
+
+    glUseProgram(s_glow_prog);
+    glUniformMatrix4fv(s_glow_loc_mvp, 1, GL_FALSE, mvp);
+    glUniform3fv(s_glow_loc_color, 1, color);
+
+    glUseProgram(s_glow_prog);
+    glUniformMatrix4fv(s_glow_loc_mvp, 1, GL_FALSE, mvp);
+    // Color is black; the alpha (falloff) darkens dest via GL_DST_COLOR-free
+    // multiply: out = dst * (1 - src_alpha_falloff).
+    glUniform3f(s_glow_loc_color, color[0], color[1], color[2]);
+
+    // Soft contact shadow: multiply the ground color by the shadow coverage.
+    // out.rgb = src.rgb (0) + dst.rgb * (1 - src.a). Shader alpha = falloff.
+    // NOTE: this overrides the global blend function — it MUST be restored,
+    // otherwise every later draw (e.g. the Hiro model, whose opaque fragments
+    // have alpha 1.0) computes dst*(1-1) = 0 and renders BLACK. That was the
+    // "black hero" bug: the shadow blob corrupted the blend right before the
+    // character drew.
+    GLint prev_src = 0, prev_dst = 0;
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &prev_src);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &prev_dst);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glBindVertexArray(s_glow_vao);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+    glBindVertexArray(0);
+    glDepthMask(GL_TRUE);
+    glBlendFunc((GLenum)prev_src, (GLenum)prev_dst);   // restore caller's blend
+    glUseProgram(0);
 }
 
 void render_grid_xy(float size, float z_level) {
@@ -1450,6 +2646,9 @@ void render_grid_xy(float size, float z_level) {
     glUniformMatrix4fv(s_loc_grid_model, 1, GL_FALSE, model);
     glUniform1f(s_loc_grid_size, size);
     glUniform4f(s_loc_grid_color, 0.35f, 0.42f, 0.55f, 0.5f);
+    const float plane_dist = fabsf(s_cam_eye[2] - z_level);
+    const float wpp = (2.0f * plane_dist) / (s_grid_proj_f * s_grid_viewport_h);
+    if (s_loc_grid_scale >= 0) glUniform1f(s_loc_grid_scale, wpp);
     glDepthMask(GL_FALSE);
     glDisable(GL_CULL_FACE);
     glBindVertexArray(s_grid_vao);

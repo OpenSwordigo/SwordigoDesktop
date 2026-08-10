@@ -413,6 +413,7 @@ float g_sre_walk_speed = 1.0f;
 float g_sre_run_speed = 1.0f;
 float g_sre_jump_height = 1.0f;
 int   g_sre_move_direction = 0;  /* 0=stopped, -1=left, 1=right */
+volatile float g_sre_z_walk_axis = 0.0f;
 
 static void* sre_get_hero_cc(lua_State* L);
 
@@ -1896,6 +1897,14 @@ static int l_mini_arch(lua_State* L) {
 /* Mini.GetProfileID() → string (UUID of current save) */
 static int l_mini_get_profile_id(lua_State* L) {
     g_lua_pushstring(L, g_sre_mod_profile_id);
+    return 1;
+}
+
+/* Mini.HostZAxis() → number (-1..1) — host keyboard Z-walk axis.
+ * +1 while W is held (front), -1 while S is held (back), else 0. */
+static int l_mini_host_z_axis(lua_State* L) {
+    (void)L;
+    g_lua_pushnumber(L, (lua_Number)g_sre_z_walk_axis);
     return 1;
 }
 
@@ -3879,6 +3888,9 @@ void sre_register_mini_api(lua_State* L) {
 
     g_lua_pushcclosure(L, l_mini_get_profile_id, 0);
     g_lua_setfield(L, -2, "GetProfileID");
+
+    g_lua_pushcclosure(L, l_mini_host_z_axis, 0);
+    g_lua_setfield(L, -2, "HostZAxis");
 
     g_lua_pushcclosure(L, l_mini_set_controls_hidden, 0);
     g_lua_setfield(L, -2, "SetControlsHidden");
@@ -5878,6 +5890,9 @@ void sre_mini_ensure_injected(lua_State* L) {
                     "end\n"
                 );
             }
+
+            /* Lazy-spawn the Z-walk coroutine once Program.NewThread exists */
+            sre_eval_lua(L, "if _G.sre_ensure_zwalk_loop then _G.sre_ensure_zwalk_loop() end\n");
             return;
         }
     }
@@ -5915,6 +5930,103 @@ void sre_mini_ensure_injected(lua_State* L) {
     sre_register_pack_lib(L);
     extern void sre_register_raknet_lib(lua_State* L);
     sre_register_raknet_lib(L);
+
+    /* Port of redstell's front/back Z-walk mod (hiro.scl): W/S drive Z-depth
+     * movement using the exact same game API calls (GameControlButtonDown/Up,
+     * ModelTransformController.SetRotationAngle, hero velocity/position,
+     * Camera.JumpToFocus, Entity.SetFacingDirection). Reads the host keyboard
+     * axis via Mini.HostZAxis() and runs as a per-frame coroutine so the
+     * press/hold/release semantics match the original onTouch/onHeld handlers.
+     * Spawned lazily: only once Program.NewThread is available (the game
+     * registers the Program table during RegisterProgramLibrary), and retried
+     * on later lua_calls via sre_ensure_zwalk_loop(). */
+    sre_eval_lua(L,
+        "_G.sre_ensure_zwalk_loop = function()\n"
+        "  if _G.__sre_zwalk_started then return end\n"
+        "  if not (Program and Program.NewThread) then return end\n"
+        "  _G.__sre_zwalk_started = true\n"
+        "  local function sre_zwalk_hero()\n"
+        "    local h = rawget(_G, 'hero')\n"
+        "    if h and type(h) == 'userdata' then return h end\n"
+        "    if Scene and Scene.Find then\n"
+        "      local ok, r = pcall(Scene.Find, 'hero')\n"
+        "      if ok and r and type(r) == 'userdata' then return r end\n"
+        "    end\n"
+        "    return nil\n"
+        "  end\n"
+        "  local function sre_zwalk_safe(fn)\n"
+        "    local ok, err = pcall(fn)\n"
+        "    if not ok then print('sre_zwalk:', err) end\n"
+        "    return ok\n"
+        "  end\n"
+        "  Program.NewThread('sre_zwalk_loop', function()\n"
+        "    local prev_front = false\n"
+        "    local prev_back = false\n"
+        "    while true do\n"
+        "      local axis = 0\n"
+        "      if Mini and Mini.HostZAxis then\n"
+        "        local ok, v = pcall(Mini.HostZAxis)\n"
+        "        if ok and type(v) == 'number' then axis = v end\n"
+        "      end\n"
+        "      local hero = sre_zwalk_hero()\n"
+        "      local in_game = true\n"
+        "      if Game and Game.CurrentLevelName then\n"
+        "        local ok, lvl = pcall(Game.CurrentLevelName)\n"
+        "        if ok and (lvl == 'menu' or lvl == 'hero') then in_game = false end\n"
+        "      end\n"
+        "      local front = axis > 0.5\n"
+        "      local back = axis < -0.5\n"
+        "      if hero and in_game then\n"
+        "        if front and not prev_front then\n"
+        "          sre_zwalk_safe(function()\n"
+        "            GameController.GameControlButtonDown(2)\n"
+        "            hero:setVelocity(Vector3.New(-10, hero:velocity():y(), 0))\n"
+        "          end)\n"
+        "        elseif back and not prev_back then\n"
+        "          sre_zwalk_safe(function()\n"
+        "            GameController.GameControlButtonDown(1)\n"
+        "            hero:setVelocity(Vector3.New(10, hero:velocity():y(), 0))\n"
+        "          end)\n"
+        "        end\n"
+        "        if front then\n"
+        "          sre_zwalk_safe(function()\n"
+        "            ModelTransformController.SetRotationAngle(hero, 90)\n"
+        "            hero:setVelocity(Vector3.New(-10, hero:velocity():y(), 0))\n"
+        "            hero:setPosition(hero:position() + Vector3.New(0, 0, -10))\n"
+        "            Camera.JumpToFocus()\n"
+        "            Entity.SetFacingDirection(hero, 0)\n"
+        "          end)\n"
+        "        elseif back then\n"
+        "          sre_zwalk_safe(function()\n"
+        "            ModelTransformController.SetRotationAngle(hero, 90)\n"
+        "            hero:setVelocity(Vector3.New(10, hero:velocity():y(), 0))\n"
+        "            hero:setPosition(hero:position() + Vector3.New(0, 0, 10))\n"
+        "            Camera.JumpToFocus()\n"
+        "            Entity.SetFacingDirection(hero, 0)\n"
+        "          end)\n"
+        "        end\n"
+        "        if prev_front and not front then\n"
+        "          sre_zwalk_safe(function() GameController.GameControlButtonUp(2) end)\n"
+        "        end\n"
+        "        if prev_back and not back then\n"
+        "          sre_zwalk_safe(function() GameController.GameControlButtonUp(1) end)\n"
+        "        end\n"
+        "      else\n"
+        "        if prev_front then\n"
+        "          sre_zwalk_safe(function() GameController.GameControlButtonUp(2) end)\n"
+        "        end\n"
+        "        if prev_back then\n"
+        "          sre_zwalk_safe(function() GameController.GameControlButtonUp(1) end)\n"
+        "        end\n"
+        "      end\n"
+        "      prev_front = front\n"
+        "      prev_back = back\n"
+        "      if Program and Program.Wait then pcall(Program.Wait, 0) end\n"
+        "    end\n"
+        "  end)\n"
+        "end\n"
+        "sre_ensure_zwalk_loop()\n"
+    );
 
     /* Register luasocket, luamime, luafilesystem, and toml in package.preload */
     g_lua_getfield(L, LUA_GLOBALSINDEX, "package");
@@ -6282,4 +6394,3 @@ void sre_mini_ensure_injected(lua_State* L) {
         g_injected_states[g_injected_count++] = L;
     }
 }
-

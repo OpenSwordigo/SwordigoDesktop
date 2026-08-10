@@ -79,6 +79,7 @@ bool Display::init(int w, int h, const std::string& title) {
     
     SDL_GL_MakeCurrent(window, gl_context);
     SDL_GL_SetSwapInterval(1); // VSync
+    sword_init_gl_after();
     
     // Log both logical and physical pixel dimensions for HiDPI awareness
     int phys_w, phys_h;

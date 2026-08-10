@@ -11,15 +11,15 @@
 #include "srt_overlay.h"
 #include "gui.h"
 
-#include <GL/gl.h>
+#include "platform/gl_inc.h"
 #include <fstream>
 #include <iostream>
 #include <algorithm>
 #include <sstream>
 #include <cstring>
 #include <cmath>
-#include <dirent.h>
-#include <sys/stat.h>
+#include <filesystem>
+#include <vector>
 
 // ============================================================================
 // Minimal Protobuf Wire Format Parser/Writer
@@ -492,22 +492,14 @@ void SrtOverlay::draw_item_button(GuiRenderer& gui, float x, float y, float w, f
 void SrtOverlay::scan_saves() {
     save_files.clear();
     std::string eff_dir = get_vfs_save_dir(save_dir);
-    DIR* dir = opendir(eff_dir.c_str());
-    if (!dir) return;
-
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string name(entry->d_name);
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_directory(eff_dir, ec)) return;
+    for (const auto& entry : fs::directory_iterator(eff_dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        std::string name = entry.path().filename().string();
         if (name.size() > 8 && name.substr(name.size() - 8) == ".gplayer") {
-            // Skip backup files (ending in _b0, _b1, etc.)
-            size_t underscore = name.rfind('_');
-            if (underscore != std::string::npos) {
-                std::string suffix = name.substr(underscore);
-                if (suffix.size() >= 3 && suffix[1] == 'b' && suffix.back() == 'r') {
-                    // Could be _b0.gplayer — check more carefully
-                    // Actually just check if it has _b followed by digit
-                }
-            }
             // Only include if name doesn't contain "_b" followed by a digit before .gplayer
             bool is_backup = false;
             size_t bp = name.rfind("_b");
@@ -519,8 +511,8 @@ void SrtOverlay::scan_saves() {
                 save_files.push_back(name);
             }
         }
+        ec.clear();
     }
-    closedir(dir);
     std::sort(save_files.begin(), save_files.end());
 }
 

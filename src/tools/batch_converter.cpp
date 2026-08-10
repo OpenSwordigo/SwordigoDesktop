@@ -27,7 +27,8 @@
  *     - Gzip compression (wrapped dynamically for .tex.png assets)
  */
 
-#define STB_IMAGE_IMPLEMENTATION
+// stb_image implementation is provided by embedded_assets.cpp (swcore); only
+// declare here to avoid duplicate STB_IMAGE_IMPLEMENTATION symbols.
 #include "stb/stb_image.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -53,10 +54,12 @@
 #include <string>
 #include <map>
 #include <cassert>
+#ifndef BATCH_CONVERTER_NO_UI
 #include <SDL3/SDL.h>
 
 // imgui.h must be included OUTSIDE any namespace
 #include "imgui.h"
+#endif
 
 namespace fs = std::filesystem;
 namespace batch {
@@ -81,21 +84,40 @@ struct PVRv3Hdr {
     uint32_t metadata_sz  = 0;
 };
 
+// Game-compatible legacy 52-byte PVR v2-style header. The game's
+// PVRTTextureLoadFromPointer ONLY accepts files whose first u32 == 52 and
+// rejects PVR v3 ("PVR\3") containers entirely, so every .pvr we write for
+// the game must use this exact layout (flags low byte = format, magic at +44).
 struct PVRv2Hdr {
-    uint32_t header_size;
+    uint32_t header_size; // = 52
     uint32_t height;
     uint32_t width;
-    uint32_t mip_count;
-    uint32_t flags;
-    uint32_t data_size;
-    uint32_t bpp;
+    uint32_t mip_count;   // = 1
+    uint32_t flags;       // low byte = format (0x36 ETC1, 0x12 RGBA8888)
+    uint32_t data_size;   // compressed bytes per surface
+    uint32_t bpp;         // bits/pixel (4 for ETC1, 32 for RGBA8888)
     uint32_t mask_r;
     uint32_t mask_g;
     uint32_t mask_b;
-    uint32_t magic;
-    uint32_t num_surfaces;
+    uint32_t mask_a;
+    uint32_t magic;       // 0x21525650 "PVR!"
+    uint32_t num_surfaces; // = 1
 };
 #pragma pack(pop)
+
+static PVRv2Hdr make_v2_pvr_hdr(uint32_t w, uint32_t height, uint32_t flags_, uint32_t data_size, uint32_t bpp) {
+    PVRv2Hdr h{};
+    h.header_size  = 52;
+    h.height       = height;
+    h.width        = w;
+    h.mip_count    = 1;
+    h.flags        = flags_;
+    h.data_size    = data_size;
+    h.bpp          = bpp;
+    h.magic        = 0x21525650; // "PVR!"
+    h.num_surfaces = 1;
+    return h;
+}
 
 #define PVR3_FMT_ETC1      6ULL
 #define PVR3_FMT_RGBA8888  0x0808080861626772ULL
@@ -730,15 +752,28 @@ static void do_import_file(BatchState& bs,
                                 ((uint64_t)pvr_c3 << 24) | ((uint64_t)pvr_c2 << 16) |
                                 ((uint64_t)pvr_c1 << 8)  | (uint64_t)pvr_c0;
 
-        PVRv3Hdr hdr;
-        hdr.pixel_format = pixel_format;
-        hdr.width        = (uint32_t)w;
-        hdr.height       = (uint32_t)h;
-
         size_t bpp = (pvr_d0 + pvr_d1 + pvr_d2 + pvr_d3 + 7) / 8;
-        pvr_raw.resize(sizeof(PVRv3Hdr) + w * h * bpp);
-        memcpy(pvr_raw.data(), &hdr, sizeof(PVRv3Hdr));
-        uint8_t* dst = pvr_raw.data() + sizeof(PVRv3Hdr);
+
+        // Game-compatible 52-byte v2 header for RGBA8888 (the only uncompressed
+        // format the game loader has); legacy luminance/sub-layout formats keep
+        // the v3 container for round-trip fidelity.
+        PVRv3Hdr v3hdr;
+        v3hdr.pixel_format = pixel_format;
+        v3hdr.width        = (uint32_t)w;
+        v3hdr.height       = (uint32_t)h;
+
+        uint8_t* dst = nullptr;
+        if (pvr_c0 == 'r' && pvr_c1 == 'g' && pvr_c2 == 'b' && pvr_c3 == 'a' &&
+            pvr_d0 == 8 && pvr_d1 == 8 && pvr_d2 == 8 && pvr_d3 == 8) {
+            PVRv2Hdr hdr = make_v2_pvr_hdr((uint32_t)w, (uint32_t)h, 0x12, (uint32_t)(w * h * 4), 32);
+            pvr_raw.resize(sizeof(PVRv2Hdr) + w * h * bpp);
+            memcpy(pvr_raw.data(), &hdr, sizeof(PVRv2Hdr));
+            dst = pvr_raw.data() + sizeof(PVRv2Hdr);
+        } else {
+            pvr_raw.resize(sizeof(PVRv3Hdr) + w * h * bpp);
+            memcpy(pvr_raw.data(), &v3hdr, sizeof(PVRv3Hdr));
+            dst = pvr_raw.data() + sizeof(PVRv3Hdr);
+        }
 
         if (pvr_c0 == 'r' && pvr_c1 == 'g' && pvr_c2 == 'b' && pvr_c3 == 'a' && pvr_d0 == 8) {
             // RGBA8888
@@ -816,14 +851,10 @@ static void do_import_file(BatchState& bs,
             int bh = (h + 3) / 4;
             size_t etc1_bytes = (size_t)bw * bh * 8;
 
-            PVRv3Hdr hdr;
-            hdr.pixel_format = PVR3_FMT_ETC1;
-            hdr.width        = (uint32_t)w;
-            hdr.height       = (uint32_t)h;
-
-            pvr_raw.resize(sizeof(PVRv3Hdr) + etc1_bytes, 0);
-            memcpy(pvr_raw.data(), &hdr, sizeof(PVRv3Hdr));
-            uint8_t* out_blocks = pvr_raw.data() + sizeof(PVRv3Hdr);
+            PVRv2Hdr hdr = make_v2_pvr_hdr((uint32_t)w, (uint32_t)h, 0x36, (uint32_t)etc1_bytes, 4);
+            pvr_raw.resize(sizeof(PVRv2Hdr) + etc1_bytes, 0);
+            memcpy(pvr_raw.data(), &hdr, sizeof(PVRv2Hdr));
+            uint8_t* out_blocks = pvr_raw.data() + sizeof(PVRv2Hdr);
 
             int pw = bw * 4, ph = bh * 4;
             std::vector<uint8_t> padded((size_t)pw * ph * 4, 0);
@@ -844,15 +875,11 @@ static void do_import_file(BatchState& bs,
             }
             encode_ok = !bs.cancel_flag.load();
         } else {
-            PVRv3Hdr hdr;
-            hdr.pixel_format = PVR3_FMT_RGBA8888;
-            hdr.width        = (uint32_t)w;
-            hdr.height       = (uint32_t)h;
-
             size_t px_bytes = (size_t)w * h * 4;
-            pvr_raw.resize(sizeof(PVRv3Hdr) + px_bytes);
-            memcpy(pvr_raw.data(), &hdr, sizeof(PVRv3Hdr));
-            memcpy(pvr_raw.data() + sizeof(PVRv3Hdr), rgba, px_bytes);
+            PVRv2Hdr hdr = make_v2_pvr_hdr((uint32_t)w, (uint32_t)h, 0x12, (uint32_t)px_bytes, 32);
+            pvr_raw.resize(sizeof(PVRv2Hdr) + px_bytes);
+            memcpy(pvr_raw.data(), &hdr, sizeof(PVRv2Hdr));
+            memcpy(pvr_raw.data() + sizeof(PVRv2Hdr), rgba, px_bytes);
             encode_ok = true;
         }
     }
@@ -929,6 +956,10 @@ static std::vector<ConvTask> collect_tasks(const BatchState& bs) {
                 dst_name = name + ".png";
             } else if (bs.filter_texpng && lower.find(".tex.png") != std::string::npos) {
                 dst_name = name + ".png";
+            } else if (bs.filter_tex && lower.size() > 4 && lower.substr(lower.size()-4) == ".tex" && lower.find(".tex.png") == std::string::npos) {
+                // Raw .tex container (gzip: 12-byte header + pixels) → PNG.
+                // atlon.tex → atlon.tex.png (same convention as .tex.png).
+                dst_name = name + ".png";
             } else {
                 return;
             }
@@ -938,6 +969,15 @@ static std::vector<ConvTask> collect_tasks(const BatchState& bs) {
                 out_texpng = false;
             } else if (bs.filter_texppng && lower.size() > 12 && lower.substr(lower.size()-12) == ".tex.png.png") {
                 dst_name = name.substr(0, name.size() - 4);
+                out_texpng = true;
+            } else if (bs.filter_texpng && lower.size() > 8 &&
+                       lower.substr(lower.size()-8) == ".tex.png" &&
+                       !(lower.size() > 12 &&
+                         lower.substr(lower.size()-12) == ".tex.png.png")) {
+                // A .tex.png that is NOT a .tex.png.png export is the PNG form
+                // of a raw .tex source (atlon.tex → atlon.tex.png). Import it
+                // back as the raw .tex container.
+                dst_name = name.substr(0, name.size() - 4);   // atlon.tex.png → atlon.tex
                 out_texpng = true;
             } else {
                 return;
@@ -1107,6 +1147,46 @@ void shutdown_batch(BatchState& bs) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// §10b  Headless CLI entry (used by bin/ruby_cli batch) — no ImGui required.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+int run_batch_headless(BatchState& bs) {
+    if (bs.src_dir[0] == '\0' || bs.dst_dir[0] == '\0') {
+        std::fprintf(stderr, "batch: source and destination directories are required\n");
+        return -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(bs.log_mutex);
+        bs.log.clear();
+        bs.results.clear();
+        bs.current_file.clear();
+        bs.metadata_export.clear();
+    }
+    bs.total_files.store(0);
+    bs.done_files.store(0);
+    bs.ok_count.store(0);
+    bs.err_count.store(0);
+    bs.cancel_flag.store(false);
+    bs.finished.store(false);
+
+    worker_thread(&bs, wall_ms());
+
+    {
+        std::lock_guard<std::mutex> lk(bs.log_mutex);
+        for (auto& entry : bs.log) {
+            std::printf("%s\n", entry.text.c_str());
+        }
+    }
+    std::fflush(stdout);
+
+    if (bs.total_files.load() == 0) return 1;
+    if (bs.err_count.load() > 0)    return 1;
+    return 0;
+}
+
+#ifndef BATCH_CONVERTER_NO_UI
+// ═══════════════════════════════════════════════════════════════════════════════
 // §11  ImGui UI — Professional Batch Converter window
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1177,6 +1257,8 @@ void draw_batch_converter(BatchState& bs, double now_sec) {
         ImGui::SameLine(140.0f);
         ImGui::Checkbox(".pvr##exp",     &bs.filter_pvr);
         ImGui::SameLine();
+        ImGui::Checkbox(".tex##exp",     &bs.filter_tex);
+        ImGui::SameLine();
         ImGui::Checkbox(".tex.png##exp", &bs.filter_texpng);
     } else {
         ImGui::TextUnformatted("Convert:");
@@ -1184,6 +1266,8 @@ void draw_batch_converter(BatchState& bs, double now_sec) {
         ImGui::Checkbox(".pvr.png  → .pvr##imp",         &bs.filter_pvrpng);
         ImGui::SameLine();
         ImGui::Checkbox(".tex.png.png  → .tex.png##imp", &bs.filter_texppng);
+        ImGui::SameLine();
+        ImGui::Checkbox(".tex.png → .tex##imp",          &bs.filter_texpng);
     }
 
     ImGui::Spacing();
@@ -1337,5 +1421,7 @@ void draw_batch_converter(BatchState& bs, double now_sec) {
 
     ImGui::EndPopup();
 }
+
+#endif // BATCH_CONVERTER_NO_UI
 
 } // namespace batch

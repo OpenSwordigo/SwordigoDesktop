@@ -34,6 +34,15 @@ BIN_DIR := bin
 LIB_DIR := bin/libs
 BUILD   := build
 
+# Unicorn is optional and runtime-loaded (see src/platform/unicorn_dyn.cpp).
+# Link against it only when the dev package is installed; a build without it
+# is fine — the loader finds libunicorn.so at runtime or falls back to Dynarmic.
+ifeq ($(shell $(CXX) -print-file-name=libunicorn.so 2>/dev/null | grep -q libunicorn && echo yes),yes)
+UNICORN_LINK := -lunicorn
+else
+UNICORN_LINK :=
+endif
+
 # ============================================================================
 # Common compiler flags
 # ============================================================================
@@ -63,6 +72,7 @@ ZLIB_LIBS    := $(shell pkg-config --libs   zlib 2>/dev/null || echo "-lz")
 OAL_LIBS     := $(shell pkg-config --libs   openal 2>/dev/null || echo "-lopenal")
 
 ALL_CXXFLAGS := $(COMMON_CXXFLAGS) $(SDL3_CFLAGS) $(SDL3I_CFLAGS) $(VORB_CFLAGS) $(MP3_CFLAGS)
+ALL_CXXFLAGS += -Isrc/tools/ufbx
 ALL_CFLAGS   := $(COMMON_CFLAGS)   $(SDL3_CFLAGS)
 
 # -fPIC for shared objects (host side)
@@ -84,6 +94,10 @@ DYNARMIC_BUILD := $(DYNARMIC_DIR)/build
 # interpreter (~50-100x slower) — "lags like hell".
 ALL_CXXFLAGS += -DUSE_DYNARMIC -DSWORDIGO_HAS_DYNARMIC -I$(DYNARMIC_DIR)/src
 SO_CXXFLAGS  += -DUSE_DYNARMIC -DSWORDIGO_HAS_DYNARMIC -I$(DYNARMIC_DIR)/src
+
+# Lua 5.1 headers for the SCL Lua AI host (scene_lua.cpp). The VM itself is
+# already embedded in libfilerift.so — ruby only needs the headers.
+ALL_CXXFLAGS += -Isrc/sre/lua/src
 
 DYNARMIC_STATIC_LIBS := \
     -L$(DYNARMIC_BUILD)/src/dynarmic       -ldynarmic \
@@ -120,6 +134,7 @@ FFMPEG_STATIC_LIBS := \
 CORE_CXX_SRCS := \
     src/platform/data_path.cpp \
     src/platform/io_thread.cpp \
+    src/platform/os_external.cpp \
     src/platform/embedded_assets.cpp
 
 CORE_C_SRCS := \
@@ -308,7 +323,9 @@ EMU_CXX_SRCS := \
     src/loader/elf_loader_arm64.cpp \
     src/platform/emulator.cpp \
     src/platform/emulator_arm64.cpp \
+    src/platform/unicorn_dyn.cpp \
     src/platform/emulator_dynarmic64.cpp \
+    src/platform/emulator_dynarmic32.cpp \
     src/srehost/srehost_impl.cpp \
     src/jni/jni_bridge.cpp \
     src/jni/jni_bridge_arm64.cpp \
@@ -342,7 +359,7 @@ $(LIB_DIR)/libswemu.so: $(EMU_OBJS) | \
 	    -Wl,--allow-shlib-undefined \
 	    -o $@ $^ \
 	    -L$(LIB_DIR) -lswcore -lswgfx \
-	    -lunicorn -lpthread -ldl -lm
+	    $(UNICORN_LINK) -lpthread -ldl -lm
 
 # ============================================================================
 # ── libswordfare.so ── Swordfare overlay, launcher UI, save editor, mods
@@ -389,10 +406,6 @@ ALL_HOST_SO := \
     $(LIB_DIR)/libswemu.so \
     $(LIB_DIR)/libswordfare.so
 
-# Optional native OpenSwordigo bridge. The engine is built independently in
-# OpenSwordigo and loaded at runtime by --openswordigo; it is not linked into
-# the normal Swordfare binary.
-OPENSWORDIGO_LIB := OpenSwordigo/build/bin/libopenswordigo.so
 
 # ============================================================================
 # ── bin/swordfare ── Main desktop engine executable
@@ -430,13 +443,6 @@ $(BIN_DIR)/swordfare: $(BOOT_OBJS) | $(ALL_HOST_SO)
 	    -lGL -lpthread -lm -ldl
 	@echo "[OK]   bin/swordfare  —  run with: ./run_swordigo.sh"
 
-openswordigo:
-	@$(MAKE) $(LIB_DIR)/libswpod.so
-	@cmake -S OpenSwordigo -B OpenSwordigo/build -DCMAKE_BUILD_TYPE=Release
-	@cmake --build OpenSwordigo/build -j$(nproc) --target openswordigo_swordfare
-	@mkdir -p $(LIB_DIR)
-	@cp $(OPENSWORDIGO_LIB) $(LIB_DIR)/libopenswordigo.so
-	@echo "[OK]   $(LIB_DIR)/libopenswordigo.so"
 
 # ============================================================================
 # ── bin/ruby ── Standalone asset browser / previewer
@@ -448,20 +454,44 @@ RUBY_SRCS := \
     src/tools/av_audio.cpp \
     src/tools/scene_loader.cpp \
     src/tools/scene_workspace.cpp \
+    src/tools/scene_player.cpp \
+    src/tools/scene_lua.cpp \
+    src/tools/scene_terrain.cpp \
+    src/tools/scene_entity.cpp \
+    src/tools/scene_collision.cpp \
+    src/tools/scene_physics.cpp \
+    src/tools/scene_game.cpp \
     src/tools/intellij.cpp \
     src/tools/batch_converter.cpp \
     src/tools/gltf_export.cpp \
     src/tools/gltf_import.cpp \
+    src/tools/obj_loader.cpp \
+    src/tools/ani_loader.cpp \
+    src/tools/scn_loader.cpp \
     src/tools/pod_writer.cpp \
+    src/tools/fbx_import.cpp \
+    src/tools/pod_convert.cpp \
+    src/tools/ruby_mcp.cpp \
     src/imgui/Guizmo/src/ImGuizmo.cpp
 
-RUBY_OBJS := $(patsubst src/%.cpp, $(BUILD)/ruby/%.o, $(RUBY_SRCS))
+# ufbx is a C (not C++) single-file library; compile it with the C compiler.
+RUBY_C_SRCS := \
+    src/tools/ufbx/ufbx.c
+RUBY_C_OBJS := $(patsubst src/%.c, $(BUILD)/ruby/%.o, $(RUBY_C_SRCS))
+
+RUBY_OBJS := $(patsubst src/%.cpp, $(BUILD)/ruby/%.o, $(RUBY_SRCS)) $(RUBY_C_OBJS)
 RUBY_DEPS := $(RUBY_OBJS:.o=.d)
 
 $(BUILD)/ruby/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
 	@echo "[CXX/ruby]  $<"
 	@$(CXX) $(ALL_CXXFLAGS) -c $< -o $@
+
+# ufbx.c (and any future .c source) is compiled with the C compiler.
+$(BUILD)/ruby/%.o: src/%.c
+	@mkdir -p $(dir $@)
+	@echo "[CC/ruby]  $<"
+	@$(CC) $(ALL_CFLAGS) -c $< -o $@
 
 $(BIN_DIR)/ruby: $(RUBY_OBJS) | \
     $(LIB_DIR)/libswcore.so \
@@ -477,6 +507,39 @@ $(BIN_DIR)/ruby: $(RUBY_OBJS) | \
 	    $(SDL3_LIBS) $(SDL3I_LIBS) $(ZLIB_LIBS) \
 	    -lGL -lutil -lm
 	@echo "[AV]   bin/ruby  —  run with: ./bin/ruby"
+
+# ============================================================================
+# ── bin/ruby_cli ── Native FileRift-compatible CLI (decode/recode/APK/batch)
+#    Compiles the headless batch converter (no ImGui/SDL) + the CLI driver.
+# ============================================================================
+RUBY_CLI_SRCS := \
+    src/tools/ruby_cli.cpp \
+    src/tools/batch_converter.cpp \
+    src/tools/ruby_mcp.cpp \
+    src/tools/scene_collision.cpp \
+    src/tools/scene_entity.cpp \
+    src/tools/scene_physics.cpp
+
+RUBY_CLI_OBJS := $(patsubst src/%.cpp, $(BUILD)/ruby_cli/%.o, $(RUBY_CLI_SRCS))
+RUBY_CLI_DEPS := $(RUBY_CLI_OBJS:.o=.d)
+
+$(BUILD)/ruby_cli/%.o: src/%.cpp
+	@mkdir -p $(dir $@)
+	@echo "[CXX/ruby_cli]  $<"
+	@$(CXX) $(ALL_CXXFLAGS) -DBATCH_CONVERTER_NO_UI -c $< -o $@
+
+$(BIN_DIR)/ruby_cli: $(RUBY_CLI_OBJS) | \
+    $(LIB_DIR)/libswcore.so \
+    $(LIB_DIR)/libswfmt.so \
+    $(LIB_DIR)/libswpod.so \
+    $(LIB_DIR)/libfilerift.so
+	@mkdir -p $(BIN_DIR)
+	@echo "[LINK] $@"
+	@$(CXX) $(RPATH_FLAGS) -o $@ $^ \
+	    -L$(LIB_DIR) \
+	    -lswcore -lswfmt -lswpod -lfilerift \
+	    $(ZLIB_LIBS) -lGL -lm
+	@echo "[CLI]  bin/ruby_cli  —  run with: ./bin/ruby_cli --help"
 
 # ============================================================================
 # ── bin/scanscene ── Scene diagnostics CLI (unresolved templates / .scl libs)
@@ -590,7 +653,7 @@ ALL_DEPS := \
 # ============================================================================
 .DEFAULT_GOAL := all
 
-all: $(ALL_HOST_SO) $(BIN_DIR)/swordfare $(BIN_DIR)/ruby $(BIN_DIR)/scanscene $(LIB_DIR)/libsre.so
+all: $(ALL_HOST_SO) $(BIN_DIR)/swordfare $(BIN_DIR)/ruby $(BIN_DIR)/ruby_cli $(BIN_DIR)/scanscene $(LIB_DIR)/libsre.so
 	@echo ""
 	@echo "====================================================="
 	@echo "  Swordfare Desktop — modular build complete"
@@ -615,7 +678,7 @@ dynarmic-build:
 	@cd $(DYNARMIC_BUILD) && cmake .. \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DDYNARMIC_TESTS=OFF \
-		-DDYNARMIC_FRONTENDS=A64 \
+		-DDYNARMIC_FRONTENDS="A32;A64" \
 		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
 		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
 		-DDYNARMIC_IGNORE_ASSERTS=ON \

@@ -60,6 +60,10 @@ static bool is_printable(const std::string& s) {
 }
 
 static void parse_scene_waters(SceneData& scene);
+static bool parse_float_color(const std::string& bytes, float out[4]);
+static bool read_vector3(const std::string& bytes, float out[3]);
+static void parse_scene_shadows(SceneData& scene);
+static void parse_scene_fires(SceneData& scene);
 
 static bool ends_with_ci(const std::string& s, const std::string& suffix) {
     if (suffix.size() > s.size()) return false;
@@ -107,7 +111,7 @@ static std::string first_printable_len_field(const std::string& raw, int field_n
 
 static int component_payload_field(const SceneComponent& component) {
     if (component.payload_field >= 50) return component.payload_field;
-    // main.js::Ot dispatches the first nested message at field >= 50. This is
+    // libswordigo_arm32.c::Ot dispatches the first nested message at field >= 50. This is
     // authoritative even when ClassName uses the short form ("Model") while
     // generated schemas use "ModelComponent".
     try {
@@ -225,7 +229,7 @@ static void parse_single_mesh(SceneObject& obj, const std::string& bytes, int sr
     // validation checks below so the parallel vectors stay in sync with the
     // parsed ground_meshes list.
 
-    // main.js::addGroundMesh ignores MeshData metadata and treats field 50 as
+    // libswordigo_arm32.c::addGroundMesh ignores MeshData metadata and treats field 50 as
     // a packed position3/normal3/uv2 stream. Follow it exactly: metadata in
     // shipped scenes is often stale and was producing exploded geometry.
     if (vertex_data.empty()) return;
@@ -244,7 +248,7 @@ static void parse_single_mesh(SceneObject& obj, const std::string& bytes, int sr
         std::memcpy(&pm.uvs[i*2], ptr + 24, 8);
     }
 
-    // main.js always creates Uint16Array from field 51 for GroundMesh.
+    // libswordigo_arm32.c always creates Uint16Array from field 51 for GroundMesh.
     const int index_count = static_cast<int>(index_data.size() / 2);
     if (index_count > 0) {
         pm.indices.resize(index_count);
@@ -287,7 +291,7 @@ static void parse_ground_mesh_component(SceneObject& obj, const SceneComponent& 
             std::vector<std::string> base_meshes;
             while (gm_reader.read_field(gm_f)) {
                 if (gm_f.wire_type == proto::WIRE_LEN) {
-                    // main.js order: FrontMesh(8), SurfaceMesh(9), Mesh(6).
+                    // libswordigo_arm32.c order: FrontMesh(8), SurfaceMesh(9), Mesh(6).
                     if (gm_f.field_number == 8) front_meshes.push_back(gm_f.bytes_val);
                     else if (gm_f.field_number == 9) surface_meshes.push_back(gm_f.bytes_val);
                     else if (gm_f.field_number == 6) base_meshes.push_back(gm_f.bytes_val);
@@ -402,7 +406,20 @@ static void resolve_object_render_data(SceneObject& obj) {
     obj.mesh_name.clear();
     obj.texture_name.clear();
     obj.background_name.clear();
+    obj.model_y_rotation = 0.0f;
+    obj.has_model_y_rotation = false;
     obj.is_spawn_point = false;
+    obj.spawn_facing = 1;
+    obj.spawn_offset[0] = obj.spawn_offset[1] = obj.spawn_offset[2] = 0.0f;
+    obj.has_model_transform = false;
+    obj.model_transform_origin[0] = obj.model_transform_origin[1] = obj.model_transform_origin[2] = 0.0f;
+    obj.model_transform_axis[0] = obj.model_transform_axis[2] = 0.0f;
+    obj.model_transform_axis[1] = 1.0f;
+    obj.model_transform_angle = obj.model_transform_speed = 0.0f;
+    obj.is_portal = false;
+    obj.portal_destination.clear();
+    obj.portal_spawn_point.clear();
+    obj.portal_tap_to_enter = false;
     // When the object's ground meshes were edited in the SDK, keep the parsed
     // (modified) mesh data instead of re-deriving it from the original raw
     // component bytes — scene_refresh() is called during interactive edits.
@@ -419,8 +436,68 @@ static void resolve_object_render_data(SceneObject& obj) {
         if (schema_name == "GroundMeshComponent" && !preserve_meshes)
             parse_ground_mesh_component(obj, comp);
 
-        if (comp.type_name == "SpawnPoint")
+        if (schema_name == "SpawnPointComponent" || comp.type_name == "SpawnPoint") {
             obj.is_spawn_point = true;
+            const int payload = component_payload_field(comp);
+            try {
+                proto::Reader wrapper(comp.raw_data);
+                proto::Field field;
+                while (wrapper.read_field(field)) {
+                    if (field.field_number != payload || field.wire_type != proto::WIRE_LEN) continue;
+                    proto::Reader spawn(field.bytes_val);
+                    proto::Field spawn_field;
+                    while (spawn.read_field(spawn_field)) {
+                        if (spawn_field.field_number == 1 && spawn_field.wire_type == proto::WIRE_VARINT) {
+                            obj.spawn_facing = static_cast<int>(spawn_field.varint_val);
+                        } else if (spawn_field.field_number == 2 && spawn_field.wire_type == proto::WIRE_LEN) {
+                            read_vector3(spawn_field.bytes_val, obj.spawn_offset);
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+
+        if (schema_name == "ModelTransformControllerComponent") {
+            const int payload = component_payload_field(comp);
+            try {
+                proto::Reader wrapper(comp.raw_data); proto::Field field;
+                while (wrapper.read_field(field)) {
+                    if (field.field_number != static_cast<uint32_t>(payload) || field.wire_type != proto::WIRE_LEN) continue;
+                    proto::Reader data(field.bytes_val); proto::Field value;
+                    while (data.read_field(value)) {
+                        if (value.field_number == 2 && value.wire_type == proto::WIRE_LEN)
+                            read_vector3(value.bytes_val, obj.model_transform_origin);
+                        else if (value.field_number == 3 && value.wire_type == proto::WIRE_LEN)
+                            read_vector3(value.bytes_val, obj.model_transform_axis);
+                        else if (value.field_number == 4 && value.wire_type == proto::WIRE_I32)
+                            obj.model_transform_angle = value.float_val;
+                        else if (value.field_number == 5 && value.wire_type == proto::WIRE_I32)
+                            obj.model_transform_speed = value.float_val;
+                    }
+                    obj.has_model_transform = true;
+                }
+            } catch (...) {}
+        }
+
+        if (schema_name == "PortalComponent") {
+            const int payload = component_payload_field(comp);
+            try {
+                proto::Reader wrapper(comp.raw_data); proto::Field field;
+                while (wrapper.read_field(field)) {
+                    if (field.field_number != static_cast<uint32_t>(payload) || field.wire_type != proto::WIRE_LEN) continue;
+                    proto::Reader data(field.bytes_val); proto::Field value;
+                    while (data.read_field(value)) {
+                        if (value.field_number == 1 && value.wire_type == proto::WIRE_LEN)
+                            obj.portal_destination.assign(value.bytes_val.data(), value.bytes_val.size());
+                        else if (value.field_number == 2 && value.wire_type == proto::WIRE_LEN)
+                            obj.portal_spawn_point.assign(value.bytes_val.data(), value.bytes_val.size());
+                        else if (value.field_number == 3 && value.wire_type == proto::WIRE_VARINT)
+                            obj.portal_tap_to_enter = value.varint_val != 0;
+                    }
+                    obj.is_portal = true;
+                }
+            } catch (...) {}
+        }
 
         if (comp.type_name == "MeshRenderer" || comp.type_name == "SkinnedMeshRenderer")
             scan_for_asset_refs(comp.raw_data, obj.mesh_name, obj.texture_name);
@@ -429,6 +506,32 @@ static void resolve_object_render_data(SceneObject& obj) {
         // suffix. Resolve this form as well as the older filename form.
         if (schema_name == "ModelComponent" && obj.mesh_name.empty())
             obj.mesh_name = component_string_field(comp, 1);
+
+        // ModelComponent payload field 2 = baked Y-rotation (radians), applied
+        // by main.js addModel as rotation.y. This is what makes doors and
+        // props face their mesh side in-game instead of at the camera.
+        if (schema_name == "ModelComponent") {
+            const int payload = component_payload_field(comp);
+            if (payload != 0) {
+                try {
+                    proto::Reader wrapper(comp.raw_data);
+                    proto::Field field;
+                    while (wrapper.read_field(field)) {
+                        if (field.field_number != static_cast<uint32_t>(payload) ||
+                            field.wire_type != proto::WIRE_LEN)
+                            continue;
+                        proto::Reader inner(field.bytes_val);
+                        proto::Field sf;
+                        while (inner.read_field(sf)) {
+                            if (sf.field_number == 2 && sf.wire_type == proto::WIRE_I32) {
+                                obj.model_y_rotation = sf.float_val;
+                                obj.has_model_y_rotation = std::fabsf(sf.float_val) > 1e-5f;
+                            }
+                        }
+                    }
+                } catch (...) {}
+            }
+        }
 
         if (comp.type_name == "Background") {
             // BackgroundComponent stores TextureName in payload field 1 as a
@@ -453,6 +556,31 @@ struct SceneTemplate {
     float scaling = 1.0f;
     std::vector<SceneComponent> components;
 };
+
+// parse_object_library is defined below; forward declare for scene_list_templates
+static std::vector<SceneTemplate> parse_object_library(const std::string& bytes);
+
+std::vector<SceneTemplateInfo> scene_list_templates(const SceneData& scene) {
+    std::unordered_map<std::string, SceneTemplateInfo> merged;
+    auto collect = [&](const std::string& bytes) {
+        for (const auto& item : parse_object_library(bytes)) {
+            auto& info = merged[item.name];
+            info.name = item.name;
+            info.scaling = item.scaling;
+            if (info.component_types.empty()) {
+                info.component_types.reserve(item.components.size());
+                for (const auto& c : item.components)
+                    info.component_types.push_back(c.type_name);
+            }
+        }
+    };
+    for (const auto& lib : scene.object_libraries) collect(lib);
+    for (const auto& lib : scene.external_libraries) collect(lib);
+    std::vector<SceneTemplateInfo> result;
+    result.reserve(merged.size());
+    for (auto& kv : merged) result.push_back(std::move(kv.second));
+    return result;
+}
 
 static std::vector<SceneTemplate> parse_object_library(const std::string& bytes) {
     std::vector<SceneTemplate> templates;
@@ -538,7 +666,11 @@ static void load_external_libraries(SceneData& scene) {
         std::ifstream in(found, std::ios::binary);
         if (!in) continue;
         std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        if (!bytes.empty()) scene.external_libraries.push_back(std::move(bytes));
+        if (!bytes.empty()) {
+            scene.external_libraries.push_back(std::move(bytes));
+            scene.imported_library_names.push_back(name);
+            scene.imported_library_paths.push_back(found.string());
+        }
     }
 }
 
@@ -804,6 +936,158 @@ static void compute_bounds(SceneData& scene) {
     scene.bounds_max[2] = max_z;
 }
 
+static void parse_scene_lights(SceneData& scene) {
+    scene.lights.clear();
+    scene.overlays.clear();
+    for (int oi = 0; oi < (int)scene.objects.size(); ++oi) {
+        const auto& obj = scene.objects[oi];
+        if (obj.hidden) continue;
+        const auto& components = obj.resolved_components.empty()
+            ? obj.components : obj.resolved_components;
+        for (const auto& comp : components) {
+            const std::string schema_name = component_schema_name(comp);
+            if (schema_name == "LightComponent") {
+                SceneData::SceneLight light;
+                light.object_index = oi;
+                light.pos[0] = obj.pos_x;
+                light.pos[1] = obj.pos_y;
+                light.pos[2] = obj.pos_z;
+                float offset[3] = {0, 0, 0};
+                try {
+                    proto::Reader wrapper(comp.raw_data);
+                    proto::Field field;
+                    while (wrapper.read_field(field)) {
+                        if (field.field_number != static_cast<uint32_t>(component_payload_field(comp)) ||
+                            field.wire_type != proto::WIRE_LEN)
+                            continue;
+                        proto::Reader data(field.bytes_val);
+                        proto::Field value;
+                        while (data.read_field(value)) {
+                            switch (value.field_number) {
+                                case 1: light.type = static_cast<int>(value.as_int()); break;
+                                case 2: light.intensity = value.as_float(); break;
+                                case 3: {
+                                    float rgba[4] = {1, 1, 1, 1};
+                                    if (value.wire_type == proto::WIRE_LEN &&
+                                        parse_float_color(value.bytes_val, rgba)) {
+                                        light.color[0] = rgba[0];
+                                        light.color[1] = rgba[1];
+                                        light.color[2] = rgba[2];
+                                    }
+                                    break;
+                                }
+                                case 6: {
+                                    if (value.wire_type != proto::WIRE_LEN) break;
+                                    proto::Reader offsets(value.bytes_val);
+                                    proto::Field coordinate;
+                                    int index = 0;
+                                    while (offsets.read_field(coordinate) && index < 3) {
+                                        if (coordinate.wire_type == proto::WIRE_I32)
+                                            offset[index++] = coordinate.as_float();
+                                        else if (coordinate.wire_type == proto::WIRE_I64)
+                                            offset[index++] = static_cast<float>(coordinate.as_double());
+                                    }
+                                    break;
+                                }
+                                case 7: light.radius = value.as_float(); break;
+                            }
+                        }
+                        break;
+                    }
+                } catch (...) {}
+
+                light.base_intensity = light.intensity;
+                if (light.type < 1 || light.type > 4 || !(light.intensity > 0.0f))
+                    continue;
+                if (light.type == 4) {
+                    // Overlay light = darkness veil seed. Not a point light.
+                    SceneData::SceneOverlay ov;
+                    ov.intensity = light.intensity;
+                    for (int a = 0; a < 3; ++a) ov.color[a] = light.color[a];
+                    for (int a = 0; a < 3; ++a) ov.pos[a] = light.pos[a];
+                    scene.overlays.push_back(ov);
+                    continue;
+                }
+                if (light.type == 2) {
+                    // The original renderer normalizes the owning object's
+                    // position/depth and uploads it with w=0. Swordigo scenes
+                    // therefore author directional orientation through this
+                    // vector rather than the object's rotation.
+                    light.pos[0] = obj.pos_x;
+                    light.pos[1] = obj.pos_y;
+                    light.pos[2] = obj.pos_z;
+                } else if (light.type == 3) {
+                    const float scale = obj.scale_x * obj.template_scaling;
+                    const float cosine = std::cos(obj.rot_y);
+                    const float sine = std::sin(obj.rot_y);
+                    light.pos[0] += (offset[0] * cosine - offset[1] * sine) * scale;
+                    light.pos[1] += (offset[0] * sine + offset[1] * cosine) * scale;
+                    light.pos[2] += offset[2] * scale;
+                    light.radius = std::max(0.0f, light.radius * std::fabs(scale));
+                    light.glow = true;
+                }
+                scene.lights.push_back(light);
+                continue;
+            }
+
+            if (schema_name != "SimpleGlowComponent") continue;
+            SceneData::SceneLight light;
+            light.type = 3;
+            light.intensity = 1.0f;
+            light.glow = true;
+            light.color[0] = light.color[1] = light.color[2] = 0.5f;
+            float size = 20.0f;
+            float depth = 0.0f;
+            float offset[2] = {0, 0};
+            try {
+                proto::Reader wrapper(comp.raw_data);
+                proto::Field field;
+                while (wrapper.read_field(field)) {
+                    if (field.field_number != static_cast<uint32_t>(component_payload_field(comp)) ||
+                        field.wire_type != proto::WIRE_LEN)
+                        continue;
+                    proto::Reader data(field.bytes_val);
+                    proto::Field value;
+                    while (data.read_field(value)) {
+                        if (value.field_number == 1 && value.wire_type == proto::WIRE_LEN) {
+                            float rgba[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+                            if (parse_float_color(value.bytes_val, rgba)) {
+                                light.color[0] = rgba[0];
+                                light.color[1] = rgba[1];
+                                light.color[2] = rgba[2];
+                                light.intensity = std::max(0.0f, rgba[3]);
+                            }
+                        } else if (value.field_number == 2) {
+                            size = value.as_float();
+                        } else if (value.field_number == 4) {
+                            depth = value.as_float();
+                        } else if (value.field_number == 7 && value.wire_type == proto::WIRE_LEN) {
+                            proto::Reader offsets(value.bytes_val);
+                            proto::Field coordinate;
+                            int index = 0;
+                            while (offsets.read_field(coordinate) && index < 2)
+                                if (coordinate.wire_type == proto::WIRE_I32)
+                                    offset[index++] = coordinate.as_float();
+                        }
+                    }
+                    break;
+                }
+            } catch (...) {}
+            const float scale = obj.scale_x * obj.template_scaling;
+            const float cosine = std::cos(obj.rot_y);
+            const float sine = std::sin(obj.rot_y);
+            light.pos[0] = obj.pos_x + (offset[0] * cosine - offset[1] * sine) * scale;
+            light.pos[1] = obj.pos_y + (offset[0] * sine + offset[1] * cosine) * scale;
+            light.pos[2] = obj.pos_z + depth * scale;
+            light.radius = std::max(1.0f, std::fabs(size * scale) * 3.0f);
+            if (light.intensity > 0.0f) scene.lights.push_back(light);
+        }
+    }
+}
+
+static void parse_scene_shadows(SceneData& scene);
+static void parse_scene_fires(SceneData& scene);
+
 void scene_refresh(SceneData& scene) {
     resolve_scene_templates(scene);
     scene.object_count = static_cast<int>(scene.objects.size());
@@ -812,6 +1096,131 @@ void scene_refresh(SceneData& scene) {
     // object add/delete/move edits (parse_scene_waters is cheap — it only
     // scans for WaterMesh components).
     parse_scene_waters(scene);
+    parse_scene_lights(scene);
+    parse_scene_shadows(scene);
+    parse_scene_fires(scene);
+    // Re-derive the entity / physics / collision subsystem lists so the
+    // parsed SceneEntityEntry/ScenePhysicsEntry/SceneCollisionEntry data
+    // (scene_entity.h / scene_physics.h / scene_collision.h) stays in sync
+    // with the object list across load and interactive edits.
+    scene.entities.clear();
+    scene.physics_objects.clear();
+    scene.collisions.clear();
+    for (int oi = 0; oi < (int)scene.objects.size(); ++oi) {
+        const auto& obj = scene.objects[oi];
+        EntityData ed = entity_parse(obj);
+        if (ed.is_entity) scene.entities.push_back({oi, ed});
+        PhysicsData pd = physics_parse(obj);
+        if (pd.enabled) scene.physics_objects.push_back({oi, pd});
+        CollisionData cd = collision_parse(obj);
+        if (!cd.shapes.empty() || !cd.ground_polygons.empty())
+            scene.collisions.push_back({oi, cd});
+    }
+}
+
+// ============================================================
+// Shadow parsing (ShadowComponent payload 131)
+// { f1 WidthRadius, f2 DepthRadius, f3 Offset(Vector3) }
+// Soft ellipse under the object; X aligned with object local X, scaled by
+// the object + template scale, rotated to the object Y-rotation.
+// ============================================================
+static void parse_scene_shadows(SceneData& scene) {
+    scene.shadows.clear();
+    for (int oi = 0; oi < (int)scene.objects.size(); ++oi) {
+        const auto& obj = scene.objects[oi];
+        if (obj.hidden) continue;
+        const auto& components = obj.resolved_components.empty()
+            ? obj.components : obj.resolved_components;
+        for (const auto& comp : components) {
+            if (component_schema_name(comp) != "ShadowComponent") continue;
+            SceneData::SceneShadow sd;
+            sd.object_index = oi;
+            sd.pos[0] = obj.pos_x;
+            sd.pos[1] = obj.pos_y;
+            sd.pos[2] = obj.pos_z;
+            float offset[3] = {0, 0, 0};
+            try {
+                proto::Reader wrapper(comp.raw_data);
+                proto::Field field;
+                while (wrapper.read_field(field)) {
+                    if (field.field_number != static_cast<uint32_t>(component_payload_field(comp)) ||
+                        field.wire_type != proto::WIRE_LEN)
+                        continue;
+                    proto::Reader data(field.bytes_val);
+                    proto::Field value;
+                    while (data.read_field(value)) {
+                        switch (value.field_number) {
+                            case 1: if (value.wire_type == proto::WIRE_I32)
+                                        sd.width_radius = value.float_val; break;
+                            case 2: if (value.wire_type == proto::WIRE_I32)
+                                        sd.depth_radius = value.float_val; break;
+                            case 3: if (value.wire_type == proto::WIRE_LEN)
+                                        read_vector3(value.bytes_val, offset); break;
+                        }
+                    }
+                    break;
+                }
+            } catch (...) {}
+
+            const float scale = obj.scale_x * obj.template_scaling;
+            const float cosine = std::cos(obj.rot_y);
+            const float sine = std::sin(obj.rot_y);
+            sd.pos[0] += offset[0] * scale;
+            sd.pos[1] += offset[2] * scale; // offset z is vertical (into depth)
+            sd.pos[2] += offset[1] * scale;
+            sd.width_radius = std::max(0.0f, sd.width_radius * std::fabs(scale));
+            sd.depth_radius = std::max(0.0f, sd.depth_radius * std::fabs(scale));
+            sd.rot_y = obj.rot_y;
+            if (sd.width_radius > 0.0f || sd.depth_radius > 0.0f)
+                scene.shadows.push_back(sd);
+        }
+    }
+}
+
+// ============================================================
+// FireEmitterComponent parsing: links a FireEmitter's LightId to the point
+// light on the same component, enabling flicker on the owning object. The
+// LightId is a component id (type_id) that resolves to a LightComponent on
+// this object — when found we mark that light as fire-flickering.
+// ============================================================
+static void parse_scene_fires(SceneData& scene) {
+    // First reset flicker flags so removed fires stop animating.
+    for (auto& light : scene.lights) light.flicker = false;
+    for (int oi = 0; oi < (int)scene.objects.size(); ++oi) {
+        const auto& obj = scene.objects[oi];
+        if (obj.hidden) continue;
+        const auto& components = obj.resolved_components.empty()
+            ? obj.components : obj.resolved_components;
+        for (const auto& comp : components) {
+            if (component_schema_name(comp) != "FireEmitterComponent") continue;
+            int light_id = -1;
+            float speed = 8.0f, amount = 0.35f;
+            try {
+                proto::Reader wrapper(comp.raw_data);
+                proto::Field field;
+                while (wrapper.read_field(field)) {
+                    if (field.field_number != static_cast<uint32_t>(component_payload_field(comp)) ||
+                        field.wire_type != proto::WIRE_LEN)
+                        continue;
+                    proto::Reader data(field.bytes_val);
+                    proto::Field value;
+                    while (data.read_field(value)) {
+                        if (value.field_number == 3)                        light_id = static_cast<int>(value.as_int());
+                        else if (value.field_number == 6) speed = value.as_float();
+                    }
+                    break;
+                }
+            } catch (...) {}
+            if (light_id < 0) continue;
+            for (auto& light : scene.lights) {
+                if (light.object_index == oi && light.type == 3) {
+                    light.flicker = true;
+                    light.flicker_speed = std::max(1.0f, speed);
+                    light.flicker_amount = amount;
+                }
+            }
+        }
+    }
 }
 
 void scene_mark_ground_mesh_dirty(SceneData& scene, size_t object_index) {
@@ -972,6 +1381,7 @@ bool scene_add_component(SceneData& scene, size_t object_index,
     component.raw_data = wrapper.to_string();
     object.components.push_back(std::move(component));
     if (new_index) *new_index = object.components.size() - 1;
+    scene_refresh(scene);
     return true;
 }
 
@@ -980,6 +1390,7 @@ bool scene_remove_component(SceneData& scene, size_t object_index, size_t compon
     auto& components = scene.objects[object_index].components;
     if (component_index >= components.size()) return false;
     components.erase(components.begin() + static_cast<std::ptrdiff_t>(component_index));
+    scene_refresh(scene);
     return true;
 }
 
@@ -1010,6 +1421,7 @@ bool scene_paste_component(SceneData& scene, size_t object_index,
     pasted.type_id = instance_id;
     components.push_back(std::move(pasted));
     if (new_index) *new_index = components.size() - 1;
+    scene_refresh(scene);
     return true;
 }
 
@@ -1144,7 +1556,7 @@ bool scene_set_program_source(std::string& program_data, const std::string& sour
 // UtilityShape); its ShapeComponent payload (field 120) field 1 is the
 // Rectangle (x, y, w, h) that defines the fluid sheet. The texture mapping
 // (payload 113) field 1 names the texture (e.g. "water"), field 2 the tile
-// size, field 3 the offset — mirroring main.js PS() / WaterMeshComponent.
+// size, field 3 the offset — mirroring libswordigo_arm32.c PS() / WaterMeshComponent.
 // ============================================================
 
 // Read a FloatColor message (fixed32 fields 1-4 = RGBA) from bytes.
@@ -1160,6 +1572,24 @@ static bool parse_float_color(const std::string& bytes, float out[4]) {
         return idx >= 4;
     } catch (...) {}
     return false;
+}
+
+// Read a Vector3 { x, y, z } (I32 fixed floats) from bytes into out[3].
+// Returns false when no coordinate was read.
+static bool read_vector3(const std::string& bytes, float out[3]) {
+    if (bytes.empty()) return false;
+    int n = 0;
+    try {
+        proto::Reader reader(bytes);
+        proto::Field  f;
+        while (reader.read_field(f) && n < 3) {
+            if (f.wire_type == proto::WIRE_I32)
+                out[n++] = f.float_val;
+            else if (f.wire_type == proto::WIRE_I64 && n < 3)
+                out[n++] = static_cast<float>(f.as_double());
+        }
+    } catch (...) {}
+    return n > 0;
 }
 
 // Extract the Rectangle { x, y, w, h } from a ShapeComponent payload
@@ -1403,83 +1833,6 @@ SceneData scene_load(const std::string& path) {
     load_external_libraries(scene);
     scene.parsed_groups = parse_scene_groups(scene.groups);
     scene_refresh(scene);
-
-    // Collect render-time lights from Light components (never serialized).
-    // LightComponent payload (verified against OpenSwordigo arm32): embedded
-    // field 130 -> { f1 Type, f2 Intensity, f3 Color, f6 Offset, f7 Radius }.
-    scene.lights.clear();
-    for (const auto& obj : scene.objects) {
-        for (const auto& comp : obj.components) {
-            if (comp.type_name != "Light") continue;
-            SceneData::SceneLight light;
-            light.pos[0] = obj.pos_x; light.pos[1] = obj.pos_y; light.pos[2] = obj.pos_z;
-            try {
-                proto::Reader reader(comp.raw_data);
-                proto::Field  f;
-                while (reader.read_field(f)) {
-                    if (f.field_number != 130 || f.wire_type != proto::WIRE_LEN) continue;
-                    proto::Reader data(f.bytes_val);
-                    proto::Field  d;
-                    while (data.read_field(d)) {
-                        switch (d.field_number) {
-                            case 1: light.type = (int)d.as_int(); break;
-                            case 2: light.intensity = d.as_float(); break;
-                            case 3: {
-                                proto::Reader col(d.bytes_val);
-                                proto::Field cf;
-                                int ci = 0;
-                                while (col.read_field(cf) && ci < 3) {
-                                    if (cf.wire_type == proto::WIRE_I32)
-                                        light.color[ci++] = cf.as_float();
-                                    else if (cf.wire_type == proto::WIRE_I64)
-                                        light.color[ci++] = (float)cf.as_double();
-                                }
-                                break;
-                            }
-                            case 6: {
-                                proto::Reader ofs(d.bytes_val);
-                                proto::Field of;
-                                float off[3] = {0, 0, 0};
-                                int oi = 0;
-                                while (ofs.read_field(of) && oi < 3) {
-                                    if (of.wire_type == proto::WIRE_I32)
-                                        off[oi++] = of.as_float();
-                                    else if (of.wire_type == proto::WIRE_I64)
-                                        off[oi++] = (float)of.as_double();
-                                }
-                                light.pos[0] = obj.pos_x + off[0];
-                                light.pos[1] = obj.pos_y + off[1];
-                                light.pos[2] = obj.pos_z + off[2];
-                                break;
-                            }
-                            case 7: light.radius = d.as_float() * 3.0f; break;
-                        }
-                    }
-                    break;
-                }
-            } catch (...) {}
-            if (light.type == 1) continue;         // Ambient lights are baked into g_ambient
-            if (!(light.intensity > 0.0f)) continue;  // also rejects NaN
-            // Some components omit the color sub-message; fall back to warm white.
-            if (light.color[0] <= 0.0f && light.color[1] <= 0.0f && light.color[2] <= 0.0f) {
-                light.color[0] = 1.0f; light.color[1] = 0.92f; light.color[2] = 0.78f;
-            }
-            scene.lights.push_back(light);
-        }
-    }
-    // SimpleGlow components act as warm point lights (torches, fire, crystals).
-    for (const auto& obj : scene.objects) {
-        for (const auto& comp : obj.components) {
-            if (comp.type_name != "SimpleGlow") continue;
-            SceneData::SceneLight light;
-            light.type = 4;
-            light.intensity = 1.4f;
-            light.color[0] = 1.0f; light.color[1] = 0.72f; light.color[2] = 0.42f;
-            light.pos[0] = obj.pos_x; light.pos[1] = obj.pos_y; light.pos[2] = obj.pos_z;
-            light.radius = 260.0f;
-            scene.lights.push_back(light);
-        }
-    }
 
     std::cout << "[scene_loader] loaded " << scene.filename
               << ": " << scene.object_count << " objects"

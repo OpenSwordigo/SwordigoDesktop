@@ -131,6 +131,7 @@ public:
 
     void process_main_thread_deletions();
     void flush_thread_local_queues();
+    void auto_flush_tl_queue();  // size/time-bounded flush of the calling thread's event queue
     void process_event_queue();
     void generate_allocation_report();
 

@@ -1587,6 +1587,7 @@ LaunchConfig show_launcher(BinarySelector& selector) {
     }
     SDL_GL_MakeCurrent(window, gl_context);
     SDL_GL_SetSwapInterval(1); // Vsync
+    sword_init_gl_after();
 
     // ── ImGui init ──
     IMGUI_CHECKVERSION();

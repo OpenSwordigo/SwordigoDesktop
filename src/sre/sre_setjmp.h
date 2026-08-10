@@ -2,14 +2,16 @@
 #ifndef SRE_SETJMP_H
 #define SRE_SETJMP_H
 
-/* jmp_buf: 176 bytes (13 GP regs + SP + 8 FP regs = 22 slots) */
+/* jmp_buf: 176 bytes. ARM64 state occupies 168 bytes; the final slot pads
+ * each recovery entry to a 16-byte-friendly size. */
 typedef unsigned long long sre_jmp_buf[22];
 
-/* Returns 0 on initial call, non-zero when longjmp fires */
-extern int sre_setjmp(sre_jmp_buf buf);
+/* The compiler must preserve the post-setjmp control path and locals because
+ * sre_longjmp can make this function return a second time. */
+extern int sre_setjmp(sre_jmp_buf buf) __attribute__((returns_twice));
 
 /* Jump back to setjmp point with return value val */
-extern void sre_longjmp(sre_jmp_buf buf, int val);
+extern void sre_longjmp(sre_jmp_buf buf, int val) __attribute__((noreturn));
 
 /* ========== Recovery Stack ==========
  * Handles nested lua_call → pcall → lua_call → pcall chains.
@@ -25,6 +27,7 @@ typedef struct {
 
 extern sre_recovery_entry g_sre_recovery_stack[SRE_MAX_RECOVERY];
 extern int g_sre_recovery_depth;
+extern const unsigned int g_sre_recovery_stack_bytes;
 
 /* Offset of errorJmp in lua_State (ARM64 Lua 5.1) */
 #define LUA_ERRORJMP_OFFSET 0xa8

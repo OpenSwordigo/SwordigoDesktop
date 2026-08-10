@@ -239,6 +239,7 @@ void sre_log_lua_error(const char* source, const char* err_msg) {
 /* Recovery stack — shared with sre_cxa_throw (sre_effects.c) */
 sre_recovery_entry g_sre_recovery_stack[SRE_MAX_RECOVERY];
 int g_sre_recovery_depth = 0;
+const unsigned int g_sre_recovery_stack_bytes = sizeof(g_sre_recovery_stack);
 
 /* Push a recovery entry. Returns the depth index, or -1 if stack full.
  * NOT static: sre_scene_update.c and other SRE compilation units call this

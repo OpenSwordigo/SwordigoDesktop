@@ -170,6 +170,24 @@ volatile int g_sre_gui_scene_active = 0;
 volatile uint64_t g_sre_gui_scene_view_ptr = 0;
 void* g_sre_gamesceneview_ptr = NULL;
 
+/* ── Per-frame world-update drive guard ──────────────────────────────────────
+ * The original update pipeline ticks the simulation through
+ *   GameSceneView::Update → GameSceneController::Update → Scene::Update
+ * (see sre_frame_loop.c header). Our GameSceneView reimplementation mirrors
+ * only the HUD half, so Scene::Update — which owns the per-object component
+ * updates, physics/collision and the DEFERRED DELETION loop that removes
+ * objects after their timed destruction window — was never ticked in SRE
+ * builds. We drive GameSceneController::Update once per frame from the view
+ * update, and use Scene's frame counter (Scene+0x310, incremented at the top
+ * of Scene::Update) to detect whether the original chain already ticked the
+ * scene this frame, so we never double-step physics. */
+static uint64_t s_sre_last_driven_scene  = 0;
+static int      s_sre_last_driven_frame  = -1;
+/* Total number of frames we actually drove GameSceneController::Update.
+ * Exported to the host and printed with the frame diagnostics so we can
+ * verify the world-simulation drive is active without spamming stderr. */
+volatile uint64_t g_sre_world_drive_count = 0;
+
 /* GameState pointer — exported so host can directly read/write game state.
  * This is a GUEST pointer (offset from guest memory base).
  * Host reads as: *(int*)(g_guest_memory + gamestate_ptr + OFFSET) */
@@ -237,7 +255,9 @@ static void sp_release(void* pn) {
             return;
         }
 
-        /* Call virtual dispose() — vtable[2] (offset 0x10) */
+        /* Call virtual dispose() — vtable[2] (offset 0x10).
+         * NOTE: dispose() may free 'pn' or alter its refcount fields.
+         * We capture use_count/weak_count BEFORE the call and re-validate after. */
         typedef void (*fn_dispose)(void*);
         fn_dispose dispose = (fn_dispose)(*(uint64_t*)(vtable + 0x10));
         if (sp_code_is_valid((uint64_t)(uintptr_t)dispose)) {
@@ -247,13 +267,21 @@ static void sp_release(void* pn) {
                     (unsigned long long)(uintptr_t)dispose);
         }
 
-        /* Decrement weak_count */
+        /* After dispose(), re-read weak_count and re-validate vtable before
+         * calling destroy(). dispose() may have freed the block, recycled the
+         * allocator slot, or zeroed the counts itself. */
+        uint64_t vtable2 = *(uint64_t*)pn;
+        if (!sp_vtable_is_valid(vtable2)) {
+            /* vtable invalidated by dispose() — block was freed, skip destroy() */
+            return;
+        }
+
         int64_t* weak_count = (int64_t*)((char*)pn + 0x10);
         (*weak_count)--;
         if (*weak_count == 0) {
             /* Call virtual destroy() — vtable[3] (offset 0x18) */
             typedef void (*fn_destroy)(void*);
-            fn_destroy destroy = (fn_destroy)(*(uint64_t*)(vtable + 0x18));
+            fn_destroy destroy = (fn_destroy)(*(uint64_t*)(vtable2 + 0x18));
             if (sp_code_is_valid((uint64_t)(uintptr_t)destroy)) {
                 destroy(pn);
             } else {
@@ -580,6 +608,38 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
             }
         }
     }
+
+    /* ---- 6.5. GAME WORLD UPDATE — tick the engine simulation ---- */
+    /* The original chain reaches Scene::Update (object updates, physics,
+     * collision, and the DEFERRED DELETION loop that removes objects after
+     * their timed destruction window) via GameSceneController::Update. The
+     * SRE frame driver never dispatched it, so timed object destruction and
+     * world simulation were dead. Drive it here, guarded by Scene's frame
+     * counter (+0x310) so we never double-step if the original chain also
+     * ticks the scene this frame. GameSceneController::Update is the entry
+     * that also handles hero spawn, camera and enemy targeting (nm 0x349d84). */
+    {
+        extern volatile int g_sre_scene_loading;
+        extern uint64_t g_swordigo_base;
+        if (!g_sre_scene_loading && ctrl_ptr != 0) {
+            void* scene = *(void**)((char*)ctrl_ptr + 0x20);  /* GameSceneController+0x20 = Scene* */
+            if (scene && (uint64_t)scene > 0x10000) {
+                uint64_t scene_vt = *(uint64_t*)scene;
+                if (scene_vt && (scene_vt & 7) == 0) {
+                    int frame = *(int*)((char*)scene + 0x310);
+                    if ((uint64_t)scene != s_sre_last_driven_scene ||
+                        frame == s_sre_last_driven_frame) {
+                        g_sre_world_drive_count++;
+                        typedef void (*pfn_gsc_update)(void*, float);
+                        ((pfn_gsc_update)(g_swordigo_base + 0x349d84))((void*)ctrl_ptr, deltaTime);
+                        frame = *(int*)((char*)scene + 0x310);
+                    }
+                    s_sre_last_driven_scene = (uint64_t)scene;
+                    s_sre_last_driven_frame = frame;
+                }
+            }
+        }
+    }
  
 do_effects:
     /* ---- 7. GUI EFFECT UPDATES ---- */
@@ -626,6 +686,13 @@ void sre_SceneLoadingView_InitWithGameState(void* self, void* state_ptr, void* m
      * entire duration of scene loading, preventing mutex-under-longjmp deadlock. */
     g_sre_scene_loading = 1;
     g_sre_last_slv = self;
+
+    /* New scene is loading: forget the previously-driven scene so the world-
+     * update drive re-engages even if the fresh scene is allocated at the
+     * same address as the old one (which would otherwise match the stale
+     * last-driven guard state and silently skip the drive). */
+    s_sre_last_driven_scene = 0;
+    s_sre_last_driven_frame = -1;
 
     if (g_orig_SceneLoadingView_InitWithGameState) {
         g_orig_SceneLoadingView_InitWithGameState(self, state_ptr, map_node_ptr);

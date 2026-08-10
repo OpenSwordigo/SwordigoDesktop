@@ -8,6 +8,7 @@
 #include <stack>
 #include <algorithm>
 #include <unordered_map>
+#include <cctype>
 
 
 
@@ -162,6 +163,22 @@ static size_t find_balanced(const std::string& str, char open, char close, size_
     return std::string::npos;
 }
 
+static size_t find_string_end(const std::string& str, size_t start) {
+    for (size_t i = start; i < str.size(); ++i) {
+        if (str[i] != '"') continue;
+        size_t slashes = 0;
+        for (size_t j = i; j > start && str[j - 1] == '\\'; --j) ++slashes;
+        if ((slashes & 1u) == 0) return i;
+    }
+    return std::string::npos;
+}
+
+static bool has_unescaped_quote(const std::string& text, size_t pos) {
+    size_t slashes = 0;
+    for (size_t i = pos; i > 0 && text[i - 1] == '\\'; --i) ++slashes;
+    return (slashes & 1u) == 0;
+}
+
 static std::string escape_regex(const std::string& str) {
     static const std::string meta = ".^$*+?()[]{}\\|-";
     std::string out;
@@ -172,6 +189,59 @@ static std::string escape_regex(const std::string& str) {
         out += c;
     }
     return out;
+}
+
+// STYX stores regexes in quoted, JSON-like strings. Decode escapes that must
+// reach std::regex (notably \\b and \\w) without interpreting arbitrary text.
+static std::string unescape_styx_string(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    bool escaped = false;
+    for (char c : value) {
+        if (!escaped) {
+            if (c == '\\') escaped = true;
+            else out += c;
+            continue;
+        }
+        switch (c) {
+        case 'n': out += '\n'; break;
+        case 'r': out += '\r'; break;
+        case 't': out += '\t'; break;
+        case '\\': out += '\\'; break;
+        case '"': out += '"'; break;
+        default: out += c; break;
+        }
+        escaped = false;
+    }
+    if (escaped) out += '\\';
+    return out;
+}
+
+static void inherit_base_styles(StyxStyleSheet& sheet) {
+    const std::map<std::string, StyxColor> base_styles = {
+        {"background", {ImVec4(0.10f, 0.10f, 0.13f, 1.0f)}},
+        {"default", {ImVec4(0.85f, 0.85f, 0.85f, 1.0f)}},
+        {"keyword", {ImVec4(0.80f, 0.47f, 0.20f, 1.0f), true, false, false}},
+        {"string", {ImVec4(0.41f, 0.53f, 0.35f, 1.0f)}},
+        {"number", {ImVec4(0.41f, 0.59f, 0.73f, 1.0f)}},
+        {"comment", {ImVec4(0.50f, 0.50f, 0.50f, 1.0f), false, true, false}},
+        {"type", {ImVec4(0.86f, 0.35f, 0.35f, 1.0f)}},
+        {"call", {ImVec4(0.66f, 0.78f, 0.98f, 1.0f)}},
+        {"constant", {ImVec4(0.90f, 0.90f, 0.90f, 1.0f), true, false, false}},
+        {"operator", {ImVec4(0.72f, 0.75f, 0.80f, 1.0f)}},
+        {"property", {ImVec4(0.72f, 0.82f, 0.92f, 1.0f)}},
+        {"punctuation", {ImVec4(0.70f, 0.72f, 0.76f, 1.0f)}}
+    };
+    const std::map<std::string, std::vector<std::string>> base_keywords = {
+        {"keyword", {"local", "global", "return", "then", "while", "and", "break", "do", "else", "elseif", "end", "for", "function", "if", "in", "not", "or", "repeat", "until"}},
+        {"constant", {"true", "false", "nil", "T", "F"}},
+        {"type", {"boolean", "userdata", "String", "Object", "Template", "Zone", "Program"}}
+    };
+    for (const auto& item : base_styles)
+        if (!sheet.styles.count(item.first)) sheet.styles[item.first] = item.second;
+    for (const auto& item : base_keywords)
+        if (!sheet.keywords.count(item.first)) sheet.keywords[item.first] = item.second;
+    if (sheet.name.empty()) sheet.name = "Default Dark";
 }
 
 static bool parse_bool_prop(const std::string& props, const std::string& key) {
@@ -406,16 +476,16 @@ bool IntelliJ::load_style(const std::string& path) {
                     size_t style_pos = obj_content.find("\"style\"");
                     if (style_pos != std::string::npos) {
                         size_t q1 = obj_content.find('"', style_pos + 7);
-                        size_t q2 = obj_content.find('"', q1 + 1);
+                        size_t q2 = find_string_end(obj_content, q1 + 1);
                         if (q1 != std::string::npos && q2 != std::string::npos)
                             style_name = obj_content.substr(q1 + 1, q2 - q1 - 1);
                     }
                     size_t reg_pos = obj_content.find("\"regex\"");
                     if (reg_pos != std::string::npos) {
                         size_t q1 = obj_content.find('"', reg_pos + 7);
-                        size_t q2 = obj_content.find('"', q1 + 1);
+                        size_t q2 = find_string_end(obj_content, q1 + 1);
                         if (q1 != std::string::npos && q2 != std::string::npos)
-                            regex_str = obj_content.substr(q1 + 1, q2 - q1 - 1);
+                            regex_str = unescape_styx_string(obj_content.substr(q1 + 1, q2 - q1 - 1));
                     }
                     
                     if (!style_name.empty() && !regex_str.empty()) {
@@ -434,8 +504,14 @@ bool IntelliJ::load_style(const std::string& path) {
         return false;
     }
     
+    inherit_base_styles(new_style);
+    if (new_style.name.empty() || new_style.extensions.empty() || new_style.styles.empty()) {
+        std::cerr << "[intellij] Invalid style sheet " << path << ": name, extension, and styles are required\n";
+        return false;
+    }
     compile_keywords(new_style);
     style_ = new_style;
+    token_cache_.clear();
     current_style_path_ = path;
     std::cout << "[intellij] Successfully loaded style sheet: " << style_.name << "\n";
     return true;
@@ -624,16 +700,16 @@ bool IntelliJ::load_style_from_memory(const std::string& content) {
                     size_t style_pos = obj_content.find("\"style\"");
                     if (style_pos != std::string::npos) {
                         size_t q1 = obj_content.find('"', style_pos + 7);
-                        size_t q2 = obj_content.find('"', q1 + 1);
+                        size_t q2 = find_string_end(obj_content, q1 + 1);
                         if (q1 != std::string::npos && q2 != std::string::npos)
                             style_name = obj_content.substr(q1 + 1, q2 - q1 - 1);
                     }
                     size_t reg_pos = obj_content.find("\"regex\"");
                     if (reg_pos != std::string::npos) {
                         size_t q1 = obj_content.find('"', reg_pos + 7);
-                        size_t q2 = obj_content.find('"', q1 + 1);
+                        size_t q2 = find_string_end(obj_content, q1 + 1);
                         if (q1 != std::string::npos && q2 != std::string::npos)
-                            regex_str = obj_content.substr(q1 + 1, q2 - q1 - 1);
+                            regex_str = unescape_styx_string(obj_content.substr(q1 + 1, q2 - q1 - 1));
                     }
                     
                     if (!style_name.empty() && !regex_str.empty()) {
@@ -652,14 +728,22 @@ bool IntelliJ::load_style_from_memory(const std::string& content) {
         return false;
     }
     
+    inherit_base_styles(new_style);
+    if (new_style.name.empty() || new_style.extensions.empty() || new_style.styles.empty()) {
+        std::cerr << "[intellij] Invalid embedded style sheet: name, extension, and styles are required\n";
+        return false;
+    }
     compile_keywords(new_style);
     style_ = new_style;
+    token_cache_.clear();
     current_style_path_ = "memory://" + style_.name;
     std::cout << "[intellij] Loaded embedded style sheet: " << style_.name << "\n";
     return true;
 }
 
 void IntelliJ::load_default_style() {
+    style_ = StyxStyleSheet{};
+    token_cache_.clear();
     style_.name = "Default Dark";
     style_.line_comment = "--";
     style_.block_comment_start = "--[[";
@@ -699,14 +783,66 @@ LexState IntelliJ::tokenize_line_stateful(const std::string& line, LexState in_s
     ImVec4 def_col = is_dark_theme ? ImVec4(0.85f, 0.85f, 0.85f, 1.0f) : ImVec4(0.15f, 0.15f, 0.15f, 1.0f);
     StyxColor default_sty = {def_col, false, false, false};
     if (style_.styles.find("default") != style_.styles.end()) default_sty = style_.styles["default"];
+    const ImVec4 bg = style_.styles.count("background") ? style_.styles["background"].color
+                                                          : (is_dark_theme ? ImVec4(0.10f, 0.10f, 0.13f, 1.0f)
+                                                                            : ImVec4(0.97f, 0.97f, 0.98f, 1.0f));
+    const float bg_luma = bg.x * 0.2126f + bg.y * 0.7152f + bg.z * 0.0722f;
+    const float default_luma = default_sty.color.x * 0.2126f + default_sty.color.y * 0.7152f + default_sty.color.z * 0.0722f;
+    if (std::fabs(default_luma - bg_luma) < 0.24f)
+        default_sty.color = is_dark_theme ? ImVec4(0.86f, 0.88f, 0.92f, 1.0f) : ImVec4(0.12f, 0.13f, 0.16f, 1.0f);
     StyxColor comment_sty = style_.styles.count("comment") ? style_.styles["comment"] : default_sty;
+    const float comment_luma = comment_sty.color.x * 0.2126f + comment_sty.color.y * 0.7152f + comment_sty.color.z * 0.0722f;
+    if (std::fabs(comment_luma - bg_luma) < 0.16f) comment_sty = default_sty;
+
+    // Secondary semantic styles used to classify spans a style sheet leaves
+    // unstyled (numbers, operators, punctuation). These make STYX keep the
+    // rich baseline look instead of collapsing every fallback run to one color.
+    const StyxColor number_sty      = style_.styles.count("number")      ? style_.styles["number"]      : (is_dark_theme ? StyxColor{ImVec4(0.41f, 0.59f, 0.73f, 1.0f), false, false, false} : StyxColor{ImVec4(0.09f, 0.31f, 0.92f, 1.0f), false, false, false});
+    const StyxColor operator_sty    = style_.styles.count("operator")    ? style_.styles["operator"]    : (is_dark_theme ? StyxColor{ImVec4(0.72f, 0.75f, 0.80f, 1.0f), false, false, false} : StyxColor{ImVec4(0.30f, 0.30f, 0.32f, 1.0f), false, false, false});
+    const StyxColor punctuation_sty = style_.styles.count("punctuation") ? style_.styles["punctuation"] : operator_sty;
+
+    // Split an unmatched span into number / operator / punctuation runs so the
+    // token stream carries the same granularity as the pre-intellij baseline.
+    auto push_code = [&](std::vector<EditorToken>& dest, const std::string& text) {
+        size_t i = 0;
+        const size_t n = text.size();
+        int cur_kind = -1;
+        std::string cur;
+        auto flush = [&]() {
+            if (cur.empty()) return;
+            StyxColor sty = default_sty;
+            if (cur_kind == 0) sty = number_sty;
+            else if (cur_kind == 1) sty = punctuation_sty;
+            else if (cur_kind == 2) sty = operator_sty;
+            dest.push_back({cur, sty});
+            cur.clear();
+        };
+        while (i < n) {
+            const char c = text[i];
+            int kind = -1;
+            if (std::isdigit((unsigned char)c)) {
+                kind = 0;
+            } else if (c == '(' || c == ')' || c == '{' || c == '}' || c == '[' || c == ']' ||
+                       c == ',' || c == ';' || c == ':') {
+                kind = 1;
+            } else if (c == '+' || c == '-' || c == '*' || c == '/' || c == '%' ||
+                       c == '=' || c == '<' || c == '>' || c == '~' || c == '^' || c == '#') {
+                kind = 2;
+            }
+            if (kind != cur_kind) { flush(); cur_kind = kind; }
+            cur += c;
+            ++i;
+        }
+        flush();
+    };
 
     // Handle multiline block comment continuation
     if (in_state == LexState::IN_BLOCK_COMMENT) {
-        size_t end_pos = line.find("]]");
+        const std::string marker = style_.block_comment_end.empty() ? "]]" : style_.block_comment_end;
+        size_t end_pos = line.find(marker);
         if (end_pos != std::string::npos) {
-            out_tokens.push_back({line.substr(0, end_pos + 2), comment_sty});
-            std::string remainder = line.substr(end_pos + 2);
+            out_tokens.push_back({line.substr(0, end_pos + marker.size()), comment_sty});
+            std::string remainder = line.substr(end_pos + marker.size());
             if (!remainder.empty()) {
                 std::vector<EditorToken> rem_tokens;
                 tokenize_line_stateful(remainder, LexState::NORMAL, is_dark_theme, rem_tokens);
@@ -739,9 +875,9 @@ LexState IntelliJ::tokenize_line_stateful(const std::string& line, LexState in_s
                 size_t start = match.position();
                 size_t end = start + match.length();
                 StyxColor sty = default_sty;
-                if (style_.styles.find(pat.style_name) != style_.styles.end()) {
-                    sty = style_.styles[pat.style_name];
-                }
+                if (style_.styles.find(pat.style_name) != style_.styles.end()) sty = style_.styles[pat.style_name];
+                const float style_luma = sty.color.x * 0.2126f + sty.color.y * 0.7152f + sty.color.z * 0.0722f;
+                if (std::fabs(style_luma - bg_luma) < 0.16f) sty = default_sty;
                 matches.push_back({start, end, sty, p_idx});
             }
         } catch (...) {}
@@ -768,20 +904,21 @@ LexState IntelliJ::tokenize_line_stateful(const std::string& line, LexState in_s
     for (const auto& m : clean_matches) {
         if (m.start > current_idx) {
             std::string text = line.substr(current_idx, m.start - current_idx);
-            out_tokens.push_back({text, default_sty});
+            push_code(out_tokens, text);
         }
         std::string text = line.substr(m.start, m.end - m.start);
         out_tokens.push_back({text, m.style});
         current_idx = m.end;
     }
     if (current_idx < line.size()) {
-        std::string text = line.substr(current_idx);
-        out_tokens.push_back({text, default_sty});
+        push_code(out_tokens, line.substr(current_idx));
     }
 
-    // Check if line opens an unclosed block comment `--[[`
-    size_t block_start = line.find("--[[");
-    if (block_start != std::string::npos && line.find("]]", block_start + 4) == std::string::npos) {
+    const std::string block_start_marker = style_.block_comment_start.empty() ? "--[[" : style_.block_comment_start;
+    const std::string block_end_marker = style_.block_comment_end.empty() ? "]]" : style_.block_comment_end;
+    size_t block_start = line.find(block_start_marker);
+    if (block_start != std::string::npos &&
+        line.find(block_end_marker, block_start + block_start_marker.size()) == std::string::npos) {
         return LexState::IN_BLOCK_COMMENT;
     }
 
@@ -820,30 +957,34 @@ std::vector<BracketError> IntelliJ::check_syntax_errors(const std::string& text)
             continue;
         }
 
-        // Check comment start/end
+        const std::string block_start = style_.block_comment_start.empty() ? "--[[" : style_.block_comment_start;
+        const std::string block_end = style_.block_comment_end.empty() ? "]]" : style_.block_comment_end;
+        const std::string line_comment = style_.line_comment.empty() ? "--" : style_.line_comment;
+
+        // Check comment start/end using the active Styx grammar.
         if (!in_single_quote && !in_double_quote) {
-            if (!in_block_comment && i + 3 < text.size() && text[i] == '-' && text[i+1] == '-' && text[i+2] == '[' && text[i+3] == '[') {
+            if (!in_block_comment && text.compare(i, block_start.size(), block_start) == 0) {
                 in_block_comment = true;
-                i += 3;
-                col_num += 3;
+                i += block_start.size() - 1;
+                col_num += static_cast<int>(block_start.size()) - 1;
                 continue;
             }
-            if (in_block_comment && i + 1 < text.size() && text[i] == ']' && text[i+1] == ']') {
+            if (in_block_comment && text.compare(i, block_end.size(), block_end) == 0) {
                 in_block_comment = false;
-                i += 1;
-                col_num += 1;
+                i += block_end.size() - 1;
+                col_num += static_cast<int>(block_end.size()) - 1;
                 continue;
             }
-            if (!in_block_comment && i + 1 < text.size() && ((text[i] == '-' && text[i+1] == '-') || (text[i] == '/' && text[i+1] == '/'))) {
+            if (!in_block_comment && text.compare(i, line_comment.size(), line_comment) == 0) {
                 in_line_comment = true;
             }
         }
 
         // Check quote state
         if (!in_line_comment && !in_block_comment) {
-            if (c == '"' && (i == 0 || text[i-1] != '\\') && !in_single_quote) {
+            if (c == '"' && has_unescaped_quote(text, i) && !in_single_quote) {
                 in_double_quote = !in_double_quote;
-            } else if (c == '\'' && (i == 0 || text[i-1] != '\\') && !in_double_quote) {
+            } else if (c == '\'' && has_unescaped_quote(text, i) && !in_double_quote) {
                 in_single_quote = !in_single_quote;
             }
         }
@@ -912,7 +1053,18 @@ std::vector<SwordigoApiSymbol> IntelliJ::get_swordigo_autocomplete(const std::st
 void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modified, const std::string& filepath, ImFont* mono_font, ImVec4& custom_bg,
                            bool has_compile_result, bool compile_success, const std::string& compile_error_msg, double compile_time_ms) {
     ImGuiContext& g = *GImGui;
-    bool is_dark_theme = (g.Style.Colors[ImGuiCol_Text].x + g.Style.Colors[ImGuiCol_Text].y + g.Style.Colors[ImGuiCol_Text].z) / 3.0f > 0.5f;
+    
+    // The editor is a self-contained canvas: pick its background (custom > style
+    // sheet > dark default) and derive dark/light from that actual background.
+    // Decoupling it from the window chrome theme keeps every token, gutter and
+    // selection contrast-correct no matter which app theme is active.
+    ImVec4 editor_bg = ImVec4(0.10f, 0.10f, 0.13f, 1.0f);
+    if (custom_bg.w > 0.0f) {
+        editor_bg = custom_bg;
+    } else if (style_.styles.find("background") != style_.styles.end()) {
+        editor_bg = style_.styles["background"].color;
+    }
+    bool is_dark_theme = (editor_bg.x * 0.2126f + editor_bg.y * 0.7152f + editor_bg.z * 0.0722f) < 0.5f;
     
     static float zoom = 1.0f;
     
@@ -963,13 +1115,6 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
     
     ImGui::Separator();
     
-    ImVec4 editor_bg = is_dark_theme ? ImVec4(0.10f, 0.10f, 0.13f, 1.0f) : ImVec4(0.97f, 0.97f, 0.98f, 1.0f);
-    if (custom_bg.w > 0.0f) {
-        editor_bg = custom_bg;
-    } else if (style_.styles.find("background") != style_.styles.end()) {
-        editor_bg = style_.styles["background"].color;
-    }
-    
     ImVec4 gutter_bg = editor_bg;
     if (is_dark_theme) {
         gutter_bg.x = std::max(0.0f, gutter_bg.x - 0.02f);
@@ -981,8 +1126,13 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
         gutter_bg.z = std::min(1.0f, gutter_bg.z + 0.02f);
     }
     
-    float editor_w = ImGui::GetContentRegionAvail().x - gutter_w;
-    float editor_h = ImGui::GetContentRegionAvail().y - 24.0f;
+float editor_w = ImGui::GetContentRegionAvail().x - gutter_w;
+float editor_h = ImGui::GetContentRegionAvail().y - 24.0f;
+// Guard against negative/zero-sized children: an inverted child clip rect is
+// what tripped the "ClipRect.x <= z" AddDrawCmd assertion when a short window
+// (e.g. a freshly decoded multi-KB buffer) left editor_h near/at zero.
+if (editor_w < 16.0f) editor_w = 16.0f;
+if (editor_h < 16.0f) editor_h = 16.0f;
     
     static std::unordered_map<std::string, ImVec2> s_editor_scroll;
     std::string label_key(label);

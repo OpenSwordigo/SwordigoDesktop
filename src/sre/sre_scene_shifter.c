@@ -328,17 +328,25 @@ static void sre_scene_shifter_poll_complete(void) {
 
 /* =========================================================================
  * sre_scene_shifter_normal
- * Normal gateway — calls GotoLevel and completes the transition inside the
- * SRE call (loading screen is never left half-rendered, so it cannot crash).
+ * Normal gateway — calls GotoLevel with instant-complete to avoid the
+ * loading-screen rendering crash (stale VC vtable/matrix corruption).
+ *
+ * NOTE: Previously this left g_sre_instant_scene_load_enabled=0 so the
+ * loading screen would render on its own — this caused reliable crashes
+ * due to stale vtable dispatch in the SceneLoadingView render path during
+ * the transition. Both Normal and Forced now arm instant-complete; the
+ * difference is UI presentation only.
  * ========================================================================= */
 int sre_scene_shifter_normal(const char* level_name, const char* spawn_point) {
-    g_sre_instant_scene_load_enabled = 0;  /* Normal load: no instant-complete */
+    /* Arm instant-complete: same as forced to avoid SLV rendering crash */
+    g_sre_instant_scene_load_enabled = 1;
     g_sre_scene_shift_active         = 1;
-    g_sre_last_slv = NULL;                 /* discard stale SLV from previous loads */
+    g_sre_last_slv = NULL;
     g_sre_scene_shift_wait_frames = 0;
 
     int ok = sre_scene_shifter_call_goto_level(level_name, spawn_point);
     if (!ok) {
+        g_sre_instant_scene_load_enabled = 0;
         g_sre_scene_shift_active = 0;
         fprintf(stderr, "[SRE/SceneShifter] Normal gateway FAILED: %s\n",
                 g_sre_scene_shift_last_error);

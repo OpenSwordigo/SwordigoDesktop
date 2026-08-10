@@ -59,10 +59,11 @@ struct BatchState {
     Mode    mode           = Mode::EXPORT_TO_PNG;
 
     // Export format filter checkboxes
-    bool    filter_pvr     = true;
-    bool    filter_texpng  = true;
-    bool    filter_pvrpng  = true;  // for import mode: select .pvr.png files
-    bool    filter_texppng = true;  // for import mode: select .tex.png.png files
+    bool    filter_pvr     = true;  // export: .pvr files
+    bool    filter_tex     = true;  // export: raw .tex files (→ .tex.png)
+    bool    filter_texpng  = true;  // export: .tex.png files; import: .tex.png → .tex
+    bool    filter_pvrpng  = true;  // import mode: select .pvr.png files
+    bool    filter_texppng = true;  // import mode: select .tex.png.png files
 
     // Import advanced options
     CompressFmt compress_fmt = CompressFmt::ETC1;
@@ -122,5 +123,13 @@ void cancel_batch_job(BatchState& bs);
 
 /* Join the worker thread (called on app exit). */
 void shutdown_batch(BatchState& bs);
+
+/* Headless batch job for the ruby_cli tool. Runs synchronously on the calling
+ * thread, prints progress/results to stdout, and returns a process exit code:
+ *   0  = at least one file converted with no errors
+ *   1  = everything failed / nothing found
+ *  -1  = invalid arguments (missing src/dst dirs)
+ * Requires bs.src_dir / bs.dst_dir to be filled in (plus mode/filters). */
+int run_batch_headless(BatchState& bs);
 
 } // namespace batch

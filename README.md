@@ -144,4 +144,5 @@ All technical documentation, reverse-engineering analyses, and API specification
 ## 7. License and Copyright
 
 * **SwordigoDesktop Engine & SRE Codebase**: Released under the [GNU General Public License v2.0 or later](LICENSE).
+* **ufbx** (FBX importer, [github.com/bqqqqqq/ufbx](https://github.com/bqqqqqq/ufbx)): MIT-licensed single-file FBX loader, vendored in `src/tools/ufbx/`.
 * **Swordigo Game Assets**: Original game assets, binaries, and trademarks remain the intellectual property of Touch Foo / Ville Mäkynen. This compatibility layer requires user-supplied game data files.

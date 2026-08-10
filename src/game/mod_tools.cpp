@@ -5,8 +5,7 @@
 #include <cmath>
 #include <iostream>
 #include <algorithm>
-#include <GL/gl.h>
-
+#include "platform/gl_inc.h"
 // ============================================================
 //  SwordigoDesktop — Mod Tools Implementation
 //  Game speed, pause/step, toast notifications.

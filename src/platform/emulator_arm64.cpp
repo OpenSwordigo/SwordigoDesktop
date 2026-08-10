@@ -1,11 +1,11 @@
 #include "emulator_arm64.h"
+#include "unicorn_dyn.h"
 #include "platform/binary_selector.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
 #include <chrono>
 #include <iomanip>
-#include <unicorn/unicorn.h>
 
 // ============================================================================
 // ARM64 Emulator — AArch64 mode via Unicorn Engine
@@ -187,6 +187,12 @@ static void hook_bridge_64(uc_engine *uc, uint64_t address, uint32_t size, void 
 EmulatorArm64::EmulatorArm64(uint8_t* guest_mem, uint64_t mem_size)
     : memory(guest_mem), size(mem_size), uc(nullptr) {
     
+    if (!unicorn_backend_available()) {
+        std::cerr << "[ARM64] Unicorn backend is unavailable: "
+                  << unicorn_backend_error() << std::endl;
+        return;
+    }
+
     // Open Unicorn in AArch64 mode (no Thumb, no mode switching!)
     uc_err err = uc_open(UC_ARCH_ARM64, UC_MODE_ARM, (uc_engine**)&uc);
     if (err) {
@@ -329,6 +335,10 @@ uint64_t EmulatorArm64::get_bridge_base() { return 0xFF000000; }
 // --- Execution ---
 
 void EmulatorArm64::run(uint64_t start_pc) {
+    if (!uc) {
+        std::cerr << "[ARM64] run() called but Unicorn engine is not available" << std::endl;
+        return;
+    }
     uint64_t magic_lr = 0xE0000000;
     uc_reg_write((uc_engine*)uc, UC_ARM64_REG_LR, &magic_lr);
     uc_reg_write((uc_engine*)uc, UC_ARM64_REG_PC, &start_pc);

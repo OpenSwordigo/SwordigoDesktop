@@ -69,13 +69,21 @@ static constexpr uint32_t eNodeAnimationScaleIndex      = 5015;
 static constexpr uint32_t eNodeAnimationMatrixIndex     = 5016;
 
 // Mesh properties
+// (Block-ID table cross-checked against blenderift's jPOD.py — the PowerVR
+// POD spec from Imagination's Developer Technology Team — see
+// docs/BLENDERIFT_INTEGRATION.md for the full reference.)
 static constexpr uint32_t eMeshNumVertices              = 6000;
 static constexpr uint32_t eMeshNumFaces                 = 6001;
 static constexpr uint32_t eMeshNumUVWChannels            = 6002;
 static constexpr uint32_t eMeshVertexIndexList          = 6003;
+static constexpr uint32_t eMeshStripLengthList          = 6004;  // 'il' list of strip lengths (strips only)
+static constexpr uint32_t eMeshNumStrips                = 6005;  // >0 => faces stored as triangle strips
 static constexpr uint32_t eMeshVertexList               = 6006;
 static constexpr uint32_t eMeshNormalList               = 6007;
+static constexpr uint32_t eMeshTangentList              = 6008;
+static constexpr uint32_t eMeshBinormalList             = 6009;
 static constexpr uint32_t eMeshUVWList                  = 6010;
+static constexpr uint32_t eMeshVertexColourList         = 6011;
 static constexpr uint32_t eMeshBoneIndexList            = 6012;
 static constexpr uint32_t eMeshBoneWeightList            = 6013;
 static constexpr uint32_t eMeshInteravedDataList        = 6014;
@@ -84,12 +92,21 @@ static constexpr uint32_t eMeshNumBoneIndicesPerBatch   = 6016;
 static constexpr uint32_t eMeshBoneOffsetPerBatch       = 6017;
 static constexpr uint32_t eMeshMaxNumBonesPerBatch      = 6018;
 static constexpr uint32_t eMeshNumBoneBatches           = 6019;
+static constexpr uint32_t eMeshUnpackMatrix             = 6020;  // 'f' 16 floats, unpacks packed vertex data
+static constexpr uint32_t eMeshType                     = 6021;  // 0 = triangles (list/strip), 1 = quads, 2 = lines
+static constexpr uint32_t eMeshAdjacencyIndexList       = 6022;  // 'il' 6 per face, optional
 
 // Vertex Block fields
 static constexpr uint32_t eBlockDataType                = 9000;
 static constexpr uint32_t eBlockNumComponents           = 9001;
 static constexpr uint32_t eBlockStride                  = 9002;
 static constexpr uint32_t eBlockData                    = 9003;
+
+// Vertex data types (DataType 9000 values, from jPOD.py / PowerVR SDK)
+// 1 Float, 2 Int, 3 UnsignedShort, 4 RGBA, 5 ARGB, 6 D3DCOLOR, 7 UBYTE4,
+// 8 DEC3N, 9 Fixed16_16, 10 UnsignedByte, 11 Short, 12 ShortNorm,
+// 13 Byte, 14 ByteNorm, 15 UnsignedByteNorm, 16 UnsignedShortNorm,
+// 17 UnsignedInt, 18 ABGR, 19 HalfFloat.
 
 // Helper to safely read values
 static uint32_t read_u32(const uint8_t* data, size_t size, size_t& off) {
@@ -206,7 +223,7 @@ static std::vector<float> unpack_vertex_data(
     else if (type == 3 || type == 11 || type == 12 || type == 16) comp_size = 2; // short / ushort
     else if (type == 10 || type == 13 || type == 14 || type == 15) comp_size = 1; // byte / ubyte
 
-    // main.js Is(): stride defaults to blockNumComponents * compSize when 0
+    // libswordigo_arm32.c Is(): stride defaults to blockNumComponents * compSize when 0
     uint32_t block_components = (de.num_components > 0) ? de.num_components : (uint32_t)num_components;
     if (stride == 0) {
         stride = block_components * comp_size;
@@ -258,11 +275,13 @@ static std::vector<float> unpack_vertex_data(
 }
 
 // Parse indices (Face Index List)
-// Matches main.js yS: indices are decoded by dataType and widened into a
-// Uint32Array of size numFaces*3 (never truncated to 16-bit).
-static void parse_indices(const DataElement& de, int num_faces, PODMesh& mesh) {
+// Matches libswordigo_arm32.c yS: indices are decoded by dataType and widened into a
+// Uint32Array of size numFaces*verts_per_face (never truncated to 16-bit).
+// Triangle meshes use 3; quad meshes (MeshType 6021 == 1) use 4 and are
+// expanded to triangles here. All stock Swordigo meshes are triangles.
+static void parse_indices(const DataElement& de, int num_faces, int verts_per_face, PODMesh& mesh) {
     if (!de.payload || de.payload_size == 0) return;
-    int index_count = num_faces * 3;
+    const int index_count = num_faces * verts_per_face;
     mesh.indices.resize(index_count);
 
     size_t comp_size = 4;
@@ -283,6 +302,16 @@ static void parse_indices(const DataElement& de, int num_faces, PODMesh& mesh) {
         }
         mesh.indices[i] = val;
     }
+    if (verts_per_face == 4) {
+        std::vector<uint32_t> tris;
+        tris.reserve((size_t)num_faces * 6);
+        for (int f = 0; f < num_faces; ++f) {
+            const uint32_t* q = &mesh.indices[(size_t)f * 4];
+            tris.push_back(q[0]); tris.push_back(q[1]); tris.push_back(q[2]);
+            tris.push_back(q[0]); tris.push_back(q[2]); tris.push_back(q[3]);
+        }
+        mesh.indices.swap(tris);
+    }
 }
 
 // Compute single mesh AABB bounding box
@@ -300,6 +329,39 @@ static void compute_mesh_aabb(PODMesh& mesh) {
         mesh.max_x = std::max(mesh.max_x, x);
         mesh.max_y = std::max(mesh.max_y, y);
         mesh.max_z = std::max(mesh.max_z, z);
+    }
+}
+
+// MeshUnpackMatrix (6020) is how PowerVR-packed exports undo their packing.
+// Real Swordigo PODs carry an identity here (verified across the asset
+// library); non-identity values must be applied so Blender/GLB round-trips
+// see unpacked vertices.
+static bool unpack_matrix_is_identity_or_degenerate(const float m[16]) {
+    const float id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    bool ident = true, zero = true;
+    for (int i = 0; i < 16; ++i) {
+        if (m[i] != id[i]) ident = false;
+        if (m[i] != 0.0f)  zero = false;
+    }
+    return ident || zero;
+}
+
+// Apply the column-major 4x4 unpack matrix to positions (w=1) and normals
+// (w=0, rotation part only).
+static void apply_unpack_matrix(float* positions, size_t pos_count,
+                                float* normals, size_t nrm_count,
+                                const float m[16]) {
+    for (size_t i = 0; i + 2 < pos_count; i += 3) {
+        const float x = positions[i], y = positions[i + 1], z = positions[i + 2];
+        positions[i]     = m[0] * x + m[4] * y + m[8]  * z + m[12];
+        positions[i + 1] = m[1] * x + m[5] * y + m[9]  * z + m[13];
+        positions[i + 2] = m[2] * x + m[6] * y + m[10] * z + m[14];
+    }
+    for (size_t i = 0; i + 2 < nrm_count; i += 3) {
+        const float x = normals[i], y = normals[i + 1], z = normals[i + 2];
+        normals[i]     = m[0] * x + m[4] * y + m[8]  * z;
+        normals[i + 1] = m[1] * x + m[5] * y + m[9]  * z;
+        normals[i + 2] = m[2] * x + m[6] * y + m[10] * z;
     }
 }
 
@@ -381,14 +443,29 @@ static PODMesh readMeshBlock(const uint8_t* data, size_t size, size_t& off) {
             case eMeshNumBoneBatches:
                 num_bone_batches = read_u32(data, size, off);
                 break;
+            case eMeshUnpackMatrix:
+                if (len >= 16 * 4) {
+                    std::memcpy(mesh.unpack_matrix, data + off, 16 * 4);
+                    mesh.has_unpack_matrix = true;
+                }
+                off += len;
+                break;
+            case eMeshType:
+                if (len >= 4) {
+                    mesh.mesh_type = static_cast<int>(read_u32(data, size, off));
+                    if (len > 4) off += len - 4;   // keep the block walker aligned
+                } else {
+                    off += len;
+                }
+                break;
             default:
                 off += len;
                 break;
         }
     }
 
-    // Now convert and unpack elements
-    parse_indices(idx_element, mesh.num_faces, mesh);
+    // Now convert and unpack elements. Quads (mesh_type 1) expand to tris.
+    parse_indices(idx_element, mesh.num_faces, mesh.mesh_type == 1 ? 4 : 3, mesh);
 
     mesh.positions = unpack_vertex_data(interleaved_payload, interleaved_size, pos_element, mesh.num_vertices, 3);
     mesh.normals   = unpack_vertex_data(interleaved_payload, interleaved_size, nrm_element, mesh.num_vertices, 3);
@@ -407,6 +484,13 @@ static PODMesh readMeshBlock(const uint8_t* data, size_t size, size_t& off) {
         mesh.bone_batches.offsets = std::move(bone_batch_offsets);
         mesh.bone_batches.max_bones = max_bones_per_batch;
         mesh.bone_batches.count = num_bone_batches;
+    }
+
+    if (mesh.has_unpack_matrix &&
+        !unpack_matrix_is_identity_or_degenerate(mesh.unpack_matrix)) {
+        apply_unpack_matrix(mesh.positions.data(), mesh.positions.size(),
+                            mesh.normals.data(), mesh.normals.size(),
+                            mesh.unpack_matrix);
     }
 
     compute_mesh_aabb(mesh);
@@ -672,7 +756,7 @@ PODModel pod_parse(const uint8_t* data, size_t size) {
     return model;
 }
 
-PODModel pod_load(const std::string& path) {
+PODModel pod_load(const std::string& path, const std::string& merge_hint) {
     if (g_pod_file_loader) {
         std::vector<uint8_t> data;
         if (g_pod_file_loader(path, data) && !data.empty()) {
@@ -753,12 +837,36 @@ PODModel pod_load(const std::string& path) {
                 }
             }
 
+            // Fall back to an explicit base-model hint from the caller — the
+            // scene object's own base mesh. npc_stand.POD carries only the
+            // anim streams; the stripped prefix (npc.POD) doesn't exist, but
+            // the prisoner's base rig lives at knight.POD (and snowball_land
+            // at shadowblob.POD). Node names are matched, so a wrong hint is
+            // harmless (no stream copies).
+            if (base_path.empty() && !merge_hint.empty()) {
+                for (const fs::path& cand : {parent_dir / (merge_hint + ".POD"),
+                                             parent_dir / (merge_hint + ".pod")}) {
+                    if (fs::exists(cand)) { base_path = cand; break; }
+                }
+            }
+
             if (!base_path.empty()) {
                 std::cout << "[POD] Detected animation-only POD. Merging with base model: " << base_path.string() << std::endl;
                 PODModel base_model = pod_load(base_path.string());
                 if (!base_model.meshes.empty()) {
                     base_model.num_frames = model.num_frames;
                     base_model.fps = model.fps;
+                    // Capture the base model's TRUE bind pose first: the mesh
+                    // was exported in this pose, and skinning must stay
+                    // relative to it even after the anim streams are replaced.
+                    // (The base model stores its rest pose as 1-frame anim
+                    // streams — frame 0 of THAT model is the bind pose.)
+                    for (size_t bi = 0; bi < base_model.nodes.size(); ++bi) {
+                        float bind_m[16];
+                        get_node_matrix(base_model, static_cast<int>(bi), 0.0f, bind_m);
+                        base_model.nodes[bi].has_bind_matrix = true;
+                        std::memcpy(base_model.nodes[bi].bind_matrix, bind_m, sizeof(bind_m));
+                    }
                     for (auto& base_node : base_model.nodes) {
                         for (const auto& anim_node : model.nodes) {
                             if (base_node.name == anim_node.name) {
@@ -838,7 +946,7 @@ static bool local_mat4_inverse(const float in[16], float out[16]) {
 }
 
 static void local_mat4_from_quat(const float q[4], float m[16]) {
-    // main.js::$c converts POD quaternions into the editor coordinate system
+    // libswordigo_arm32.c::$c converts POD quaternions into the editor coordinate system
     // by negating xyz while preserving w.
     float x = -q[0], y = -q[1], z = -q[2], w = q[3];
     m[0] = 1.0f - 2.0f * (y * y + z * z);
@@ -1005,6 +1113,79 @@ void get_node_matrix(const PODModel& model, int node_idx, float frame, float* mO
     get_node_matrix_internal(model, node_idx, frame, mOut, 0);
 }
 
+float pod_feet_offset(const PODModel& model) {
+    // Measure the lowest rendered vertex at REST pose, not animation frame 0:
+    // for merged animation PODs frame 0 may be mid-stride (legs split, feet
+    // higher/lower than standing). Nodes captured a TRUE bind matrix at merge
+    // time — use it when present, fall back to frame 0, then apply the
+    // center-point shift exactly like the render path (centerOffset * node_m).
+    // NOTE: assumes the lowest vertex is the FEET (no trailing weapon tip
+    // below them) — true for hiro (sword node bottoms at +9.98 vs feet −35.14).
+    float min_y = 0.0f;
+    bool  any   = false;
+    const float cy = model.has_center_point ? -model.center_point[1] : 0.0f;
+    for (int ni = 0; ni < (int)model.nodes.size() && ni < model.num_mesh_nodes; ++ni) {
+        const auto& node = model.nodes[ni];
+        if (node.object_index < 0 || node.object_index >= (int)model.meshes.size())
+            continue;
+        const auto& mesh = model.meshes[node.object_index];
+        if (mesh.positions.empty()) continue;
+        float mm[16];
+        if (node.has_bind_matrix)
+            std::memcpy(mm, node.bind_matrix, sizeof(mm));
+        else
+            get_node_matrix(model, ni, 0.0f, mm);
+        const float xs[2] = {mesh.min_x, mesh.max_x};
+        const float ys[2] = {mesh.min_y, mesh.max_y};
+        const float zs[2] = {mesh.min_z, mesh.max_z};
+        for (float x : xs)
+            for (float y : ys)
+                for (float z : zs) {
+                    const float oy = mm[1]*x + mm[5]*y + mm[9]*z + mm[13] + cy;
+                    min_y = std::min(min_y, oy);
+                }
+        any = true;
+    }
+    if (any) return -min_y;
+    // Node-less PODs: raw mesh-space bounds.
+    for (const auto& mesh : model.meshes) {
+        if (mesh.positions.empty()) continue;
+        min_y = std::min(min_y, mesh.min_y);
+        any = true;
+    }
+    return any ? -min_y : 0.0f;
+}
+
+bool pod_anim_feet(const PODModel& model, std::vector<float>& out) {
+    out.clear();
+    const float cy = model.has_center_point ? model.center_point[1] : 0.0f;
+    const int nf = std::max(model.num_frames, 1);
+    for (int f = 0; f < nf; ++f) {
+        float min_y = 0.0f;
+        bool  any   = false;
+        for (int ni = 0; ni < (int)model.nodes.size() && ni < model.num_mesh_nodes; ++ni) {
+            const auto& node = model.nodes[ni];
+            if (node.object_index < 0 || node.object_index >= (int)model.meshes.size())
+                continue;
+            const auto& mesh = model.meshes[node.object_index];
+            if (mesh.positions.empty()) continue;
+            std::vector<float> sp, sn;
+            const bool skinned = skin_mesh(model, ni, (float)f, sp, sn);
+            const std::vector<float>& src = skinned ? sp : mesh.positions;
+            float mm[16];
+            get_node_matrix(model, ni, (float)f, mm);
+            for (size_t i = 0; i + 2 < src.size(); i += 3) {
+                const float oy = mm[1]*src[i] + mm[5]*src[i+1] + mm[9]*src[i+2]
+                               + mm[13] - cy;
+                min_y = std::min(min_y, oy);
+                any   = true;
+            }
+        }
+        out.push_back(any ? -min_y : 0.0f);
+    }
+    return !out.empty();
+}
+
 bool skin_mesh(const PODModel& model, int mesh_node_idx, float frame,
                std::vector<float>& positions, std::vector<float>& normals) {
     if (mesh_node_idx < 0 || mesh_node_idx >= static_cast<int>(model.nodes.size())) return false;
@@ -1022,7 +1203,15 @@ bool skin_mesh(const PODModel& model, int mesh_node_idx, float frame,
 
     std::vector<float> bind_world(model.nodes.size() * 16), current_world(model.nodes.size() * 16);
     for (size_t i = 0; i < model.nodes.size(); ++i) {
-        get_node_matrix(model, static_cast<int>(i), 0.0f, &bind_world[i * 16]);
+        // Bind = the pose the mesh was exported in. For merged animation
+        // models this is the base model's rest pose (captured at merge time),
+        // NOT animation frame 0 — using frame 0 there renders the baked
+        // T-pose at frame 0 and offsets every animated pose.
+        if (model.nodes[i].has_bind_matrix) {
+            std::memcpy(&bind_world[i * 16], model.nodes[i].bind_matrix, 16 * sizeof(float));
+        } else {
+            get_node_matrix(model, static_cast<int>(i), 0.0f, &bind_world[i * 16]);
+        }
         get_node_matrix(model, static_cast<int>(i), frame, &current_world[i * 16]);
     }
     std::vector<float> skin_matrices(model.nodes.size() * 16);

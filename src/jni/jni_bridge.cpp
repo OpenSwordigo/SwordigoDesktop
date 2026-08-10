@@ -1,3 +1,4 @@
+#include "wincompat/posix.h"
 #include "jni_bridge.h"
 #include "platform/emulator.h"
 
@@ -24,13 +25,13 @@ extern "C" const char* sre_resolve_symbol(uint64_t addr);
 #include <sys/stat.h>
 #ifndef _WIN32
 #include <dirent.h>
-#endif
 #include <sys/time.h>
+#include <unistd.h>
+#endif
 #include <filesystem>
 namespace fs = std::filesystem;
 #include <vorbis/vorbisfile.h>
 #include <time.h>
-#include <unistd.h>
 #include <cerrno>
 #define GL_GLEXT_PROTOTYPES
 #include "platform/gl_inc.h"
@@ -51,7 +52,11 @@ extern uint8_t* g_guest_memory;
 
 // When true, GL bridge functions call real OpenGL instead of no-ops
 bool g_display_active = false;
+#if defined(_MSC_VER)
+extern std::string g_save_dir;  // Defined in src/platform/data_path.cpp; MSVC weak is no-op
+#else
 std::string g_save_dir = "./save";  // Default; overwritten by main.cpp at startup
+#endif
 int g_death_detected_countdown = 0;  // Set when gameover music loads, counted down in game loop
 bool g_text_input_active = false;   // Set by JNI bridge when game requests text input
 std::string g_text_input_buffer;    // Current text buffer for text input mode
@@ -180,6 +185,7 @@ struct DeferredBlock {
     uint32_t addr;
     uint32_t size;
     uint64_t alloc_index;
+    uint64_t free_ms;   // wall-clock ms when deferred — enables the time-based drain
 };
 static uint32_t g_guest_heap_ptr = 0x20000000; // Start heap at 512MB
 static std::unordered_map<uint32_t, uint32_t> g_guest_allocs;
@@ -274,9 +280,14 @@ static uint32_t host_malloc_locked(uint32_t size) {
     size = (size + 7) & ~7;
     if (size == 0) size = 8;
     
+    // Drain if EITHER enough allocations passed OR the block is older than 250 ms
+    // wall-clock (time fallback prevents unbounded growth when frees outpace allocs).
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000u);
     while (!g_deferred_free_list.empty()) {
         const auto& db = g_deferred_free_list.front();
-        if (g_alloc_counter - db.alloc_index > 500) {
+        if (g_alloc_counter - db.alloc_index > 500 || (now_ms - db.free_ms > 500)) {
             add_free_block_locked(db.addr, db.size);
             g_deferred_free_list.pop_front();
         } else {
@@ -315,6 +326,9 @@ static void host_free_locked(uint32_t ptr) {
         db.addr = ptr;
         db.size = (size + 7) & ~7;
         db.alloc_index = g_alloc_counter;
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        db.free_ms = (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000u);
         g_deferred_free_list.push_back(db);
         g_guest_allocs.erase(ptr);
     }

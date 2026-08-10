@@ -18,11 +18,25 @@ sed -n '/VK_VERT_SHADER_GLSL/,/)glsl"/p' "$SRCDIR/vulkan_shaders.glsl.h" | \
 sed -n '/VK_FRAG_SHADER_GLSL/,/)glsl"/p' "$SRCDIR/vulkan_shaders.glsl.h" | \
     sed '1d;$d' > "$TMPDIR/uber.frag"
 
+# Extract postfx vertex shader GLSL
+sed -n '/VK_VERT_POSTFX_GLSL/,/)glsl"/p' "$SRCDIR/vulkan_shaders.glsl.h" | \
+    sed '1d;$d' > "$TMPDIR/postfx.vert"
+
+# Extract postfx fragment shader GLSL
+sed -n '/VK_FRAG_POSTFX_GLSL/,/)glsl"/p' "$SRCDIR/vulkan_shaders.glsl.h" | \
+    sed '1d;$d' > "$TMPDIR/postfx.frag"
+
 echo "[Shaders] Compiling vertex shader..."
 glslangValidator -V "$TMPDIR/uber.vert" -o "$TMPDIR/uber.vert.spv"
 
 echo "[Shaders] Compiling fragment shader..."
 glslangValidator -V "$TMPDIR/uber.frag" -o "$TMPDIR/uber.frag.spv"
+
+echo "[Shaders] Compiling PostFX vertex shader..."
+glslangValidator -V "$TMPDIR/postfx.vert" -o "$TMPDIR/postfx.vert.spv"
+
+echo "[Shaders] Compiling PostFX fragment shader..."
+glslangValidator -V "$TMPDIR/postfx.frag" -o "$TMPDIR/postfx.frag.spv"
 
 echo "[Shaders] Generating C header..."
 
@@ -34,10 +48,12 @@ cat > "$OUTDIR/vulkan_shaders_spirv.h" << 'HEADER_START'
 
 HEADER_START
 
-# Convert vertex SPIR-V to C array
-echo "static const uint32_t VK_VERT_SHADER_SPIRV[] = {" >> "$OUTDIR/vulkan_shaders_spirv.h"
-xxd -i < "$TMPDIR/uber.vert.spv" | sed 's/unsigned char.*\[\] = {//;s/};$//' | \
-    python3 -c "
+convert_spirv() {
+    local infile="$1"
+    local array_name="$2"
+    echo "static const uint32_t ${array_name}[] = {" >> "$OUTDIR/vulkan_shaders_spirv.h"
+    xxd -i < "$infile" | sed 's/unsigned char.*\[\] = {//;s/};$//' | \
+        python3 -c "
 import sys
 data = bytes([int(x.strip().rstrip(','), 16) for x in sys.stdin.read().replace('\n',' ').split(',') if x.strip()])
 words = []
@@ -47,25 +63,19 @@ for i in range(0, len(data), 4):
 for i in range(0, len(words), 8):
     print('    ' + ', '.join(words[i:i+8]) + ',')
 " >> "$OUTDIR/vulkan_shaders_spirv.h"
-echo "};" >> "$OUTDIR/vulkan_shaders_spirv.h"
-echo "" >> "$OUTDIR/vulkan_shaders_spirv.h"
+    echo "};" >> "$OUTDIR/vulkan_shaders_spirv.h"
+    echo "" >> "$OUTDIR/vulkan_shaders_spirv.h"
+}
 
-# Convert fragment SPIR-V to C array
-echo "static const uint32_t VK_FRAG_SHADER_SPIRV[] = {" >> "$OUTDIR/vulkan_shaders_spirv.h"
-xxd -i < "$TMPDIR/uber.frag.spv" | sed 's/unsigned char.*\[\] = {//;s/};$//' | \
-    python3 -c "
-import sys
-data = bytes([int(x.strip().rstrip(','), 16) for x in sys.stdin.read().replace('\n',' ').split(',') if x.strip()])
-words = []
-for i in range(0, len(data), 4):
-    w = int.from_bytes(data[i:i+4], 'little')
-    words.append(f'0x{w:08x}')
-for i in range(0, len(words), 8):
-    print('    ' + ', '.join(words[i:i+8]) + ',')
-" >> "$OUTDIR/vulkan_shaders_spirv.h"
-echo "};" >> "$OUTDIR/vulkan_shaders_spirv.h"
+convert_spirv "$TMPDIR/uber.vert.spv" "VK_VERT_SHADER_SPIRV"
+convert_spirv "$TMPDIR/uber.frag.spv" "VK_FRAG_SHADER_SPIRV"
+convert_spirv "$TMPDIR/postfx.vert.spv" "VK_VERT_POSTFX_SPIRV"
+convert_spirv "$TMPDIR/postfx.frag.spv" "VK_FRAG_POSTFX_SPIRV"
 
 VERT_SIZE=$(wc -c < "$TMPDIR/uber.vert.spv")
 FRAG_SIZE=$(wc -c < "$TMPDIR/uber.frag.spv")
-echo "[Shaders] Done! Vertex: ${VERT_SIZE} bytes, Fragment: ${FRAG_SIZE} bytes"
+POSTFX_V_SIZE=$(wc -c < "$TMPDIR/postfx.vert.spv")
+POSTFX_F_SIZE=$(wc -c < "$TMPDIR/postfx.frag.spv")
+echo "[Shaders] Done! UberVert: ${VERT_SIZE}B, UberFrag: ${FRAG_SIZE}B, PostFXVert: ${POSTFX_V_SIZE}B, PostFXFrag: ${POSTFX_F_SIZE}B"
 echo "[Shaders] Output: $OUTDIR/vulkan_shaders_spirv.h"
+

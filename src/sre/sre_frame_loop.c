@@ -90,6 +90,9 @@ extern void sre_AchievementsManager_Update(void* self, float deltaTime);
 /* From sre_lua.c */
 extern void sre_ProgramState_Update(void* self, float deltaTime);
 
+/* Z-walk is implemented in Lua (see sre_zwalk_loop in sre_mini_api.c),
+ * driven by g_sre_z_walk_axis written by the host each frame. */
+
 /* ──────────────────────────────────────────────────────────────────────────
  * Time-slice budget for ProgramState (Lua coroutine) tree per frame
  *

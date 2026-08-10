@@ -16,8 +16,19 @@ namespace boulder {
         double x, y;
     };
 
+    // A "round hat" dome (Caver::GroundMeshGenerator::InsertRoundHatVertices /
+    // InsertCapForRoundHat): a rounded bump standing on the surface of the
+    // ground mesh. The footprint is a circle of radius r centered at (x,y) in
+    // sketch space; the dome rises `height` above the polygon's top edge.
+    struct Hat {
+        double x = 0.0, y = 0.0;
+        double radius = 60.0;
+        double height = 40.0;
+    };
+
     struct GroundMesh {
         std::vector<PolygonPoint> polygon;
+        std::vector<Hat> hats;               // round-hat domes on the surface
         double min_depth = -45.0;
         double max_depth = 45.0;
         double top_angle = 20.0;

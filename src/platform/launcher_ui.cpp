@@ -10,6 +10,8 @@
 #include "platform/IconsFontAwesome6.h"
 #include "platform/pvr_loader.h"
 #include "platform/embedded_assets.h"
+#include "platform/unicorn_dyn.h"
+#include "platform/os_external.h"
 
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_sdl3.h"
@@ -29,7 +31,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <cmath>
 #include <future>
 
@@ -41,22 +45,15 @@ namespace fs = std::filesystem;
 static void launch_ruby_viewer() {
     std::string path = "./ruby";
     if (!fs::exists(path)) {
-        char exe_buf[4096];
-        ssize_t len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
-        if (len > 0) {
-            exe_buf[len] = '\0';
-            path = fs::path(exe_buf).parent_path() / "ruby";
+        std::string exe_dir = os_external::exe_dir();
+        if (!exe_dir.empty()) {
+            path = (fs::path(exe_dir) / "ruby").string();
         }
     }
     if (fs::exists(path)) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            execlp(path.c_str(), path.c_str(), (char*)NULL);
-            _exit(1);
-        }
+        os_external::spawn_detached(path, {});
     } else {
-        pid_t pid = fork();
-        if (pid == 0) { execlp("ruby", "ruby", (char*)NULL); _exit(1); }
+        os_external::spawn_detached("ruby", {});
         std::cerr << "[Launcher] ruby not found next to binary — tried PATH" << std::endl;
     }
 }
@@ -154,6 +151,31 @@ static bool                     g_save_status_ok   = false;
 
 static bool g_confirm_delete    = false;
 static int  g_delete_target_idx = -1;
+
+// CPU-backend availability: Dynarmic is always available when compiled in;
+// Unicorn is optional and runtime-loaded, so it may be missing. When the user
+// picks a backend that cannot run, we surface a modal instead of launching.
+static bool g_show_backend_warning = false;
+static std::string g_backend_warning;
+
+static bool backend_selection_ok(bool use_dynarmic) {
+    if (use_dynarmic) {
+#ifdef SWORDIGO_HAS_DYNARMIC
+        return true;
+#else
+        // Dynarmic not compiled in; fall through to the Unicorn requirement.
+        return backend_selection_ok(false);
+#endif
+    }
+    if (unicorn_backend_available()) return true;
+    g_backend_warning =
+        "The Unicorn CPU engine is not available.\n\n"
+        "Drop libunicorn.so (Linux) or unicorn.dll (Windows) next to Swordigo Desktop,\n"
+        "or install the Unicorn Engine package (e.g. libunicorn-dev), then restart.\n\n"
+        "Alternatively pick Dynarmic (JIT) above - it is bundled and always works.";
+    g_show_backend_warning = true;
+    return false;
+}
 
 static bool  g_show_add_instance  = false;
 static char  g_add_name[128]      = "";
@@ -987,13 +1009,15 @@ static void DrawHomePage(BinarySelector& selector, int& selected,
         if (ImGui::Button(ICON_FA_PLAY "  PLAY", ImVec2(btn_w, btn_h))) {
             cfg.graphics_api = (api_sel == 0) ? GraphicsAPI::OPENGL : GraphicsAPI::VULKAN;
             cfg.use_dynarmic = (engine_sel == 1);
-            cfg.use_sre = use_sre_sel;
-            cfg.advanced_redstell_opts = adv_opts_sel;
-            cfg.selected_binary = b.filepath;
-            cfg.assets_dir = b.assets_dir;
-            cfg.game_type = b.game_type;
-            cfg.should_launch = true;
-            running = false;
+            if (backend_selection_ok(cfg.use_dynarmic)) {
+                cfg.use_sre = use_sre_sel;
+                cfg.advanced_redstell_opts = adv_opts_sel;
+                cfg.selected_binary = b.filepath;
+                cfg.assets_dir = b.assets_dir;
+                cfg.game_type = b.game_type;
+                cfg.should_launch = true;
+                running = false;
+            }
         }
         ImGui::PopStyleColor(3);
         if (g_font_heading) ImGui::PopFont();
@@ -1168,8 +1192,7 @@ static void DrawLibraryPage(BinarySelector& selector, int& selected,
             if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN "  Open Folder")) {
                 std::string full = b.filepath[0] == '/' ? b.filepath : (get_user_data_dir() + "/" + b.filepath);
                 std::string dir = fs::path(full).parent_path().string();
-                pid_t pid = fork();
-                if (pid == 0) { execlp("xdg-open", "xdg-open", dir.c_str(), nullptr); _exit(1); }
+                os_external::open_in_file_manager(dir);
             }
             ImGui::Separator();
             bool is_vanilla = (b.game_type == "Swordigo" || b.game_type == "RLSwordigo" || b.game_type == "SwordigoMini");
@@ -1299,13 +1322,15 @@ static void DrawLibraryPage(BinarySelector& selector, int& selected,
     if (ImGui::Button(ICON_FA_PLAY "  PLAY", ImVec2(launch_w, 52))) {
         cfg.graphics_api = (api_sel == 0) ? GraphicsAPI::OPENGL : GraphicsAPI::VULKAN;
         cfg.use_dynarmic  = (engine_sel == 1);
-        cfg.use_sre       = use_sre_sel;
-        cfg.advanced_redstell_opts = adv_opts_sel;
-        cfg.selected_binary = b.filepath;
-        cfg.assets_dir      = b.assets_dir;
-        cfg.game_type       = b.game_type;
-        cfg.should_launch   = true;
-        running = false;
+        if (backend_selection_ok(cfg.use_dynarmic)) {
+            cfg.use_sre       = use_sre_sel;
+            cfg.advanced_redstell_opts = adv_opts_sel;
+            cfg.selected_binary = b.filepath;
+            cfg.assets_dir      = b.assets_dir;
+            cfg.game_type       = b.game_type;
+            cfg.should_launch   = true;
+            running = false;
+        }
     }
     if (g_font_heading) ImGui::PopFont();
     ImGui::PopStyleColor(3);
@@ -1392,8 +1417,7 @@ static void DrawLibraryPage(BinarySelector& selector, int& selected,
     if (ImGui::Button(ICON_FA_FOLDER_OPEN "  Open Folder", ImVec2(abw, 36))) {
         std::string full = b.filepath[0] == '/' ? b.filepath : (get_user_data_dir() + "/" + b.filepath);
         std::string dir  = fs::path(full).parent_path().string();
-        pid_t pid = fork();
-        if (pid == 0) { execlp("xdg-open", "xdg-open", dir.c_str(), nullptr); _exit(1); }
+        os_external::open_in_file_manager(dir);
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open instance folder");
 
@@ -1446,8 +1470,7 @@ static void DrawModsPage() {
     PushSecondaryBtn();
     if (ImGui::Button(ICON_FA_FOLDER_OPEN "  Open Mods Folder", ImVec2(165, 32))) {
         std::string mods_dir = get_user_data_dir() + "/mods";
-        pid_t pid = fork();
-        if (pid == 0) { execlp("xdg-open", "xdg-open", mods_dir.c_str(), nullptr); _exit(1); }
+        os_external::open_in_file_manager(mods_dir);
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open ~/.local/share/swordigo-desktop/mods/");
     ImGui::SameLine();
@@ -2277,6 +2300,7 @@ LaunchConfig show_launcher(BinarySelector& selector) {
     }
     SDL_GL_MakeCurrent(window, gl_context);
     SDL_GL_SetSwapInterval(1); // Vsync
+    sword_init_gl_after();
 
     // ── ImGui init ──
     IMGUI_CHECKVERSION();
@@ -2579,13 +2603,15 @@ LaunchConfig show_launcher(BinarySelector& selector) {
                         if (!cur_bins.empty() && bin_sel >= 0 && bin_sel < (int)cur_bins.size()) {
                             cfg.graphics_api = (api_sel == 0) ? GraphicsAPI::OPENGL : GraphicsAPI::VULKAN;
                             cfg.use_dynarmic = (engine_sel == 1);
-                            cfg.use_sre = use_sre_sel;
-                            cfg.advanced_redstell_opts = adv_redstell_opts_sel;
-                            cfg.selected_binary = cur_bins[bin_sel].filepath;
-                            cfg.assets_dir = cur_bins[bin_sel].assets_dir;
-                            cfg.game_type = cur_bins[bin_sel].game_type;
-                            cfg.should_launch = true;
-                            running = false;
+                            if (backend_selection_ok(cfg.use_dynarmic)) {
+                                cfg.use_sre = use_sre_sel;
+                                cfg.advanced_redstell_opts = adv_redstell_opts_sel;
+                                cfg.selected_binary = cur_bins[bin_sel].filepath;
+                                cfg.assets_dir = cur_bins[bin_sel].assets_dir;
+                                cfg.game_type = cur_bins[bin_sel].game_type;
+                                cfg.should_launch = true;
+                                running = false;
+                            }
                         }
                     }
                     else if (event.key.key == SDLK_DELETE) {
@@ -2755,11 +2781,7 @@ LaunchConfig show_launcher(BinarySelector& selector) {
                 ImGui::SameLine();
                 if (ImGui::Button("Browse##ca", ImVec2(60, 0))) {
                     std::string data_dir = get_user_data_dir();
-                    pid_t pid = fork();
-                    if (pid == 0) {
-                        execlp("xdg-open", "xdg-open", data_dir.c_str(), nullptr);
-                        _exit(1);
-                    }
+                    os_external::open_in_file_manager(data_dir);
                 }
             }
 
@@ -2923,6 +2945,25 @@ LaunchConfig show_launcher(BinarySelector& selector) {
             ImGui::PopStyleColor(2);
 
             ImGui::PopStyleVar();
+            ImGui::EndPopup();
+        }
+
+        // CPU backend unavailable modal (Unicorn selected but not present)
+        if (g_show_backend_warning) {
+            ImGui::OpenPopup("Backend Unavailable");
+        }
+        ImVec2 warn_center = ImGui::GetMainViewport()->GetCenter();
+        ImGui::SetNextWindowPos(warn_center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_Appearing);
+        if (ImGui::BeginPopupModal("Backend Unavailable", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.45f, 0.3f, 1.0f));
+            ImGui::TextWrapped("%s", g_backend_warning.c_str());
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+            if (ImGui::Button("OK", ImVec2(120, 32))) {
+                g_show_backend_warning = false;
+                ImGui::CloseCurrentPopup();
+            }
             ImGui::EndPopup();
         }
 

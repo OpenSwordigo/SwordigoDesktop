@@ -27,6 +27,9 @@
 #include <vector>
 #include "platform/protobuf_reader.h"
 #include "tools/pod_loader.h"
+#include "tools/scene_entity.h"
+#include "tools/scene_physics.h"
+#include "tools/scene_collision.h"
 
 namespace av {
 
@@ -86,7 +89,24 @@ struct SceneObject {
     std::string mesh_name;           // .POD model name if MeshRenderer found
     std::string texture_name;        // texture name if found in component data
     std::string background_name;     // background model if Background component
+    // ModelComponent payload: field 2 = baked Y-rotation (radians) that the
+    // editor (main.js addModel) applies as rotation.y on top of the scene
+    // object's own Rotation. e.g. castle_lockdoor = 4.7124 (270°), chair = 1.57.
+    // Ignoring it makes doors/objects face the viewer instead of their mesh side.
+    float       model_y_rotation = 0.0f;
+    bool        has_model_y_rotation = false;
     bool        is_spawn_point = false;  // SpawnPoint component (camera port)
+    int         spawn_facing = 1;        // SpawnPointComponent.FacingDirection
+    float       spawn_offset[3] = {0.0f, 0.0f, 0.0f};
+    bool        has_model_transform = false;
+    float       model_transform_origin[3] = {0.0f, 0.0f, 0.0f};
+    float       model_transform_axis[3] = {0.0f, 1.0f, 0.0f};
+    float       model_transform_angle = 0.0f;
+    float       model_transform_speed = 0.0f;
+    bool        is_portal = false;
+    std::string portal_destination;
+    std::string portal_spawn_point;
+    bool        portal_tap_to_enter = false;
 
     // True when this object carries no renderable geometry — its components are
     // purely non-visual (Light, Portal, CollisionShape, SpawnPoint, controllers,
@@ -115,6 +135,17 @@ struct SceneObject {
     // --- Embedded GroundMesh meshes and textures ---
     std::vector<PODMesh>       ground_meshes;
     std::vector<std::string>   ground_mesh_textures;
+
+    // --- GroundPolygon walkable surface (from GroundPolygonComponent) ---
+    // Populated by scene_loader from GroundPolygonComponent data.
+    // Flat {x0,y0, x1,y1, ...} pairs in object-local space, CCW winding.
+    // Matches Caver::GroundPolygonComponent vertex list exactly.
+    std::vector<float> ground_polygon_points;  // flat xy pairs
+    bool               ground_polygon_collides    = true;
+    bool               ground_polygon_unsafe      = false;
+    float              ground_polygon_friction     = 0.0f;
+    float              ground_polygon_min_depth    = -1e9f;
+    float              ground_polygon_max_depth    =  1e9f;
 
     // --- GroundMesh round-trip state (vertex editing support) ---
     // ground_mesh_raw[i]   = original serialized MeshData message for mesh i
@@ -153,6 +184,11 @@ struct SceneData {
     // never serialized back into the scene file.
     std::vector<std::string> external_libraries;
 
+    // Imported library name / resolved path for each entry in external_libraries
+    // (parallel vectors, e.g. "game_common" + "/path/to/game_common.scl").
+    std::vector<std::string> imported_library_names;
+    std::vector<std::string> imported_library_paths;
+
     // Names of imported libraries that could not be found on disk (diagnostics).
     std::vector<std::string> missing_libraries;
 
@@ -176,17 +212,46 @@ struct SceneData {
     };
     std::vector<SceneWater> waters;
 
-    // Parsed Light components (never serialized — render-time lighting).
-    // LightComponent payload: f130 { f1 Type(1=Ambient,2=Dir,4=Point),
+    // Parsed Light/SimpleGlow components (never serialized — render-time lighting).
+    // LightComponent payload: f130 { f1 Type(1=Ambient,2=Dir,3=Point,4=Overlay),
     // f2 Intensity, f3 Color, f6 Offset, f7 Radius }.
     struct SceneLight {
-        int     type      = 4;        // 1 Ambient, 2 Directional, 4 Point
+        int     type      = 3;        // 1 Ambient, 2 Directional, 3 Point, 4 Overlay
         float   intensity = 1.0f;
         float   color[3]  = {1.0f, 0.95f, 0.8f};
-        float   pos[3]    = {0, 0, 0};
+        float   pos[3]    = {0, 0, 0}; // point position or directional vector
         float   radius    = 300.0f;
+        bool    glow      = false;
+        bool    flicker   = false;    // fire-linked point light (FireEmitterComponent)
+        float   flicker_speed = 8.0f; // flicker rate multiplier
+        float   flicker_amount = 0.35f; // intensity variance around base
+        int     object_index = -1;    // owning SceneObject index (fire link resolution)
+        float   base_intensity = 1.0f; // stored for flicker modulation
     };
     std::vector<SceneLight> lights;
+
+    // Parsed ShadowComponent instances (never serialized — render-time blobs).
+    // ShadowComponent payload: f131 { f1 WidthRadius, f2 DepthRadius, f3 Offset }.
+    // The shadow is a soft ellipse on the ground plane under the object.
+    struct SceneShadow {
+        int    object_index = -1;    // owning SceneObject index
+        float  width_radius = 50.0f; // X extent (world units after scale)
+        float  depth_radius = 25.0f; // Z extent (world units after scale)
+        float  pos[3] = {0, 0, 0};   // world-space blob center
+        float  rot_y  = 0.0f;        // object rotation so the ellipse tracks it
+    };
+    std::vector<SceneShadow> shadows;
+
+    // Parsed overlay (type 4) lights — darkness veil seeds. A scene with an
+    // overlay light has a darkened backdrop whose brightness is restored
+    // around point-light falloff radii. Kept separate from `lights` so the
+    // point-light upload path never sees them.
+    struct SceneOverlay {
+        float intensity = 1.0f;
+        float color[3]  = {0.0f, 0.0f, 0.0f}; // darkness tint
+        float pos[3]    = {0, 0, 0};          // ambient/overlay origin
+    };
+    std::vector<SceneOverlay> overlays;
 
     // Any unrecognised top-level fields — preserved verbatim for forward compat
     std::vector<proto::Field> other_fields;
@@ -194,6 +259,30 @@ struct SceneData {
     // Axis-aligned bounding box computed from object positions
     float bounds_min[3] = {0, 0, 0};
     float bounds_max[3] = {0, 0, 0};
+
+    // ── Parsed subsystem lists (never serialized — runtime/editor use only) ──
+
+    // Entity instances (objects with EntityComponent / Hero / Monster).
+    struct SceneEntityEntry {
+        int        object_index = -1;
+        EntityData entity;
+    };
+    std::vector<SceneEntityEntry> entities;
+
+    // Physics instances (objects with PhysicsObjectComponent / PhysicsPlatformComponent).
+    struct ScenePhysicsEntry {
+        int         object_index = -1;
+        PhysicsData physics;
+    };
+    std::vector<ScenePhysicsEntry> physics_objects;
+
+    // Collision shape instances (objects with ShapeComponent / CollisionShapeComponent
+    // / BoneControlledCollisionShapeComponent / GroundPolygonComponent).
+    struct SceneCollisionEntry {
+        int           object_index = -1;
+        CollisionData collision;
+    };
+    std::vector<SceneCollisionEntry> collisions;
 };
 
 // A scene-level group (SceneObjectGroup) that bunches objects together for
@@ -231,6 +320,20 @@ bool scene_set_ground_mesh_texture(SceneObject& obj, size_t mesh_index,
 // Object-list editing helpers. New and duplicated objects receive a unique
 // objN identifier, matching Ruby's reference editor behavior.
 std::string scene_fresh_identifier(const SceneData& scene);
+
+/// One entry of a scene's embedded ObjectLibrary (.scl) — enough for the
+/// editor's add-object palette (main.js `library` parity).
+struct SceneTemplateInfo {
+    std::string name;                              // template name (SceneObject TemplateName)
+    float scaling = 1.0f;                          // template scaling (applied at render)
+    std::vector<std::string> component_types;      // component type names, in order
+};
+
+/// Enumerate every template from the scene's embedded object libraries and
+/// its external (.scl) libraries. Components are NOT resolved here — the
+/// caller (editor) can call scene_refresh() after adding an object with this
+/// template name to materialize them.
+std::vector<SceneTemplateInfo> scene_list_templates(const SceneData& scene);
 
 // Parse the raw SceneObjectGroup messages into SceneGroup structs.
 std::vector<SceneGroup> parse_scene_groups(const std::vector<std::string>& raw_groups);

@@ -44,7 +44,12 @@
 #define ICON_FA_BOLT             "\xef\x83\xa7"  // U+F0E7
 #define ICON_FA_ROCKET           "\xef\x84\xb5"  // U+F135
 #define ICON_FA_PUZZLE_PIECE     "\xef\x84\xae"  // U+F12E
-#define ICON_FA_CUBE             "\xef\x86\xb2"  // U+F1B2
+#define ICON_FA_CUBE              "\xef\x86\xb2"  // U+F1B2
+#define ICON_FA_CUBES             "\xef\x86\xb3"  // U+F1B3
+#define ICON_FA_BOX               "\xef\x91\xa6"  // U+F466
+#define ICON_FA_PERSON            "\xef\x86\x83"  // U+F183
+#define ICON_FA_LINK              "\xee\x83\x81"  // U+F0C1
+#define ICON_FA_OBJECT_GROUP      "\xef\x89\x87"  // U+F247
 #define ICON_FA_HAND_POINTER     "\xef\x89\x9a"  // U+F25A
 #define ICON_FA_DOWNLOAD         "\xef\x80\x99"  // U+F019
 
@@ -66,6 +71,13 @@
 #define ICON_FA_MUSIC            "\xef\x80\x81"  // U+F001
 #define ICON_FA_VOLUME_HIGH      "\xef\x80\xa8"  // U+F028
 #define ICON_FA_EYE              "\xef\x81\xae"  // U+F06E
+#define ICON_FA_EYE_SLASH         "\xef\x81\xb0"  // U+F070
+#define ICON_FA_GEM               "\xef\x8e\xa5"  // U+F3A5
+#define ICON_FA_LIGHTBULB         "\xef\x83\xab"  // U+F0EB
+#define ICON_FA_BUG               "\xef\x86\x88"  // U+F188
+#define ICON_FA_CROSSHAIR         "\xef\x81\x9b"  // U+F05B
+#define ICON_FA_DOOR_OPEN         "\xef\x95\xab"  // U+F52B
+#define ICON_FA_SHUFFLE           "\xef\x81\xb4"  // U+F074
 #define ICON_FA_WRENCH           "\xef\x82\xad"  // U+F0AD
 #define ICON_FA_SLIDERS          "\xef\x87\x9e"  // U+F1DE
 #define ICON_FA_LAYER_GROUP      "\xef\x97\xbd"  // U+F5FD
@@ -84,6 +96,7 @@
 #define ICON_FA_NEWSPAPER        "\xef\x87\xaa"  // U+F1EA
 #define ICON_FA_CLOCK_ROTATE_LEFT "\xef\x87\xda" // U+F1F6
 #define ICON_FA_LIST             "\xef\x80\xba"  // U+F03A
+#define ICON_FA_ELLIPSIS         "\xef\x85\x81"  // U+F141
 #define ICON_FA_TOOLBOX          "\xef\x92\x91"  // U+F491
 #define ICON_FA_PLUG             "\xef\x8e\xac"  // U+F1E6
 #define ICON_FA_SHIRT            "\xef\x95\x93"  // U+F553

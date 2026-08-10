@@ -51,7 +51,14 @@ extern float g_current_projection[16];
 extern float g_current_color[4];
 
 // Host-side cached hero position (synchronized from guest memory each frame)
+#if defined(_MSC_VER)
+// MSVC names namespace-scope array objects with a C (undecorated) symbol;
+// the definition in jni_bridge_arm64.cpp emits the same plain name, so the
+// declaration must use C linkage on Windows to match.
+extern "C" float g_host_hero_pos[3];
+#else
 extern float g_host_hero_pos[3];
+#endif
 
 #ifdef __cplusplus
 }

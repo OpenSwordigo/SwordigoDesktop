@@ -255,6 +255,73 @@ static void generate_top_mesh(const GroundMesh& gm, std::vector<uint8_t>& vertex
     }
 }
 
+// Round hat — a smooth dome standing on the surface (the polygon's top edge).
+// Ported structure from the game's GroundMeshGenerator::InsertRoundHatVertices
+// / InsertCapForRoundHat (Caver @0x2BA45C / @0x2BA724): a profile ring of
+// vertices around the hat footprint plus cap faces closing the dome. The
+// cross-section is a half-ellipse (base radius r, height h) and the ridge
+// spans the full Min..Max depth like the top surface, so it reads as a
+// rounded bump on the ground mesh in-game.
+static void generate_hat_mesh(const GroundMesh& gm, const Hat& hat,
+                              std::vector<uint8_t>& vertexBits,
+                              std::vector<uint8_t>& indexBits) {
+    const int N = 18;                     // cross-section segments
+    double base = gm.polygon.empty() ? 0.0 : gm.polygon[0].y;
+    for (const auto& p : gm.polygon) base = std::max(base, p.y);
+    base += 0.05;   // lift off the top surface plane (anti z-fighting)
+    const double r = std::max(1.0, hat.radius);
+    const double h = std::max(1.0, hat.height);
+    const double cx = hat.x;
+    // Guard against an inverted Min/Max depth range (the editor lets the user
+    // drag Min above Max) — a reversed range flips the dome inside-out.
+    double z0 = gm.min_depth, z1 = gm.max_depth;
+    if (z0 > z1) std::swap(z0, z1);
+
+    const double pi = 3.14159265358979323846;
+    auto add_v = [&](double x, double y, double z, const Vector3& n) {
+        append_float(vertexBits, x);
+        append_float(vertexBits, y);
+        append_float(vertexBits, z);
+        append_float(vertexBits, n.x);
+        append_float(vertexBits, n.y);
+        append_float(vertexBits, n.z);
+        append_float(vertexBits, tex(x));
+        append_float(vertexBits, tex(y));
+    };
+
+    // Profile arc: left base -> apex -> right base with outward normals.
+    std::vector<int> ring0(N + 1), ring1(N + 1);
+    for (int t = 0; t <= N; ++t) {
+        const double phi = pi * (double)t / (double)N;
+        const double px = cx + r * std::cos(phi);
+        const double py = base + h * std::sin(phi);
+        const Vector3 n = normalize_v3({std::cos(phi), std::sin(phi), 0.0});
+        ring0[t] = (int)(vertexBits.size() / vertexSize);
+        add_v(px, py, z0, n);             // back depth
+        ring1[t] = (int)(vertexBits.size() / vertexSize);
+        add_v(px, py, z1, n);             // front depth
+    }
+    // Ridge sheet (same winding convention as the top surface mesh so the
+    // outward face keeps the correct orientation).
+    for (int t = 0; t < N; ++t) {
+        const int a = ring0[t],  b = ring0[t + 1];
+        const int c = ring1[t + 1], d = ring1[t];
+        append_ushort(indexBits, a); append_ushort(indexBits, b); append_ushort(indexBits, c);
+        append_ushort(indexBits, a); append_ushort(indexBits, c); append_ushort(indexBits, d);
+    }
+    // End caps: fans from the bottom-center close the dome at both depths.
+    const int cb = (int)(vertexBits.size() / vertexSize);
+    add_v(cx, base, z0, {0.0, 0.0, -1.0});
+    for (int t = 0; t < N; ++t) {
+        append_ushort(indexBits, cb); append_ushort(indexBits, ring0[t + 1]); append_ushort(indexBits, ring0[t]);
+    }
+    const int cf = (int)(vertexBits.size() / vertexSize);
+    add_v(cx, base, z1, {0.0, 0.0, 1.0});
+    for (int t = 0; t < N; ++t) {
+        append_ushort(indexBits, cf); append_ushort(indexBits, ring1[t]); append_ushort(indexBits, ring1[t + 1]);
+    }
+}
+
 static void generate_side_mesh(const GroundMesh& gm, std::vector<uint8_t>& vertexBits, std::vector<uint8_t>& indexBits) {
     PolygonPoint prevVertex;
     double totalDistance = 0.5;
@@ -384,6 +451,7 @@ static GroundMesh parse_gmesh(const std::string& content) {
     std::stringstream ss(content);
     std::string line;
     bool in_vertex = false;
+    bool in_hat = false;
     
     while (std::getline(ss, line)) {
         size_t comment_pos = line.find("//");
@@ -406,7 +474,23 @@ static GroundMesh parse_gmesh(const std::string& content) {
             }
             continue;
         }
+        if (in_hat) {
+            if (line == "]") {
+                in_hat = false;
+                continue;
+            }
+            std::stringstream line_ss(line);
+            double x, y, r, h;
+            if (line_ss >> x >> y >> r >> h) {
+                gm.hats.push_back({x, y, r, h});
+            }
+            continue;
+        }
         
+        if (line.rfind("Hat[", 0) == 0 || line.rfind("Hat [", 0) == 0) {
+            in_hat = true;
+            continue;
+        }
         if (line.rfind("Vertex[", 0) == 0 || line.rfind("Vertex [", 0) == 0) {
             in_vertex = true;
             continue;
@@ -462,6 +546,10 @@ std::string serialize_swdm(const GroundMesh& gm) {
     ss << "GenerateTop " << (gm.generate_top ? "true" : "false") << "\n";
     ss << "TopTexture \"" << gm.top_texture << "\"\n";
     ss << "BottomTexture \"" << gm.bottom_texture << "\"\n";
+    ss << "Hat[\n";
+    for (const auto& h : gm.hats)
+        ss << h.x << " " << h.y << " " << h.radius << " " << h.height << "\n";
+    ss << "]\n";
     ss << "Vertex[\n";
     for (const auto& v : gm.polygon)
         ss << v.x << " " << v.y << "\n";
@@ -818,6 +906,14 @@ std::string generate_ground_mesh_object(const std::string& gmesh_content,
     generate_side_mesh(gm, side_v, side_i);
     std::vector<uint8_t> face_v = generate_face_mesh(gm);
 
+    // ── round-hat domes: one SurfaceMesh per hat (top texture) ──
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> hat_meshes;
+    for (const auto& hat : gm.hats) {
+        std::vector<uint8_t> hv, hi;
+        generate_hat_mesh(gm, hat, hv, hi);
+        if (!hv.empty()) hat_meshes.emplace_back(std::move(hv), std::move(hi));
+    }
+
     // ── polygon message (used by GroundPolygon + CollisionShape) ──
     proto::Writer poly;
     for (const auto& v : gm.polygon)
@@ -847,6 +943,8 @@ std::string generate_ground_mesh_object(const std::string& gmesh_content,
         gmc.write_nested_field(8, make_mesh(side_v, side_i, gm.bottom_texture)); // SurfaceMesh (side walls)
     if (!face_v.empty())
         gmc.write_nested_field(9, make_mesh(face_v, {}, gm.bottom_texture));  // FrontMesh (non-indexed)
+    for (const auto& hm : hat_meshes)
+        gmc.write_nested_field(8, make_mesh(hm.first, hm.second, gm.top_texture)); // RoundHat mesh
     gmc.write_nested_field(10, make_float_color(1, 1, 1, 1)); // Color
     proto::Writer comp_ground_mesh;
     comp_ground_mesh.write_string_field(1, "GroundMesh");

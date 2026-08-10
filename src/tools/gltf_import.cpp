@@ -218,7 +218,7 @@ struct GltfSkin {
 };
 struct GltfPrimitive {
     int material = -1;
-    int pos = -1, nrm = -1, uv = -1, joints = -1, weights = -1, idx = -1;
+    int pos = -1, nrm = -1, uv = -1, tangent = -1, joints = -1, weights = -1, idx = -1;
 };
 struct GltfMesh {
     std::vector<GltfPrimitive> prims;
@@ -264,6 +264,19 @@ struct GltfDocument {
     std::vector<float> mat_diffuse; // 3 floats per material
     std::vector<float> mat_opacity;
     std::vector<int> mat_base_tex;  // glTF texture index (-1 none)
+    // PBR (pbrMetallicRoughness) — parallel per material
+    std::vector<float> mat_metalness;
+    std::vector<float> mat_roughness;
+    std::vector<float> mat_occlusion;   // occlusionTexture.strength
+    std::vector<float> mat_emissive;    // 3 floats per material
+    std::vector<int> mat_metalrough_tex; // glTF texture index (-1 none)
+    std::vector<int> mat_normal_tex;
+    std::vector<float> mat_normal_scale;
+    std::vector<int> mat_occl_tex;
+    std::vector<int> mat_emissive_tex;
+    std::vector<float> mat_alpha_cutoff;
+    std::vector<int> mat_alpha_mode;    // 0 opaque, 1 mask, 2 blend
+    std::vector<bool> mat_double_sided;
     // textures -> images
     std::vector<int> tex_image;     // per glTF texture, image index
     // images
@@ -272,17 +285,53 @@ struct GltfDocument {
     std::vector<std::string> img_mime;
 };
 
-bool parse_document(const uint8_t* json, size_t json_len, const uint8_t* bin, size_t bin_len, GltfDocument& doc) {
+// Decode a base64 string into raw bytes. Whitespace (data: URIs may wrap
+// lines) is filtered from the INPUT string — never from the decoded output,
+// which may legitimately contain 0x0A/0x0D bytes.
+void decode_base64(const std::string& b64, std::vector<uint8_t>& out) {
+    std::string s;
+    s.reserve(b64.size());
+    for (char c : b64)
+        if (c != '\n' && c != '\r' && c != ' ' && c != '\t') s += c;
+    static const std::string table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const size_t len = s.size();
+    for (size_t i = 0; i + 1 < len; i += 4) {
+        auto d = [&](char c) -> int { if (c == '=') return 0; size_t p = table.find(c); return p == std::string::npos ? 0 : (int)p; };
+        const int a = d(s[i]), b_ = d(s[i + 1]);
+        const int cc = i + 2 < len ? d(s[i + 2]) : 0, dd = i + 3 < len ? d(s[i + 3]) : 0;
+        out.push_back(static_cast<uint8_t>((a << 2) | (b_ >> 4)));
+        if (i + 2 < len && s[i + 2] != '=') out.push_back(static_cast<uint8_t>(((b_ & 0xF) << 4) | (cc >> 2)));
+        if (i + 3 < len && s[i + 3] != '=') out.push_back(static_cast<uint8_t>(((cc & 0x3) << 6) | dd));
+    }
+}
+
+bool parse_document(const uint8_t* json, size_t json_len, const uint8_t* bin, size_t bin_len,
+                    const std::string& base_dir, GltfDocument& doc,
+                    std::vector<uint8_t>* ext_bin) {
     JsonNode root;
     JsonParser parser(reinterpret_cast<const char*>(json), json_len);
     if (!parser.parse(root) || !root.is_obj()) return false;
 
-    // buffers (only first / GLB-stored is used)
+    // buffers: GLB-stored buffer 0 (no uri) arrives via `bin`; a uri on buffer 0
+    // (bare .gltf — data: base64 or a .bin file) is loaded into *ext_bin.
     const JsonNode* buffers = root.get("buffers");
-    if (buffers && buffers->is_arr()) {
-        for (const auto& b : buffers->arr) {
-            (void)b;
-            // buffer 0 is the BIN chunk; others would need URI loading (unsupported)
+    if (buffers && buffers->is_arr() && !buffers->arr.empty()) {
+        const JsonNode& b0 = buffers->arr[0];
+        const JsonNode* uri = b0.get("uri");
+        if (uri && uri->is_str() && ext_bin) {
+            const std::string& u = uri->s;
+            if (u.rfind("data:", 0) == 0) {
+                size_t comma = u.find(',');
+                if (comma != std::string::npos) decode_base64(u.substr(comma + 1), *ext_bin);
+            } else if (!base_dir.empty()) {
+                std::ifstream bf(base_dir + "/" + u, std::ios::binary | std::ios::ate);
+                if (bf) {
+                    std::streamsize bsz = bf.tellg();
+                    bf.seekg(0);
+                    ext_bin->resize(static_cast<size_t>(bsz));
+                    if (bsz > 0) bf.read(reinterpret_cast<char*>(ext_bin->data()), bsz);
+                }
+            }
         }
     }
 
@@ -343,6 +392,7 @@ bool parse_document(const uint8_t* json, size_t json_len, const uint8_t* bin, si
                         if ((v = attrs->get("POSITION"))) gp.pos = v->numi(-1);
                         if ((v = attrs->get("NORMAL"))) gp.nrm = v->numi(-1);
                         if ((v = attrs->get("TEXCOORD_0"))) gp.uv = v->numi(-1);
+                        if ((v = attrs->get("TANGENT"))) gp.tangent = v->numi(-1);
                         if ((v = attrs->get("JOINTS_0"))) gp.joints = v->numi(-1);
                         if ((v = attrs->get("WEIGHTS_0"))) gp.weights = v->numi(-1);
                     }
@@ -441,11 +491,64 @@ bool parse_document(const uint8_t* json, size_t json_len, const uint8_t* bin, si
                 const JsonNode* bct = pbr->get("baseColorTexture");
                 if (bct && bct->get("index")) tex = bct->get("index")->numi(-1);
             }
+            int alpha_mode = 0;
             const JsonNode* am = m.get("alphaMode");
-            if (am && am->is_str() && am->s == "BLEND") { /* opacity already read */ }
+            if (am && am->is_str()) {
+                if (am->s == "BLEND") alpha_mode = 2;
+                else if (am->s == "MASK") alpha_mode = 1;
+            }
+            float metal = 1.0f, rough = 1.0f, occ = 1.0f;
+            float emiss[3] = {0, 0, 0};
+            int mr_tex = -1, nm_tex = -1, oc_tex = -1, em_tex = -1;
+            float nm_scale = 1.0f, alpha_cutoff = 0.5f;
+            bool dside = false;
+            if (pbr) {
+                const JsonNode* mf = pbr->get("metallicFactor");
+                if (mf) metal = static_cast<float>(mf->num());
+                const JsonNode* rf = pbr->get("roughnessFactor");
+                if (rf) rough = static_cast<float>(rf->num());
+                const JsonNode* mrt = pbr->get("metallicRoughnessTexture");
+                if (mrt && mrt->get("index")) mr_tex = mrt->get("index")->numi(-1);
+            }
+            const JsonNode* nt = m.get("normalTexture");
+            if (nt && nt->get("index")) {
+                nm_tex = nt->get("index")->numi(-1);
+                const JsonNode* ns = nt->get("scale");
+                if (ns) nm_scale = static_cast<float>(ns->num());
+            }
+            const JsonNode* ot = m.get("occlusionTexture");
+            if (ot && ot->get("index")) {
+                oc_tex = ot->get("index")->numi(-1);
+                const JsonNode* os = ot->get("strength");
+                if (os) occ = static_cast<float>(os->num());
+            }
+            const JsonNode* ef = m.get("emissiveFactor");
+            if (ef && ef->is_arr() && ef->size() >= 3) {
+                emiss[0] = static_cast<float>(ef->arr[0].num());
+                emiss[1] = static_cast<float>(ef->arr[1].num());
+                emiss[2] = static_cast<float>(ef->arr[2].num());
+            }
+            const JsonNode* et = m.get("emissiveTexture");
+            if (et && et->get("index")) em_tex = et->get("index")->numi(-1);
+            const JsonNode* ac = m.get("alphaCutoff");
+            if (ac) alpha_cutoff = static_cast<float>(ac->num());
+            const JsonNode* ds = m.get("doubleSided");
+            if (ds) dside = ds->b;
             doc.mat_diffuse.push_back(d[0]); doc.mat_diffuse.push_back(d[1]); doc.mat_diffuse.push_back(d[2]);
             doc.mat_opacity.push_back(op);
             doc.mat_base_tex.push_back(tex);
+            doc.mat_metalness.push_back(metal);
+            doc.mat_roughness.push_back(rough);
+            doc.mat_occlusion.push_back(occ);
+            doc.mat_emissive.push_back(emiss[0]); doc.mat_emissive.push_back(emiss[1]); doc.mat_emissive.push_back(emiss[2]);
+            doc.mat_metalrough_tex.push_back(mr_tex);
+            doc.mat_normal_tex.push_back(nm_tex);
+            doc.mat_normal_scale.push_back(nm_scale);
+            doc.mat_occl_tex.push_back(oc_tex);
+            doc.mat_emissive_tex.push_back(em_tex);
+            doc.mat_alpha_cutoff.push_back(alpha_cutoff);
+            doc.mat_alpha_mode.push_back(alpha_mode);
+            doc.mat_double_sided.push_back(dside);
         }
     }
 
@@ -483,21 +586,26 @@ bool parse_document(const uint8_t* json, size_t json_len, const uint8_t* bin, si
                     // data:image/png;base64,...
                     size_t comma = u.find(',');
                     if (comma != std::string::npos) {
-                        std::string b64 = u.substr(comma + 1);
                         std::vector<uint8_t> raw;
-                        static const std::string table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-                        size_t len = b64.size();
-                        for (size_t i = 0; i + 1 < len; i += 4) {
-                            auto d = [&](char c) -> int { if (c == '=') return 0; size_t p = table.find(c); return p == std::string::npos ? 0 : (int)p; };
-                            int a = d(b64[i]), b_ = d(b64[i+1]), cc = i + 2 < len ? d(b64[i+2]) : 0, dd = i + 3 < len ? d(b64[i+3]) : 0;
-                            raw.push_back(static_cast<uint8_t>((a << 2) | (b_ >> 4)));
-                            if (i + 2 < len && b64[i+2] != '=') raw.push_back(static_cast<uint8_t>(((b_ & 0xF) << 4) | (cc >> 2)));
-                            if (i + 3 < len && b64[i+3] != '=') raw.push_back(static_cast<uint8_t>(((cc & 0x3) << 6) | dd));
-                        }
-                        // strip data: header whitespace/newlines
-                        std::vector<uint8_t> cleaned;
-                        for (uint8_t x : raw) if (x != '\n' && x != '\r') cleaned.push_back(x);
-                        doc.img_data.push_back(std::move(cleaned));
+                        decode_base64(u.substr(comma + 1), raw);
+                        doc.img_data.push_back(std::move(raw));
+                        continue;
+                    }
+                } else if (!base_dir.empty()) {
+                    // external image file relative to the .gltf
+                    std::ifstream ifile(base_dir + "/" + u, std::ios::binary | std::ios::ate);
+                    if (ifile) {
+                        std::streamsize isz = ifile.tellg();
+                        ifile.seekg(0);
+                        std::vector<uint8_t> raw(static_cast<size_t>(isz));
+                        if (isz > 0) ifile.read(reinterpret_cast<char*>(raw.data()), isz);
+                        doc.img_data.push_back(std::move(raw));
+                        // infer the mime type from the extension when unspecified
+                        size_t dot = u.find_last_of('.');
+                        std::string ext = dot == std::string::npos ? "" : u.substr(dot + 1);
+                        for (auto& c : ext) c = (char)tolower((unsigned char)c);
+                        if (ext == "jpg" || ext == "jpeg" || ext == "webp")
+                            doc.img_mime.back() = "image/jpeg";
                         continue;
                     }
                 }
@@ -571,8 +679,15 @@ void mat_decompose_col(const float m[16], float t[3], float q[4], float s[3]) {
 
 } // namespace
 
+// Shared rebuild (defined below): parsed GltfDocument → PODModel + PBR info.
+static bool build_pod_from_doc(const GltfDocument& doc, const uint8_t* bin, size_t bin_len,
+                               PODModel& out, std::vector<GLTFImageBuffer>& images,
+                               GLTFPBRInfo* pbr, std::string* err);
+
+// Parse a GLB file into a PODModel (+ PBR info). See gltf_glb.h.
 bool gltf_import_glb(const std::string& path, PODModel& out,
-                     std::vector<GLTFImageBuffer>& images, std::string* err) {
+                     std::vector<GLTFImageBuffer>& images, std::string* err,
+                     GLTFPBRInfo* pbr) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f.is_open()) { if (err) *err = "cannot open: " + path; return false; }
     std::streamsize size = f.tellg();
@@ -606,11 +721,43 @@ bool gltf_import_glb(const std::string& path, PODModel& out,
     if (!json) { if (err) *err = "missing JSON chunk"; return false; }
 
     GltfDocument doc;
-    if (!parse_document(json, json_len, bin, bin_len, doc)) {
+    if (!parse_document(json, json_len, bin, bin_len, std::string(), doc, nullptr)) {
         if (err) *err = "failed to parse glTF JSON"; return false;
     }
+    return build_pod_from_doc(doc, bin, bin_len, out, images, pbr, err);
+}
 
-    // ── Rebuild PODModel ───────────────────────────────────────────────
+// Parse a bare .gltf (JSON) — external buffer/image URIs resolved relative to
+// the file. See gltf_glb.h.
+bool gltf_import_gltf(const std::string& path, PODModel& out,
+                      std::vector<GLTFImageBuffer>& images, std::string* err,
+                      GLTFPBRInfo* pbr) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) { if (err) *err = "cannot open: " + path; return false; }
+    std::streamsize size = f.tellg();
+    f.seekg(0);
+    std::vector<uint8_t> file(static_cast<size_t>(size));
+    if (size > 0) f.read(reinterpret_cast<char*>(file.data()), size);
+    if (!f) { if (err) *err = "read failed"; return false; }
+
+    std::string base_dir;
+    size_t slash = path.find_last_of('/');
+    if (slash != std::string::npos) base_dir = path.substr(0, slash);
+
+    std::vector<uint8_t> ext_bin;
+    GltfDocument doc;
+    if (!parse_document(file.data(), file.size(), nullptr, 0, base_dir, doc, &ext_bin)) {
+        if (err) *err = "failed to parse glTF JSON"; return false;
+    }
+    const uint8_t* bin = ext_bin.empty() ? nullptr : ext_bin.data();
+    return build_pod_from_doc(doc, bin, ext_bin.size(), out, images, pbr, err);
+}
+
+// ── Rebuild PODModel ──────────────────────────────────────────────────
+static bool build_pod_from_doc(const GltfDocument& doc, const uint8_t* bin, size_t bin_len,
+                               PODModel& out, std::vector<GLTFImageBuffer>& images,
+                               GLTFPBRInfo* pbr, std::string* err) {
+    (void)err;   // parse/load failures are reported by the entry points
     std::vector<int> parent_of(doc.nodes.size(), -1);
     for (size_t i = 0; i < doc.nodes.size(); ++i)
         for (int c : doc.nodes[i].children)
@@ -638,6 +785,8 @@ bool gltf_import_glb(const std::string& path, PODModel& out,
             if (!nrm.empty()) m.normals = nrm;
             const std::vector<float>& uv = load(p.uv);
             if (!uv.empty()) m.uvs = uv;
+            const std::vector<float>& tng = load(p.tangent);
+            if (!tng.empty()) m.tangents = tng;
             const std::vector<float>& idx = load(p.idx);
             if (!idx.empty()) {
                 m.indices.reserve(idx.size());
@@ -792,6 +941,56 @@ bool gltf_import_glb(const std::string& path, PODModel& out,
             }
         }
         out.materials.push_back(std::move(mat));
+    }
+
+    // ── PBR material info (optional) ───────────────────────────────────
+    if (pbr) {
+        pbr->materials.clear();
+        pbr->images.clear();
+        pbr->image_gltf_index.clear();
+        std::vector<int> img_slot(doc.img_data.size(), -1);   // glTF image → payload
+        auto ensure_image = [&](int img) -> int {
+            if (img < 0 || img >= (int)doc.img_data.size()) return -1;
+            if (img_slot[img] >= 0) return img_slot[img];
+            if (doc.img_data[img].empty()) return -1;
+            int pi = (int)pbr->images.size();
+            GLTFPBRInfo::Image im;
+            im.mime = doc.img_mime[img];
+            im.data = doc.img_data[img];
+            pbr->images.push_back(std::move(im));
+            pbr->image_gltf_index.push_back(img);
+            img_slot[img] = pi;
+            return pi;
+        };
+        auto tex_to_img = [&](int tex_idx) -> int {
+            if (tex_idx < 0 || tex_idx >= (int)doc.tex_image.size()) return -1;
+            return ensure_image(doc.tex_image[tex_idx]);
+        };
+        for (size_t i = 0; i < doc.mat_names.size(); ++i) {
+            GLTFPBRMaterial pm;
+            pm.base_color[0] = doc.mat_diffuse[i * 3 + 0];
+            pm.base_color[1] = doc.mat_diffuse[i * 3 + 1];
+            pm.base_color[2] = doc.mat_diffuse[i * 3 + 2];
+            pm.base_color[3] = doc.mat_opacity[i];
+            if (i < doc.mat_metalness.size()) {
+                pm.metallic = doc.mat_metalness[i];
+                pm.roughness = doc.mat_roughness[i];
+                pm.occlusion = doc.mat_occlusion[i];
+                pm.emissive[0] = doc.mat_emissive[i * 3 + 0];
+                pm.emissive[1] = doc.mat_emissive[i * 3 + 1];
+                pm.emissive[2] = doc.mat_emissive[i * 3 + 2];
+                pm.normal_scale = doc.mat_normal_scale[i];
+                pm.alpha_cutoff = doc.mat_alpha_cutoff[i];
+                pm.alpha_mode = doc.mat_alpha_mode[i];
+                pm.double_sided = doc.mat_double_sided[i];
+                pm.base_tex = tex_to_img(doc.mat_base_tex[i]);
+                pm.metalrough_tex = tex_to_img(i < doc.mat_metalrough_tex.size() ? doc.mat_metalrough_tex[i] : -1);
+                pm.normal_tex = tex_to_img(i < doc.mat_normal_tex.size() ? doc.mat_normal_tex[i] : -1);
+                pm.occl_tex = tex_to_img(i < doc.mat_occl_tex.size() ? doc.mat_occl_tex[i] : -1);
+                pm.emissive_tex = tex_to_img(i < doc.mat_emissive_tex.size() ? doc.mat_emissive_tex[i] : -1);
+            }
+            pbr->materials.push_back(std::move(pm));
+        }
     }
 
     // ── Animations: dense per-frame streams ────────────────────────────

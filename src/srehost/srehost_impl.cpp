@@ -17,6 +17,7 @@
  */
 
 #include "srehost_abi.h"
+#include "platform/os_external.h"
 #include <iostream>
 #include <unordered_map>
 #include <string>
@@ -134,16 +135,25 @@ extern "C" int sre_host_patch_guest(
 }
 
 // ============================================================================
+// Forward declaration (definition provided by elf_loader_arm64.cpp; MSVC
+// also compiles the stub out below so only the real symbol remains).
+extern "C" uint64_t elf_lookup_symbol(const char* name);
+
 // elf_lookup_symbol weak stub — overridden by elf_loader_arm64.cpp's
 // real implementation which searches g_main_mod_64 and g_sre_mod.
 // This stub is the Phase 1 fallback for builds that don't link the loader.
+// On MSVC there is no weak-symbol semantics, so the stub is skipped entirely:
+// the real loader is always linked, and emitting both would be a duplicate
+// symbol. Linux keeps the weak stub so it degrades gracefully if absent.
 // ============================================================================
-extern "C" __attribute__((weak)) uint64_t elf_lookup_symbol(const char* name) {
+#if !defined(_WIN32)
+extern "C" SWORDIGO_WEAK uint64_t elf_lookup_symbol(const char* name) {
     (void)name;
     fprintf(stderr, "[SREHost/Stub] elf_lookup_symbol(\"%s\"): weak stub — loader not linked\n",
             name ? name : "(null)");
     return 0;
 }
+#endif
 
 
 
