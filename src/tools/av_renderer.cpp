@@ -36,7 +36,7 @@ static constexpr float DEG2RAD = PI / 180.0f;
 // Vanilla Swordigo: a warm sun from above, deep dark cave ambient, strong
 // top-vs-side distinction so platforms read as lit on top and shaded below.
 float g_light_dir[3]   = { 0.35f,  0.85f,  0.39f };  // mostly-down sun
-float g_light_color[3] = { 1.05f,  0.92f,  0.72f };  // warm golden
+float g_light_color[3] = { 0.95f,  0.86f,  0.70f };  // warm golden (tamed)
 // Cool fill from the opposite side of the key — keeps undersides and the
 // side of the player away from the key readable instead of dead black.
 float g_fill_color[3]  = { 0.30f,  0.38f,  0.55f };
@@ -158,7 +158,7 @@ void main() {
     vec3 keyCol = (uDirLightCount == 0) ? uLightColor : uDirLightCol[0];
     float ndl   = dot(N, keyDir);
     float wrap  = clamp((ndl + 0.22) / 1.22, 0.0, 1.0);
-    vec3  key   = keyCol * (wrap * wrap * 1.28);
+    vec3  key   = keyCol * (wrap * wrap * 0.9);
 
     // ── Fill light: cool light from the opposite side of the key. This is
     //    the classic three-point setup — it gives walls/players shape on the
@@ -221,6 +221,11 @@ void main() {
         vec3 fogged = uFogColor * (uAmbient * 2.0 + 0.02);
         lit = mix(lit, fogged, f * f);
     }
+
+    // Tonemap + clamp so the Lambertian path can never wash out to white
+    // (matches the PBR path). Keeps Swordigo's softer, non-bleached look.
+    lit = clamp(lit, 0.0, 1e4);
+    lit = (lit * (2.51 * lit + 0.03)) / (lit * (2.43 * lit + 0.59) + 0.14);
 
     FragColor = vec4(lit, base.a * uAlpha);
 }

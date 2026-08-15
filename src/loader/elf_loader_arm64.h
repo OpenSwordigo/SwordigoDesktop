@@ -18,6 +18,11 @@ struct so_module_arm64 {
     
     uintptr_t text_base;
     size_t text_size;
+    // Guest-VA byte range of the .dynstr STRTAB section (never executable).
+    // Used by the emulator RenderGuard to reject a stray branch/return into
+    // the string table. 0 if not found.
+    uintptr_t dynstr_vaddr;
+    size_t dynstr_size;
     
     std::vector<uintptr_t> data_bases;
     std::vector<size_t> data_sizes;

@@ -27,6 +27,7 @@
 #include "platform/swordfare_gui.h"
 #include "platform/IconsFontAwesome6.h"
 #include "platform/embedded_assets.h"
+#include "platform/swordfare_theme.h"
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_sdl3.h"
 #include "imgui/backends/imgui_impl_opengl3.h"
@@ -106,7 +107,11 @@ static void swardfare_push_fps(float* history, int& idx, float value, int size) 
 // ---------------------------------------------------------------------------
 
 void SwordfareGUI::apply_swordfare_theme() {
-    ImGui::StyleColorsDark();
+    // Start from the shared design system so the in-game overlays (F1 mod
+    // overlay, F3 debug/tools) share rounding, spacing, and the base palette
+    // with the launcher, loading screen, and crash dialog. The Swordfare
+    // crimson-accent overrides below then refine the look on top.
+    sf_theme::ApplyTheme();
     ImGuiStyle& s = ImGui::GetStyle();
 
     // --- Geometry ---
@@ -1927,7 +1932,7 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                                 ImGui::SameLine();
                                 ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f),
                                                    "%d x %d @ %d Hz%s",
-                                                   dm->w, dm->h, dm->refresh_rate,
+                                                   dm->w, dm->h, (int)(dm->refresh_rate + 0.5f),
                                                    is_fs ? "  (fullscreen)" : "  (windowed)");
                             }
                         }
@@ -1976,7 +1981,7 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                             for (int i = 0; i < mode_count; i++) {
                                 char buf[64];
                                 snprintf(buf, sizeof(buf), "%d x %d @ %d Hz",
-                                         modes[i]->w, modes[i]->h, modes[i]->refresh_rate);
+                                         modes[i]->w, modes[i]->h, (int)(modes[i]->refresh_rate + 0.5f));
                                 mode_labels.push_back(buf);
                                 if (cur_dm && modes[i]->w == cur_dm->w && modes[i]->h == cur_dm->h &&
                                     modes[i]->refresh_rate == cur_dm->refresh_rate)

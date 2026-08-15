@@ -22,6 +22,8 @@ struct OpenSwordigoConfig {
     const char* scene;
     int width;
     int height;
+    void* sdl_window;
+    void* sdl_gl_context;
     uint32_t (*load_texture)(const char* name, int* width, int* height);
     int (*read_asset)(const char* name, uint8_t** data, size_t* size);
     void (*free_asset)(uint8_t* data);
@@ -171,7 +173,27 @@ int native_model_mesh(void* handle, int index, const float** positions, int* pos
     if (uv_count) *uv_count = static_cast<int>(mesh.uvs.size());
     if (indices) *indices = mesh.indices.data();
     if (index_count) *index_count = static_cast<int>(mesh.indices.size());
-    if (texture_name) *texture_name = model->texture_filenames.empty() ? nullptr : model->texture_filenames[0].c_str();
+    // Resolve the mesh's OWN texture via node -> material -> diffuse texture
+    // index. texturing_filenames[0] is wrong for multi-texture PODs (hero,
+    // monsters) — each mesh can carry a different material.
+    if (texture_name) {
+        *texture_name = nullptr;
+        const int node_index = [&]() -> int {
+            for (int n = 0; n < static_cast<int>(model->nodes.size()); ++n) {
+                if (model->nodes[n].object_index == index) return n;
+            }
+            return -1;
+        }();
+        if (node_index >= 0 && node_index < static_cast<int>(model->nodes.size())) {
+            const auto& node = model->nodes[node_index];
+            if (node.material_index >= 0 &&
+                node.material_index < static_cast<int>(model->materials.size())) {
+                const int tex_idx = model->materials[node.material_index].diffuse_texture_index;
+                if (tex_idx >= 0 && tex_idx < static_cast<int>(model->texture_filenames.size()))
+                    *texture_name = model->texture_filenames[tex_idx].c_str();
+            }
+        }
+    }
     return 1;
 }
 
@@ -191,6 +213,26 @@ int native_scene_object_count(void* scene) {
     return scene ? static_cast<int>(static_cast<av::SceneData*>(scene)->objects.size()) : 0;
 }
 
+// True when the object carries a model-bearing component (its own or inherited
+// from its template library entry). scene_loader's template resolution merges
+// library components into resolved_components and only then fills mesh_name;
+// without this check, pure non-visual objects (Background, Light, CollisionShape,
+// SpawnPoint, portals, AI controllers) would inherit the mesh_name = template_name
+// fallback and trigger bogus model loads.
+static bool object_has_model_component(const av::SceneObject& object) {
+    const auto& comps = object.resolved_components.empty() ? object.components
+                                                           : object.resolved_components;
+    for (const auto& c : comps) {
+        const std::string& t = c.type_name;
+        if (t.find("MeshRenderer") != std::string::npos ||
+            t.find("SkinnedMeshRenderer") != std::string::npos ||
+            t.find("ModelComponent") != std::string::npos ||
+            t.find("Sprite") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 int native_scene_object(void* handle, int index, const char** identifier, const char** template_name,
                         float* x, float* y, float* depth, float* rotation, float* scale, int* hidden,
                         const char** model_name, const char** background_name) {
@@ -206,7 +248,11 @@ int native_scene_object(void* handle, int index, const char** identifier, const 
     if (rotation) *rotation = object.rot_y;
     if (scale) *scale = object.scale_x * object.template_scaling;
     if (hidden) *hidden = object.hidden ? 1 : 0;
-    if (model_name) *model_name = object.mesh_name.empty() ? nullptr : object.mesh_name.c_str();
+    if (model_name) {
+        *model_name = nullptr;
+        if (object_has_model_component(object) && !object.mesh_name.empty())
+            *model_name = object.mesh_name.c_str();
+    }
     if (background_name) *background_name = object.background_name.empty() ? nullptr : object.background_name.c_str();
     return 1;
 }
@@ -308,6 +354,7 @@ int run_openswordigo(Display& display, const OpenSwordigoLaunchOptions& options)
     SDL_GetWindowSizeInPixels(display.get_window(), &width, &height);
     OpenSwordigoConfig config{
         options.assets_root.c_str(), options.scene.c_str(), width, height,
+        display.get_window(), display.get_gl_context(),
         load_native_texture, read_native_asset, free_native_asset,
         load_native_model, free_native_model, native_model_mesh_count, native_model_mesh,
         load_native_scene, free_native_scene, native_scene_object_count, native_scene_object,

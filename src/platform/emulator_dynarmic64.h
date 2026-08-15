@@ -46,10 +46,16 @@ public:
     void run(uint64_t start_pc) override;
     uint64_t call(uint64_t addr, const std::vector<uint64_t>& args) override;
 
+    // Clear a previously-latched fault so guest execution can be retried on a
+    // later frame. Also clears Dynarmic's halt reason and the recoverable-fault
+    // bookkeeping so a fresh call() starts clean.
+    void clear_faulted() override;
+
     void set_bridge(JniBridge64* b) override { this->bridge = b; }
     void handle_bridge_call(uint64_t address) override;
     uint64_t get_bridge_base() override;
     uint8_t* get_memory_base() override { return memory; }
+    uint64_t get_memory_size() override { return mem_size; }
     void* get_uc_handle() override { return nullptr; }  // No Unicorn handle
 
     void record_pc(uint64_t pc) override;
@@ -90,6 +96,17 @@ public:
     // Quiet mode — suppresses frequent InterpreterFallback log spam.
     // Set to false only for deep debugging.
     bool quiet_mode = true;
+
+    // Recoverable-fault policy state (see run() MemoryAbort branch).
+    // consecutive_mem_faults: number of guest memory faults seen back-to-back
+    //   without an intervening clean MAGIC_LR return. Reset to 0 on a clean
+    //   return; once it reaches a hard threshold we permanently poison the
+    //   emulator via set_faulted(true).
+    // last_call_faulted: set true when the CURRENT run() call aborted due to a
+    //   recoverable memory fault (as opposed to permanent poison). Cleared at
+    //   the top of every run() invocation.
+    int consecutive_mem_faults = 0;
+    bool last_call_faulted = false;
 
 private:
     uint8_t* memory;

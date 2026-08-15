@@ -107,6 +107,10 @@ struct SceneObject {
     std::string portal_destination;
     std::string portal_spawn_point;
     bool        portal_tap_to_enter = false;
+    // DimensionObject component: the object only appears in-game while the
+    // Dimension Rift powerup is active (obj5#5 in lowergrove_part1, etc).
+    // Ruby ghosts it (very faint + transparent) unless the rift is toggled on.
+    bool        is_dimension_object = false;
 
     // True when this object carries no renderable geometry — its components are
     // purely non-visual (Light, Portal, CollisionShape, SpawnPoint, controllers,

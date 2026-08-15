@@ -1,3 +1,14 @@
+/* ============================================================================
+ * DEAD LEGACY PROTOTYPE — NOT COMPILED.
+ *
+ * This file is an obsolete ARMv7 boot prototype (it uses the old ARM32
+ * so_module / so_file_load API and prints "CRITICAL BLOCKER: ARMv7 execution
+ * not possible"). It defines its OWN int main() which collides with the real
+ * host entry point in src/main.cpp. It is not referenced by any CMake target;
+ * the whole body is disabled with #if 0 so it can never be compiled in.
+ * Kept on disk for historical reference only — superseded by src/main.cpp.
+ * ============================================================================ */
+#if 0
 #include <stdio.h>
 #include <stdlib.h>
 #include "../loader/loader.h"
@@ -62,3 +73,4 @@ int main() {
 
     return 0;
 }
+#endif /* dead legacy ARMv7 prototype — superseded by src/main.cpp */

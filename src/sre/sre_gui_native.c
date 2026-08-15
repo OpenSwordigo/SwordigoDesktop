@@ -785,21 +785,9 @@ static void native_GUIButton_DrawRect(void* self, void* ctx, void* rect, void* m
             if (container) g_main_menu_view_ptr = GV_SUPERVIEW(container);
         }
     } else {
-        /* Icon-only button (no title or empty title).
-         * Only hide if this button is a descendant of the MainMenuView.
-         * This catches Twitter, Facebook, music/SFX toggles in the
-         * main menu, but preserves back buttons, in-game controls, etc. */
-        if (g_main_menu_view_ptr) {
-            void* p = GV_SUPERVIEW(self);
-            int depth;
-            for (depth = 0; depth < 4 && p; depth++) {
-                if (p == g_main_menu_view_ptr) {
-                    GV_HIDDEN(self) = 1;
-                    return;
-                }
-                p = GV_SUPERVIEW(p);
-            }
-        }
+        /* Do not hide icon-only buttons based on g_main_menu_view_ptr. That
+         * pointer outlives scene teardown and may be reused by an in-game
+         * HUD object, which hides the HUD after a transition or pickup. */
     }
 
     /* Phase 2: Poll Options button state for click detection */
@@ -880,10 +868,6 @@ static void native_GUIButton_DrawRect(void* self, void* ctx, void* rect, void* m
             imgRect = GB_IMG_NORMAL(self);
         }
         if (imgRect && g_GUITexturedRect_Draw) {
-            /* Set color on the textured rect (packed RGBA at texRect+0x1C) */
-            *(unsigned int*)((char*)imgRect + 0x1C) =
-                (tintR & 0xFF) | ((tintG & 0xFF) << 8) |
-                ((tintB & 0xFF) << 16) | ((tintA & 0xFF) << 24);
             g_GUITexturedRect_Draw(imgRect, ctx);
         }
     }
@@ -1002,17 +986,40 @@ void sre_GUIView_DrawRect(void* self, void* ctx, void* rect, void* mat,
 
 void sre_GUILabel_DrawRect(void* self, void* ctx, void* rect, void* mat,
                             void* p4, void* p5, void* p6, void* p7) {
-    native_GUILabel_DrawRect(self, ctx, rect, mat, p4, p5, p6, p7);
+    const char* override = sre_find_override(sre_read_label_text(self));
+    if (override) sre_apply_text_override(self, override);
+
+    if (g_orig_GUILabel_DrawRect)
+        ((pfn_DrawRect_N)g_orig_GUILabel_DrawRect)(self, ctx, rect, mat, p4, p5, p6, p7);
 }
 
 void sre_GUIButton_DrawRect(void* self, void* ctx, void* rect, void* mat,
                               void* p4, void* p5, void* p6, void* p7) {
-    native_GUIButton_DrawRect(self, ctx, rect, mat, p4, p5, p6, p7);
+    void* titleLabel = GB_TITLE_LABEL(self);
+    const char* btnText = titleLabel ? sre_read_label_text(titleLabel) : 0;
+
+    if (btnText && btnText[0] != '\0') {
+        if (sre_should_hide(btnText)) {
+            GV_HIDDEN(self) = 1;
+            return;
+        }
+        if (!g_main_menu_view_ptr && sre_streq(btnText, "Start")) {
+            void* container = GV_SUPERVIEW(self);
+            if (container) g_main_menu_view_ptr = GV_SUPERVIEW(container);
+        }
+    }
+
+    if (self == g_options_button && g_options_button != 0)
+        sre_check_options_click(self);
+
+    if (g_orig_GUIButton_DrawRect)
+        ((pfn_DrawRect_N)g_orig_GUIButton_DrawRect)(self, ctx, rect, mat, p4, p5, p6, p7);
 }
 
 void sre_GUIFrameView_DrawRect(void* self, void* ctx, void* rect, void* mat,
                                  void* p4, void* p5, void* p6, void* p7) {
-    native_GUIFrameView_DrawRect(self, ctx, rect, mat, p4, p5, p6, p7);
+    if (g_orig_GUIFrameView_DrawRect)
+        ((pfn_DrawRect_N)g_orig_GUIFrameView_DrawRect)(self, ctx, rect, mat, p4, p5, p6, p7);
 }
 
 /* These still use relay for now — they have complex logic beyond
@@ -1377,7 +1384,15 @@ void sre_textInputTextDidChange(void* env, void* cls, void* jstring_text) {
     uint64_t vtable = *(uint64_t*)delegate;
     uint64_t func_ptr = *(uint64_t*)vtable;
 
-    if (func_ptr) {
+    /* CONSERVATIVE SAFETY GUARD (FIX7): the ITextInputDelegate vtable can be the
+     * corrupt/unrelocated one (its patch is intentionally disabled), so dispatching
+     * blindly here can jump the JIT into non-code (the documented ~0x2d6ce4c wild
+     * jump). Validate the vtable pointer AND the resolved function pointer before
+     * the blr; if either is bad, skip the dispatch entirely (safe fallback — the
+     * text value is still synced to the host globals below). This does NOT enable
+     * the disabled ITextInputDelegate vtable patch; it only refuses to branch into
+     * garbage. */
+    if (func_ptr && sre_is_valid_vtable_ptr(vtable) && sre_is_valid_code_ptr(func_ptr)) {
         register void* r_x0 __asm__("x0") = (void*)delegate;
         register void* r_x1 __asm__("x1") = &in_str;
         register void* r_x8 __asm__("x8") = &out_str;
@@ -1481,5 +1496,3 @@ void sre_GameOverlayView_SetControlsHidden(void* self, int hide) {
         if (btn_spell) *(uint8_t*)((char*)btn_spell + 0xE4) = 1; // isHidden = true
     }
 }
-
-

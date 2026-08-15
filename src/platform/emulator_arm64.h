@@ -48,6 +48,7 @@ public:
     void handle_bridge_call(uint64_t address) override;
     uint64_t get_bridge_base() override;
     uint8_t* get_memory_base() override { return memory; }
+    uint64_t get_memory_size() override { return size; }
     void* get_uc_handle() override { return uc; }
 
     // Debugging

@@ -471,6 +471,43 @@ static PODMesh readMeshBlock(const uint8_t* data, size_t size, size_t& off) {
     mesh.normals   = unpack_vertex_data(interleaved_payload, interleaved_size, nrm_element, mesh.num_vertices, 3);
     mesh.uvs       = unpack_vertex_data(interleaved_payload, interleaved_size, uv_element,  mesh.num_vertices, 2);
 
+    // Some PODs ship no normal block (or an all-zero one). Without normals the
+    // lighting shader receives a zero/NaN normal and mis-shades the model —
+    // the "some POD files break" symptom. Synthesize flat face normals from
+    // the index/position data so every mesh lights correctly.
+    bool normals_missing = (nrm_element.payload == nullptr) || mesh.normals.empty();
+    if (!normals_missing) {
+        double sumsq = 0.0;
+        for (float n : mesh.normals) sumsq += (double)n * (double)n;
+        if (sumsq < 1e-12) normals_missing = true;
+    }
+    if (normals_missing && !mesh.positions.empty() && !mesh.indices.empty() &&
+        mesh.num_vertices > 0) {
+        mesh.normals.assign((size_t)mesh.num_vertices * 3, 0.0f);
+        for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+            uint32_t i0 = mesh.indices[t], i1 = mesh.indices[t + 1], i2 = mesh.indices[t + 2];
+            if (i0 >= (uint32_t)mesh.num_vertices || i1 >= (uint32_t)mesh.num_vertices ||
+                i2 >= (uint32_t)mesh.num_vertices) continue;
+            const float* p0 = &mesh.positions[(size_t)i0 * 3];
+            const float* p1 = &mesh.positions[(size_t)i1 * 3];
+            const float* p2 = &mesh.positions[(size_t)i2 * 3];
+            float ux = p1[0]-p0[0], uy = p1[1]-p0[1], uz = p1[2]-p0[2];
+            float vx = p2[0]-p0[0], vy = p2[1]-p0[1], vz = p2[2]-p0[2];
+            float nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
+            for (uint32_t idx : {i0, i1, i2}) {
+                mesh.normals[(size_t)idx * 3 + 0] += nx;
+                mesh.normals[(size_t)idx * 3 + 1] += ny;
+                mesh.normals[(size_t)idx * 3 + 2] += nz;
+            }
+        }
+        for (size_t v = 0; v < (size_t)mesh.num_vertices; ++v) {
+            float* n = &mesh.normals[v * 3];
+            float len = std::sqrt(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
+            if (len > 1e-8f) { n[0]/=len; n[1]/=len; n[2]/=len; }
+            else { n[0]=0.0f; n[1]=1.0f; n[2]=0.0f; }
+        }
+    }
+
     mesh.bones_per_vertex = bone_idx_element.num_components;
     if (mesh.bones_per_vertex > 0) {
         mesh.bone_indices = unpack_vertex_data(interleaved_payload, interleaved_size, bone_idx_element, mesh.num_vertices, mesh.bones_per_vertex);

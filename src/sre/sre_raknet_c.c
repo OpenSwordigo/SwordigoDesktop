@@ -38,6 +38,14 @@ typedef struct {
     uint32_t last_recv_time;
     uint8_t last_sequence;
     void* hero_ghost;
+    /* Item 6 (docs/onlineplay/04_multiplayer_player_sync_and_interpolation_plan.md):
+     * host->guest state is sent at 30 Hz but the ghost is rendered at frame rate.
+     * Snapping the ghost to each received packet looks jittery, so we store the
+     * latest received transform as an interpolation TARGET and ease the ghost's
+     * visible position toward it every frame (see sre_raknet_lan_sync_update). */
+    bool  have_target;      /* a PLAYER_SYNC target has been received at least once */
+    float target_x, target_y, target_z; /* last received authoritative position */
+    int   target_facing;    /* last received facing dir (EntityComponent + 0x70) */
 } SrePeer;
 
 static SreRakNetPeer g_sre_raknet_peer_instance = { -1, 0, 32, false, false, {0}, 0, 0, 0, 0 };
@@ -83,6 +91,61 @@ int sre_raknet_is_connected_impl(void) {
         if (g_peers[i].is_active) return 1;
     }
     return 0;
+}
+
+/* =========================================================================
+ * Item 8 — Automatic nickname generator.
+ *
+ * Produces a fun, human-readable default player name for LAN sessions so a
+ * player never has to type one. The name is deterministic for the lifetime of
+ * the process (generated once, then cached) but varies between machines/runs
+ * because it is seeded from pid + a time sample + the bound socket fd. Format:
+ * "<Adjective><Noun><NN>" e.g. "SwiftGoblin42", which fits comfortably in the
+ * 32-byte name field the multiplayer layer reserves for player names.
+ * ========================================================================= */
+static char g_sre_local_nickname[32] = {0};
+
+const char* sre_generate_nickname(void) {
+    if (g_sre_local_nickname[0]) return g_sre_local_nickname; /* cached */
+
+    static const char* const adjectives[] = {
+        "Swift", "Brave", "Silent", "Mighty", "Cunning", "Shadow", "Iron",
+        "Golden", "Crimson", "Frost", "Storm", "Ancient", "Wild", "Noble",
+        "Fierce", "Lucky", "Rogue", "Grim", "Blazing", "Emerald"
+    };
+    static const char* const nouns[] = {
+        "Goblin", "Knight", "Mage", "Ranger", "Wyrm", "Golem", "Phantom",
+        "Warden", "Hunter", "Slayer", "Wizard", "Paladin", "Reaper", "Druid",
+        "Sentinel", "Nomad", "Raider", "Champion", "Warlock", "Sorcerer"
+    };
+    const int n_adj = (int)(sizeof(adjectives) / sizeof(adjectives[0]));
+    const int n_noun = (int)(sizeof(nouns) / sizeof(nouns[0]));
+
+    /* Mix a few cheap, dependency-free entropy sources so two instances differ.
+     * We avoid getpid()/time() here because the SRE compiles against a minimal
+     * libc shim (src/sre/include) that does not expose them; the socket fd, a
+     * stack/static address (ASLR-influenced), and a monotonic counter give
+     * enough variation for a friendly default name. */
+    static unsigned int call_salt = 0x9E3779B9u;
+    call_salt += 0x6D2B79F5u;
+    unsigned int seed = call_salt;
+    if (g_sre_raknet_peer_instance.sockfd >= 0)
+        seed ^= (unsigned int)(g_sre_raknet_peer_instance.sockfd * 40503);
+    seed ^= (unsigned int)((uintptr_t)&g_sre_local_nickname >> 4);
+    seed ^= (unsigned int)((uintptr_t)&seed >> 3);
+
+    /* xorshift so we don't rely on rand() global state. */
+    seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+
+    int ai = (int)(seed % (unsigned)n_adj);
+    seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+    int ni = (int)(seed % (unsigned)n_noun);
+    seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+    int num = (int)(seed % 100u); /* 00..99 */
+
+    snprintf(g_sre_local_nickname, sizeof(g_sre_local_nickname),
+             "%s%s%02d", adjectives[ai], nouns[ni], num);
+    return g_sre_local_nickname;
 }
 
 static void sre_raknet_note_send(ssize_t sent) {
@@ -493,6 +556,30 @@ void sre_raknet_lan_sync_update(void* game_scene_view) {
     static uint32_t frame_counter = 0;
     frame_counter++;
 
+    /* 0. Remote-ghost interpolation (Item 6 — doc 04 §3).
+     * State packets arrive at ~30 Hz but we run every frame, so ease each remote
+     * ghost's visible position toward its last-received authoritative target with
+     * framerate-independent exponential smoothing. alpha = 1 - exp(-rate * dt);
+     * we approximate dt with 1/60s per tick (the sync loop is frame-driven) and use
+     * a smoothing rate that reaches the target within ~2 packets, which keeps ghosts
+     * responsive without visible teleport-jitter. Discrete state (facing/HP) is
+     * applied immediately in the receive handler, not interpolated. */
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (!g_peers[i].is_active || !g_peers[i].hero_ghost || !g_peers[i].have_target) continue;
+        float cx = 0, cy = 0, cz = 0;
+        caver_getPosition_impl(g_peers[i].hero_ghost, &cx, &cy, &cz);
+        const float alpha = 0.35f; /* per-frame lerp factor (~1-exp(-25*(1/60))) */
+        float nx = cx + (g_peers[i].target_x - cx) * alpha;
+        float ny = cy + (g_peers[i].target_y - cy) * alpha;
+        float nz = cz + (g_peers[i].target_z - cz) * alpha;
+        /* Snap the last fraction so the ghost settles exactly and doesn't creep. */
+        float dx = g_peers[i].target_x - nx, dy = g_peers[i].target_y - ny, dz = g_peers[i].target_z - nz;
+        if ((dx*dx + dy*dy + dz*dz) < 0.0004f) {
+            nx = g_peers[i].target_x; ny = g_peers[i].target_y; nz = g_peers[i].target_z;
+        }
+        caver_setPosition_impl(g_peers[i].hero_ghost, nx, ny, nz);
+    }
+
     /* 1. Track scene changes and broadcast SCENE_CHANGE */
     static char last_local_scene[128] = {0};
     if (strcmp(last_local_scene, g_sre_current_scene_name) != 0) {
@@ -693,7 +780,23 @@ void sre_raknet_lan_sync_update(void* game_scene_view) {
                         }
 
                         if (g_peers[peer_idx].hero_ghost) {
-                            caver_setPosition_impl(g_peers[peer_idx].hero_ghost, rx, ry, rz);
+                            /* Item 6 (doc 04 §3 — interpolation): do NOT snap the ghost to
+                             * the received position. State arrives at 30 Hz but we render at
+                             * frame rate, so snapping looks jittery. Store the authoritative
+                             * transform as an interpolation target; the per-frame smoothing
+                             * pass at the top of this function eases the visible ghost toward
+                             * it. If this is the first target for a freshly spawned ghost,
+                             * snap once so it doesn't lerp from a stale origin. */
+                            if (!g_peers[peer_idx].have_target) {
+                                caver_setPosition_impl(g_peers[peer_idx].hero_ghost, rx, ry, rz);
+                            }
+                            g_peers[peer_idx].target_x = rx;
+                            g_peers[peer_idx].target_y = ry;
+                            g_peers[peer_idx].target_z = rz;
+                            g_peers[peer_idx].target_facing = (int)facing;
+                            g_peers[peer_idx].have_target = true;
+
+                            /* Facing and HP are discrete state — apply them immediately. */
                             if (g_SceneObject_ComponentWithInterface) {
                                 if (EntityComponent_Interface) {
                                     void* comp = g_SceneObject_ComponentWithInterface(g_peers[peer_idx].hero_ghost, EntityComponent_Interface);

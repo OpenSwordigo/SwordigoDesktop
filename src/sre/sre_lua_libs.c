@@ -2627,6 +2627,16 @@ static const void* swd_systemlib[] = {
 extern int   sre_raknet_startup_impl(uint16_t port);
 extern int   sre_raknet_connect_impl(const char* host, uint16_t port);
 extern void  sre_raknet_shutdown_impl(void);
+extern const char* sre_generate_nickname(void); /* Item 8 — auto nickname generator */
+
+/* Item 8: Swd.Net.GenerateNickname() — returns a fun auto-generated default
+ * player name (e.g. "SwiftGoblin42"), cached per process. Mods/UI can use this
+ * as the default LAN player name so users never have to type one. */
+static int l_swd_net_generate_nickname(lua_State* L) {
+    const char* nick = sre_generate_nickname();
+    if (g_lua_pushstring) g_lua_pushstring(L, nick ? nick : "Player");
+    return 1;
+}
 static int l_swd_net_host(lua_State* L) {
     int port = (g_lua_isnumber && g_lua_isnumber(L, 1)) ? (int)g_lua_tointeger(L, 1) : 12345;
     int result = sre_raknet_startup_impl((uint16_t)port);
@@ -2685,6 +2695,7 @@ static const void* swd_netlib[] = {
     (const void*)"IsConnected", (const void*)l_swd_net_is_connected,
     (const void*)"Disconnect",  (const void*)l_swd_net_disconnect,
     (const void*)"SetScene",    (const void*)l_swd_net_set_scene,
+    (const void*)"GenerateNickname", (const void*)l_swd_net_generate_nickname,
     (const void*)0,             (const void*)0
 };
 

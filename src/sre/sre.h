@@ -94,6 +94,11 @@ void sre_init(uint64_t swordigo_base, uint64_t empty_sentinel_bss_offset);
 /* Vtable Validator — verifies if vtable is 8-byte aligned and inside valid module range */
 int sre_is_valid_vtable_ptr(uint64_t vtable);
 
+/* Code-pointer validator (FIX6) — verifies addr is a 4-byte-aligned executable
+ * function pointer inside the UNION superset of all known .text/code ranges:
+ * guest .text [0x1203e90, 0x1583478) OR libsre [0x2000000, 0x2300000). */
+int sre_is_valid_code_ptr(uint64_t addr);
+
 /* CppString replacements — hooked via trampoline */
 SreString* sre_CppString_from_char_p(SreString* self, const char* src);
 SreString* sre_CppString_assign(SreString* self, const char* src, uint64_t len);

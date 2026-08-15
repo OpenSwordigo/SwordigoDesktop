@@ -562,7 +562,7 @@ static int l_ffi_typeof(lua_State* L) {
 /* =========================================================================
  * Register _G.ffi
  * ========================================================================= */
-void sre_ffi_register_lua(lua_State* L) {
+__attribute__((visibility("hidden"))) void sre_ffi_register_lua(lua_State* L) {
     if (!g_lua_createtable || !g_lua_pushcclosure || !g_lua_setfield) return;
 
     g_lua_createtable(L, 0, 32);  /* ffi = {} */

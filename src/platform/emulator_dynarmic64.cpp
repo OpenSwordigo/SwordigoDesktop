@@ -32,6 +32,8 @@ extern void* g_sre_render_recovery_jmp;
 // Used for render-guard PC validation (crash report 03 fix).
 extern uint64_t g_sre_text_base;          // libswordigo executable segment start
 extern uint64_t g_sre_text_end;           // libswordigo executable segment end
+extern uint64_t g_sre_dynstr_base;        // libswordigo .dynstr STRTAB start (non-exec)
+extern uint64_t g_sre_dynstr_end;         // libswordigo .dynstr STRTAB end (non-exec)
 extern uint64_t g_sre_runtime_text_base;  // libsre executable segment start
 extern uint64_t g_sre_runtime_text_end;   // libsre executable segment end
 
@@ -129,6 +131,105 @@ static constexpr uint32_t BRK_PC_HOOK = 0xD4200840u;  // BRK #0x42
 // Public API — install a PC-intercept hook (no guest writes)
 static void* s_emulator_instance = nullptr;  // set by EmulatorDynarmic64 ctor
 
+// ============================================================================
+// JOB 1 — scene-transition freeze: break the __do_upcast RTTI self-loop
+// ============================================================================
+// When a GotoLevel is launched from the MENU, Scene::FinishLoad completes and
+// Caver::GUINavigationController::FinishTransitionToViewController (nm 0x49a42c)
+// runs a C++ dynamic_cast to swap the menu VC to the GameViewController. That
+// cast enters __cxxabiv1::__vmi_class_type_info::__do_upcast (nm 0x54c6d4) and
+// SPINS FOREVER on this tight self-loop (objdump of the live ARM64 binary):
+//
+//   54c6d4:  mov  x1, x0
+//   54c6d8:  ldr  x0, [x1, #8]     ; x0 = base type_info (*(x1+8))
+//   54c6dc:  ldr  x2, [x0, #24]    ; x2 = *(x0+24)
+//   54c6e0:  cmp  x2, x1
+//   54c6e4:  b.eq 54c6d4           ; loop while (*(base+24) == x1)  ← never ends
+//
+// Under Dynarmic a mis-relocated type_info base pointer is self-referential
+// (base->base == self && base+24 == self), so x2==x1 stays true and the walk
+// never advances. The VC swap never completes → GameSceneView::Update is never
+// dispatched → world frozen (world_drive/ps_ticks=0, scene never renders).
+//
+// FIX: install a Tier-2 PC hook (no guest writes) at the loop head 0x54c6d4.
+// Each time the JIT re-enters the loop head we check whether the chain is
+// degenerate/non-advancing; if so we redirect PC to the natural loop EXIT
+// (0x54c6e8) so __do_upcast finishes its compare+ret and the dynamic_cast
+// returns. A hit counter is a hard safety cap. Legitimate casts advance the
+// chain (x2 != x1) and exit the loop on their own within a couple iterations,
+// so this only ever fires on the genuinely stuck self-loop.
+//
+// Guest VA = load base (0x1000000) + nm RVA.
+#define SRE_UPCAST_LOOP_HEAD  (0x1000000ULL + 0x54c6d4ULL)
+#define SRE_UPCAST_LOOP_EXIT  (0x1000000ULL + 0x54c6e8ULL)
+
+extern "C" int sre_emulator_install_pc_hook(uint64_t, bool (*)(void*), uint32_t*);
+
+static bool sre_upcast_spin_break_handler(void* emu_ptr) {
+    auto* emu = static_cast<EmulatorDynarmic64*>(emu_ptr);
+    extern uint8_t* g_guest_memory;
+
+    // Registers at the loop head 0x54c6d4 ("mov x1, x0"): x0 is the current
+    // type_info node about to be copied into x1, then the loop reads
+    //   x0' = *(x1+8)  (base)   and   x2 = *(x0'+24).
+    // Reproduce that one step to decide if the chain advances or self-references.
+    uint64_t x0 = emu->get_reg(0);
+    uint64_t x1_after = x0;                       // 54c6d4: mov x1, x0
+    uint64_t base = 0, base24 = 0;
+    bool degenerate = false;
+    if (x1_after && (x1_after + 8) < 0xE0000000ULL) {
+        std::memcpy(&base, g_guest_memory + ((x1_after + 8) & 0xffffffffULL), 8);
+        if (base && (base + 24) < 0xE0000000ULL) {
+            std::memcpy(&base24, g_guest_memory + ((base + 24) & 0xffffffffULL), 8);
+            // Loop condition is `*(base+24) == x1`. If it holds AND the walk
+            // does not advance (base points back at the same node), it is the
+            // infinite self-loop → break out.
+            if (base24 == x1_after && (base == x1_after || base == 0 || base24 == base))
+                degenerate = true;
+        } else {
+            degenerate = true;  // null/garbage base — the walk can't progress
+        }
+    }
+
+    // Hard safety cap: even if the heuristic misjudges, never let this loop head
+    // be re-entered an absurd number of times in one transition.
+    static uint64_t s_hits = 0;
+    static uint64_t s_broken = 0;
+    s_hits++;
+    if (degenerate || s_hits > 200000ULL) {
+        if (s_broken++ < 5) {
+            std::cerr << "[SRE/UpcastGuard] Breaking __do_upcast self-loop at 0x54c6d4 "
+                      << "(x0=0x" << std::hex << x0 << " base=0x" << base
+                      << " base24=0x" << base24 << std::dec
+                      << ") — redirecting to loop exit so the dynamic_cast completes"
+                      << std::endl;
+        }
+        s_hits = 0;
+        // Redirect to the loop exit (0x54c6e8). __do_upcast then runs its
+        // final compare/csel/ret and returns to its caller normally.
+        emu->redirect_pc = SRE_UPCAST_LOOP_EXIT;
+        return true;  // consumed
+    }
+
+    // Not (yet) degenerate — re-arm the hook and let the real instruction run
+    // this iteration (pass-through). The dispatcher removes the sentinel, so we
+    // must re-install to keep watching subsequent iterations.
+    sre_emulator_install_pc_hook(SRE_UPCAST_LOOP_HEAD, sre_upcast_spin_break_handler, nullptr);
+    return false;  // pass-through: execute the real instruction at 0x54c6d4
+}
+
+// Registered once, lazily, from run() after the guest image is mapped.
+static void sre_install_upcast_spin_breaker_once() {
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+    if (sre_emulator_install_pc_hook(SRE_UPCAST_LOOP_HEAD,
+                                     sre_upcast_spin_break_handler, nullptr) == 0) {
+        std::cerr << "[SRE/UpcastGuard] Installed __do_upcast(0x54c6d4) spin-breaker "
+                     "PC hook (JOB 1 scene-transition freeze fix)" << std::endl;
+    }
+}
+
 extern "C" int sre_emulator_install_pc_hook(
         uint64_t guest_pc,
         bool (*handler)(void* emu),
@@ -140,7 +241,7 @@ extern "C" int sre_emulator_install_pc_hook(
     // Read the original instruction from guest memory
     uint32_t orig = 0;
     extern uint8_t* g_guest_memory;
-    if (guest_pc + 3 < 0xF0000000ULL)
+    if (guest_pc + 4 <= 0xE0000000ULL)
         std::memcpy(&orig, g_guest_memory + guest_pc, 4);
 
     g_pc_hooks[guest_pc] = { handler, orig };
@@ -207,6 +308,16 @@ public:
         /* NULL-pointer or sign-extended negative offset reads (e.g. 0xfffffffffffffff8):
          * Return 0 silently without halting guest CPU so guest C++ NULL checks evaluate to false. */
         if (vaddr < 0x1000ULL || vaddr >= 0x0000800000000000ULL) {
+            /* Diagnostic: these are normally benign NULL-guard reads, but a
+             * NULL-range fault inside a hot copy loop (e.g. std::vector
+             * _M_insert_aux ldrb [x9]) indicates a corrupted container header.
+             * Log the first few with the guest PC so the culprit function can
+             * be nm-symbolized, without changing the silent-return behaviour. */
+            static int null_fault_log = 0;
+            if (null_fault_log++ < 20 && emu->get_jit()) {
+                std::cerr << "[SRE/Fault] NULL-range " << op << " addr=0x" << std::hex << vaddr
+                          << " PC=0x" << emu->get_jit()->GetPC() << std::dec << std::endl;
+            }
             return;
         }
 
@@ -229,7 +340,7 @@ public:
     }
 
     std::uint16_t MemoryRead16(Dynarmic::A64::VAddr vaddr) override {
-        if (vaddr + 1 < mem_size) {
+        if (vaddr + 2 <= mem_size) {
             std::uint16_t val;
             std::memcpy(&val, memory + vaddr, 2);
             return val;
@@ -240,7 +351,7 @@ public:
     }
 
     std::uint32_t MemoryRead32(Dynarmic::A64::VAddr vaddr) override {
-        if (vaddr + 3 < mem_size) {
+        if (vaddr + 4 <= mem_size) {
             std::uint32_t val;
             std::memcpy(&val, memory + vaddr, 4);
             return val;
@@ -251,7 +362,7 @@ public:
     }
 
     std::uint64_t MemoryRead64(Dynarmic::A64::VAddr vaddr) override {
-        if (vaddr + 7 < mem_size) {
+        if (vaddr + 8 <= mem_size) {
             std::uint64_t val;
             std::memcpy(&val, memory + vaddr, 8);
             return val;
@@ -263,7 +374,7 @@ public:
 
     Dynarmic::A64::Vector MemoryRead128(Dynarmic::A64::VAddr vaddr) override {
         Dynarmic::A64::Vector val = {0, 0};
-        if (vaddr + 15 < mem_size) {
+        if (vaddr + 16 <= mem_size) {
             std::memcpy(&val, memory + vaddr, 16);
             return val;
         }
@@ -279,17 +390,17 @@ public:
     }
 
     void MemoryWrite16(Dynarmic::A64::VAddr vaddr, std::uint16_t value) override {
-        if (vaddr + 1 < mem_size) std::memcpy(memory + vaddr, &value, 2);
+        if (vaddr + 2 <= mem_size) std::memcpy(memory + vaddr, &value, 2);
         else if (vaddr < 0x0000800000000000ULL) HandleMemoryFault(vaddr, "MemoryWrite16");
     }
 
     void MemoryWrite32(Dynarmic::A64::VAddr vaddr, std::uint32_t value) override {
-        if (vaddr + 3 < mem_size) std::memcpy(memory + vaddr, &value, 4);
+        if (vaddr + 4 <= mem_size) std::memcpy(memory + vaddr, &value, 4);
         else if (vaddr < 0x0000800000000000ULL) HandleMemoryFault(vaddr, "MemoryWrite32");
     }
 
     void MemoryWrite64(Dynarmic::A64::VAddr vaddr, std::uint64_t value) override {
-        if (vaddr + 7 < mem_size) std::memcpy(memory + vaddr, &value, 8);
+        if (vaddr + 8 <= mem_size) std::memcpy(memory + vaddr, &value, 8);
         else if (vaddr < 0x0000800000000000ULL) HandleMemoryFault(vaddr, "MemoryWrite64");
     }
 
@@ -327,13 +438,13 @@ public:
     }
 
     bool MemoryWriteExclusive16(Dynarmic::A64::VAddr vaddr, std::uint16_t value, std::uint16_t expected) override {
-        if (vaddr + 1 >= mem_size) { HandleMemoryFault(vaddr, "MemoryWriteExclusive16"); return false; }
+        if (vaddr + 2 > mem_size) { HandleMemoryFault(vaddr, "MemoryWriteExclusive16"); return false; }
         auto* p = reinterpret_cast<std::atomic<std::uint16_t>*>(memory + vaddr);
         return p->compare_exchange_strong(expected, value, std::memory_order_acq_rel, std::memory_order_acquire);
     }
 
     bool MemoryWriteExclusive32(Dynarmic::A64::VAddr vaddr, std::uint32_t value, std::uint32_t expected) override {
-        if (vaddr + 3 >= mem_size) { HandleMemoryFault(vaddr, "MemoryWriteExclusive32"); return false; }
+        if (vaddr + 4 > mem_size) { HandleMemoryFault(vaddr, "MemoryWriteExclusive32"); return false; }
         /* [YUZU-INSPIRED] CAS on 32-bit word — the hot path for boost::shared_ptr refcounts. */
         auto* p = reinterpret_cast<std::atomic<std::uint32_t>*>(memory + vaddr);
         return p->compare_exchange_strong(expected, value, std::memory_order_acq_rel, std::memory_order_acquire);
@@ -455,6 +566,26 @@ public:
                 return 0xD4200060u;  // BRK #3 → ExceptionRaised(Breakpoint)
             }
         }
+        // RenderGuard extension: a code fetch inside libswordigo's .dynstr STRTAB
+        // is NEVER valid — .dynstr holds symbol-name strings, not code. It lives
+        // INSIDE the executable PT_LOAD segment, so the coarse [text_base,text_end)
+        // range above cannot exclude it. Observed failure: a virtual call walked
+        // past the end of a CaverShell vtable into the adjacent RTTI type-name
+        // pointer, which points at "_ZTSN5Caver...Shell" in .dynstr; the guest
+        // then blr'd to 0x1077168 (start of .dynstr) and executed the name bytes
+        // as instructions → undefined-instruction exception → dead guest / black
+        // screen. Returning BRK #3 routes this through ExceptionRaised(Breakpoint)
+        // → SRE render-recovery longjmp (skip the frame) instead of a hard halt.
+        if (g_sre_dynstr_base && vaddr >= g_sre_dynstr_base && vaddr < g_sre_dynstr_end) {
+            static int dynstr_guard_log = 0;
+            if (dynstr_guard_log++ < 10 && emu->get_jit()) {
+                std::cerr << "[RenderGuard] Bad fetch in .dynstr at 0x" << std::hex << vaddr
+                          << " LR(X30)=0x" << emu->get_jit()->GetRegister(30)
+                          << " — returning BRK #3 for recovery" << std::dec << std::endl;
+            }
+            return 0xD4200060u;  // BRK #3 → ExceptionRaised(Breakpoint) → recovery
+        }
+
         // Regular memory
         if (vaddr + 3 < mem_size) {
             std::uint32_t val;
@@ -633,6 +764,90 @@ public:
             }
 
 
+            // ── .dynstr Bad-Indirect-Call Recovery (BRK #3 from MemoryReadCode) ──
+            // MemoryReadCode returns BRK #3 (0xD4200060) for any code fetch inside
+            // libswordigo's .dynstr STRTAB — that region holds symbol-name strings,
+            // never code. Reaching here means the guest executed `BLR Xn`/`BR Xn`
+            // through a poisoned function pointer (a virtual dispatch that walked
+            // off the end of a vtable into the adjacent RTTI type-name pointer,
+            // which is a .dynstr address). By this point LR(X30) is typically 0x0
+            // (the poisoned call already clobbered it), so returning to LR is NOT
+            // safe. The correct, frame-safe recovery is the SRE render-frame
+            // longjmp: unwind the entire bad guest frame and let the render loop
+            // start a fresh frame. This is the same recovery the run-loop PC
+            // pre-check uses for an out-of-text PC — we just trigger it earlier,
+            // from inside jit->Run(), before the corrupt PC can halt with LR=0x0.
+            if (g_sre_dynstr_base && pc >= g_sre_dynstr_base && pc < g_sre_dynstr_end) {
+                static int dynstr_recover_log = 0;
+                if (dynstr_recover_log++ < 10) {
+                    std::cerr << "[RenderGuard] .dynstr breakpoint at 0x" << std::hex << pc
+                              << " LR=0x" << emu->get_jit()->GetRegister(30) << std::dec
+                              << " — recovering (bad virtual dispatch into STRTAB)"
+                              << std::endl;
+                    // [DIAG/vcall] Dump the object + vtable that produced this jump.
+                    // drawApplication does: x0=obj; x8=[x0] (vptr); x8=[x8+0x70]; blr x8.
+                    // Re-read the live values so we can see whether the object's
+                    // vptr, or the vtable slot, was overwritten at runtime.
+                    uint64_t obj  = emu->get_reg(0);
+                    uint64_t vptr = 0, slot = 0, x1 = emu->get_reg(1);
+                    extern uint8_t* g_guest_memory;
+                    if (obj && obj < 0xE0000000ULL)
+                        std::memcpy(&vptr, g_guest_memory + (obj & 0xffffffffULL), 8);
+                    if (vptr && (vptr + 0x70) < 0xE0000000ULL)
+                        std::memcpy(&slot, g_guest_memory + ((vptr + 0x70) & 0xffffffffULL), 8);
+                    std::cerr << "[DIAG/vcall] X0(obj)=0x" << std::hex << obj
+                              << " X1=0x" << x1
+                              << " vptr=[obj]=0x" << vptr
+                              << " [vptr+0x70]=0x" << slot
+                              << "  (live vtable[Render] should be 0x1211014)"
+                              << std::dec << std::endl;
+                }
+                // Prefer a safe return-to-LR if the caller is still intact…
+                uint64_t lr = emu->get_jit()->GetRegister(30);
+                if (is_valid_exec_pc(lr) && lr != pc) {
+                    emu->redirect_pc = lr;
+                    emu->get_jit()->HaltExecution(Dynarmic::HaltReason::UserDefined2);
+                    return;
+                }
+                // …otherwise unwind the whole frame via the SRE render-recovery longjmp.
+                if (g_sre_render_recovery_active && g_sre_render_recovery_jmp) {
+                    sre_longjmp(g_sre_render_recovery_jmp, 2); // val=2 → render-guard path
+                    // not reached if longjmp succeeds
+                }
+                // ── Last-resort: unwind THIS guest call back to the host ──────
+                // We reach here on the first-frame updateApplication tick: the
+                // guest performed a bad virtual dispatch (root-view ptr / vtable
+                // slot is garbage) landing in .dynstr, LR(X30)==0 so return-to-LR
+                // is impossible, AND no SRE render-recovery longjmp is armed
+                // (g_sre_render_recovery_active==0 during updateApplication).
+                //
+                // Previously this fell through to a hard HaltExecution which made
+                // run() latch a permanent fault → the host stopped calling
+                // updateApplication forever (permanent black screen).
+                //
+                // Instead, emulate the innermost guest function returning cleanly
+                // back to the host `call()` entry point: force PC to MAGIC_LR so
+                // the run() loop treats it exactly like a normal function return,
+                // return a null/void result in X0, and set function_returned so
+                // run() takes its clean-return path (which also resets
+                // consecutive_mem_faults). No permanent isolation, and the host
+                // frame loop keeps invoking updateApplication on later frames.
+                {
+                    static int dynstr_unwind_log = 0;
+                    if (dynstr_unwind_log++ < 10) {
+                        std::cerr << "[RenderGuard] .dynstr bad-vcall with LR=0 and no "
+                                     "render-recovery armed — unwinding guest call to host "
+                                     "(PC→MAGIC_LR, X0=0) instead of isolating guest"
+                                  << std::endl;
+                    }
+                    emu->get_jit()->SetRegister(0, 0);        // void/null return value
+                    emu->function_returned = true;            // run() clean-return path
+                    emu->get_jit()->SetPC(0xE0000000ULL);     // MAGIC_LR sentinel
+                    emu->get_jit()->HaltExecution(Dynarmic::HaltReason::UserDefined2);
+                    return;
+                }
+            }
+
             // Unknown breakpoint — log and halt
 
             std::cerr << "[Dynarmic] Unknown breakpoint at 0x" << std::hex << pc << std::dec << std::endl;
@@ -652,6 +867,18 @@ public:
             }
             std::cerr << "  SP = 0x" << std::hex << emu->get_jit()->GetSP() << std::dec << std::endl;
             std::cerr << "  PC = 0x" << std::hex << pc << std::dec << std::endl;
+            // Diagnostic: distinguish a genuinely unmapped code address from a
+            // corrupted float/pointer being used as a code pointer. Guest RAM
+            // lives below 0xE0000000 (MAGIC_LR / bridge region start); a PC at
+            // or above that with high bits set is almost never real code — it
+            // is typically a float/double bit-pattern that leaked into a
+            // branch target. This is informational only; we still HaltExecution
+            // below so run() can apply its recoverable-fault policy.
+            if (pc >= 0xE0000000ULL && (pc >> 32) != 0) {
+                std::cerr << "[Dynarmic] Faulting PC is not a valid guest code address "
+                          << "(likely a corrupted float/pointer) — aborting call, attempting recovery."
+                          << std::endl;
+            }
             emu->get_jit()->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
             return;
         }
@@ -659,6 +886,10 @@ public:
         // All other exceptions — log and halt to prevent hangs
         std::cerr << "[Dynarmic] Exception at 0x" << std::hex << pc
                   << " type=" << static_cast<int>(exception) << std::dec << " — halting" << std::endl;
+        // DIAG: dump the recent PC history so we can see the exact branch/return
+        // that jumped into a non-code region (e.g. .dynstr). record_pc() must be
+        // wired for this to be populated.
+        emu->print_trace();
         std::cerr << "=== REGISTERS ===" << std::endl;
         for (int r = 0; r < 31; r++) {
             uint64_t val = emu->get_reg(r);
@@ -775,6 +1006,13 @@ EmulatorDynarmic64::EmulatorDynarmic64(uint8_t* guest_mem, uint64_t size)
     config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
     config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
     config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+    // RESTORED (regression fix): Unsafe_IgnoreGlobalMonitor makes STXR/STLXR always
+    // succeed. This is the known-good behaviour from the 2-day-old reference build.
+    // Removing it (to rely on the real global monitor + MemoryWriteExclusive CAS)
+    // caused guest exclusive-store retry loops during menu bring-up to spin forever
+    // — the game froze silently right after "Menu background loaded" (no fault, no
+    // frame loop, draws=0). Keep it enabled; the STXR-neutering patcher in main.cpp
+    // handles refcount correctness on top of this.
     config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
 
     // Enable fastmem optimization since we mapped the entire 4GB virtual address space
@@ -881,6 +1119,10 @@ float EmulatorDynarmic64::get_sreg(int reg) {
 
 void EmulatorDynarmic64::run(uint64_t start_pc) {
     static const uint64_t MAGIC_LR = 0xE0000000;
+    /* JOB 1 (scene-transition freeze): install the __do_upcast(0x54c6d4) spin
+     * breaker once, now that the guest image is mapped and s_emulator_instance
+     * is live. See sre_upcast_spin_break_handler above for the full rationale. */
+    sre_install_upcast_spin_breaker_once();
     /* [YUZU-INSPIRED] Tick budget: 10M → 50M ticks per JIT chunk.
      * Yuzu uses UINT64_MAX (unlimited) since it has real OS scheduling.
      * We use 50M: large enough to run most functions without a re-entry,
@@ -909,6 +1151,11 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
         function_returned = true;
         return;
     }
+
+    // Fresh call: assume it will complete cleanly until proven otherwise.
+    // last_call_faulted is set true by the MemoryAbort branch below if THIS
+    // call aborts on a recoverable memory fault.
+    last_call_faulted = false;
 
     // Set LR to magic sentinel (function return detection)
     jit->SetRegister(30, MAGIC_LR);
@@ -1018,6 +1265,39 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
                 sre_longjmp(g_sre_render_recovery_jmp, 2); // val=2 → render-guard path
                 // never reached if longjmp succeeds
             }
+
+            // UNIVERSAL BAD-CALL RECOVERY (fixes the recurring 0x10771ac crash):
+            //
+            // A non-executable PC almost always means the guest just executed a
+            // `BLR Xn` / `BR Xn` through a poisoned function pointer — e.g. a
+            // virtual dispatch `LDR X8,[X0]; LDR X8,[X8,#off]; BLR X8` where the
+            // slot held the guest stack canary 0xdeadc0de12345678, landing PC in
+            // .dynstr at 0x10771ac. This happens during MainMenuView /
+            // shared_from_this bring-up under SRE and, left as a hard fault, it
+            // halts every frame so the menu never renders (draws=0).
+            //
+            // The correct, universally-safe behaviour for a bad indirect CALL is
+            // to treat that one call as a no-op and RETURN to the caller: set
+            // PC = LR and continue. The callee produced no result, but the caller
+            // (and the whole frame loop) keeps running instead of dying. If LR is
+            // itself invalid we have no safe return target, so fall through to the
+            // hard fault as before.
+            {
+                uint64_t lr = jit->GetRegister(30);
+                if (is_valid_exec_pc(lr) && lr != pre_pc) {
+                    static int bad_call_skip_log = 0;
+                    if (bad_call_skip_log < 20) {
+                        bad_call_skip_log++;
+                        std::cerr << "[RenderGuard] Skipping bad indirect call to 0x"
+                                  << std::hex << pre_pc << " — returning to LR=0x" << lr
+                                  << std::dec << " (call treated as no-op)" << std::endl;
+                    }
+                    // X0 (return value) is left as-is; most poisoned calls here are
+                    // void virtuals (Update/DrawRect/accept_owner), so this is safe.
+                    jit->SetPC(lr);
+                    continue;   // re-enter the run loop at the caller
+                }
+            }
             set_faulted(true);
             break;
         }
@@ -1087,7 +1367,7 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
                 handle_bridge_call(bridge_halt_address);
                 bridge_halt_requested = false;
                 curr_pc = jit->GetPC();
-                if (curr_pc == MAGIC_LR) break;
+                if (curr_pc == MAGIC_LR) { consecutive_mem_faults = 0; break; }
 
                 // Now run all pending threads inline
                 run_pending_threads();
@@ -1104,7 +1384,7 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
                 handle_bridge_call(bridge_halt_address);
                 bridge_halt_requested = false;
                 curr_pc = jit->GetPC();
-                if (curr_pc == MAGIC_LR) break;
+                if (curr_pc == MAGIC_LR) { consecutive_mem_faults = 0; break; }
                 chunk--;
                 continue;
             }
@@ -1114,7 +1394,7 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
             bridge_halt_requested = false;
 
             curr_pc = jit->GetPC();
-            if (curr_pc == MAGIC_LR) break;
+            if (curr_pc == MAGIC_LR) { consecutive_mem_faults = 0; break; }
 
             // Normal bridge call — don't count as chunk
             chunk--;
@@ -1128,6 +1408,9 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
                 std::cerr << "[Dynarmic/dbg] Function returned cleanly (bridge_calls=" << bridge_calls << ")" << std::endl;
             }
             */
+            // Clean function return (UserDefined2 + function_returned) —
+            // clear the transient memory-fault streak.
+            consecutive_mem_faults = 0;
             break;
         }
 
@@ -1150,7 +1433,34 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
         // Check for MemoryAbort (e.g. NoExecuteFault or unmapped memory)
         if (Dynarmic::Has(hr, Dynarmic::HaltReason::MemoryAbort)) {
             std::cerr << "[Dynarmic] MemoryAbort halt at PC=0x" << std::hex << curr_pc << std::dec << " — stopping execution" << std::endl;
-            set_faulted(true);
+
+            // Recoverable-fault policy: a single memory fault (e.g. a corrupted
+            // float used as a code pointer) should abort only THIS guest call,
+            // not permanently poison the whole emulator. We count consecutive
+            // faults and only give up (set_faulted) once the guest looks truly
+            // wedged. A clean MAGIC_LR return resets the streak (see below).
+            consecutive_mem_faults++;
+
+            // If a render-frame recovery longjmp is armed, unwind this frame
+            // cleanly (matches the pre_pc invalid-PC handling above).
+            if (g_sre_render_recovery_active && g_sre_render_recovery_jmp) {
+                sre_longjmp(g_sre_render_recovery_jmp, 2); // val=2 → render-guard path
+                // never reached if longjmp succeeds
+            }
+
+            // No recovery longjmp armed: abort just this call. Mark it faulted
+            // so the caller can tell this frame did not complete normally, and
+            // break WITHOUT permanently poisoning the emulator — unless we have
+            // hit the hard consecutive-fault threshold, in which case the guest
+            // is truly wedged and we disable execution for good.
+            static const int MAX_CONSECUTIVE_MEM_FAULTS = 16;
+            last_call_faulted = true;
+            if (consecutive_mem_faults >= MAX_CONSECUTIVE_MEM_FAULTS) {
+                std::cerr << "[Dynarmic] Too many consecutive memory faults ("
+                          << consecutive_mem_faults
+                          << ") — disabling guest execution." << std::endl;
+                set_faulted(true);
+            }
             break;
         }
 
@@ -1171,7 +1481,16 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
         }
 
         // Check if function completed
-        if (curr_pc == MAGIC_LR) break;
+        if (curr_pc == MAGIC_LR) {
+            // Clean return (primary MAGIC_LR site): the guest completed a full
+            // call without a fatal memory fault, so clear the transient-fault
+            // streak. This is what lets the emulator survive occasional
+            // recoverable faults — a good frame resets the counter that would
+            // otherwise permanently poison execution once it reaches the hard
+            // threshold in the MemoryAbort branch below.
+            consecutive_mem_faults = 0;
+            break;
+        }
 
         /* LEGACY_SPINLOOP_DETECTION_START
          * PC-repetition spin detector: if the PC doesn't advance across tick
@@ -1255,14 +1574,27 @@ void EmulatorDynarmic64::run(uint64_t start_pc) {
                     // Do NOT break out of the run loop or reset PC/SP. Let the guest resume exactly where it was.
                 } else {
                     // HEAVY FUNCTION / UNYIELDING LOOP:
-                    // If updateApplication (0x1478ccc) or handleTouchEvent (0x1478f84) is spinning at the exact same PC
-                    // with zero pending threads and zero bridge calls made during this chunk loop, break out cleanly
-                    // so the host main loop can poll SDL events and render without hanging!
+                    // Same PC for 3+ chunks with ZERO pending threads means no other
+                    // thread is being waited on — this is NOT a spinlock, it's a
+                    // legitimate long-running routine (a destructor sweep, a bulk
+                    // memset/zero-fill init, etc.). Break out cleanly so the host
+                    // main loop can poll SDL events and render instead of hanging.
                     //
-                    if (start_pc == 0x1478cccULL || start_pc == 0x1478f84ULL) {
-                        break;
-                    }
-                    same_pc_count = 0;
+                    // Previously only two hardcoded entry points (updateApplication
+                    // 0x1478ccc, handleTouchEvent 0x1478f84) were allowed to break;
+                    // every other heavy function hit `same_pc_count = 0`, which reset
+                    // the counter so it could NEVER break OR reach the MAX_CHUNKS
+                    // safety bound — an infinite benign loop. This manifested only
+                    // with SRE enabled, because SRE's GUI / program-library hooks
+                    // route menu init through such a heavy zero-fill loop (observed
+                    // stall: PC=0x144fdc8 zero-fill, start=0x14789f0 GUI init), which
+                    // is not in the whitelist → the game froze at the menu.
+                    //
+                    // MAX_CHUNKS remains the outer safety bound: a truly infinite
+                    // loop still faults cleanly after MAX_CHUNKS windows. Breaking
+                    // here just lets the host loop breathe; execution re-enters at
+                    // the same PC next tick and continues the legitimate work.
+                    break;
                 }
             }
         } else {
@@ -1387,6 +1719,17 @@ void EmulatorDynarmic64::run_pending_threads() {
 }
 
 uint64_t EmulatorDynarmic64::call(uint64_t addr, const std::vector<uint64_t>& args) {
+    // Front gate: reject implausible guest code targets before running. A
+    // float/double bit-pattern (e.g. 0x40e00000434f0000) read out of a
+    // half-initialized scene object must never be executed as code via the
+    // bridge/call path. Guest code addresses are 4-byte aligned and live
+    // below the guest memory size.
+    if (addr == 0 || (addr & 3u) || addr >= 0xE0000000ULL) {
+        std::cerr << "[Dynarmic] call() rejected implausible target 0x"
+                  << std::hex << addr << std::dec << std::endl;
+        return 0;
+    }
+
     if (!quiet_mode) {
         std::cout << "[Dynarmic] Calling guest function at 0x" << std::hex << addr << std::dec << std::endl;
     }
@@ -1413,6 +1756,13 @@ uint64_t EmulatorDynarmic64::call(uint64_t addr, const std::vector<uint64_t>& ar
 
     run(addr);
     uint64_t result = jit->GetRegister(0); // Read return value BEFORE restoring state
+
+    // If the guest call faulted (bad PC / MemoryAbort), X0 holds stale/garbage
+    // data. Returning it propagates corruption into callers (e.g. as a pointer
+    // or vtable). Yield a safe 0 instead.
+    if (has_faulted()) {
+        result = 0;
+    }
 
     // Restore previous state
     for (int i = 0; i < 31; ++i) {
@@ -1462,6 +1812,31 @@ void EmulatorDynarmic64::protect_memory(uint64_t addr, uint64_t size, uint32_t p
     }
     std::cout << "[Dynarmic] protect_memory(0x" << std::hex << addr
               << ", 0x" << size << ", " << std::dec << perms << ") — cache invalidated" << std::endl;
+}
+
+// --- Fault management (Step A: non-permanent guest faults) ---
+
+void EmulatorDynarmic64::clear_faulted() {
+    // Clear the shared latched-fault flag (base class member).
+    fault_flag = false;
+    // Also clear Dynarmic's own halt reason and the recoverable-fault
+    // bookkeeping so a subsequent call() starts from a clean slate. Without
+    // clearing consecutive_mem_faults, a previously-hit hard threshold would
+    // re-poison the emulator on the very next fault.
+    consecutive_mem_faults = 0;
+    last_call_faulted = false;
+    // Also clear the transient reentrancy flags so a fresh call() begins with
+    // no pending function-return / bridge-halt sentinel from the poisoned frame.
+    function_returned = false;
+    bridge_halt_requested = false;
+    if (jit) {
+        // Clear any pending halt reasons so the next Run() isn't immediately
+        // interrupted by a stale halt latched from the poisoned frame.
+        jit->ClearHalt(Dynarmic::HaltReason::MemoryAbort);
+        jit->ClearHalt(Dynarmic::HaltReason::UserDefined1);
+        jit->ClearHalt(Dynarmic::HaltReason::UserDefined2);
+        jit->ClearHalt(Dynarmic::HaltReason::CacheInvalidation);
+    }
 }
 
 // --- Debugging ---

@@ -21,6 +21,7 @@
 
 #include "tools/filerift.h"
 #include "tools/scene_loader.h"   // av:: scene graph (pulls entity/physics/collision/pod)
+#include "tools/map_loader.h"     // mapedit:: world-map (.scmap) graph
 #include "platform/pvr_loader.h"  // pvr_decode_to_rgba (texture_info decode)
 #include <zlib.h>
 
@@ -904,6 +905,169 @@ static Json tool_scene_summary(const Json& a, std::string& err) {
     return r;
 }
 
+static Json tool_map_decode(const Json& a, std::string& err) {
+    std::string path = a.str("path");
+    if (path.empty()) { err = "missing 'path'"; return Json::Null(); }
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err = "cannot open file: " + path; return Json::Null(); }
+    std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    Json r = Json::Obj();
+    r.set("path", path);
+    r.set("markup", filerift::decode_protobuf(bytes, "scmap"));
+    return r;
+}
+
+static Json tool_map_summary(const Json& a, std::string& err) {
+    std::string path = a.str("path");
+    if (path.empty()) { err = "missing 'path'"; return Json::Null(); }
+    mapedit::MapData m;
+    std::string lerr;
+    if (!mapedit::map_load(path, m, &lerr)) { err = lerr; return Json::Null(); }
+    Json r = Json::Obj();
+    r.set("path", path);
+    r.set("zones", (int)m.zones.size());
+    r.set("nodes", (int)m.node_index.size());
+    mapedit::map_validate(m);
+    Json issues = Json::Arr();
+    for (const auto& i : m.issues) issues.push(Json::Str(i));
+    r.set("issues", std::move(issues));
+    Json zones = Json::Arr();
+    for (const auto& z : m.zones) {
+        Json zj = Json::Obj();
+        zj.set("name", z.name);
+        zj.set("title", z.title);
+        zj.set("experience_level", z.experience_level);
+        zj.set("music", z.music);
+        zj.set("node_count", (int)z.nodes.size());
+        Json nodes = Json::Arr();
+        for (const auto& n : z.nodes) {
+            Json nj = Json::Obj();
+            nj.set("level", n.level_name);
+            nj.set("title", n.title);
+            nj.set("type", n.type);
+            nj.set("hidden", n.hidden ? 1 : 0);
+            nj.set("experience_level", n.experience_level);
+            nj.set("treasures", n.num_treasures);
+            Json ports = Json::Arr();
+            for (const auto& p : n.portals) {
+                Json pj = Json::Obj();
+                pj.set("destination", p.destination_name);
+                pj.set("direction", p.direction);
+                ports.push(std::move(pj));
+            }
+            nj.set("portals", std::move(ports));
+            nodes.push(std::move(nj));
+        }
+        zj.set("nodes", std::move(nodes));
+        zones.push(std::move(zj));
+    }
+    r.set("zones_data", std::move(zones));
+    std::string from = a.str("from");
+    std::string to = a.str("to");
+    if (!from.empty() && !to.empty()) {
+        auto route = mapedit::map_find_path(m, from, to);
+        Json pj = Json::Arr();
+        for (const auto& s : route) pj.push(Json::Str(s));
+        r.set("path", std::move(pj));
+    }
+    return r;
+}
+
+static Json tool_map_node(const Json& a, std::string& err) {
+    std::string path = a.str("path");
+    std::string level = a.str("node");
+    if (path.empty() || level.empty()) { err = "missing 'path' or 'node'"; return Json::Null(); }
+    mapedit::MapData m;
+    std::string lerr;
+    if (!mapedit::map_load(path, m, &lerr)) { err = lerr; return Json::Null(); }
+    auto it = m.node_index.find(level);
+    if (it == m.node_index.end()) { err = "node '" + level + "' not in map"; return Json::Null(); }
+    auto [zi, ni] = it->second;
+    const mapedit::MapZoneData& z = m.zones[zi];
+    const mapedit::MapNodeData& n = z.nodes[ni];
+    Json r = Json::Obj();
+    r.set("zone_name", z.name);
+    r.set("zone_title", z.title);
+    r.set("zone_experience_level", z.experience_level);
+    r.set("level", n.level_name);
+    r.set("title", n.title);
+    r.set("type", n.type);
+    r.set("hidden", n.hidden ? 1 : 0);
+    r.set("experience_level", n.experience_level);
+    r.set("music", n.music);
+    r.set("treasures", n.num_treasures);
+    r.set("has_portal", n.has_portal ? 1 : 0);
+    r.set("node_index_in_zone", ni);
+    r.set("zone_index", zi);
+    // Layout position (if auto-layout available)
+    mapedit::map_auto_layout(m);
+    r.set("auto_layout_x", (double)n.lx);
+    r.set("auto_layout_y", (double)n.ly);
+    // Portal destinations (neighbors)
+    Json ports = Json::Arr();
+    for (const auto& p : n.portals) {
+        Json pj = Json::Obj();
+        pj.set("destination", p.destination_name);
+        pj.set("direction", p.direction);
+        pj.set("pass_direction", p.pass_direction);
+        pj.set("ignore_in_node_positioning", p.ignore_in_node_positioning ? 1 : 0);
+        ports.push(std::move(pj));
+    }
+    r.set("portals", std::move(ports));
+    // Backward edges (nodes that have portals → this node)
+    Json back = Json::Arr();
+    for (const auto& oz : m.zones)
+        for (const auto& on : oz.nodes)
+            for (const auto& p : on.portals)
+                if (p.destination_name == level)
+                    back.push(Json::Str(oz.name + "/" + on.level_name));
+    r.set("incoming_from", std::move(back));
+    return r;
+}
+
+static Json tool_save_info(const Json& a, std::string& err) {
+    std::string path = a.str("path");
+    if (path.empty()) { err = "missing 'path'"; return Json::Null(); }
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err = "cannot open save"; return Json::Null(); }
+    std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::string markup;
+    try {
+        markup = filerift::decode_protobuf(bytes, "gplayer");
+    } catch (const std::exception& e) {
+        err = std::string("decode failed: ") + e.what(); return Json::Null();
+    }
+    auto grab_str = [&](const std::string& key) -> std::string {
+        std::string pat = key + " : ";
+        size_t p = markup.find(pat);
+        if (p == std::string::npos) return std::string();
+        p += pat.size();
+        size_t q = markup.find('\n', p);
+        std::string v = markup.substr(p, (q == std::string::npos ? markup.size() : q) - p);
+        while (!v.empty() && (v.front() == ' ' || v.front() == '\'' || v.front() == '\r'))
+            v.erase(v.begin());
+        while (!v.empty() && (v.back() == ' ' || v.back() == '\'' || v.back() == '\r'))
+            v.pop_back();
+        return v;
+    };
+    auto grab_int = [&](const std::string& key) -> int {
+        std::string v = grab_str(key);
+        if (v.empty()) return 0;
+        try { return std::stoi(v); } catch (...) { return 0; }
+    };
+    Json r = Json::Obj();
+    r.set("path", path);
+    r.set("name", grab_str("Name"));
+    r.set("experience_level", grab_int("ExperienceLevel"));
+    r.set("current_map_node", grab_str("CurrentMapNodeName"));
+    r.set("current_level", grab_str("CurrentLevel"));
+    r.set("current_spawn_point", grab_str("CurrentSpawnPoint"));
+    r.set("equipped_weapon", grab_str("EquippedWeaponName"));
+    r.set("equipped_armor", grab_str("EquippedArmorName"));
+    r.set("raw_markup_size", (int)markup.size());
+    return r;
+}
+
 static Json tool_scene_programs(const Json& a, std::string& err) {
     std::string path = a.str("path");
     if (path.empty()) { err = "missing 'path'"; return Json::Null(); }
@@ -1588,6 +1752,18 @@ static std::vector<Tool>& tool_registry() {
         {"scene_libraries",
          "List the external .scl object libraries a scene references (paths + names) and any that could not be resolved.",
          schema_from("path:string:Path to a .scene file;path"), tool_scene_libraries},
+        {"map_decode",
+         "Decode a Swordigo .scmap world-map file to full FileRift markup text (zones, nodes, portals, metadata).",
+         schema_from("path:string:Path to a .scmap world-map file;path"), tool_map_decode},
+        {"map_summary",
+         "Structured world-map graph: every zone/node/portal with types and metadata, validation issues, and an optional BFS travel path between two levels (from/to).",
+         schema_from("path:string:Path to a .scmap world-map file,from:string:Start level name for a travel-path query,to:string:Destination level name for a travel-path query;path"), tool_map_summary},
+        {"map_node",
+         "Details for a single map node: zone, type, title, XP gate, treasures, portals (with directions), incoming edges, and auto-layout position.",
+         schema_from("path:string:Path to a .scmap world-map file,node:string:Level name of the node to query;path,node"), tool_map_node},
+        {"save_info",
+         "Decode a Swordigo .gplayer save file: player name, level, current map node/level/spawn, equipped items.",
+         schema_from("path:string:Path to a .gplayer save file;path"), tool_save_info},
         {"search",
          "Search for a string across an entire folder (decoded-aware: .scl/.scene are searched as decoded text). Returns per-file match counts + context snippets.",
          schema_from("dir:string:Directory to search,query:string:String to find,extensions:string:Comma-separated extension filter (optional, e.g. .scl,.scene),recursive:boolean:Include subdirectories (default true),case_sensitive:boolean:Case-sensitive match (default false),max_results:number:Max files to return (default 100),snippets_per_file:number:Context snippets per file (default 3),context:number:Context chars around each hit (default 120);dir,query"), tool_search},

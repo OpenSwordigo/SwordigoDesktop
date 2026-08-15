@@ -5,6 +5,8 @@
 # Build artifacts
 build/
 build-cmake/
+srcs/
+bin/
 *.o
 swordigo_boot
 swordigo_headless

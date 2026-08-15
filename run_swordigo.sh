@@ -28,12 +28,13 @@ if [ "$BUILD" -eq 1 ]; then
         if [ "$USE_DYNARMIC" -eq 1 ] && [ ! -f "$ROOT_DIR/deps/dynarmic/build/src/dynarmic/libdynarmic.a" ]; then
             cmake --build "$BUILD_DIR" --target dynarmic-build -j "$(nproc)"
         fi
-        cmake --build "$BUILD_DIR" --target sre -j "$(nproc)"
+            cmake --build "$BUILD_DIR" --target sre -j "$(nproc)"
         cmake --build "$BUILD_DIR" -j "$(nproc)"
     fi
 fi
+# Products are built straight into bin/ + bin/libs/ — no install step needed.
 if [ ! -x "$ROOT_DIR/bin/swordfare" ]; then
-    echo "Swordfare is not built. Run: ./run_swordigo.sh --build" >&2
+    echo "Swordfare is not installed. Run: ./run_swordigo.sh --build" >&2
     exit 1
 fi
 if [ -f "$ROOT_DIR/engine/manifest.json" ]; then mkdir -p "$HOME/.local/share/swordigo-desktop/engine"; cp "$ROOT_DIR/engine/manifest.json" "$HOME/.local/share/swordigo-desktop/engine/manifest.json"; fi

@@ -100,6 +100,10 @@ int apk_sign(const std::string& apk_path, const std::string& apksigner);
 // Build an APK from a FileRift .frproject. Returns 0 on success.
 int apk_build(const std::string& project_file, const Options& opt);
 
+// ─── Scene creator ────────────────────────────────────────────────────────────
+// Implements `ruby_cli scene create ...` using the same backend as Ruby's GUI.
+int run_scene_create_command(const std::vector<std::string>& args);
+
 // ─── Batch converter hook ─────────────────────────────────────────────────────
 int run_batch_command(const Options& opt);
 

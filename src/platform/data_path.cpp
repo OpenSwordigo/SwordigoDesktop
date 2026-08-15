@@ -451,6 +451,15 @@ extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_p
     candidates.push_back(data_dir + "/resources/" + path);
     // 5. custom_assets/resources/X (fallback to configured assets dir)
     candidates.push_back(data_dir + "/" + g_instance_assets_dir + "/resources/" + path);
+    // 6. Vanilla base-game assets/resources/X — final fallback so a modded
+    //    instance (g_instance_assets_dir != "assets", e.g. "rln_assets") that
+    //    does NOT ship a given asset transparently falls back to the base game
+    //    assets, mirroring Android AssetManager's mod-overlay -> base-APK
+    //    behaviour. Prevents "[AssetMgr/fopen] Failed to open ... -> rln_assets/
+    //    resources/..." misses for files that exist only under assets/resources/.
+    if (g_instance_assets_dir != "assets") {
+        candidates.push_back(data_dir + "/assets/resources/" + path);
+    }
 
 
     // Search through candidates in priority order

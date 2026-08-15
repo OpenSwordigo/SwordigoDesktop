@@ -86,6 +86,18 @@ void SREHost_RegisterEmulator(EmulatorDynarmic64* emu) {
 // Guest memory base — set in main.cpp, same pointer used by TrampolineMgr
 extern uint8_t* g_guest_memory;
 
+// Returns true only if [gaddr, gaddr+len) lies in guest memory AND a NUL
+// terminator exists within max_len bytes (prevents host OOB reads when the
+// guest passes an unterminated or out-of-bounds string pointer).
+static inline bool guest_cstr_ok(uint64_t gaddr, size_t max_len) {
+    if (!gaddr || gaddr >= 0xE0000000ULL) return false;
+    size_t avail = (size_t)(0xE0000000ULL - gaddr);
+    size_t limit = max_len < avail ? max_len : avail;
+    const char* p = (const char*)(g_guest_memory + gaddr);
+    for (size_t i = 0; i < limit; ++i) if (p[i] == '\0') return true;
+    return false;
+}
+
 extern "C" int sre_host_patch_guest(
     uint64_t guest_addr,
     void*    replacement_func,
@@ -106,25 +118,35 @@ extern "C" int sre_host_patch_guest(
     char hook_name[64];
     snprintf(hook_name, sizeof(hook_name), "ProHook_0x%llx", (unsigned long long)guest_addr);
 
-    // Install hook: writes B <replacement> at guest_addr, relay cave for call-through
-    // g_orig_guest_addr = 0 (we write it manually below via orig_out)
+    // Install hook: writes B <replacement> at guest_addr, relay cave for call-through.
+    // g_orig_guest_addr = 0 (we write it manually below via orig_out).
+    // insns_to_save=1 preserves the historical patch size; allow_replace=true so
+    // re-installing a hook on an already-hooked address updates it in place rather
+    // than being refused by the duplicate-hook guard (matches previous behavior
+    // where re-patching simply overwrote).
     bool ok = mgr.install_hook(hook_name, guest_addr, replacement_vaddr,
-                               /*g_orig_guest_addr=*/0, /*insns_to_save=*/1);
+                               /*g_orig_guest_addr=*/0, /*insns_to_save=*/1,
+                               /*allow_replace=*/true);
     if (!ok) {
         fprintf(stderr, "[SREHost] sre_host_patch_guest: TrampolineMgr::install_hook failed for 0x%llx\n",
                 (unsigned long long)guest_addr);
         return -1;
     }
 
-    // Return the relay cave address for call-through
+    // Return the relay cave address for call-through. Look it up by target
+    // (robust even if allow_replace reused an existing slot) rather than
+    // assuming the just-allocated cave is the most recent bump.
     if (orig_out) {
-        // The most recently added entry is the one we just installed
-        // TrampolineMgr stores it; retrieve via next_cave_addr - SLOT_SIZE
-        uint64_t cave_vaddr = mgr.next_cave_addr() - TrampolineMgr::SLOT_SIZE;
+        uint64_t cave_vaddr = 0;
+        if (TrampolineEntry* e = mgr.find_entry(guest_addr)) {
+            cave_vaddr = e->cave_vaddr;
+        } else {
+            cave_vaddr = mgr.next_cave_addr() - TrampolineMgr::SLOT_SIZE;
+        }
         *orig_out = (void*)(uintptr_t)cave_vaddr;
     }
 
-    // Flush the JIT cache for the patched range
+    // Flush the JIT cache for the patched range.
     if (s_dynarmic_emu) {
         s_dynarmic_emu->invalidate_cache_range(guest_addr, 4);
     }
@@ -163,8 +185,10 @@ extern "C" SWORDIGO_WEAK uint64_t elf_lookup_symbol(const char* name) {
 
 struct HookRecord {
     uint64_t target_vaddr;
-    void*    saved_opcodes;   // 16 bytes of original instructions
-    size_t   patch_size;
+    void*    saved_opcodes;   // deprecated: original bytes now owned by TrampolineMgr
+    size_t   patch_size;      // bytes overwritten at target (4 = single B trampoline)
+    HookRecord() : target_vaddr(0), saved_opcodes(nullptr), patch_size(0) {}
+    HookRecord(uint64_t t, void* s, size_t p) : target_vaddr(t), saved_opcodes(s), patch_size(p) {}
 };
 
 static std::unordered_map<void*, HookRecord> s_hook_registry;
@@ -212,24 +236,28 @@ SREHost_HookHandle SREHost_InstallHook(
 
     if (orig_func_out) *orig_func_out = orig;
 
-    // Save hook record for later removal
-    HookRecord record;
-    record.target_vaddr = target_vaddr;
-    record.saved_opcodes = nullptr;  // Patcher owns this
-    record.patch_size = 16;
+    // Save hook record for later removal. The original opcodes are now captured
+    // by TrampolineMgr::install_hook (saved_bytes in the TrampolineEntry) at the
+    // moment the B trampoline is written, so SREHost_RemoveHook can restore them
+    // via TrampolineMgr::uninstall_hook. We do not keep a second copy here;
+    // TrampolineMgr owns the authoritative saved bytes keyed by target_vaddr.
+    // saved_opcodes stays null: TrampolineMgr owns the authoritative saved bytes
+    // (keyed by target_vaddr). patch_size=4: sre_host_patch_guest writes one B.
+    HookRecord record(target_vaddr, /*saved_opcodes=*/nullptr, /*patch_size=*/4);
 
     auto* handle = new HookRecord(record);
     {
         std::lock_guard<std::mutex> lock(s_hook_mutex);
-        s_hook_registry[handle] = record;
+        s_hook_registry.emplace(static_cast<void*>(handle), record);
     }
 
     std::cout << "[SREHost] Hook installed at 0x" << std::hex << target_vaddr
-              << " -> " << proxy_func << std::dec << "\n";
+              << " -> " << proxy_func << std::dec
+              << " (original bytes captured by TrampolineMgr for RemoveHook restore)\n";
 
     // Phase 2: Invalidate Dynarmic JIT cache for the patched range
     if (s_dynarmic_emu) {
-        s_dynarmic_emu->invalidate_cache_range(target_vaddr, 16);
+        s_dynarmic_emu->invalidate_cache_range(target_vaddr, 4);
     }
 
     return static_cast<SREHost_HookHandle>(handle);
@@ -243,20 +271,35 @@ bool SREHost_RemoveHook(SREHost_HookHandle handle) {
     if (!handle) return false;
 
     std::lock_guard<std::mutex> lock(s_hook_mutex);
-    auto it = s_hook_registry.find(handle);
+    auto it = s_hook_registry.find(static_cast<void*>(handle));
     if (it == s_hook_registry.end()) return false;
 
-    // Phase 1: Restoration is through the trampoline manager
-    // (full implementation in Phase 3 when we have opcode save/restore)
-    std::cout << "[SREHost] RemoveHook at 0x" << std::hex
-              << it->second.target_vaddr << std::dec << "\n";
+    uint64_t target_vaddr = it->second.target_vaddr;
+    size_t   patch_size   = it->second.patch_size;
 
-    if (s_dynarmic_emu) {
-        s_dynarmic_emu->invalidate_cache_range(it->second.target_vaddr, 16);
+    // Real opcode restore: TrampolineMgr now saves the original bytes at install
+    // time and can restore them. This replaces the original B trampoline at
+    // target_vaddr with the untouched instruction(s).
+    bool restored = TrampolineMgr::instance().uninstall_hook(target_vaddr);
+    if (!restored) {
+        std::cerr << "[SREHost] RemoveHook: TrampolineMgr had no restorable hook at 0x"
+                  << std::hex << target_vaddr << std::dec
+                  << " (bytes may already be restored); clearing registry entry\n";
     }
 
-    delete static_cast<HookRecord*>(handle);
+    // Invalidate the Dynarmic JIT cache so the restored bytes are re-translated.
+    if (s_dynarmic_emu) {
+        s_dynarmic_emu->invalidate_cache_range(target_vaddr, patch_size);
+    }
+
+    std::cout << "[SREHost] RemoveHook at 0x" << std::hex << target_vaddr
+              << std::dec << (restored ? " (original bytes restored; JIT cache invalidated)\n"
+                                       : " (registry + JIT cache cleared)\n");
+
+    // Erase the registry entry (a copy) before freeing the heap-allocated
+    // HookRecord that `handle` points to, so `it` is not left dangling.
     s_hook_registry.erase(it);
+    delete static_cast<HookRecord*>(handle);
     return true;
 }
 
@@ -364,7 +407,12 @@ void SREHost_Dispatch(uint32_t svc_num, uint64_t* regs, uint64_t x8_syscall_id) 
          */
         uint64_t  target_vaddr  = regs[0];
         void*     proxy_func    = (void*)regs[1];
-        void**    orig_out      = (void**)( regs[2] ? (g_guest_memory + regs[2]) : nullptr );
+        void** orig_out = nullptr;
+        if (regs[2] && regs[2] < (0xE0000000ULL - sizeof(void*))) {
+            orig_out = (void**)(g_guest_memory + regs[2]);
+        } else if (regs[2]) {
+            fprintf(stderr, "[SREHost] INSTALL_HOOK: orig_out guest addr 0x%llx out of bounds — ignoring\n", (unsigned long long)regs[2]);
+        }
         SREHost_HookBackend backend = (SREHost_HookBackend)(int)regs[3];
 
         SREHost_HookHandle h = SREHost_InstallHook(target_vaddr, proxy_func, orig_out, backend);
@@ -382,10 +430,9 @@ void SREHost_Dispatch(uint32_t svc_num, uint64_t* regs, uint64_t x8_syscall_id) 
          * X0 = guest_addr of null-terminated symbol name string
          * Returns: X0 = resolved guest virtual address (0 = not found)
          */
-        const char* sym_name = (regs[0] && regs[0] < 0xE0000000ULL)
-                                 ? (const char*)(g_guest_memory + regs[0])
-                                 : nullptr;
-        regs[0] = sym_name ? SREHost_GetSymbol(sym_name) : 0;
+        if (!guest_cstr_ok(regs[0], 512)) { regs[0] = 0; break; }
+        const char* sym_name = (const char*)(g_guest_memory + regs[0]);
+        regs[0] = SREHost_GetSymbol(sym_name);
         break;
     }
     case SRE_SVC_INVALIDATE_RANGE: {
@@ -401,26 +448,22 @@ void SREHost_Dispatch(uint32_t svc_num, uint64_t* regs, uint64_t x8_syscall_id) 
          * X2 = guest_addr of message string
          */
         int         level   = (int)regs[0];
-        const char* tag     = (regs[1] && regs[1] < 0xE0000000ULL)
-                                ? (const char*)(g_guest_memory + regs[1]) : "?";
-        const char* message = (regs[2] && regs[2] < 0xE0000000ULL)
-                                ? (const char*)(g_guest_memory + regs[2]) : "";
+        const char* tag     = guest_cstr_ok(regs[1], 256)  ? (const char*)(g_guest_memory + regs[1]) : "?";
+        const char* message = guest_cstr_ok(regs[2], 4096) ? (const char*)(g_guest_memory + regs[2]) : "";
         SREHost_Log(level, tag, message);
         regs[0] = 0;
         break;
     }
     case SRE_SVC_PROFILE_BEGIN: {
         /* X0 = guest_addr of region_name string */
-        const char* name = (regs[0] && regs[0] < 0xE0000000ULL)
-                             ? (const char*)(g_guest_memory + regs[0]) : nullptr;
+        const char* name = guest_cstr_ok(regs[0], 256) ? (const char*)(g_guest_memory + regs[0]) : nullptr;
         if (name) SREHost_ProfileBegin(name);
         regs[0] = 0;
         break;
     }
     case SRE_SVC_PROFILE_END: {
         /* X0 = guest_addr of region_name string */
-        const char* name = (regs[0] && regs[0] < 0xE0000000ULL)
-                             ? (const char*)(g_guest_memory + regs[0]) : nullptr;
+        const char* name = guest_cstr_ok(regs[0], 256) ? (const char*)(g_guest_memory + regs[0]) : nullptr;
         if (name) SREHost_ProfileEnd(name);
         regs[0] = 0;
         break;

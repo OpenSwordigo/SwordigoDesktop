@@ -1049,6 +1049,16 @@ std::vector<SwordigoApiSymbol> IntelliJ::get_swordigo_autocomplete(const std::st
     return results;
 }
 
+struct EditorRenderCache {
+    const std::string* source = nullptr;
+    size_t source_size = 0;
+    bool pending_refresh = false;
+    double changed_at = 0.0;
+    std::vector<std::string> lines;
+    std::vector<BracketError> errors;
+    std::vector<LexState> line_states;
+};
+
 // Render unified code editor + viewer
 void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modified, const std::string& filepath, ImFont* mono_font, ImVec4& custom_bg,
                            bool has_compile_result, bool compile_success, const std::string& compile_error_msg, double compile_time_ms) {
@@ -1068,21 +1078,39 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
     
     static float zoom = 1.0f;
     
-    // Calculate lines
-    std::vector<std::string> lines;
-    {
-        std::istringstream iss(*buffer);
-        std::string line;
-        while (std::getline(iss, line)) {
-            lines.push_back(line);
+    // Large decoded scenes used to be split, syntax-checked, and lexed from
+    // line 1 on *every frame*.  Keep a document cache and only rebuild after
+    // the user pauses typing, while rendering just the visible lines.
+    static std::unordered_map<std::string, EditorRenderCache> render_caches;
+    EditorRenderCache& cache = render_caches[label];
+    auto rebuild_document_cache = [&]() {
+        cache.lines.clear();
+        cache.lines.reserve(std::max<size_t>(1, std::count(buffer->begin(), buffer->end(), '\n') + 1));
+        size_t begin = 0;
+        while (begin < buffer->size()) {
+            const size_t end = buffer->find('\n', begin);
+            cache.lines.emplace_back(buffer->data() + begin,
+                                     (end == std::string::npos ? buffer->size() : end) - begin);
+            if (end == std::string::npos) break;
+            begin = end + 1;
         }
-        if (buffer->empty() || buffer->back() == '\n') {
-            lines.push_back("");
+        if (buffer->empty() || buffer->back() == '\n') cache.lines.emplace_back();
+        cache.errors = check_syntax_errors(*buffer);
+        cache.line_states.resize(cache.lines.size());
+        LexState state = LexState::NORMAL;
+        for (size_t i = 0; i < cache.lines.size(); ++i) {
+            cache.line_states[i] = state;
+            std::vector<EditorToken> discard;
+            state = tokenize_line_stateful(cache.lines[i], state, is_dark_theme, discard);
         }
-    }
-    
-    // Check for syntax errors (comment and string aware)
-    std::vector<BracketError> errors = check_syntax_errors(*buffer);
+        cache.source = buffer;
+        cache.source_size = buffer->size();
+        cache.pending_refresh = false;
+    };
+    if (cache.source != buffer || cache.source_size != buffer->size()) rebuild_document_cache();
+    if (cache.pending_refresh && ImGui::GetTime() - cache.changed_at > 0.30) rebuild_document_cache();
+    const std::vector<std::string>& lines = cache.lines;
+    const std::vector<BracketError>& errors = cache.errors;
     
     float line_h = ImGui::GetTextLineHeight();
     char max_line_str[32];
@@ -1228,6 +1256,8 @@ if (editor_h < 16.0f) editor_h = 16.0f;
     if (changed) {
         modified = true;
         token_cache_.clear(); // Invalidate line token cache on edits
+        cache.pending_refresh = true;
+        cache.changed_at = ImGui::GetTime();
     }
     
     ImGuiWindow* etch_win = ImGui::GetCurrentWindow();
@@ -1251,12 +1281,10 @@ if (editor_h < 16.0f) editor_h = 16.0f;
     first_visible = std::max(0, first_visible);
     last_visible = std::min((int)lines.size(), last_visible);
 
-    // Multiline state propagation across visible lines
-    LexState line_lex_state = LexState::NORMAL;
-    for (int i = 0; i < first_visible; i++) {
-        std::vector<EditorToken> dummy;
-        line_lex_state = tokenize_line_stateful(lines[i], line_lex_state, is_dark_theme, dummy);
-    }
+    // Lex state was computed with the cached document, so jumping to the end
+    // of a 100k-line scene is O(visible lines), not O(the whole file).
+    LexState line_lex_state = first_visible < (int)cache.line_states.size()
+        ? cache.line_states[first_visible] : LexState::NORMAL;
     
     for (int line_idx = first_visible; line_idx < last_visible; line_idx++) {
         ImVec2 line_pos = start_pos + ImVec2(0.0f, line_idx * line_h);

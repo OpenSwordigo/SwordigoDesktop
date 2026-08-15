@@ -90,18 +90,9 @@ static void mat4_identity(float* m) {
     m[0] = 1.0f; m[5] = 1.0f; m[10] = 1.0f; m[15] = 1.0f;
 }
 
-static void mat4_mul(const float* a, const float* b, float* out) {
-    int i, j, k;
-    for (i = 0; i < 4; i++) {
-        for (j = 0; j < 4; j++) {
-            float sum = 0.0f;
-            for (k = 0; k < 4; k++) {
-                sum += a[i * 4 + k] * b[k * 4 + j];
-            }
-            out[i * 4 + j] = sum;
-        }
-    }
-}
+/* NOTE: an unused static mat4_mul() helper was removed here — the Draw path
+ * builds its matrix inline and had no callers of it (tree-wide grep confirmed
+ * zero references), so it was dead code. */
 
 void sre_BackgroundComponent_Draw(void* self, void* ctx, void* camera) {
     g_sre_bg_draw_count++;

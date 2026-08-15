@@ -53,6 +53,11 @@ public:
 
     // --- Memory ---
     virtual uint8_t* get_memory_base() = 0;
+    // Size (in bytes) of the guest memory arena backing get_memory_base().
+    // Bridge handlers use this to bounds-check guest pointers before handing
+    // them to host libc (memcmp/memcpy/strlen/...). A guest offset o is a
+    // valid single-byte access iff o < get_memory_size().
+    virtual uint64_t get_memory_size() = 0;
     virtual void* get_uc_handle() = 0;  // Returns nullptr for non-Unicorn backends
     virtual void protect_memory(uint64_t addr, uint64_t size, uint32_t perms) = 0;
 
@@ -88,6 +93,10 @@ public:
     bool fault_flag = false;
     virtual bool has_faulted() const { return fault_flag; }
     virtual void set_faulted(bool f) { fault_flag = f; }
+    // Clear a previously-latched fault so guest execution can be retried on a
+    // later frame. Backends that maintain additional halt/latch state (e.g.
+    // Dynarmic's halt reason) should override this to also clear that state.
+    virtual void clear_faulted() { fault_flag = false; }
     bool quiet_mode = false;
     uint64_t redirect_pc = 0;
     std::vector<DeferredThread> pending_threads;

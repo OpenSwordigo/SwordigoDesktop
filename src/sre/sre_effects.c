@@ -409,7 +409,10 @@ void sre_cxa_throw(void* thrown_exception, void* tinfo, void(*dest)(void*)) {
 }
 
 /* ========== ProgramPanic hook ==========
- * Original: Caver::ProgramPanic at nm offset 0x5c0ab4
+ * Original: Caver::ProgramPanic at nm offset 0x4c0d60 (v1.4.12 ARM64).
+ * (An earlier note here said 0x5c0ab4 — that is WRONG: 0x5c0ab4 falls inside
+ *  .eh_frame, not .text. The hook table in sre_init.c installs at the verified
+ *  0x4c0d60 = _ZN5Caver12ProgramPanicEP9lua_State.)
  *
  * This is the lua_atpanic handler registered by ProgramState's constructor.
  * Called by luaD_throw when L->errorJmp == NULL (no protected call frame).

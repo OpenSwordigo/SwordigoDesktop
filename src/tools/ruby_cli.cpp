@@ -35,6 +35,8 @@
 #include "tools/filerift.h"
 #include "tools/batch_converter.h"
 #include "tools/ruby_mcp.h"
+#include "tools/scene_creator.h"
+#include "tools/map_loader.h"
 
 #include <zlib.h>
 #include <cstdio>
@@ -817,6 +819,184 @@ int apk_build(const std::string& project_file, const Options& opt) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Playable scene creator (shared with Ruby GUI)
+// ════════════════════════════════════════════════════════════════════════════
+
+int run_scene_create_command(const std::vector<std::string>& args) {
+    if (args.size() < 3 || args[1] != "create") {
+        std::fprintf(stderr,
+            "usage: ruby_cli scene create <output.scene|directory> [options]\n"
+            "  --level NAME              map/runtime level name\n"
+            "  --namespace NAME          object-library namespace\n"
+            "  --mesh RESOURCE           optional starter POD resource\n"
+            "  --background RESOURCE     optional background texture stem\n"
+            "  --ground-top RESOURCE     platform top texture\n"
+            "  --ground-side RESOURCE    platform side texture\n"
+            "  --map PATH                link editor manifest to a .scmap\n"
+            "  --width N --height N --depth N\n"
+            "  --spawn-x N --spawn-y N --spawn-z N\n"
+            "  --facing left|right\n");
+        return 2;
+    }
+
+    scenecreate::Options options;
+    options.output_path = args[2];
+    fs::path output(options.output_path);
+    options.level_name = output.has_extension()
+        ? output.stem().string()
+        : "new_level";
+    options.scene_namespace = options.level_name;
+
+    auto value_after = [&](size_t& i, const char* flag, std::string& value) -> bool {
+        if (i + 1 >= args.size()) {
+            std::fprintf(stderr, "scene create: %s requires a value\n", flag);
+            return false;
+        }
+        value = args[++i];
+        return true;
+    };
+    auto float_after = [&](size_t& i, const char* flag, float& value) -> bool {
+        std::string text;
+        if (!value_after(i, flag, text)) return false;
+        try {
+            size_t used = 0;
+            value = std::stof(text, &used);
+            if (used != text.size()) throw std::invalid_argument("trailing data");
+        } catch (const std::exception&) {
+            std::fprintf(stderr, "scene create: invalid number for %s: %s\n", flag, text.c_str());
+            return false;
+        }
+        return true;
+    };
+
+    for (size_t i = 3; i < args.size(); ++i) {
+        const std::string& flag = args[i];
+        if (flag == "--level") {
+            if (!value_after(i, "--level", options.level_name)) return 2;
+        } else if (flag == "--namespace") {
+            if (!value_after(i, "--namespace", options.scene_namespace)) return 2;
+        } else if (flag == "--mesh") {
+            if (!value_after(i, "--mesh", options.base_mesh)) return 2;
+        } else if (flag == "--background") {
+            if (!value_after(i, "--background", options.background)) return 2;
+        } else if (flag == "--ground-top") {
+            if (!value_after(i, "--ground-top", options.ground_top_texture)) return 2;
+        } else if (flag == "--ground-side") {
+            if (!value_after(i, "--ground-side", options.ground_side_texture)) return 2;
+        } else if (flag == "--map") {
+            if (!value_after(i, "--map", options.map_path)) return 2;
+            options.link_to_map = true;
+        } else if (flag == "--width") {
+            if (!float_after(i, "--width", options.platform_width)) return 2;
+        } else if (flag == "--height") {
+            if (!float_after(i, "--height", options.platform_height)) return 2;
+        } else if (flag == "--depth") {
+            if (!float_after(i, "--depth", options.platform_depth)) return 2;
+        } else if (flag == "--spawn-x") {
+            if (!float_after(i, "--spawn-x", options.spawn_x)) return 2;
+        } else if (flag == "--spawn-y") {
+            if (!float_after(i, "--spawn-y", options.spawn_y)) return 2;
+        } else if (flag == "--spawn-z") {
+            if (!float_after(i, "--spawn-z", options.spawn_z)) return 2;
+        } else if (flag == "--facing") {
+            std::string facing;
+            if (!value_after(i, "--facing", facing)) return 2;
+            if (facing == "left" || facing == "-1") options.spawn_facing = -1;
+            else if (facing == "right" || facing == "1") options.spawn_facing = 1;
+            else {
+                std::fprintf(stderr, "scene create: --facing must be left or right\n");
+                return 2;
+            }
+        } else {
+            std::fprintf(stderr, "scene create: unknown option '%s'\n", flag.c_str());
+            return 2;
+        }
+    }
+
+    scenecreate::Result result;
+    std::string error;
+    if (!scenecreate::create(options, result, error)) {
+        std::fprintf(stderr, "scene create: %s\n", error.c_str());
+        return 1;
+    }
+    std::printf("Created playable scene: %s\n", result.scene_path.c_str());
+    std::printf("Ruby scene manifest: %s\n", result.manifest_path.c_str());
+    std::printf("Objects: %d (world_base, spawn_default%s%s)\n",
+                result.object_count,
+                options.base_mesh.empty() ? "" : ", base_mesh",
+                options.background.empty() ? "" : ", scene_background");
+    return 0;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// `ruby_cli map` — .scmap world-map (zones → nodes → portals) SDK surface.
+// Exposes the map_loader API (byte-exact decode, validate, travel-path BFS,
+// summary) so the whole overworld travel graph is scriptable, mirroring the
+// scene subcommand. See docs/scmap_map_editor_feasibility.md.
+// ════════════════════════════════════════════════════════════════════════════
+static int run_map_command(const std::vector<std::string>& args) {
+    if (args.size() < 3) {
+        std::fprintf(stderr,
+            "usage: ruby_cli map <summary|decode|validate|path|list-nodes> "
+            "<file.scmap> [args]\n");
+        return 2;
+    }
+    const std::string& sub  = args[1];
+    const std::string& file = args[2];
+
+    mapedit::MapData m;
+    std::string err;
+    if (!mapedit::map_load(file, m, &err)) {
+        std::fprintf(stderr, "map: %s\n", err.c_str());
+        return 2;
+    }
+
+    if (sub == "summary") {
+        size_t portals = 0;
+        for (const auto& z : m.zones)
+            for (const auto& n : z.nodes) portals += n.portals.size();
+        std::printf("%zu zones, %zu nodes, %zu portals\n",
+                    m.zones.size(), m.node_index.size(), portals);
+        for (const auto& z : m.zones)
+            std::printf("  zone %s%s%s  [%zu nodes]\n", z.name.c_str(),
+                        z.title.empty() ? "" : " — ", z.title.c_str(),
+                        z.nodes.size());
+        return 0;
+    }
+    if (sub == "decode") {
+        std::printf("%s\n", mapedit::map_to_markup(m).c_str());
+        return 0;
+    }
+    if (sub == "validate") {
+        mapedit::map_validate(m);
+        if (m.issues.empty()) { std::printf("OK: no issues\n"); return 0; }
+        for (const auto& is : m.issues) std::printf("ISSUE: %s\n", is.c_str());
+        return 1;
+    }
+    if (sub == "path") {
+        if (args.size() < 5) {
+            std::fprintf(stderr, "usage: ruby_cli map path <file.scmap> <fromLevel> <toLevel>\n");
+            return 2;
+        }
+        std::vector<std::string> p = mapedit::map_find_path(m, args[3], args[4]);
+        if (p.empty()) { std::printf("no path\n"); return 1; }
+        for (size_t i = 0; i < p.size(); ++i)
+            std::printf("%s%s", i ? " -> " : "", p[i].c_str());
+        std::printf("\n");
+        return 0;
+    }
+    if (sub == "list-nodes") {
+        for (const auto& z : m.zones)
+            for (const auto& n : z.nodes)
+                std::printf("%s\t%s\t%s\ttype=%d\n", z.name.c_str(),
+                            n.level_name.c_str(), n.title.c_str(), n.type);
+        return 0;
+    }
+    std::fprintf(stderr, "map: unknown subcommand '%s'\n", sub.c_str());
+    return 2;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Batch converter hook
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -859,6 +1039,16 @@ static void print_info(const Options& opt) {
         "    apk extract <apk> <dest>\n"
         "    apk sign <apk> [--apksigner path]\n"
         "    apk build <project> [--apksigner path]\n"
+        "\nScene creator:\n"
+        "    scene create <output.scene|directory> [--level NAME] [--namespace NAME]\n"
+        "                 [--mesh RESOURCE] [--background RESOURCE] [--map FILE.scmap]\n"
+        "                 [--width N --height N --depth N] [--facing left|right]\n"
+        "\nWorld map (.scmap) SDK:\n"
+        "    map summary    <file.scmap>                 zone/node/portal counts + per-zone list\n"
+        "    map decode     <file.scmap>                 print FileRift markup (byte-exact)\n"
+        "    map validate   <file.scmap>                 report orphan/broken/dup issues\n"
+        "    map path       <file.scmap> <from> <to>     BFS travel path between two nodes\n"
+        "    map list-nodes <file.scmap>                 tab-separated zone/level/title/type\n"
         "\nBatch texture converter:\n"
         "    batch [--import] <src_dir> <dst_dir>\n"
         "\nMCP (Model Context Protocol server for AI agents):\n"
@@ -882,8 +1072,14 @@ int run_cli(int argc, char** argv) {
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) args.push_back(argv[i]);
 
-    // Subcommand dispatch: apk / batch / mcp.
+    // Subcommand dispatch: scene / apk / batch / mcp.
     if (!args.empty()) {
+        if (args[0] == "scene") {
+            return run_scene_create_command(args);
+        }
+        if (args[0] == "map") {
+            return run_map_command(args);
+        }
         if (args[0] == "mcp") {
             std::string root = (args.size() > 1 && args[1][0] != '-') ? args[1] : "";
             return mcp::RunStdioServer(root);

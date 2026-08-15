@@ -363,7 +363,29 @@ extern bool g_advanced_redstell_opts;
 extern uint64_t g_sre_profile_addr;
 extern uint64_t g_sre_vfs_profile_addr;
 
+// Upper bound for the shared guest arena (offsets into g_guest_memory must
+// stay strictly below this). Mirrors GUEST_MEM_SIZE in main.cpp.
+static constexpr uint32_t GUEST_ARENA_END = 0xE0000000u;
+// No legitimate single guest allocation is this large. A request at/above this
+// is a corrupted size (e.g. a garbage register after a recovered bad vcall) and
+// must be rejected as OOM rather than overflowing g_guest_heap_ptr and writing
+// past the end of g_guest_memory (host SIGSEGV in the memset below).
+static constexpr uint32_t GUEST_MALLOC_MAX = 0x10000000u; // 256 MB
+
 static uint32_t host_malloc_locked(uint32_t size) {
+    // Reject obviously-corrupt sizes up front. Returning 0 makes the guest see
+    // a normal malloc() failure (NULL), which its C++ allocators handle, instead
+    // of the host crashing while zero-filling an impossible range.
+    if (size == 0 || size > GUEST_MALLOC_MAX) {
+        if (size > GUEST_MALLOC_MAX) {
+            static int oversize_log = 0;
+            if (oversize_log++ < 10) {
+                std::cerr << "[SRE/Heap] Rejecting corrupt malloc size 0x" << std::hex << size
+                          << std::dec << " (> 256MB) — returning NULL (OOM) to guest" << std::endl;
+            }
+            return 0;
+        }
+    }
     size = (size + 7) & ~7;
     if (size == 0) size = 8;
     
@@ -389,9 +411,16 @@ static uint32_t host_malloc_locked(uint32_t size) {
             }
             g_guest_allocs[addr] = found_size;
             g_alloc_counter++;
-            if (addr >= 0x10000) memset(g_guest_memory + addr, 0, found_size);
+            // Bound the zero-fill to the guest arena — a corrupted free block
+            // could carry a found_size that runs past g_guest_memory's end.
+            if (addr >= 0x10000 && (uint64_t)addr + found_size <= GUEST_ARENA_END)
+                memset(g_guest_memory + addr, 0, found_size);
             return addr;
         }
+        // Bump path: reject if the arena would overflow (garbage/huge size or an
+        // already-exhausted heap). Returning 0 = OOM to the guest, never a host
+        // out-of-bounds write.
+        if ((uint64_t)g_guest_heap_ptr + size > GUEST_ARENA_END) return 0;
         addr = g_guest_heap_ptr;
         g_guest_heap_ptr += size;
         g_guest_allocs[addr] = size;
@@ -502,12 +531,17 @@ static void bridge_malloc(void* emu_ptr) {
 
 static void bridge_calloc(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    uint32_t num = emu->get_reg(0);
-    uint32_t size = emu->get_reg(1);
-    uint32_t total = num * size;
+    uint64_t num = emu->get_reg(0);
+    uint64_t size = emu->get_reg(1);
+    // Guard the num*size multiply against 32-bit overflow (a corrupted arg pair
+    // could wrap to a small total, then a later access reads OOB). Compute in
+    // 64-bit and reject anything that cannot be a legitimate allocation.
+    uint64_t total64 = num * size;
     std::lock_guard<std::mutex> lock(g_heap_mutex);
+    uint32_t total = (total64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)total64;
     uint32_t addr = host_malloc_locked(total);
-    std::memset(emu->get_memory_base() + addr, 0, total);
+    // host_malloc_locked returns 0 on OOM / corrupt size — do NOT memset then.
+    if (addr != 0 && addr >= 0x10000) std::memset(emu->get_memory_base() + addr, 0, total);
 
     uint64_t lr = emu->get_reg(30);
     bool should_track = false;
@@ -741,65 +775,141 @@ static void bridge_signal(void* emu_ptr) {
 
 
 // --- Standard C Memory & String Bridges ---
+//
+// Guest-pointer / length ABI  (READ THIS BEFORE EDITING)
+// ------------------------------------------------------
+// The guest is 32-bit-pointer code recompiled to AArch64: its C `memcpy`,
+// `memset`, `memcmp`, `strlen`, ... take pointers and sizes that are only
+// 32 bits wide (offsets into the <=0xE0000000 guest arena, and size_t values
+// that never exceed the arena). When such a call reaches a bridge halt, the
+// caller frequently leaves GARBAGE in the upper 32 bits of X0..X2 (dirty
+// caller-saved regs). ONLY the low 32 bits are meaningful.
+//
+//   => Every guest offset/length MUST be masked to 32 bits (GUEST_OFF / the
+//      explicit `& 0xffffffffu`) BEFORE it is used or bounds-checked. Reading
+//      the raw 64-bit register makes a legitimate 22-byte copy look like a
+//      0x1a89'200060fa-byte copy and either faults host libc or (if we bound-
+//      check the raw value) wrongly REJECTS the copy — which silently breaks
+//      guest data structures, throws std::out_of_range, and leaves the game on
+//      a black screen with draws=0. (This is exactly what regressed once when
+//      these handlers were "widened" to 64-bit.)
+//
+// After masking, we still bounds-check the 32-bit offset against the arena so
+// a genuinely bad low-32 pointer (e.g. a parser continuing after a failed
+// asset load) is rejected gracefully instead of faulting glibc's SIMD
+// memcmp/strlen deep inside libc.
+
+// Mask a raw guest register to its meaningful 32-bit offset/length.
+static inline uint32_t guest_u32(uint64_t v) { return (uint32_t)(v & 0xffffffffu); }
+
+// True iff the byte range [off, off+len) is fully inside the guest arena.
+// off/len are already-masked 32-bit values. len==0 is always valid.
+static inline bool bridge_range_ok(IEmulatorArm64* emu, uint32_t off, uint32_t len) {
+    if (len == 0) return true;
+    uint64_t sz = emu->get_memory_size();
+    if ((uint64_t)off >= sz) return false;
+    return (uint64_t)len <= sz - off;   // no wrap: sz - off is well-defined here
+}
+
+// True iff a C-string starting at (masked) guest offset `off` is safe to read:
+// it must start in-bounds AND be NUL-terminated before the end of the arena.
+// Returns the string length (excluding NUL) via *out_len when valid.
+static inline bool bridge_cstr_ok(IEmulatorArm64* emu, uint32_t off, size_t* out_len) {
+    if (off == 0) return false;
+    uint64_t sz = emu->get_memory_size();
+    if ((uint64_t)off >= sz) return false;
+    const char* s = (const char*)(emu->get_memory_base() + off);
+    size_t max = (size_t)(sz - off);
+    const void* nul = std::memchr(s, '\0', max);
+    if (!nul) return false;   // runs off the arena with no terminator
+    if (out_len) *out_len = (size_t)((const char*)nul - s);
+    return true;
+}
+
 static void bridge_memcpy(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    uint32_t dest = emu->get_reg(0);
-    uint32_t src = emu->get_reg(1);
-    uint32_t n = emu->get_reg(2);
+    uint32_t dest = guest_u32(emu->get_reg(0));
+    uint32_t src  = guest_u32(emu->get_reg(1));
+    uint32_t n    = guest_u32(emu->get_reg(2));
 
-    if (n > 0) {
+    if (n > 0 && bridge_range_ok(emu, dest, n) && bridge_range_ok(emu, src, n)) {
         std::memmove(emu->get_memory_base() + dest, emu->get_memory_base() + src, n);
+    } else if (n > 0) {
+        std::cerr << "[Bridge64/memcpy] rejected OOB copy dest=0x" << std::hex << dest
+                  << " src=0x" << src << " n=0x" << n << std::dec << std::endl;
     }
     emu->set_reg(0, dest);
 }
 
 static void bridge_memset(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    uint32_t dest = emu->get_reg(0);
-    uint32_t c = emu->get_reg(1);
-    uint32_t n = emu->get_reg(2);
-    if (n > 0) {
+    uint32_t dest = guest_u32(emu->get_reg(0));
+    uint32_t c    = (uint32_t)emu->get_reg(1);
+    uint32_t n    = guest_u32(emu->get_reg(2));
+    if (n > 0 && bridge_range_ok(emu, dest, n)) {
         std::memset(emu->get_memory_base() + dest, c, n);
+    } else if (n > 0) {
+        std::cerr << "[Bridge64/memset] rejected OOB set dest=0x" << std::hex << dest
+                  << " n=0x" << n << std::dec << std::endl;
     }
     emu->set_reg(0, dest);
 }
 
 static void bridge_memmove(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    uint32_t dest = emu->get_reg(0);
-    uint32_t src = emu->get_reg(1);
-    uint32_t n = emu->get_reg(2);
+    uint32_t dest = guest_u32(emu->get_reg(0));
+    uint32_t src  = guest_u32(emu->get_reg(1));
+    uint32_t n    = guest_u32(emu->get_reg(2));
 
-    if (n > 0) {
+    if (n > 0 && bridge_range_ok(emu, dest, n) && bridge_range_ok(emu, src, n)) {
         std::memmove(emu->get_memory_base() + dest, emu->get_memory_base() + src, n);
+    } else if (n > 0) {
+        std::cerr << "[Bridge64/memmove] rejected OOB move dest=0x" << std::hex << dest
+                  << " src=0x" << src << " n=0x" << n << std::dec << std::endl;
     }
     emu->set_reg(0, dest);
 }
 
 static void bridge_strlen(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    uint32_t str = emu->get_reg(0);
-    const char* s = (const char*)(emu->get_memory_base() + str);
-    emu->set_reg(0, std::strlen(s));
+    uint32_t str = guest_u32(emu->get_reg(0));
+    size_t len = 0;
+    if (!bridge_cstr_ok(emu, str, &len)) {
+        std::cerr << "[Bridge64/strlen] rejected bad guest ptr 0x" << std::hex
+                  << str << std::dec << std::endl;
+        emu->set_reg(0, 0);
+        return;
+    }
+    emu->set_reg(0, len);
 }
 
 static void bridge_memcmp(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    uint64_t str1 = emu->get_reg(0);
-    uint64_t str2 = emu->get_reg(1);
-    uint64_t n = emu->get_reg(2);
+    uint32_t str1 = guest_u32(emu->get_reg(0));
+    uint32_t str2 = guest_u32(emu->get_reg(1));
+    uint32_t n    = guest_u32(emu->get_reg(2));
     int res = 0;
-    if (n > 0 && str1 && str2) {
+    if (n > 0 && bridge_range_ok(emu, str1, n) && bridge_range_ok(emu, str2, n)) {
         res = std::memcmp(emu->get_memory_base() + str1, emu->get_memory_base() + str2, n);
+    } else if (n > 0) {
+        // Bad/uninitialized guest pointer (the historic crash vector). Report
+        // "not equal" without dereferencing so the guest can take its
+        // mismatch path instead of us faulting inside host memcmp.
+        std::cerr << "[Bridge64/memcmp] rejected OOB compare s1=0x" << std::hex << str1
+                  << " s2=0x" << str2 << " n=0x" << n << std::dec << std::endl;
+        res = 1;
     }
     emu->set_reg(0, (uint64_t)(int64_t)res);
 }
 
 static void bridge_strnlen(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    uint64_t str = emu->get_reg(0);
-    uint64_t maxlen = emu->get_reg(1);
-    if (!str) { emu->set_reg(0, 0); return; }
+    uint32_t str = guest_u32(emu->get_reg(0));
+    uint32_t maxlen = guest_u32(emu->get_reg(1));
+    if (!str || (uint64_t)str >= emu->get_memory_size()) { emu->set_reg(0, 0); return; }
+    // Clamp the scan window to the arena so a missing terminator can't run off the end.
+    uint64_t avail = emu->get_memory_size() - str;
+    if ((uint64_t)maxlen > avail) maxlen = (uint32_t)avail;
     const char* s = (const char*)(emu->get_memory_base() + str);
     size_t len = 0;
     while (len < maxlen && s[len] != '\0') len++;
@@ -808,10 +918,10 @@ static void bridge_strnlen(void* emu_ptr) {
 
 static void bridge_strdup(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    uint64_t str = emu->get_reg(0);
-    if (!str) { emu->set_reg(0, 0); return; }
+    uint32_t str = guest_u32(emu->get_reg(0));
+    size_t len = 0;
+    if (!bridge_cstr_ok(emu, str, &len)) { emu->set_reg(0, 0); return; }
     const char* s = (const char*)(emu->get_memory_base() + str);
-    size_t len = std::strlen(s);
     uint32_t addr = host_malloc_locked((uint32_t)(len + 1));
     std::memcpy(emu->get_memory_base() + addr, s, len + 1);
     emu->set_reg(0, addr);
@@ -819,9 +929,11 @@ static void bridge_strdup(void* emu_ptr) {
 
 static void bridge_strndup(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    uint64_t str = emu->get_reg(0);
-    uint64_t n = emu->get_reg(1);
-    if (!str) { emu->set_reg(0, 0); return; }
+    uint32_t str = guest_u32(emu->get_reg(0));
+    uint32_t n = guest_u32(emu->get_reg(1));
+    if (!str || (uint64_t)str >= emu->get_memory_size()) { emu->set_reg(0, 0); return; }
+    uint64_t avail = emu->get_memory_size() - str;
+    if ((uint64_t)n > avail) n = (uint32_t)avail;
     const char* s = (const char*)(emu->get_memory_base() + str);
     size_t len = 0;
     while (len < n && s[len] != '\0') len++;
@@ -833,9 +945,11 @@ static void bridge_strndup(void* emu_ptr) {
 
 static void bridge_strcasecmp(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    uint64_t str1 = emu->get_reg(0);
-    uint64_t str2 = emu->get_reg(1);
-    if (!str1 || !str2) { emu->set_reg(0, 0); return; }
+    uint32_t str1 = guest_u32(emu->get_reg(0));
+    uint32_t str2 = guest_u32(emu->get_reg(1));
+    if (!bridge_cstr_ok(emu, str1, nullptr) || !bridge_cstr_ok(emu, str2, nullptr)) {
+        emu->set_reg(0, 0); return;
+    }
     const char* s1 = (const char*)(emu->get_memory_base() + str1);
     const char* s2 = (const char*)(emu->get_memory_base() + str2);
     int res = strcasecmp(s1, s2);
@@ -844,10 +958,15 @@ static void bridge_strcasecmp(void* emu_ptr) {
 
 static void bridge_strncasecmp(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
-    uint64_t str1 = emu->get_reg(0);
-    uint64_t str2 = emu->get_reg(1);
-    uint64_t n = emu->get_reg(2);
-    if (!str1 || !str2) { emu->set_reg(0, 0); return; }
+    uint32_t str1 = guest_u32(emu->get_reg(0));
+    uint32_t str2 = guest_u32(emu->get_reg(1));
+    uint32_t n = guest_u32(emu->get_reg(2));
+    if (!str1 || !str2 ||
+        (uint64_t)str1 >= emu->get_memory_size() ||
+        (uint64_t)str2 >= emu->get_memory_size()) { emu->set_reg(0, 0); return; }
+    // strncasecmp stops at NUL or n bytes; clamp n so it cannot walk off the arena.
+    uint64_t avail = emu->get_memory_size() - (str1 > str2 ? str1 : str2);
+    if ((uint64_t)n > avail) n = (uint32_t)avail;
     const char* s1 = (const char*)(emu->get_memory_base() + str1);
     const char* s2 = (const char*)(emu->get_memory_base() + str2);
     int res = strncasecmp(s1, s2, n);
@@ -2123,6 +2242,25 @@ static void bridge_NewIntArray(void* emu_ptr) {
 // Arrays are short-lived (created, filled, passed to saveSnapshot/etc, then discarded)
 static uint64_t g_byte_array_alloc_ptr_64 = 0x48000000; // High address region for arrays
 
+// Dedicated, bounded, wrapping region for readdir() dirent scratch buffers.
+// A dirent is 280 bytes and is only live between one readdir() and the guest's
+// consumption of d_name, so a small ring of buffers below the byte-array region
+// is plenty. Keeping this OUT of the shared main heap (g_guest_heap_ptr) is the
+// fix for the unbounded growth that pushed dirents past the 0xE0000000 arena.
+#define DIRENT_REGION_BASE  0x47000000ULL
+#define DIRENT_REGION_END   0x48000000ULL   // 16 MB, ends where byte-array region begins
+#define DIRENT_SLOT_SIZE    ((280u + 7u) & ~7u)
+static uint64_t g_dirent_alloc_ptr_64 = DIRENT_REGION_BASE;
+
+static uint32_t alloc_guest_dirent_buf() {
+    uint32_t addr = (uint32_t)g_dirent_alloc_ptr_64;
+    g_dirent_alloc_ptr_64 += DIRENT_SLOT_SIZE;
+    if (g_dirent_alloc_ptr_64 + DIRENT_SLOT_SIZE > DIRENT_REGION_END) {
+        g_dirent_alloc_ptr_64 = DIRENT_REGION_BASE;   // wrap — reuse space
+    }
+    return addr;
+}
+
 static void bridge_NewByteArray(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint64_t length = emu->get_reg(1); // X1 = size
@@ -2346,7 +2484,7 @@ static void bridge_strtol(void* emu_ptr) {
         uint64_t offset = (uint64_t)(endptr - (char*)(memory + str));
         *(uint64_t*)(memory + endptr_ptr) = (uint64_t)(str + offset);  // ARM64: 64-bit pointers!
     }
-    emu->set_reg(0, (uint32_t)result);
+    emu->set_reg(0, (uint64_t)(int64_t)result);  // ARM64: full 64-bit signed return in X0
 }
 
 static void bridge_strtoul(void* emu_ptr) {
@@ -2361,7 +2499,37 @@ static void bridge_strtoul(void* emu_ptr) {
         uint64_t offset = (uint64_t)(endptr - (char*)(memory + str));
         *(uint64_t*)(memory + endptr_ptr) = (uint64_t)(str + offset);  // ARM64: 64-bit pointers!
     }
-    emu->set_reg(0, (uint32_t)result);
+    emu->set_reg(0, (uint64_t)result);  // ARM64: full 64-bit unsigned return in X0
+}
+
+static void bridge_strtoll(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    uint32_t str = emu->get_reg(0);
+    uint32_t endptr_ptr = emu->get_reg(1);
+    int base = (int)emu->get_reg(2);
+    char* endptr = nullptr;
+    long long result = std::strtoll((const char*)(memory + str), &endptr, base);
+    if (endptr_ptr && endptr) {
+        uint64_t offset = (uint64_t)(endptr - (char*)(memory + str));
+        *(uint64_t*)(memory + endptr_ptr) = (uint64_t)(str + offset);  // ARM64: 64-bit pointers!
+    }
+    emu->set_reg(0, (uint64_t)(int64_t)result);  // ARM64: full 64-bit return in X0
+}
+
+static void bridge_strtoull(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    uint8_t* memory = emu->get_memory_base();
+    uint32_t str = emu->get_reg(0);
+    uint32_t endptr_ptr = emu->get_reg(1);
+    int base = (int)emu->get_reg(2);
+    char* endptr = nullptr;
+    unsigned long long result = std::strtoull((const char*)(memory + str), &endptr, base);
+    if (endptr_ptr && endptr) {
+        uint64_t offset = (uint64_t)(endptr - (char*)(memory + str));
+        *(uint64_t*)(memory + endptr_ptr) = (uint64_t)(str + offset);  // ARM64: 64-bit pointers!
+    }
+    emu->set_reg(0, (uint64_t)result);  // ARM64: full 64-bit return in X0
 }
 
 static void bridge_atoi(void* emu_ptr) {
@@ -3091,7 +3259,7 @@ static void bridge_lseek(void* emu_ptr) {
         emu->set_reg(0, res == 0 ? ftell(g_file_handles[fd]) : -1);
     } else {
         off_t res = lseek(fd, offset, whence);
-        emu->set_reg(0, (uint32_t)res);
+        emu->set_reg(0, (uint64_t)(int64_t)res);  // ARM64: 64-bit off_t; avoid truncating large offsets / -1
     }
 }
 
@@ -3525,6 +3693,48 @@ static void bridge_fopen(void* emu_ptr) {
         if (create_f) {
             fclose(create_f);
             f = fopen(resolved_path.c_str(), mode);
+        }
+    }
+
+    /* REGRESSION FIX (black screen / draws=0): base-game asset fallback.
+     *
+     * When an active profile/mod is selected (observed: profile
+     * "5eb0d662-...(Copy)"), resolve_vfs_path builds profile-prefixed
+     * candidates (mods/<mod>/resources/<profile>/X and resources/<profile>/X)
+     * that do NOT ship the base game's shared assets. The sprite/glyph ATLAS
+     * metadata files (e.g. ui_game_atlas_2x.atlas) live only under the base
+     * assets/resources/ dir, so the profile-prefixed open failed and the guest
+     * got a NULL FILE*. With no atlas metrics, Caver::FontText::AddText read a
+     * garbage glyph count and vector<CharacterInfo>::_M_insert_aux requested a
+     * ~256-384MB allocation -> St9bad_alloc -> abort/unwind every frame ->
+     * nothing ever rendered (draws=0).
+     *
+     * Android's real AssetManager transparently falls back mod-overlay ->
+     * base-APK. Mirror that here for READ opens only: retry the open under the
+     * canonical base assets/resources/ directory. Only fires when the primary
+     * open failed and we are NOT writing, so it never changes write/creation
+     * behaviour. Strips any leading "assets/resources/" or "resources/" prefix
+     * from the guest path so we always land on <base>/resources/<leaf-relative>. */
+    if (!f && !is_write) {
+        const char* rel = path;
+        if (strncmp(rel, "assets/resources/", 17) == 0)      rel += 17;
+        else if (strncmp(rel, "resources/", 10) == 0)        rel += 10;
+        else if (rel[0] == '/') {
+            /* Absolute guest path — fall back to just its leaf under base. */
+            const char* slash = strrchr(rel, '/');
+            if (slash) rel = slash + 1;
+        }
+        const char* base = get_assets_base_path();  /* ".../assets" (parent of resources/) */
+        if (base && base[0] && rel && rel[0]) {
+            char basepath[640];
+            snprintf(basepath, sizeof(basepath), "%s/resources/%s", base, rel);
+            f = fopen(basepath, mode);
+            if (f) {
+                resolved_path = basepath;
+                if (!emu->quiet_mode) {
+                    printf("[AssetMgr/fopen] base-APK fallback: %s -> %s\n", path, basepath);
+                }
+            }
         }
     }
 
@@ -4184,9 +4394,17 @@ static void bridge_opendir(void* emu_ptr) {
     }
     
     GuestDir* gd = new GuestDir();
-    gd->guest_dirent_addr = g_guest_heap_ptr;
-    g_guest_heap_ptr += (280 + 7) & ~7; // allocate 280 bytes in guest heap for dirent struct
-    
+    // Dirent scratch buffer: allocate from a DEDICATED, BOUNDED, wrapping region
+    // rather than bumping the shared main heap (g_guest_heap_ptr). The old code
+    // did `gd->guest_dirent_addr = g_guest_heap_ptr; g_guest_heap_ptr += 280;`
+    // with no bound — after enough allocations the shared heap pointer climbed
+    // past the declared guest arena (0xE0000000), so a dirent landed at e.g.
+    // 0xe6054e98, readdir strncpy'd the name past the arena, and the guest's
+    // std::string(d_name) → strlen(0xe6054eab) read out of bounds and threw
+    // std::out_of_range (Caver::GetFilesWithExtension), stalling scene load
+    // (draws=0 / black screen). Mirror NewByteArray's bounded bump+wrap scheme.
+    gd->guest_dirent_addr = alloc_guest_dirent_buf();
+
     for (const auto& entry : fs::directory_iterator(resolved_path)) {
         std::string name = entry.path().filename().string();
         uint8_t type = 8; // DT_REG default
@@ -8137,6 +8355,14 @@ static void bridge_pthread_mutex(void* emu_ptr) {
     emu->set_reg(0, 0); // success
 }
 
+// Generic no-op success handler: return 0 (success) with no side effects.
+// Used for pthread_mutexattr_* functions which have no meaningful behavior
+// in single-threaded emulation but must not flood UNHANDLED logs.
+static void bridge_pthread_noop(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    emu->set_reg(0, 0);
+}
+
 static void bridge_pthread_once(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
@@ -8738,6 +8964,8 @@ void JniBridge64::init_standard_bridges() {
     register_handler("strcspn", bridge_strcspn);
     register_handler("strstr", bridge_strstr);
     register_handler("strtol", bridge_strtol);
+    register_handler("strtoll", bridge_strtoll);
+    register_handler("strtoull", bridge_strtoull);
     register_handler("strtoul", bridge_strtoul);
     register_handler("atoi", bridge_atoi);
     register_handler("atof", bridge_atof);
@@ -8924,6 +9152,11 @@ void JniBridge64::init_standard_bridges() {
     register_handler("pthread_mutex_lock", bridge_pthread_mutex);
     register_handler("pthread_mutex_unlock", bridge_pthread_mutex);
     register_handler("pthread_mutex_destroy", bridge_pthread_mutex);
+    register_handler("pthread_mutexattr_init", bridge_pthread_noop);
+    register_handler("pthread_mutexattr_settype", bridge_pthread_noop);
+    register_handler("pthread_mutexattr_destroy", bridge_pthread_noop);
+    register_handler("pthread_mutexattr_setpshared", bridge_pthread_noop);
+    register_handler("pthread_mutexattr_gettype", bridge_pthread_noop);
     register_handler("pthread_cond_init", bridge_pthread_cond);
     register_handler("pthread_cond_signal", bridge_pthread_cond);
     register_handler("pthread_cond_broadcast", bridge_pthread_cond);

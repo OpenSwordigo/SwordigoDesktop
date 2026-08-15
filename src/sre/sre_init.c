@@ -72,60 +72,61 @@ SreHookEntry sre_hook_table[] = {
     /* ProgramState — catch Lua errors instead of aborting */
     { 0, "sre_ProgramState_Execute" },  /* offset resolved dynamically by symbol */
     { 0, "sre_ProgramState_Resume"  },  /* offset resolved dynamically by symbol */
-    /* ProgramState::Update — handles timer-based coroutine resume with
-     * error recovery. On ARM64 the resume is inlined (unlike ARM32 where
-     * Update calls Resume separately). After handling the resume safely,
-     * sre_ProgramState_Update calls g_orig_ProgramState_Update (relay stub)
-     * for the child ProgramState iteration loop.
-     * The relay stub is set up by the host after trampoline installation.
-     *
-     * DISABLED FOR TESTING — let the native engine handle it to reduce
-     * per-frame overhead. Lua resume errors will crash without this. */
-     { 0, "sre_ProgramState_Update" },
+    /* ProgramState::Update stays native. The host hooks lua_resume itself
+     * through sre_lua_resume_safe, so the inlined timer-resume call is protected
+     * without replacing this per-frame function or duplicating its scheduler. */
      // { 0, "sre_ProgramState_destructor" },
      { 0x478ccc, "sre_updateApplication" },
 
     /* Scene Loading Pipeline Hooks — Safety Filters & Error Recovery */
-    /* SceneLoadingView::InitWithGameState — offset resolved via sym_hooks (not yet wired,
-     * kept as 0 until we add sym_hooks entry). Scene::FinishLoad, SceneObject::FinishLoad,
-     * and SceneObjectGroup::FinishLoad have hardcoded nm offsets so they ARE installed
-     * without sym_hooks entries:
-     *   Scene::FinishLoad           nm arm64 v1.4.12: 0x4642a8
-     *   SceneObject::FinishLoad     nm arm64 v1.4.12: 0x470ec4
-     *   SceneObjectGroup::FinishLoad nm arm64 v1.4.12: 0x475498
+    /* SceneLoadingView::InitWithGameState uses a hardcoded nm offset (0x4358dc).
+     * FinishLoad hooks (Scene 0x4642a8, SceneObject 0x470ec4, SceneObjectGroup
+     * 0x475498 - verified) carry hardcoded nm offsets so they ARE installed
+     * without sym_hooks entries.
      * These are the PRIMARY cause of scene-transition freeze:
      *   without the hook, corrupted component vtable[9] calls jump into .dynstr
      *   (PC=0x10771ac) and Dynarmic force-returns to LR inside the original code
      *   instead of our setjmp recovery.
      * SceneObjectGroup::FinishLoad additionally calls ProgramState::Execute on
      * attached Lua scripts immediately during scene load — any script error in the
-     * original causes ProgramPanic → abort. Our wrapper catches it via setjmp. */
+     * original causes ProgramPanic → abort. Our wrapper catches it via setjmp.
+     *
+     * NOTE: sre_GameSceneController_InitWithScene was previously DISABLED due to
+     * a bad offset (0x348920) causing startup freeze at menu background.
+     * REVERT: Subagent set this to 0x203590 but this offset was NOT verified
+     * against nm -D or IDA ground truth (GameSceneController is not in .dynsym).
+     * Keeping disabled (offset=0) until offset is confirmed by objdump/readelf
+     * of the stripped symbol table or a matching IDA address annotation.
+     * The g_sre_hero_obj=0 zero in the hook body is safe and kept. */
     { 0x4358dc, "sre_SceneLoadingView_InitWithGameState" },
     { 0,        "sre_GameSceneController_InitWithScene"  },
-    /* SceneLoadingView::Update AND AnimateIn — NOT hooked.
+    /* SceneLoadingView::Update AND AnimateIn — NOT hooked (reverted to the last
+     * stable TVPG build). Enabling these two hooks is the regression that caused
+     * the black screen (draws=0): both suffer from the relay-trampoline
+     * continuation bug — the relay's literal-pool continuation slot is filled
+     * with 0xd4400000d4400000 (BRK#0 bridge bytes) instead of the correct
+     * continuation VA. Calling g_orig_Xxx() therefore branches through a
+     * poisoned pointer (observed: virtual dispatch into .dynstr @0x1077168 with
+     * a null/garbage vtable), corrupting guest state and triggering the
+     * per-frame bogus ~256MB malloc -> St9bad_alloc -> abort/unwind so the
+     * render/scene path never runs. This CANNOT be fixed from SRE C code (it is
+     * a host relay-builder ordering bug: the relay saves the patch-site bytes
+     * AFTER the BRK is installed, capturing bridge bytes). The forced gateway
+     * teleports via GotoLevel only; the scene transition completes through
+     * BackgroundLoad -> GVC+0xE9=1 -> GameViewController::Update as normal, so
+     * these two hooks are not required for functionality.
      *
-     * Both functions suffer from the same relay-trampoline bug:
-     * the relay's literal-pool continuation slot is filled with
-     * 0xd4400000d4400000 (BRK#0 bridge bytes) instead of the correct
-     * continuation VA.  Calling g_orig_Xxx() therefore jumps to an
-     * invalid address and crashes with Dynarmic NoExecuteFault.
-     *
-     * Root cause (host relay builder): the relay saves bytes at the
-     * patch site AFTER the BRK is installed, capturing bridge bytes.
-     * This cannot be fixed from SRE C code.
-     *
-     * The forced gateway teleports using GotoLevel only; the scene
-     * transition completes via BackgroundLoad → GVC+0xE9=1 →
-     * GameViewController::Update as normal.
-     *
-     * nm arm64 v1.4.12 (for reference):
-     *   SceneLoadingView::Update    0x43650C
-     *   SceneLoadingView::AnimateIn 0x436A54  */
+     * nm arm64 v1.4.12 (for reference only — do NOT re-enable until the host
+     * relay builder is fixed to snapshot original bytes BEFORE writing the BRK):
+     *   SceneLoadingView::Update    0x43650c
+     *   SceneLoadingView::AnimateIn 0x436a54 */
+    { 0, "sre_SceneLoadingView_Update"    },
+    { 0, "sre_SceneLoadingView_AnimateIn" },
     { 0x4642a8, "sre_Scene_FinishLoad"                   },
     { 0x470ec4, "sre_SceneObject_FinishLoad"             },
     { 0x475498, "sre_SceneObjectGroup_FinishLoad"        },
-    { 0, "sre_ReadPODModelFromFile"               },
-    { 0, "sre_CPVRTModelPOD_ReadFromMemory"       },
+    //{ 0, "sre_ReadPODModelFromFile"               },
+    //{ 0, "sre_CPVRTModelPOD_ReadFromMemory"       },
 
 
     /* luaD_throw — ROOT of all Lua error handling. Every Lua error goes
@@ -136,7 +137,11 @@ SreHookEntry sre_hook_table[] = {
 
     /* ProgramPanic — safety net (should never fire now that luaD_throw
      * is hooked, but kept as backup).
-     * nm -D libswordigo.so v1.4.12 arm64-v8a: 0x4c0d60 */
+     * VERIFIED: 0x4c0d60 = _ZN5Caver12ProgramPanicEP9lua_State (readelf .dynsym,
+     *   FUNC GLOBAL, size 36). objdump shows a real prologue (stp x29,x30,[sp,#-16]!).
+     *   0x4c0d60 is inside .text (0x203e90..0x583478) — CORRECT, left unchanged.
+     *   (The audit's stale 0x5c0ab4 falls inside .eh_frame @0x5bce98 — that would be
+     *    WRONG; it is NOT the value here.) */
     { 0x4c0d60, "sre_ProgramPanic" },
 
     /* Background rendering — our own sky renderer
@@ -191,7 +196,7 @@ SreHookEntry sre_hook_table[] = {
      * When Offers is clicked, ButtonPressed calls the delegate method
      * MainMenuViewDidOpenShop. We hook THAT instead of ButtonPressed
      * to avoid PC-relative relay issues. */
-    { 0x36f394, "sre_MainMenuVC_DidOpenShop" },
+    //{ 0x36f394, "sre_MainMenuVC_DidOpenShop" },
 
     /* CreditsVC hooks — DISABLED for v6, Options menu WIP.
      * { 0x38d604, "sre_CreditsVC_LoadView" },
@@ -318,9 +323,9 @@ SreHookEntry sre_hook_table[] = {
      *   GUINavigationController::ViewControllerViewLoaded 0x499288
      *   GUINavigationController::FinishTransitionToVC     0x49a42c
      */
-    { 0, "sre_GUINavigationController_Update"           },
-    { 0, "sre_GUINavigationController_VCLoaded"         },
-    { 0, "sre_GUINavigationController_FinishTransition" },
+    { 0, "sre_GUINavigationController_Update"           },  /* resolved via sym_hooks (engine sym in .dynsym): _ZN5Caver23GUINavigationController6UpdateEf */
+    { 0, "sre_GUINavigationController_VCLoaded"         },  /* disabled — matches TVPG stable */
+    { 0, "sre_GUINavigationController_FinishTransition" },  /* resolved via sym_hooks (engine sym in .dynsym) */
 
 
     /* ─── GameData::Clear crash guard ─────────────────────────────────────────
@@ -456,14 +461,14 @@ SreHookEntry sre_hook_table[] = {
     { 0, "luaL_loadbuffer" },
     { 0, "luaL_loadfile" },
     { 0, "_Z12luaopen_baseP9lua_State" },
-    { 0, "luaopen_package" },
-    { 0, "luaopen_table" },
-    { 0, "luaopen_io" },
-    { 0, "luaopen_os" },
+    { 0, "luaopen_package" },  /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 (this build only exports luaopen_base + luaopen_string; ProgramState ctor @0x4C0D84 opens the rest inline) */
+    { 0, "luaopen_table" },    /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 */
+    { 0, "luaopen_io" },       /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 */
+    { 0, "luaopen_os" },       /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 */
     { 0, "_Z14luaopen_stringP9lua_State" },
-    { 0, "luaopen_math" },
-    { 0, "luaopen_debug" },
-    { 0, "luaL_openlibs" },
+    { 0, "luaopen_math" },     /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 */
+    { 0, "luaopen_debug" },    /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 */
+    { 0, "luaL_openlibs" },    /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 (no _Z13luaL_openlibsP9lua_State anywhere in symtab or IDA index) */
     { 0, "lua_newthread" },
     { 0, "lua_xmove" },
     { 0, "lua_tothread" },
@@ -681,6 +686,15 @@ void sre_custom_terminate_handler(void) {
     if (g_sre_recovery_depth > 0) {
         int target = g_sre_recovery_depth - 1;
         sre_recovery_entry* entry = &g_sre_recovery_stack[target];
+        /* Restore L->errorJmp for this recovery level BEFORE longjmp — same as
+         * sre_cxa_throw (sre_effects.c). Without this, after we longjmp out of
+         * the terminate handler the Lua state's errorJmp still points at the
+         * (now-unwound) pcall frame, so the next Lua error writes into a stale
+         * jmp_buf. Mirror the sre_cxa_throw restore exactly. */
+        if (entry->lua_state) {
+            void** ejp = (void**)((char*)entry->lua_state + LUA_ERRORJMP_OFFSET);
+            *ejp = entry->saved_errorJmp;
+        }
         sre_longjmp(entry->buf, 1);
         /* never reached */
     }
@@ -734,16 +748,58 @@ void sre_install_exception_safeguard(void) {
  * Rejects pointers into .text (0x1203e90–0x1584000) and .dynstr
  * (0x1077168–0x1162a8c) which would indicate a corrupted/stale vtable ptr.
  */
+/* SECTION BOUNDS (readelf -SW libswordigo.so, v1.4.12; guest VA = base+RVA):
+ *   .text        0x1203e90 .. 0x1583478
+ *   .rodata      0x1583480 .. 0x15a1145
+ *   .data.rel.ro 0x16b6a80 .. 0x16dbfc0   (nearly all Caver::* class vtables)
+ * Confirmed the _ZTVN5Caver…E vtable dyn-syms all fall inside .data.rel.ro
+ * (0x16b8ec0..0x16dbfb8). */
 int sre_is_valid_vtable_ptr(uint64_t vtable) {
     if (!vtable) return 0;
     if ((vtable & 7) != 0) return 0;  /* vtable arrays are pointer-aligned */
 
-    /* libswordigo.so .data.rel.ro: 0x16b6a80 – 0x16DC000 */
-    if (vtable >= 0x16b6a80ULL && vtable < 0x16DC000ULL) return 1;
-    /* libswordigo.so .rodata (some vtables spill into here): 0x1583480 – 0x15A2000 */
-    if (vtable >= 0x1583480ULL && vtable < 0x15A2000ULL) return 1;
+    /* libswordigo.so .data.rel.ro: readelf -SW ⇒ RVA 0x6b6a80 .. 0x6dbfc0
+     * (guest VA = 0x1000000 + RVA). This is where virtually all Caver::*
+     * class vtables actually live (_ZTVN5Caver…E dyn-syms span
+     * 0x6b8ec0..0x6dbfb8). The old upper bound 0x16DC000 clipped the very
+     * top of .data.rel.ro (last vtables end at 0x16dbfb8) but that was fine;
+     * the real problem was the split window below leaving .got out. Keep the
+     * accurate .data.rel.ro bound. */
+    if (vtable >= 0x16b6a80ULL && vtable < 0x16dc000ULL) return 1;
+    /* libswordigo.so .rodata (a few RTTI/type_info & spilled vtables): RVA
+     * 0x583480 .. 0x5a1145 ⇒ guest VA 0x1583480 .. 0x15a1145 */
+    if (vtable >= 0x1583480ULL && vtable < 0x15a1148ULL) return 1;
     /* libsre.so data sections (loaded at ~0x2000000) */
     if (vtable >= 0x2000000ULL && vtable < 0x2300000ULL) return 1;
+
+    return 0;
+}
+
+/* =========================================================================
+ * sre_is_valid_code_ptr (FIX6) — ONE shared executable code-pointer validator.
+ *
+ * Returns true for the UNION superset of all previously-scattered .text/code
+ * range checks so that NO currently-accepted pointer becomes rejected:
+ *   - guest .text : [0x1203e90, 0x1583478)   (from sre_frame_loop.c inline check)
+ *   - libsre .text: [0x2000000, 0x2300000)   (from sre_frame_loop.c inline check)
+ * Requires 4-byte instruction alignment. This does NOT tighten any existing
+ * bound; sites that currently accept a wider range must NOT be narrowed to it.
+ * ========================================================================= */
+int sre_is_valid_code_ptr(uint64_t addr) {
+    if (!addr) return 0;
+    if ((addr & 3) != 0) return 0;  /* AArch64 instructions are 4-byte aligned */
+
+    /* guest libswordigo.so .plt thunks : RVA 0x1f33d0 .. 0x203e90 (readelf -SW).
+     * PLT-dispatched calls (e.g. HasInterface, dispose/destroy through the GOT)
+     * land here; the old .text-only window rejected them, silently skipping the
+     * engine's real destroy path. */
+    if (addr >= 0x11f33d0ULL && addr < 0x1203e90ULL) return 1;
+    /* guest libswordigo.so .text : RVA 0x203e90 .. 0x583478 (readelf -SW) */
+    if (addr >= 0x1203e90ULL && addr < 0x1583478ULL) return 1;
+    /* libsre.so .text (loaded at ~0x2000000) */
+    if (addr >= 0x2000000ULL && addr < 0x2300000ULL) return 1;
+    /* relay caves (0x3000000 .. 0x3100000) — trampolines dispatch through here */
+    if (addr >= 0x3000000ULL && addr < 0x3100000ULL) return 1;
 
     return 0;
 }

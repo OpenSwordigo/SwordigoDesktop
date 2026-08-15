@@ -202,20 +202,18 @@ static void* sre_get_active_gvc(void) {
     return gvc;
 }
 
-/* =========================================================================
- * sre_SceneLoadingView_Update  (UNHOOKED — dead stub kept for symbol export)
- * =========================================================================
- * NOT installed in the hook table.  Both Update and AnimateIn at 0x43650C /
- * 0x436A54 share a relay-trampoline bug: the host relay builder samples the
- * patch site AFTER the BRK is installed, so the relay's literal-pool slot
- * contains 0xd4400000d4400000 (BRK bytes) instead of the continuation VA.
- * Calling g_orig_Xxx() jumps to that garbage address → NoExecuteFault.
- *
- * Both gateways call GotoLevel(); the scene transition completes normally
- * via BackgroundLoad → GVC+0xE9=1 → GameViewController::Update swap.
- * ========================================================================= */
-void sre_SceneLoadingView_AnimateIn(void* self, void* a2) { (void)self; (void)a2; }
-void sre_SceneLoadingView_Update(void* self, float dt)    { (void)self; (void)dt;  }
+/* Relay pointers are populated by the host's atomic trampoline installer.
+ * AnimateIn is implemented in sre_scene_loading.S because its ABI uses x8 as
+ * an indirect-result register; a C wrapper is not allowed to clobber it. */
+typedef void (*pfn_SceneLoadingView_Update)(void* self, float dt);
+pfn_SceneLoadingView_Update g_orig_SceneLoadingView_Update = NULL;
+void* g_orig_SceneLoadingView_AnimateIn = NULL;
+
+void sre_SceneLoadingView_Update(void* self, float dt) {
+    if (g_orig_SceneLoadingView_Update) {
+        g_orig_SceneLoadingView_Update(self, dt);
+    }
+}
 
 /* =========================================================================
  * sre_scene_shifter_call_goto_level
@@ -343,6 +341,8 @@ int sre_scene_shifter_normal(const char* level_name, const char* spawn_point) {
     g_sre_scene_shift_active         = 1;
     g_sre_last_slv = NULL;
     g_sre_scene_shift_wait_frames = 0;
+    extern volatile uint64_t g_sre_hero_obj;
+    g_sre_hero_obj = 0; /* Guard against use-after-free during transition */
 
     int ok = sre_scene_shifter_call_goto_level(level_name, spawn_point);
     if (!ok) {
@@ -363,6 +363,8 @@ int sre_scene_shifter_forced(const char* level_name, const char* spawn_point) {
     g_sre_scene_shift_active         = 1;
     g_sre_last_slv = NULL;
     g_sre_scene_shift_wait_frames = 0;
+    extern volatile uint64_t g_sre_hero_obj;
+    g_sre_hero_obj = 0; /* Guard against use-after-free during transition */
 
     int ok = sre_scene_shifter_call_goto_level(level_name, spawn_point);
     if (!ok) {

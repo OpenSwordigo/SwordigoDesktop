@@ -189,6 +189,13 @@ int ElfLoaderArm64::load(so_module_arm64* mod, const std::string& filename, uint
             mod->dynamic = (Elf64_Dyn*)(guest_base + addr);
         } else if (name == ".dynstr") {
             mod->dynstr = (char*)(guest_base + addr);
+            // Record the guest-VA byte range of the string table. It is a
+            // STRTAB (never executable); the emulator's RenderGuard uses this
+            // to reject a stray blr/ret that lands in .dynstr (observed: a
+            // virtual call walked past a CaverShell vtable into the adjacent
+            // RTTI type-name pointer -> jumped to the name string here).
+            mod->dynstr_vaddr = addr;
+            mod->dynstr_size  = size;
         } else if (name == ".dynsym") {
             mod->dynsym = (Elf64_Sym*)(guest_base + addr);
             mod->num_dynsym = size / sizeof(Elf64_Sym);
@@ -223,6 +230,14 @@ int ElfLoaderArm64::relocate(so_module_arm64* mod) {
             Elf64_Rela* r = &rela[i];
             uint64_t type = ELF64_R_TYPE(r->r_info);
             uint64_t sym_idx = ELF64_R_SYM(r->r_info);
+            // Bounds-check the symbol index before indexing dynsym: a malformed
+            // .rela with an out-of-range sym index would otherwise read OOB.
+            if (sym_idx >= (uint64_t)mod->num_dynsym) {
+                std::cerr << "[Reloc/ARM64] " << rel_name << ": symbol index "
+                          << sym_idx << " out of range (num_dynsym="
+                          << mod->num_dynsym << ") — skipping relocation" << std::endl;
+                continue;
+            }
             Elf64_Sym* sym = &mod->dynsym[sym_idx];
             // 64-bit pointer writes
             uint64_t* ptr = (uint64_t*)(guest_base + mod->base_addr + r->r_offset);
@@ -230,7 +245,11 @@ int ElfLoaderArm64::relocate(so_module_arm64* mod) {
             switch (type) {
                 case R_AARCH64_ABS64:
                     if (sym->st_shndx != SHN_UNDEF) {
-                        *ptr += mod->base_addr + sym->st_value + r->r_addend;
+                        // ELF ABS64 semantics are S + A (absolute assign), not an
+                        // in-place accumulate. The previous `+=` only produced the
+                        // right result when the target slot was pre-zeroed; a
+                        // non-zero initial value would corrupt the address.
+                        *ptr = mod->base_addr + sym->st_value + r->r_addend;
                     }
                     break;
                 case R_AARCH64_RELATIVE:
@@ -263,6 +282,13 @@ int ElfLoaderArm64::resolve(so_module_arm64* mod, const std::vector<so_default_d
         for (int i = 0; i < count; i++) {
             Elf64_Rela* r = &rela[i];
             uint64_t sym_idx = ELF64_R_SYM(r->r_info);
+            // Bounds-check the symbol index before indexing dynsym (see relocate()).
+            if (sym_idx >= (uint64_t)mod->num_dynsym) {
+                std::cerr << "[Resolve/ARM64] symbol index " << sym_idx
+                          << " out of range (num_dynsym=" << mod->num_dynsym
+                          << ") — skipping relocation" << std::endl;
+                continue;
+            }
             Elf64_Sym* sym = &mod->dynsym[sym_idx];
             uint64_t* ptr = (uint64_t*)(guest_base + mod->base_addr + r->r_offset);
 

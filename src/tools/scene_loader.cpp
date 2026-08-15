@@ -420,6 +420,7 @@ static void resolve_object_render_data(SceneObject& obj) {
     obj.portal_destination.clear();
     obj.portal_spawn_point.clear();
     obj.portal_tap_to_enter = false;
+    obj.is_dimension_object = false;
     // When the object's ground meshes were edited in the SDK, keep the parsed
     // (modified) mesh data instead of re-deriving it from the original raw
     // component bytes — scene_refresh() is called during interactive edits.
@@ -435,6 +436,12 @@ static void resolve_object_render_data(SceneObject& obj) {
         const std::string schema_name = component_schema_name(comp);
         if (schema_name == "GroundMeshComponent" && !preserve_meshes)
             parse_ground_mesh_component(obj, comp);
+
+        // DimensionObject: visible only while the Dimension Rift powerup is
+        // active in-game (e.g. obj5#5 bridge in lowergrove_part1).
+        if (schema_name == "DimensionObject" || schema_name == "DimensionObjectComponent" ||
+            comp.type_name == "DimensionObject")
+            obj.is_dimension_object = true;
 
         if (schema_name == "SpawnPointComponent" || comp.type_name == "SpawnPoint") {
             obj.is_spawn_point = true;
@@ -549,6 +556,15 @@ static void resolve_object_render_data(SceneObject& obj) {
             scan_for_asset_refs(comp.raw_data, obj.mesh_name, obj.texture_name);
     }
 
+    // Pure TemplateName-reference objects (no components, no baked mesh) — the
+    // real-scene form for decorations like 'bush', 'grove_tree1', 'grove_torch'
+    // (confirmed in de_out/*.scene: an Object carries only TemplateName + Position
+    // + transform, and the game resolves the mesh from the template library).
+    // When template resolution didn't yield a mesh (e.g. no .scl library is
+    // loaded in the SDK), fall back to using the TemplateName itself as the mesh
+    // stem so the decoration still previews (bush.pod, grove_tree1.pod, …).
+    if (obj.mesh_name.empty() && !obj.template_name.empty())
+        obj.mesh_name = obj.template_name;
 }
 
 struct SceneTemplate {

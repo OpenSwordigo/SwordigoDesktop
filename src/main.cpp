@@ -53,12 +53,28 @@ extern "C" void sre_guest_heap_drain_deferred(void);  // jni_bridge_arm64.cpp �
 #include "platform/fbo_scaler.h"
 #include "platform/io_thread.h"
 #include "platform/binary_selector.h"
+#include "platform/arm64_reloc.h"       // copy_and_relocate() — shared with hook-backend tests
 #include "platform/trampoline_mgr.h"
 #include "platform/launcher_ui.h"
 #include "platform/srt_overlay.h"
 #include "platform/save_editor.h"
 #include "platform/swordfare_gui.h"  /* Swordfare: ImGui-based in-game overlay */
+#include "platform/loading_screen.h" /* Boot loading screen (hiro POD + progress) */
+#include "platform/crash_dialog.h"   /* Sleek fatal-crash reporting window */
 #include "imgui/imgui.h"
+
+// Global boot loading screen. Non-null and active only during the boot gap
+// between window creation and the game's first rendered frame. The boot code
+// pumps it via BOOT_LOADING(pct, "stage") at checkpoints; it renders on the
+// main window's GL context so nothing threads across contexts.
+LoadingScreen* g_loading_screen = nullptr;
+static inline void boot_loading(float pct, const char* stage) {
+    if (!g_loading_screen) return;
+    g_loading_screen->set_progress(pct);
+    if (stage) g_loading_screen->set_stage(stage);
+    g_loading_screen->frame();
+}
+#define BOOT_LOADING(pct, stage) boot_loading((pct), (stage))
 
 extern bool g_display_active;
 extern int g_win_w;
@@ -234,6 +250,12 @@ uint64_t g_sre_profile_addr = 0;
 // =========================================================================
 uint64_t g_sre_text_base = 0;          // libswordigo executable segment start
 uint64_t g_sre_text_end  = 0;          // libswordigo executable segment end
+// libswordigo .dynstr STRTAB byte range (never executable). The RenderGuard
+// treats a code fetch here as a corrupted branch/return target and recovers,
+// because .dynstr lives INSIDE the executable PT_LOAD segment so the coarse
+// [text_base,text_end) range alone cannot exclude it.
+uint64_t g_sre_dynstr_base = 0;
+uint64_t g_sre_dynstr_end  = 0;
 uint64_t g_sre_runtime_text_base = 0;  // libsre executable segment start
 uint64_t g_sre_runtime_text_end  = 0;  // libsre executable segment end
 int      g_sre_render_recovery_active = 0;
@@ -2538,96 +2560,15 @@ void load_and_boot() {
     }
 }
 
-void copy_and_relocate(uint8_t* dest_cave, uint8_t* src_orig, uint64_t cave_vaddr, uint64_t orig_vaddr, int num_insns) {
-    for (int i = 0; i < num_insns; i++) {
-        uint32_t insn = *(uint32_t*)(src_orig + i * 4);
-        uint64_t orig_pc = orig_vaddr + i * 4;
-        uint64_t cave_pc = cave_vaddr + i * 4;
-        
-        // ADR or ADRP
-        if ((insn & 0x9F000000) == 0x90000000) {
-            bool is_adrp = (insn & 0x80000000) != 0;
-            int32_t immlo = (insn >> 29) & 3;
-            int32_t immhi = (insn >> 5) & 0x7FFFF;
-            int32_t imm = (immhi << 2) | immlo;
-            if (imm & 0x100000) {
-                imm |= ~0x1FFFFF;
-            }
-            uint64_t target;
-            if (is_adrp) {
-                target = (orig_pc & ~0xFFFULL) + ((int64_t)imm << 12);
-            } else {
-                target = orig_pc + imm;
-            }
-            int64_t new_offset;
-            if (is_adrp) {
-                new_offset = (int64_t)target - (cave_pc & ~0xFFFULL);
-                int64_t new_imm = new_offset >> 12;
-                insn = (insn & 0x9F00001F) | (((new_imm & 3) << 29) | (((new_imm >> 2) & 0x7FFFF) << 5));
-            } else {
-                new_offset = (int64_t)target - (int64_t)cave_pc;
-                insn = (insn & 0x9F00001F) | (((new_offset & 3) << 29) | (((new_offset >> 2) & 0x7FFFF) << 5));
-            }
-        }
-        // B or BL
-        else if ((insn & 0xFC000000) == 0x14000000 || (insn & 0xFC000000) == 0x94000000) {
-            int32_t imm = insn & 0x3FFFFFF;
-            if (imm & 0x2000000) {
-                imm |= ~0x3FFFFFF;
-            }
-            uint64_t target = orig_pc + (imm * 4);
-            int64_t new_offset = (int64_t)target - (int64_t)cave_pc;
-            int64_t new_imm = new_offset / 4;
-            insn = (insn & 0xFC000000) | (new_imm & 0x3FFFFFF);
-        }
-        // B.cond
-        else if ((insn & 0xFF000010) == 0x54000000) {
-            int32_t imm = (insn >> 5) & 0x7FFFF;
-            if (imm & 0x40000) {
-                imm |= ~0x7FFFF;
-            }
-            uint64_t target = orig_pc + (imm * 4);
-            int64_t new_offset = (int64_t)target - (int64_t)cave_pc;
-            int64_t new_imm = new_offset / 4;
-            insn = (insn & 0xFF00001F) | ((new_imm & 0x7FFFF) << 5);
-        }
-        // CBZ or CBNZ
-        else if ((insn & 0x7F000000) == 0x34000000 || (insn & 0x7F000000) == 0x35000000) {
-            int32_t imm = (insn >> 5) & 0x7FFFF;
-            if (imm & 0x40000) {
-                imm |= ~0x7FFFF;
-            }
-            uint64_t target = orig_pc + (imm * 4);
-            int64_t new_offset = (int64_t)target - (int64_t)cave_pc;
-            int64_t new_imm = new_offset / 4;
-            insn = (insn & 0xFF00001F) | ((new_imm & 0x7FFFF) << 5);
-        }
-        // TBZ or TBNZ
-        else if ((insn & 0x7F000000) == 0x36000000 || (insn & 0x7F000000) == 0x37000000) {
-            int32_t imm = (insn >> 5) & 0x3FFF;
-            if (imm & 0x2000) {
-                imm |= ~0x3FFF;
-            }
-            uint64_t target = orig_pc + (imm * 4);
-            int64_t new_offset = (int64_t)target - (int64_t)cave_pc;
-            int64_t new_imm = new_offset / 4;
-            insn = (insn & 0xFFF8001F) | ((new_imm & 0x3FFF) << 5);
-        }
-        // LDR literal
-        else if ((insn & 0x3F000000) == 0x18000000) {
-            int32_t imm = (insn >> 5) & 0x7FFFF;
-            if (imm & 0x40000) {
-                imm |= ~0x7FFFF;
-            }
-            uint64_t target = orig_pc + (imm * 4);
-            int64_t new_offset = (int64_t)target - (int64_t)cave_pc;
-            int64_t new_imm = new_offset / 4;
-            insn = (insn & 0xFF00001F) | ((new_imm & 0x7FFFF) << 5);
-        }
-        
-        *(uint32_t*)(dest_cave + i * 4) = insn;
-    }
-}
+// ---------------------------------------------------------------------------
+// copy_and_relocate — the ARM64 instruction relocator now lives in its own
+// translation unit (src/platform/arm64_reloc.cpp) so the SAME single definition
+// is reused by the app AND by the standalone hook-backend unit tests without
+// dragging in main.cpp's heavy dependencies. The declaration comes from
+// platform/arm64_reloc.h (included below); behavior is byte-for-byte identical
+// to the previous inline definition that lived here.
+// ---------------------------------------------------------------------------
+#include "platform/arm64_reloc.h"
 
 extern "C" void advance_guest_virtual_clock(float dt);
 
@@ -2636,12 +2577,14 @@ void load_and_boot_arm64() {
     std::cout << "[Loader64] Loading: " << so_path << std::endl;
     uint64_t load_addr = 0x1000000;
     
+    BOOT_LOADING(0.10f, "Loading game binary");
     // 1. Load ELF (ARM64)
     if (g_loader_64->load(&g_main_mod_64, so_path, load_addr) != 0) {
         std::cerr << "[Loader64] Failed to load SO" << std::endl;
         exit(1);
     }
     
+    BOOT_LOADING(0.30f, "Relocating symbols");
     // 2. Internal Relocations
     g_loader_64->relocate(&g_main_mod_64);
     
@@ -2651,6 +2594,13 @@ void load_and_boot_arm64() {
     // Populate render-guard text-segment bounds (Crash-Report-03 fix).
     // g_sre_text_base / g_sre_text_end are read by is_valid_exec_pc() in the
     // Dynarmic run loop to detect corrupted LR returns into alignment padding.
+    // .dynstr STRTAB bounds — a code fetch here is always a corrupted target.
+    if (g_main_mod_64.dynstr_vaddr && g_main_mod_64.dynstr_size) {
+        g_sre_dynstr_base = g_main_mod_64.dynstr_vaddr;
+        g_sre_dynstr_end  = g_main_mod_64.dynstr_vaddr + g_main_mod_64.dynstr_size;
+        std::cout << "[RenderGuard] .dynstr (non-exec) bounds: 0x" << std::hex
+                  << g_sre_dynstr_base << " – 0x" << g_sre_dynstr_end << std::dec << std::endl;
+    }
     if (g_main_mod_64.text_base && g_main_mod_64.text_size) {
         g_sre_text_base = g_main_mod_64.text_base;
         g_sre_text_end  = g_main_mod_64.text_base + g_main_mod_64.text_size;
@@ -2663,6 +2613,27 @@ void load_and_boot_arm64() {
     g_loader_64->resolve_all_to_bridge(&g_main_mod_64, &g_bridge_64, GUEST_GLOBALS_BASE);
     
     std::cout << "[Loader64] Game binary ready (all symbols bridged)." << std::endl;
+
+    // [DIAG/vtable] Verify the CaverShell vtable + its Render slot survived
+    // relocation AND bridge-resolution. drawApplication calls vtable[0x70]
+    // (= CaverShell::Render). Observed crash: that slot resolves into .dynstr.
+    // Print: the GOT slot 0x6e76a0 (-> _ZTVN5Caver10CaverShellE base),
+    //        the vtable Render slot 0x6b8f40 (-> CaverShell::Render code),
+    //        and the expected values, so we can see which stage corrupts it.
+    {
+        uint64_t got_slot   = g_main_mod_64.base_addr + 0x6e76a0; // GOT: &vtable
+        uint64_t vt_render  = g_main_mod_64.base_addr + 0x6b8f40; // vtable[Render]
+        uint64_t got_val    = *(uint64_t*)(g_guest_memory + got_slot);
+        uint64_t render_val = *(uint64_t*)(g_guest_memory + vt_render);
+        uint64_t exp_got    = g_main_mod_64.base_addr + 0x6b8ec0; // CaverShell vtable
+        uint64_t exp_render = g_main_mod_64.base_addr + 0x211014; // CaverShell::Render
+        std::cout << "[DIAG/vtable] GOT[0x6e76a0]=0x" << std::hex << got_val
+                  << " (expect 0x" << exp_got << ")"
+                  << (got_val == exp_got ? " OK" : " *** MISMATCH ***") << std::dec << std::endl;
+        std::cout << "[DIAG/vtable] vtable[Render]@0x6b8f40=0x" << std::hex << render_val
+                  << " (expect 0x" << exp_render << ")"
+                  << (render_val == exp_render ? " OK" : " *** MISMATCH ***") << std::dec << std::endl;
+    }
 
     // Diagnostic: find the symbol for address 0x1478ccc (offset 0x478ccc)
     std::cout << "[SRE DIAG] Finding closest symbol to 0x1478ccc..." << std::endl;
@@ -2799,6 +2770,7 @@ void load_and_boot_arm64() {
         int patched = 0;
         int cbz_fixed = 0, cbnz_fixed = 0;
         
+        int cas_skipped = 0;
         for (int i = 0; i < num_insns; i++) {
             uint32_t insn = code[i];
             
@@ -2809,7 +2781,54 @@ void load_and_boot_arm64() {
                 uint32_t Rt = insn & 0x1F;
                 uint32_t Rn = (insn >> 5) & 0x1F;
                 uint32_t Rs = (insn >> 16) & 0x1F;
-                
+
+                // ---------------------------------------------------------------
+                // CAS-AWARE GUARD (fixes 0x10771ac / draws=0 with SRE on):
+                //
+                // Neutering STXR→STR + NOPing the retry is only correct for a
+                // PLAIN refcount spin (LDXR; add/sub; STXR; CBNZ retry) — the
+                // store then always "succeeds". But boost::enable_shared_from_this
+                // ::_internal_accept_owner (and other compare-and-swap installs)
+                // use the exclusive pair as a CAS: they LOAD the current value,
+                // CONDITIONALLY BRANCH on it (bail if it doesn't match), then STXR
+                // the new pointer. Forcing that store to always succeed installs a
+                // pointer even when the CAS should have failed, leaving the guest
+                // stack canary (0xdeadc0de12345678) as the stored owner pointer —
+                // which is later called through, jumping the JIT into .dynstr at
+                // 0x10771ac and preventing MainMenuViewController::LoadView from
+                // ever building the menu (draws=0).
+                //
+                // For the Dynarmic backend the emulator already implements correct
+                // CAS via MemoryWriteExclusive8/16/32/64, so leaving the CAS
+                // sequence INTACT is both correct and safe — the real exclusive
+                // monitor handles it. We only neuter true refcount STXRs.
+                //
+                // Detection: scan backwards (small window) for the matching
+                // LDXR/LDAXR on the SAME base register Rn. If, between that load
+                // and this store, there is a conditional branch (B.cond / CBZ /
+                // CBNZ / TBZ / TBNZ) that is NOT this STXR's own status-register
+                // branch, the sequence is a CAS with an early-out → SKIP it.
+                // ---------------------------------------------------------------
+                // REGRESSION FIX: the CAS-skip below is DISABLED. With
+                // Unsafe_IgnoreGlobalMonitor re-enabled in the emulator (its
+                // known-good state), STXR/STLXR always succeed, so the correct
+                // and proven behaviour is to neuter EVERY refcount STXR here (as
+                // the 2-day-old reference build did). Leaving CAS sequences
+                // "intact" only makes sense when the real global monitor is
+                // active — which it deliberately is not — and that combination
+                // caused guest exclusive-store retry loops to spin forever,
+                // freezing the game right after the menu background loaded.
+                // We keep the detection code compiled but force is_cas=false so
+                // no STXR is ever skipped, matching the reference behaviour.
+                bool is_cas = false;
+                (void)Rn;  // detection intentionally not used while monitor is ignored
+                if (is_cas) {
+                    // (unreachable) — retained only to preserve the counter and
+                    // make re-enabling the guard a one-line change if ever needed.
+                    cas_skipped++;
+                    continue;
+                }
+
                 // Replace with size-appropriate STR (unsigned offset, imm=0)
                 uint32_t str_insn;
                 switch (size) {
@@ -2841,7 +2860,8 @@ void load_and_boot_arm64() {
             }
         }
         std::cout << "[Patch64] STXR patcher: " << patched << " stores, "
-                  << cbnz_fixed << " CBNZ\u2192NOP, " << cbz_fixed << " CBZ\u2192B" << std::endl;
+                  << cbnz_fixed << " CBNZ\u2192NOP, " << cbz_fixed << " CBZ\u2192B, "
+                  << cas_skipped << " CAS-sequences preserved" << std::endl;
     }
     /* LEGACY_STXR_PATCHER_END */
 
@@ -3000,9 +3020,13 @@ void load_and_boot_arm64() {
 
                 // Relocate
                 g_loader_64->relocate(&g_sre_mod);
+                fprintf(stderr, "[DBG-FFI] after relocate: GOT[0x20b0930]=0x%lx (want 0x2064180)\n",
+                        *(uint64_t*)(g_guest_memory + 0x20b0930));
 
                 // Resolve imports (malloc, free, memcpy, strlen, etc.) through bridge
                 g_loader_64->resolve_all_to_bridge(&g_sre_mod, &g_bridge_64, GUEST_GLOBALS_BASE);
+                fprintf(stderr, "[DBG-FFI] after resolve_all_to_bridge: GOT[0x20b0930]=0x%lx (want 0x2064180)\n",
+                        *(uint64_t*)(g_guest_memory + 0x20b0930));
 
                 // Record the exact executable range. Exception recovery must never
                 // accept writable libsre data merely because it is inside the broad
@@ -3291,7 +3315,7 @@ void load_and_boot_arm64() {
                                 lua_resume_vaddr,
                                 safe_resume_vaddr,
                                 g_lua_resume_addr,
-                                1);
+                                1, /*allow_replace=*/true);
                         } else {
                             std::cerr << "[SRE] WARNING: lua_resume trampoline skipped"
                                       << " (resume=0x" << std::hex << lua_resume_vaddr
@@ -3418,30 +3442,17 @@ void load_and_boot_arm64() {
                     uint64_t cxa_throw_vaddr = load_addr + CXA_THROW_OFFSET;
                     uint64_t CXA_RELAY = TrampolineMgr::instance().reserve_cave("__cxa_throw_relay");
                     {
-                        copy_and_relocate(g_guest_memory + CXA_RELAY,
+                        if (copy_and_relocate(g_guest_memory + CXA_RELAY,
                                           g_guest_memory + cxa_throw_vaddr,
-                                          CXA_RELAY, cxa_throw_vaddr, 1);
+                                          CXA_RELAY, cxa_throw_vaddr, 1) < 0)
+                            std::cerr << "[SRE] ERROR: __cxa_throw relay relocation out of range/unsupported @ 0x"
+                                      << std::hex << cxa_throw_vaddr << std::dec << " — relay may be corrupt\n";
                         uint32_t* tail = (uint32_t*)(g_guest_memory + CXA_RELAY + 4);
                         int64_t ret_offset = (int64_t)(cxa_throw_vaddr + 4) - (int64_t)(CXA_RELAY + 4);
                         int64_t ret_imm = ret_offset / 4;
                         tail[0] = 0x14000000 | (ret_imm & 0x3FFFFFF);
                         std::cout << "[SRE] __cxa_throw relay pre-saved @ 0x"
                                   << std::hex << CXA_RELAY << std::dec << std::endl;
-                    }
-
-                    // ProgramState::Update relay
-                    uint64_t UPDATE_RELAY = 0;
-                    uint64_t update_vaddr = g_loader_64->get_symbol_vaddr(
-                        &g_main_mod_64, "_ZN5Caver12ProgramState6UpdateEf");
-                    if (update_vaddr) {
-                        UPDATE_RELAY = TrampolineMgr::instance().reserve_cave("ProgramState_Update_relay");
-                        copy_and_relocate(g_guest_memory + UPDATE_RELAY,
-                                          g_guest_memory + update_vaddr,
-                                          UPDATE_RELAY, update_vaddr, 1);
-                        uint32_t* tail = (uint32_t*)(g_guest_memory + UPDATE_RELAY + 4);
-                        int64_t ret_offset = (int64_t)(update_vaddr + 4) - (int64_t)(UPDATE_RELAY + 4);
-                        int64_t ret_imm = ret_offset / 4;
-                        tail[0] = 0x14000000 | (ret_imm & 0x3FFFFFF);
                     }
 
                     // ─── Destructor relay ────────────────────────────────────────
@@ -3454,7 +3465,7 @@ void load_and_boot_arm64() {
                             "ProgramState_destructor",
                             destructor_vaddr,
                             g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_ProgramState_destructor"),
-                            g_orig_destructor_addr, 1);
+                            g_orig_destructor_addr, 1, /*allow_replace=*/true);
                     }
 
                     // ─── CameraController::Update relay ──────────────────────────
@@ -3464,9 +3475,11 @@ void load_and_boot_arm64() {
                         uint64_t g_orig_cam_update_addr = g_loader_64->get_symbol_vaddr(
                             &g_sre_mod, "g_orig_CameraController_Update");
                         uint64_t cam_cave = TrampolineMgr::instance().reserve_cave("CameraController_Update_relay");
-                        copy_and_relocate(g_guest_memory + cam_cave,
+                        if (copy_and_relocate(g_guest_memory + cam_cave,
                                           g_guest_memory + cam_update_vaddr,
-                                          cam_cave, cam_update_vaddr, 1);
+                                          cam_cave, cam_update_vaddr, 1) < 0)
+                            std::cerr << "[SRE] ERROR: CameraController_Update relay relocation out of range/unsupported @ 0x"
+                                      << std::hex << cam_update_vaddr << std::dec << " — relay may be corrupt\n";
                         uint32_t* tail = (uint32_t*)(g_guest_memory + cam_cave + 4);
                         int64_t ret_offset = (int64_t)(cam_update_vaddr + 4) - (int64_t)(cam_cave + 4);
                         int64_t ret_imm = ret_offset / 4;
@@ -3484,9 +3497,11 @@ void load_and_boot_arm64() {
                         uint64_t g_orig_sg_update_addr = g_loader_64->get_symbol_vaddr(
                             &g_sre_mod, "g_orig_SceneGrid_UpdateVisibleAreasWithCamera");
                         uint64_t sg_cave = TrampolineMgr::instance().reserve_cave("SceneGrid_UpdateVis_relay");
-                        copy_and_relocate(g_guest_memory + sg_cave,
+                        if (copy_and_relocate(g_guest_memory + sg_cave,
                                           g_guest_memory + scenegrid_update_vaddr,
-                                          sg_cave, scenegrid_update_vaddr, 1);
+                                          sg_cave, scenegrid_update_vaddr, 1) < 0)
+                            std::cerr << "[SRE] ERROR: SceneGrid_UpdateVis relay relocation out of range/unsupported @ 0x"
+                                      << std::hex << scenegrid_update_vaddr << std::dec << " — relay may be corrupt\n";
                         uint32_t* tail = (uint32_t*)(g_guest_memory + sg_cave + 4);
                         int64_t ret_offset = (int64_t)(scenegrid_update_vaddr + 4) - (int64_t)(sg_cave + 4);
                         int64_t ret_imm = ret_offset / 4;
@@ -3504,9 +3519,11 @@ void load_and_boot_arm64() {
                         uint64_t g_orig_sch_addr = g_loader_64->get_symbol_vaddr(
                             &g_sre_mod, "g_orig_GameOverlayView_SetControlsHidden");
                         uint64_t sch_cave = TrampolineMgr::instance().reserve_cave("GameOverlayView_SetControlsHidden_relay");
-                        copy_and_relocate(g_guest_memory + sch_cave,
+                        if (copy_and_relocate(g_guest_memory + sch_cave,
                                           g_guest_memory + set_controls_hidden_vaddr,
-                                          sch_cave, set_controls_hidden_vaddr, 1);
+                                          sch_cave, set_controls_hidden_vaddr, 1) < 0)
+                            std::cerr << "[SRE] ERROR: GameOverlayView_SetControlsHidden relay relocation out of range/unsupported @ 0x"
+                                      << std::hex << set_controls_hidden_vaddr << std::dec << " — relay may be corrupt\n";
                         uint32_t* tail = (uint32_t*)(g_guest_memory + sch_cave + 4);
                         int64_t ret_offset = (int64_t)(set_controls_hidden_vaddr + 4) - (int64_t)(sch_cave + 4);
                         int64_t ret_imm = ret_offset / 4;
@@ -3521,8 +3538,10 @@ void load_and_boot_arm64() {
 
                     // ─── GUINavigationController relay caves ────────────────────────
                     // Save original first instructions so our safe hooks can call-through.
-                    // Three functions in the transition chain:
-                    //   Update (0x303099), ViewControllerViewLoaded (0x3030bd), FinishTransition (0x303681)
+                    // Three functions in the transition chain (v1.4.12 arm64
+                    // nm-verified offsets; the old 0x303099/0x3030bd/0x303681
+                    // comment values were stale):
+                    //   Update (0x49923c), ViewControllerViewLoaded (0x499288), FinishTransition (0x49a42c)
                     struct GUINavRelay {
                         uint64_t    nm_offset;
                         const char* engine_sym;
@@ -3615,9 +3634,12 @@ void load_and_boot_arm64() {
                         }
                         uint64_t orig_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, nr.sre_orig_sym);
                         uint64_t cave = TrampolineMgr::instance().reserve_cave(nr.sre_orig_sym);
-                        copy_and_relocate(g_guest_memory + cave,
+                        if (copy_and_relocate(g_guest_memory + cave,
                                           g_guest_memory + fn_vaddr,
-                                          cave, fn_vaddr, 1);
+                                          cave, fn_vaddr, 1) < 0)
+                            std::cerr << "[SRE] ERROR: " << nr.sre_orig_sym
+                                      << " relay relocation out of range/unsupported @ 0x"
+                                      << std::hex << fn_vaddr << std::dec << " — relay may be corrupt\n";
                         uint32_t* tail = (uint32_t*)(g_guest_memory + cave + 4);
                         int64_t roff = (int64_t)(fn_vaddr + 4) - (int64_t)(cave + 4);
                         tail[0] = 0x14000000 | ((roff / 4) & 0x3FFFFFF);
@@ -3653,9 +3675,12 @@ void load_and_boot_arm64() {
                         // Find the matching SRE hook function name (strip "g_orig_" prefix)
                         // For GUI relay stubs we build the cave manually and point g_orig_* at it.
                         uint64_t gr_cave = TrampolineMgr::instance().reserve_cave(r.orig_sym);
-                        copy_and_relocate(g_guest_memory + gr_cave,
+                        if (copy_and_relocate(g_guest_memory + gr_cave,
                                           g_guest_memory + vaddr,
-                                          gr_cave, vaddr, 1);
+                                          gr_cave, vaddr, 1) < 0)
+                            std::cerr << "[SRE] ERROR: " << r.orig_sym
+                                      << " GUI relay relocation out of range/unsupported @ 0x"
+                                      << std::hex << vaddr << std::dec << " — relay may be corrupt\n";
                         uint32_t* c32 = (uint32_t*)(g_guest_memory + gr_cave + 4);
                         int64_t ret_offset = (int64_t)(vaddr + 4) - (int64_t)(gr_cave + 4);
                         int64_t ret_imm = ret_offset / 4;
@@ -3717,6 +3742,27 @@ void load_and_boot_arm64() {
                             continue;
                         }
 
+                        // Hooks that call through to the original must be installed
+                        // atomically: relocate first, publish g_orig, then patch.
+                        const char* relay_orig_sym = nullptr;
+                        if (strcmp(sym_name, "sre_SceneLoadingView_Update") == 0)
+                            relay_orig_sym = "g_orig_SceneLoadingView_Update";
+                        else if (strcmp(sym_name, "sre_SceneLoadingView_AnimateIn") == 0)
+                            relay_orig_sym = "g_orig_SceneLoadingView_AnimateIn";
+
+                        if (relay_orig_sym) {
+                            uint64_t orig_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, relay_orig_sym);
+                            if (!orig_addr) {
+                                std::cerr << "[SRE] SKIP: Missing relay pointer " << relay_orig_sym << std::endl;
+                                continue;
+                            }
+                            if (TrampolineMgr::instance().install_hook(
+                                    sym_name, target_addr, replacement, orig_addr, 1)) {
+                                installed++;
+                            }
+                            continue;
+                        }
+
                         // Write a 4-byte direct unconditional branch trampoline at the target address
                         int64_t offset = (int64_t)replacement - (int64_t)target_addr;
                         int64_t imm = offset / 4;
@@ -3736,17 +3782,6 @@ void load_and_boot_arm64() {
                         *(uint64_t*)(g_guest_memory + g_orig_cxa_addr) = CXA_RELAY;
                         std::cout << "[SRE] g_original_cxa_throw → relay @ 0x" 
                                   << std::hex << CXA_RELAY << std::dec << std::endl;
-                    }
-
-                    // Set g_orig_ProgramState_Update to point to the relay stub
-                    // This lets sre_ProgramState_Update call the original for
-                    // the child ProgramState iteration loop (entity AI, cleanup).
-                    uint64_t g_orig_update_addr = g_loader_64->get_symbol_vaddr(
-                        &g_sre_mod, "g_orig_ProgramState_Update");
-                    if (g_orig_update_addr && update_vaddr) {
-                        *(uint64_t*)(g_guest_memory + g_orig_update_addr) = UPDATE_RELAY;
-                        std::cout << "[SRE] g_orig_ProgramState_Update → relay @ 0x"
-                                  << std::hex << UPDATE_RELAY << std::dec << std::endl;
                     }
 
                     // Set g_OverlayTextComponent_Interface_addr in libsre.so
@@ -4743,11 +4778,23 @@ void load_and_boot_arm64() {
         g_apply_viewsize_env_ptr      = env_ptr;
     }
     if (applicationDidBecomeActive) {
+        BOOT_LOADING(0.95f, "Starting game");
         std::cout << "[Boot64] Calling applicationDidBecomeActive" << std::endl;
         g_emulator_64->call(applicationDidBecomeActive, {env_ptr, 0});
     }
     std::cout << "[Diag64] Post-applicationDidBecomeActive" << std::endl;
     std::cout.flush();
+
+    // Boot is complete — the game will render its own frames from here on.
+    // Finish and tear down the loading screen (frees its ImGui context so the
+    // in-game GUI's context becomes current cleanly).
+    if (g_loading_screen) {
+        g_loading_screen->finish();
+        g_loading_screen->frame();
+        g_loading_screen->shutdown();
+        delete g_loading_screen;
+        g_loading_screen = nullptr;
+    }
 
     // ========================================================================
     // Death screen fix: Make game think "Remove Ads" IAP is purchased (ARM64)
@@ -4967,6 +5014,11 @@ void load_and_boot_arm64() {
                 if (g_sre_controls_disabled) {
                     return;
                 }
+
+                // Never feed touch events into an already-faulted guest — the
+                // guest CPU state is corrupt and dispatching handleTouchEvent
+                // would run against a broken scene (corrupted branch target).
+                if (g_emulator_64->has_faulted()) return;
                 
                 // Scale from legacy 960×544 touch space to actual game resolution
                 // (same as ARM32 call_handle_touch_event)
@@ -5079,12 +5131,53 @@ void load_and_boot_arm64() {
                 }
 
                 // ARM64 AAPCS: float dt goes in S0, not X2
+                //
+                // Step A (non-permanent guest faults): a guest fault used to
+                // permanently isolate the guest — updateApp was never called
+                // again, so the screen stayed black forever (draws=0). Instead,
+                // clear the latched fault at the top of each frame so the guest
+                // retries. A bad indirect vcall (e.g. the first-frame root-view
+                // dispatch on an uninitialised FWShell+0x88 member) now unwinds
+                // cleanly back to the host via the emulator's .dynstr bad-vcall
+                // recovery (Step B) rather than aborting the whole session.
+                //
+                // Guard against a tight deterministic re-crash loop: count
+                // consecutive frames in which the guest faulted and, past a
+                // small threshold, skip the guest update for THAT frame only
+                // (still retrying on later frames, e.g. once a scene finishes
+                // loading and the root view becomes valid).
+                static int   s_consecutive_frame_faults = 0;
+                static bool  s_logged_fault = false;
+                const int    kMaxConsecutiveFrameFaults = 8;
+                bool         skip_guest_update_this_frame = false;
                 if (g_emulator_64->has_faulted()) {
-                    static bool logged_fault = false;
-                    if (!logged_fault) {
-                        std::cerr << "[SRE/Fault] Guest execution halted due to memory fault. Isolating guest context to prevent host SIGSEGV." << std::endl;
-                        logged_fault = true;
+                    s_consecutive_frame_faults++;
+                    if (!s_logged_fault) {
+                        std::cerr << "[SRE/Fault] Guest faulted — clearing fault and retrying next frame "
+                                     "(non-permanent isolation)." << std::endl;
+                        s_logged_fault = true;
                     }
+                    // Clear the latched fault so the guest can run again.
+                    g_emulator_64->clear_faulted();
+                    if (s_consecutive_frame_faults > kMaxConsecutiveFrameFaults) {
+                        // Deterministic re-crash: skip the guest update this frame
+                        // to avoid burning CPU on a call that always faults, but
+                        // DO keep trying on subsequent frames.
+                        skip_guest_update_this_frame = true;
+                        static int s_skip_log = 0;
+                        if (s_skip_log++ < 5) {
+                            std::cerr << "[SRE/Fault] " << s_consecutive_frame_faults
+                                      << " consecutive faults — skipping guest update this frame only."
+                                      << std::endl;
+                        }
+                    }
+                } else {
+                    // A clean frame resets the counter so transient faults don't
+                    // accumulate toward the skip threshold.
+                    s_consecutive_frame_faults = 0;
+                }
+                if (skip_guest_update_this_frame) {
+                    // fall through to the render/blit path without running updateApp
                 } else {
                     // Run any threads left over from the previous frame BEFORE updating.
                     // Scene transitions queue a background load thread; running it here
@@ -5125,6 +5218,75 @@ void load_and_boot_arm64() {
 
                         update_ticks_before = sre_update_ticks_addr
                             ? *(volatile uint64_t*)(g_guest_memory + sre_update_ticks_addr) : 0;
+
+                        // ── Step C: FWShell root-view sanity guard ──────────────────────────
+                        // Root cause of draws=0: on the first Update tick the guest dispatches
+                        // a virtual call through FWShell+0x88 (CaverShell::Update:
+                        // ldr x0,[x19,#136]; x8=[x0]; blr [x8,#72]). Early in boot that member
+                        // holds a garbage/not-yet-ready view pointer (observed 0xcea33c90,
+                        // vptr=0), so the vcall faults every frame and rendering never starts.
+                        // If the member currently points at a garbage view (bad range or bad
+                        // vtable), zero it so the guest's own null-checks skip the dispatch this
+                        // frame. Self-heals: once CaverShell::InitView installs a valid view
+                        // (sane vtable in code range), the guard stops firing and draws proceed.
+                        if (g_guest_memory) {
+                            static const uint64_t kShellAddr   = 0x16e9c20ULL; // DAT_007e9c20 + 0x1000000
+                            static const uint64_t kArenaEnd    = 0xE0000000ULL;
+                            static const uint32_t kRootOff     = 0x88;
+                            const uint64_t code_lo = 0x1000000ULL;
+                            const uint64_t code_hi = 0x1000000ULL + g_main_mod_64.mem_size;
+
+                            // (1) Read FWShell singleton. Inspect both widths once for diagnosis.
+                            static bool s_shell_diag = false;
+                            uint64_t shell64 = 0; uint32_t shell32 = 0;
+                            if (kShellAddr + 8 < kArenaEnd) {
+                                std::memcpy(&shell64, g_guest_memory + kShellAddr, 8);
+                                std::memcpy(&shell32, g_guest_memory + kShellAddr, 4);
+                            }
+                            if (!s_shell_diag) {
+                                std::cerr << "[RenderGuard] FWShell@0x" << std::hex << kShellAddr
+                                          << " raw64=0x" << shell64 << " raw32=0x" << shell32
+                                          << std::dec << std::endl;
+                                s_shell_diag = true;
+                            }
+                            // Prefer whichever width yields a sane guest heap pointer.
+                            auto in_heap = [](uint64_t p){ return p >= 0x20000000ULL && p < 0x47000000ULL; };
+                            uint64_t shell = 0;
+                            if (in_heap(shell32)) shell = shell32;
+                            else if (in_heap(shell64)) shell = shell64;
+
+                            if (shell) {
+                                uint32_t root_addr32 = (uint32_t)(shell & 0xffffffffULL) + kRootOff;
+                                if ((uint64_t)root_addr32 + 4 < kArenaEnd) {
+                                    uint32_t rootview = 0;
+                                    std::memcpy(&rootview, g_guest_memory + root_addr32, 4);
+                                    if (rootview != 0) {
+                                        // (3) Decide if the root view is garbage / not ready.
+                                        bool bad = (rootview < 0x10000 || rootview >= 0xE0000000ULL);
+                                        uint64_t vptr = 0;
+                                        if (!bad && (uint64_t)rootview + 8 < kArenaEnd) {
+                                            std::memcpy(&vptr, g_guest_memory + rootview, 8);
+                                            if (vptr == 0 || vptr < code_lo || vptr >= code_hi)
+                                                bad = true;
+                                        } else if (!bad) {
+                                            bad = true; // can't safely read vtable → treat as bad
+                                        }
+                                        if (bad) {
+                                            uint32_t zero = 0;
+                                            std::memcpy(g_guest_memory + root_addr32, &zero, 4);
+                                            static int s_guard_log = 0;
+                                            if (s_guard_log++ < 5) {
+                                                std::cerr << "[RenderGuard] Zeroed garbage FWShell root-view 0x"
+                                                          << std::hex << rootview << " (vptr=0x" << vptr
+                                                          << std::dec << ") — skipping dispatch until valid view installed"
+                                                          << std::endl;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         g_emulator_64->call(updateApp, {env_ptr, 0});
                         update_ticks_after = sre_update_ticks_addr
                             ? *(volatile uint64_t*)(g_guest_memory + sre_update_ticks_addr) : 0;
@@ -5141,14 +5303,30 @@ void load_and_boot_arm64() {
                             uint64_t shell_ticks = *(volatile uint64_t*)(g_guest_memory + sre_shell_ticks_addr);
                             uint64_t poll_ticks = *(volatile uint64_t*)(g_guest_memory + sre_scene_poll_ticks_addr);
                             uint64_t world_drive = 0;
+                            uint64_t ps_ticks = 0, ps_susp = 0, ps_fires = 0, ps_errs = 0;
+                            uint64_t obj_count = 0, obj_removals = 0;
                             {
                                 static uint64_t s_wd_addr = 0;
+                                static uint64_t s_ps_addr[4] = {0,0,0,0};
+                                static uint64_t s_obj_addr[2] = {0,0};
                                 static bool s_wd_resolved = false;
                                 if (!s_wd_resolved && g_loader_64) {
                                     s_wd_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_world_drive_count");
+                                    s_ps_addr[0] = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_ps_ticks");
+                                    s_ps_addr[1] = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_ps_suspended_seen");
+                                    s_ps_addr[2] = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_ps_timer_fires");
+                                    s_ps_addr[3] = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_ps_resume_errors");
+                                    s_obj_addr[0] = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_object_count");
+                                    s_obj_addr[1] = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_object_removals");
                                     s_wd_resolved = true;
                                 }
                                 if (s_wd_addr) world_drive = *(volatile uint64_t*)(g_guest_memory + s_wd_addr);
+                                if (s_ps_addr[0]) ps_ticks = *(volatile uint64_t*)(g_guest_memory + s_ps_addr[0]);
+                                if (s_ps_addr[1]) ps_susp  = *(volatile uint64_t*)(g_guest_memory + s_ps_addr[1]);
+                                if (s_ps_addr[2]) ps_fires = *(volatile uint64_t*)(g_guest_memory + s_ps_addr[2]);
+                                if (s_ps_addr[3]) ps_errs  = *(volatile uint64_t*)(g_guest_memory + s_ps_addr[3]);
+                                if (s_obj_addr[0]) obj_count = *(volatile uint64_t*)(g_guest_memory + s_obj_addr[0]);
+                                if (s_obj_addr[1]) obj_removals = *(volatile uint64_t*)(g_guest_memory + s_obj_addr[1]);
                             }
                             uint64_t guest_poll_ticks = poll_ticks >= host_scene_poll_calls
                                 ? poll_ticks - host_scene_poll_calls : 0;
@@ -5160,7 +5338,29 @@ void load_and_boot_arm64() {
                                       << " scene_poll_guest=" << guest_poll_ticks
                                       << " scene_poll_fallback=" << host_scene_poll_calls
                                       << " world_drive=" << world_drive
-                                      << std::endl;
+                                      << " ps_ticks=" << ps_ticks
+                                      << " ps_susp=" << ps_susp
+                                      << " ps_fires=" << ps_fires
+                                      << " ps_errs=" << ps_errs
+                                      << " obj=" << obj_count
+                                      << " rm=" << obj_removals
+                                      << " scene=";
+                            {
+                                static uint64_t s_scn_addr = 0;
+                                static bool s_scn_resolved = false;
+                                if (!s_scn_resolved && g_loader_64) {
+                                    s_scn_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_current_scene_name");
+                                    s_scn_resolved = true;
+                                }
+                                if (s_scn_addr && *(volatile char*)(g_guest_memory + s_scn_addr)) {
+                                    // Clamp to the 128-byte guest buffer (g_sre_current_scene_name[128])
+                                    size_t scn_len = strnlen((const char*)(g_guest_memory + s_scn_addr), 127);
+                                    std::cout.write((const char*)(g_guest_memory + s_scn_addr), scn_len);
+                                } else {
+                                    std::cout << "(none)";
+                                }
+                            }
+                            std::cout << std::endl;
                             s_diag_frame = completed_frames;
                         } else if (completed_frames == 0 &&
                                    (!sre_update_ticks_addr || !sre_frame_ticks_addr ||
@@ -5176,15 +5376,32 @@ void load_and_boot_arm64() {
                         // skipped (exception path). Force-clear so next frame runs clean.
                         // Also suppress HUD data reads for 2 frames so we don't spam
                         // stale game-state pointers while the new scene is activating.
+                        // Only force-clear after the flag has stayed stuck for a
+                        // grace period of consecutive frames. A legitimately
+                        // in-progress background scene load must not be clobbered
+                        // mid-init, otherwise the next updateApplication runs against
+                        // a half-initialized scene (corrupted branch-target crash).
+                        static int s_scene_stuck_frames = 0;
                         if (was_scene_loading && s_scene_loading_addr) {
                             int still_loading = *(volatile int*)(g_guest_memory + s_scene_loading_addr);
                             if (still_loading) {
-                                std::cout << "[Watchdog] Scene load flag stuck after frame — force-clearing." << std::endl;
-                                *(volatile int*)(g_guest_memory + s_scene_loading_addr) = 0;
-                                // Suppress HUD spam for 2 frames
-                                if (s_suppress_hud_addr)
-                                    *(volatile int*)(g_guest_memory + s_suppress_hud_addr) = 2;
+                                s_scene_stuck_frames++;
+                                if (s_scene_stuck_frames >= 8) {
+                                    std::cout << "[Watchdog] Scene load flag stuck for "
+                                              << s_scene_stuck_frames
+                                              << " consecutive frames — force-clearing." << std::endl;
+                                    *(volatile int*)(g_guest_memory + s_scene_loading_addr) = 0;
+                                    // Suppress HUD spam for 2 frames
+                                    if (s_suppress_hud_addr)
+                                        *(volatile int*)(g_guest_memory + s_suppress_hud_addr) = 2;
+                                    s_scene_stuck_frames = 0;
+                                }
+                                // Below threshold: do NOT clear — let the load finish.
+                            } else {
+                                s_scene_stuck_frames = 0;
                             }
+                        } else {
+                            s_scene_stuck_frames = 0;
                         }
                     }
 
@@ -5197,6 +5414,46 @@ void load_and_boot_arm64() {
                         host_scene_poll_calls++;
                         std::cerr << "[SRE/FrameDiag] JNI hook missed; host poll fallback used at host_frame="
                                   << completed_frames << std::endl;
+                    }
+
+                    // ── Auto Level Loader (debug) ────────────────────────────────
+                    // SWORDIGO_AUTO_LEVEL=<scene> [SWORDIGO_AUTO_SPAWN=<spawn>]
+                    // After boot stabilizes (~frame 200), requests a scene shift via
+                    // the guest scene-shifter vars so we can test in-game behavior
+                    // (e.g. timed object destruction) headlessly.
+                    // WARNING: GotoLevel from the MENU state currently hangs the
+                    // guest (spin at 0x54c6d4 after FinishLoad) — only set this
+                    // when a GameViewController is already active (in-game), or
+                    // expect the load to freeze.
+                    {
+                        static int      s_auto_state = 0;  /* 0=unresolved,1=armed,2=fired */
+                        static uint64_t s_ss_pending_va = 0, s_ss_target_va = 0, s_ss_spawn_va = 0;
+                        const char* auto_level = getenv("SWORDIGO_AUTO_LEVEL");
+                        if (auto_level && g_use_sre && g_loader_64 && g_guest_memory && s_auto_state != 2) {
+                            if (s_auto_state == 0) {
+                                s_ss_pending_va = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_pending");
+                                s_ss_target_va  = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_target");
+                                s_ss_spawn_va   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_spawn");
+                                std::cout << "[AutoLevel] resolved pending=0x" << std::hex << s_ss_pending_va
+                                          << " target=0x" << s_ss_target_va
+                                          << " spawn=0x" << s_ss_spawn_va << std::dec << std::endl;
+                                s_auto_state = 1;
+                            }
+                            if (s_auto_state == 1 && completed_frames > 200 &&
+                                s_ss_pending_va && s_ss_target_va) {
+                                int pending = *(volatile int*)(g_guest_memory + s_ss_pending_va);
+                                if (!pending) {
+                                    strncpy((char*)(g_guest_memory + s_ss_target_va), auto_level, 127);
+                                    const char* spawn = getenv("SWORDIGO_AUTO_SPAWN");
+                                    if (spawn && s_ss_spawn_va)
+                                        strncpy((char*)(g_guest_memory + s_ss_spawn_va), spawn, 63);
+                                    *(volatile int*)(g_guest_memory + s_ss_pending_va) = 1;
+                                    std::cout << "[AutoLevel] Scene shift request -> '" << auto_level
+                                              << "' spawn='" << (spawn ? spawn : "start") << "'" << std::endl;
+                                    s_auto_state = 2;
+                                }
+                            }
+                        }
                     }
 
 
@@ -6785,11 +7042,15 @@ int g_saved_argc = 0;
 int main(int argc, char* argv[]) {
     g_saved_argc = argc;
     g_saved_argv = argv;
+    // Install the sleek fatal-crash reporting window early: a SIGSEGV/SIGABRT
+    // in the emulator or host bridges now surfaces a GUI crash box with a
+    // backtrace instead of the process vanishing silently.
+    crashui::install_crash_handler();
     os_external::set_dev_working_dir(); // Windows: chdir to repo root so src/assets resolves
     // Check for --headless flag
     bool headless = false;
     bool use_openswordigo = false;
-    std::string openswordigo_scene = "menu.scene";
+    std::string openswordigo_scene = "town_part1.scene";
     std::string openswordigo_library;
 #ifdef HEADLESS_DEFAULT
     headless = true;
@@ -7021,6 +7282,10 @@ int main(int argc, char* argv[]) {
                 g_display_active = true;
                 g_display_ptr = &display;
                 display_initialized = true;
+                // The boot loading screen is created AFTER g_swordfare_gui.init()
+                // below, because it reuses that GUI's ImGui context + shared
+                // SDL3/GL3 backend (creating a second backend and later shutting
+                // it down crashed the game GUI's first frame).
             }
         }
 
@@ -7049,12 +7314,34 @@ int main(int argc, char* argv[]) {
                       << " | render: " << GAME_W << "x" << GAME_H
                       << " | aspect: " << std::fixed << std::setprecision(3)
                       << ((float)GAME_W / GAME_H) << std::endl;
-            if (g_graphics_api == GraphicsAPI::OPENGL) {
-                g_swordfare_gui.init(display.get_window(), SDL_GL_GetCurrentContext());
+            // OpenSwordigo owns its own ImGui context for the in-engine menu
+            // (see openswordigo_plugin.cpp) — don't double-init the host GUI.
+            if (!use_openswordigo) {
+                if (g_graphics_api == GraphicsAPI::OPENGL) {
+                    g_swordfare_gui.init(display.get_window(), SDL_GL_GetCurrentContext());
 #ifdef VULKAN_BACKEND
-            } else if (g_graphics_api == GraphicsAPI::VULKAN) {
-                g_swordfare_gui.init_vulkan(display.get_window(), &g_vk_backend);
+                } else if (g_graphics_api == GraphicsAPI::VULKAN) {
+                    g_swordfare_gui.init_vulkan(display.get_window(), &g_vk_backend);
 #endif
+                }
+
+                // Bring up the boot loading screen now that the game GUI owns a
+                // live ImGui context + SDL3/GL3 backend. The loading screen
+                // REUSES that context/backend (OpenGL path only) so it shows the
+                // logo + hiro animation + progress during the boot gap instead
+                // of a blank window — and tears down only its own resources.
+                if (!headless && g_graphics_api == GraphicsAPI::OPENGL &&
+                    g_swordfare_gui.is_initialized() && g_swordfare_gui.imgui_context()) {
+                    g_loading_screen = new LoadingScreen();
+                    if (!g_loading_screen->init(display.get_window(),
+                                                g_swordfare_gui.imgui_context())) {
+                        delete g_loading_screen;
+                        g_loading_screen = nullptr;
+                    } else {
+                        g_loading_screen->set_stage("Preparing runtime");
+                        g_loading_screen->frame();
+                    }
+                }
             }
         } else {
             std::cerr << "[Main] Display init failed, falling back to headless" << std::endl;

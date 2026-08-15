@@ -45,6 +45,8 @@
 #include "tools/av_renderer.h"
 #include "tools/av_audio.h"
 #include "tools/scene_loader.h"
+#include "tools/scene_creator.h"
+#include "tools/scene_generator.h"
 #include "tools/scene_schemas.h"
 #include "tools/intellij.h"
 #include "tools/boulder.h"
@@ -56,6 +58,8 @@
 #include "tools/scene_game.h"
 #include "tools/ruby_mcp.h"
 #include "tools/scene_categories.h"
+#include "tools/map_loader.h"
+#include "tools/map_editor.h"
 #include "Guizmo/src/ImGuizmo.h"
 #include <zlib.h>
 
@@ -133,6 +137,35 @@ static const float MIN_EDITOR_W      = 320.0f;
 static const float MIN_EDITOR_H      = 180.0f;
 static const char* GLSL_VERSION      = "#version 330";
 
+// The OS title bar is deliberately disabled for Ruby.  This hit-test gives
+// the borderless window native-quality resize edges plus a safe drag region in
+// the unused part of the custom app bar; menus and window-control buttons keep
+// their normal ImGui mouse input.
+static SDL_HitTestResult SDLCALL ruby_window_hit_test(SDL_Window* window,
+                                                       const SDL_Point* area,
+                                                       void*) {
+    int width = 0, height = 0;
+    SDL_GetWindowSize(window, &width, &height);
+    const bool maximized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
+    constexpr int edge = 7;
+    if (!maximized) {
+        const bool left = area->x < edge, right = area->x >= width - edge;
+        const bool top = area->y < edge, bottom = area->y >= height - edge;
+        if (top && left) return SDL_HITTEST_RESIZE_TOPLEFT;
+        if (top && right) return SDL_HITTEST_RESIZE_TOPRIGHT;
+        if (bottom && left) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+        if (bottom && right) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+        if (left) return SDL_HITTEST_RESIZE_LEFT;
+        if (right) return SDL_HITTEST_RESIZE_RIGHT;
+        if (top) return SDL_HITTEST_RESIZE_TOP;
+        if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
+    }
+    // Keep x < 650 for Ruby's menus and the right-most 116 px for controls.
+    if (!maximized && area->y < 40 && area->x >= 650 && area->x < width - 116)
+        return SDL_HITTEST_DRAGGABLE;
+    return SDL_HITTEST_NORMAL;
+}
+
 struct RubyTheme {
     ImVec4 background, panel, panel_alt, surface, surface_hover, surface_active;
     ImVec4 border, text, text_muted, accent, warning, error, success, selection;
@@ -160,8 +193,8 @@ static ImVec4 th_text_on(const ImVec4& bg) {
 // File entry & type classification
 // ============================================================================
 
-enum FileType { FTYPE_OTHER = 0, FTYPE_TEXTURE = 1, FTYPE_MODEL = 2, FTYPE_SCENE = 3, FTYPE_AUDIO = 4, FTYPE_TEXT = 5 };
-enum PreviewType { PREVIEW_NONE = 0, PREVIEW_TEXTURE, PREVIEW_MODEL, PREVIEW_SCENE, PREVIEW_AUDIO, PREVIEW_TEXT = 5 };
+enum FileType { FTYPE_OTHER = 0, FTYPE_TEXTURE = 1, FTYPE_MODEL = 2, FTYPE_SCENE = 3, FTYPE_AUDIO = 4, FTYPE_TEXT = 5, FTYPE_MAP = 6 };
+enum PreviewType { PREVIEW_NONE = 0, PREVIEW_TEXTURE, PREVIEW_MODEL, PREVIEW_SCENE, PREVIEW_AUDIO, PREVIEW_TEXT = 5, PREVIEW_MAP = 6 };
 
 struct FileEntry {
     std::string name;
@@ -172,39 +205,174 @@ struct FileEntry {
     std::string vendor_scn;   // non-empty: dir holds a renderer-master demo .scn (folder pack)
 };
 
-static int classify_file(const std::string& name) {
+struct ContentProbe {
+    int type = FTYPE_OTHER;
+    std::string protobuf_type;       // schema to use when saving decoded markup
+    bool decoded_markup = false;
+};
+
+static bool looks_like_text(const std::string& bytes) {
+    if (bytes.empty()) return true;
+    size_t printable = 0;
+    for (unsigned char c : bytes) {
+        if (c == 0) return false;
+        if (c == '\n' || c == '\r' || c == '\t' || (c >= 0x20 && c < 0x7f) || c >= 0x80) ++printable;
+    }
+    return printable * 100 >= bytes.size() * 92;
+}
+
+static ContentProbe probe_file_content(const std::string& path) {
+    ContentProbe result;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return result;
+    std::string head(64 * 1024, '\0');
+    input.read(head.data(), static_cast<std::streamsize>(head.size()));
+    head.resize(static_cast<size_t>(input.gcount()));
+    const auto starts = [&](const char* magic) {
+        const size_t n = std::strlen(magic);
+        return head.size() >= n && std::memcmp(head.data(), magic, n) == 0;
+    };
+    if (starts("\x89PNG\r\n\x1a\n") || starts("\xff\xd8\xff") || starts("PVR\x03") || starts("\x50\x56\x52\x03") || starts("OggS") ||
+        (starts("RIFF") && head.size() >= 12 && std::memcmp(head.data() + 8, "WAVE", 4) == 0) || starts("ID3")) {
+        result.type = starts("OggS") || starts("ID3") || starts("RIFF") ? FTYPE_AUDIO : FTYPE_TEXTURE;
+        return result;
+    }
+    if (starts("glTF") || starts("Kaydara FBX Binary") || starts("; FBX")) { result.type = FTYPE_MODEL; return result; }
+
+    const std::string decoded_prefix = "## FileRift decoded Swordigo file type: ";
+    if (head.rfind(decoded_prefix, 0) == 0) {
+        const size_t begin = decoded_prefix.size();
+        const size_t end = head.find_first_of("\r\n ", begin);
+        result.protobuf_type = head.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        result.decoded_markup = true;
+        result.type = result.protobuf_type == "scene" ? FTYPE_SCENE :
+                      result.protobuf_type == "scmap" ? FTYPE_MAP : FTYPE_TEXT;
+        return result;
+    }
+    // Headerless FileRift markup is common when source has been copied out of
+    // the SDK.  These root records are unambiguous enough to open as source.
+    if (looks_like_text(head)) {
+        if (head.find("SceneObject {") != std::string::npos || head.find("Object {") != std::string::npos ||
+            head.find("SceneObject{") != std::string::npos || head.find("Object{") != std::string::npos) {
+            result.type = FTYPE_SCENE;
+            result.protobuf_type = "scene";
+            result.decoded_markup = true;
+            return result;
+        }
+        if (head.find("ObjectLibrary {") != std::string::npos) {
+            result.type = FTYPE_TEXT;
+            result.protobuf_type = "scl";
+            result.decoded_markup = true;
+            return result;
+        }
+        if (head.find("type:") == 0) { result.type = FTYPE_MODEL; return result; }
+        result.type = FTYPE_TEXT;
+        return result;
+    }
+
+    // Binary FileRift scenes have no magic number. Their first-level object
+    // records reliably carry these schema strings, so recognise them before
+    // using an extension as a compatibility fallback.
+    if (head.find("Background") != std::string::npos || head.find("SpawnPoint") != std::string::npos ||
+        head.find("GroundMesh") != std::string::npos) {
+        result.type = FTYPE_SCENE;
+        result.protobuf_type = "scene";
+        return result;
+    }
+
+    const std::string name = fs::path(path).filename().string();
     auto dot = name.rfind('.');
-    if (dot == std::string::npos) return FTYPE_OTHER;
+    if (dot == std::string::npos) return result;
     std::string ext = name.substr(dot);
     for (auto& c : ext) c = (char)tolower((unsigned char)c);
 
-    if (ext == ".pvr" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tex" || ext == ".tga") return FTYPE_TEXTURE;
+    if (ext == ".pvr" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tex" || ext == ".tga") { result.type = FTYPE_TEXTURE; return result; }
     if (name.size() > 8) {
         std::string low = name;
         for (auto& c : low) c = (char)tolower((unsigned char)c);
-        if (low.find(".tex.png") != std::string::npos) return FTYPE_TEXTURE;
+        if (low.find(".tex.png") != std::string::npos) { result.type = FTYPE_TEXTURE; return result; }
     }
-    if (ext == ".pod") return FTYPE_MODEL;
-    if (ext == ".fbx") return FTYPE_MODEL;
-    if (ext == ".glb" || ext == ".gltf") return FTYPE_MODEL;   // glTF 2.0 (binary/JSON)
-    if (ext == ".obj") return FTYPE_MODEL;   // Wavefront (renderer-master ext.joint/weight)
-    if (ext == ".scene") return FTYPE_SCENE;
-    if (ext == ".wav" || ext == ".ogg" || ext == ".mp3") return FTYPE_AUDIO;
+    if (ext == ".pod" || ext == ".fbx" || ext == ".glb" || ext == ".gltf" || ext == ".obj") { result.type = FTYPE_MODEL; return result; }
+    if (ext == ".scene") { result.type = FTYPE_SCENE; result.protobuf_type = "scene"; return result; }
+    if (ext == ".scmap") { result.type = FTYPE_MAP; result.protobuf_type = "scmap"; return result; }
+    if (ext == ".wav" || ext == ".ogg" || ext == ".mp3") { result.type = FTYPE_AUDIO; return result; }
     if (ext == ".txt" || ext == ".lua" || ext == ".xml" || ext == ".plist" ||
         ext == ".json" || ext == ".shader" || ext == ".vs" || ext == ".fs" ||
         ext == ".cfg" || ext == ".ini" || ext == ".md" || ext == ".log" || ext == ".sh" ||
         ext == ".cpp" || ext == ".h" || ext == ".c" ||
         ext == ".scl" || ext == ".gdata" || ext == ".gstate" || ext == ".gplayer" ||
-        ext == ".gopt" || ext == ".sounds" || ext == ".scmap" || ext == ".atlas" || ext == ".fnt" ||
+        ext == ".gopt" || ext == ".sounds" || ext == ".atlas" || ext == ".fnt" ||
         ext == ".gmesh") {
-        return FTYPE_TEXT;
+        result.type = FTYPE_TEXT;
+        if (ext == ".scl") result.protobuf_type = "scl";
+        else if (ext == ".gdata" || ext == ".gstate" || ext == ".gplayer" || ext == ".gopt" ||
+                 ext == ".sounds" || ext == ".atlas" || ext == ".fnt") result.protobuf_type = ext.substr(1);
+        return result;
     }
-    return FTYPE_OTHER;
+    return result;
 }
 
 // ============================================================================
 // Viewer state
 // ============================================================================
+
+struct SceneCreatorPortalEntry {
+    char destination[128] = {};
+    char spawn_name[128]  = {};
+    bool tap_to_enter = true;
+    float x = 0.0f, y = 0.0f;
+    float rect_w = 83.0f, rect_h = 110.0f;
+    int   facing = 1;
+};
+
+struct SceneCreatorDialogState {
+    bool open         = false;
+    bool request_open = false;
+
+    // ── Identity & output ──────────────────────────────────────────────────
+    char output_path[1024] = {};
+    char level_name[128]   = "new_level";
+    char scene_namespace[128] = "my_mod";
+
+    // ── Template ───────────────────────────────────────────────────────────
+    int scene_template = 1;  // scenecreate::SceneTemplate index (0=Minimal … 7=Menu)
+
+    // ── Visuals ────────────────────────────────────────────────────────────
+    char base_mesh[256]  = {};
+    char background[256] = {};
+
+    // ── Ground mesh ────────────────────────────────────────────────────────
+    char ground_top[128]  = "fire_grass";
+    char ground_side[128] = "graveyard_ground";
+    float platform_size[3] = {320.0f, 48.0f, 90.0f};
+
+    // ── Spawn ──────────────────────────────────────────────────────────────
+    float spawn[3] = {0.0f, 56.0f, 0.0f};
+    int   facing   = 1;
+
+    // ── DirectionalLight overrides ─────────────────────────────────────────
+    bool  light_advanced = false;  // show the override sliders
+    float key_intensity    = 3.0f;
+    float ambient_intensity = 0.3f;
+    float shadow_intensity  = 0.4f;
+    float key_color[3]    = {1.0f, 1.0f, 1.0f};
+
+    // ── Scene Bounds override ─────────────────────────────────────────────
+    bool  bounds_override = false;
+    float bounds[4]       = {-3500.0f, -1000.0f, 5500.0f, 2500.0f}; // X,Y,W,H
+
+    // ── Portals ───────────────────────────────────────────────────────────
+    int portal_count = 0;
+    static constexpr int kMaxPortals = 4;
+    SceneCreatorPortalEntry portals[kMaxPortals];
+
+    // ── Map link ──────────────────────────────────────────────────────────
+    char map_path[1024]  = {};
+    bool link_to_map     = false;
+
+    // ── Status ────────────────────────────────────────────────────────────
+    std::string error;
+};
 
 struct ViewerState {
     // File browser
@@ -317,6 +485,8 @@ struct ViewerState {
     bool  scene_overlay_enabled = true; // apply overlay-light darkness veil
     bool  scene_lighting_enabled = true; // dynamic Lambert lighting (off = flat texture)
     bool  scene_normals_debug = false;   // color = world normal (orientation check)
+    bool  scene_dimension_rift = false;  // reveal DimensionObject components (rift powerup)
+
     // Textures for parsed WaterMesh sheets (parallel to st.scene.waters).
     std::vector<GLuint> scene_water_textures;
     float render_scale = 3.0f;          // high-DPI FBO render scale (default 3x)
@@ -384,6 +554,8 @@ struct ViewerState {
     float gm_max_depth = 45.0f;
     float gm_top_angle  = 20.0f;
     bool  gm_generate_top = true;
+    bool  gm_dimension_object = false;  // tag generated mesh as a DimensionObject
+
     char  gm_top_tex[96]    = "fire_grass";
     char  gm_bottom_tex[96] = "graveyard_ground";
     int   gm_drag_point = -1;           // point being dragged (-1 = none)
@@ -513,6 +685,8 @@ struct ViewerState {
     bool        tex_reset_required = false;
     std::string text_preview_content;
     std::string text_edit_buffer;
+    std::string text_protobuf_type;    // detected schema; independent of file name
+    bool        text_is_decoded_markup = false;
     bool        text_is_binary = false;
     bool        text_select_mode = false;
     bool        text_edit_modified = false;
@@ -535,7 +709,24 @@ pid_t                    pty_child_pid   = -1;
     char                     terminal_input[512] = {};
     bool                     terminal_scroll_to_bottom = false;
 
+    // --- Procedural Scene Generator dialog (v2 biome presets) ---
+    bool       proc_gen_open = false;
+    bool       proc_gen_request = false;
+    int        proc_gen_biome = 0;         // sgen::Biome
+    uint32_t   proc_gen_seed = 1337;
+    float      proc_gen_width = 4200.0f;
+    float      proc_gen_height = 900.0f;
+    int        proc_gen_platforms = 6;
+    bool       proc_gen_water = true;
+    bool       proc_gen_torches = true;
+    bool       proc_gen_mountains = false;
+    bool       proc_gen_islands = false;
+    float      proc_gen_deco = 1.0f;
+    char       proc_gen_name[96] = "procedural_scene";
+    std::string proc_gen_status;
+
     // --- Scene Editor state ---
+    SceneCreatorDialogState scene_creator;
     bool        scene_dirty = false;       // true when unsaved changes exist
     bool        scene_save_requested = false;
     std::string scene_save_msg;            // status message after last save
@@ -588,6 +779,9 @@ pid_t                    pty_child_pid   = -1;
     bool        convert_tex_pgm  = true;     // re-encode textures to .tex.png
     bool        convert_flip_v   = true;      // flip V (FBX top → game bottom)
     std::string convert_status;                // last conversion result line
+
+    // World-map (.scmap) editor state
+    mapedit::MapEditorState map_editor;
 };
 
 
@@ -799,6 +993,7 @@ static void paste_scene_selection(ViewerState& st) {
         ? std::vector<av::SceneObject>{st.scene_object_clipboard}
         : st.scene_object_clipboard_multi;
     st.scene_selection.clear();
+    const size_t paste_start = st.scene.objects.size();
     for (const auto& copied : source) {
         av::SceneObject pasted = copied;
         pasted.name = av::scene_fresh_identifier(st.scene);
@@ -811,6 +1006,20 @@ static void paste_scene_selection(ViewerState& st) {
     st.selected_object = st.scene_selection.empty() ? -1 : st.scene_selection.back();
     sync_scene_object_editor(st);
     resync_scene_ground_meshes(st);
+    // Fix #4 (cross-scene paste): load model + background caches for every
+    // newly pasted object — they may be from a different scene whose resources
+    // were cleared when select_file() ran. Same-scene paste is a no-op because
+    // the original object's names are already cached.
+    if (!st.scene.filepath.empty()) {
+        const fs::path scene_dir = fs::path(st.scene.filepath).parent_path();
+        for (size_t i = paste_start; i < st.scene.objects.size(); ++i) {
+            const auto& pobj = st.scene.objects[i];
+            if (!pobj.mesh_name.empty())
+                load_scene_model_to_cache(st, pobj.mesh_name, scene_dir.string());
+            if (!pobj.background_name.empty())
+                load_scene_background_texture(st, pobj.background_name, scene_dir.string());
+        }
+    }
     st.scene_dirty = true;
     st.status_msg = "Pasted " + std::to_string(source.size()) + " object(s)";
 }
@@ -845,6 +1054,8 @@ static void move_scene_object(ViewerState& st, int direction) {
     snapshot_scene(st);
     av::scene_move_object(st.scene, st.selected_object, destination);
     select_scene_object(st, destination);
+    // Fix #6: after a reorder the parallel ground-cache arrays are misaligned.
+    resync_scene_ground_meshes(st);
     st.scene_dirty = true;
 }
 
@@ -950,6 +1161,8 @@ static const char* filetype_label(int ft, const char* path) {
         case FTYPE_MODEL:   return "Model";
         case FTYPE_SCENE:   return "Scene";
         case FTYPE_AUDIO:   return "Audio";
+        case FTYPE_MAP:     return "World Map";
+        case FTYPE_TEXT:    return "Text";
         default:            return "File";
     }
 }
@@ -1044,7 +1257,7 @@ static void refresh_directory(ViewerState& st) {
         fe.full_path = entry.path().string();
         fe.is_dir = entry.is_directory(ec);
         fe.size = fe.is_dir ? 0 : (size_t)entry.file_size(ec);
-        fe.type = fe.is_dir ? FTYPE_OTHER : classify_file(fe.name);
+        fe.type = fe.is_dir ? FTYPE_OTHER : probe_file_content(fe.full_path).type;
         if (fe.is_dir) fe.vendor_scn = find_vendor_scn_in_dir(fe.full_path);
         st.files.push_back(fe);
     }
@@ -1075,7 +1288,11 @@ static void apply_filters(ViewerState& st) {
     for (auto& c : search_lower) c = (char)tolower((unsigned char)c);
 
     for (auto& f : st.files) {
-        if (st.type_filter != 0 && !f.is_dir && f.type != st.type_filter) continue;
+        if (st.type_filter != 0 && !f.is_dir) {
+            if (f.type != st.type_filter &&
+                !(st.type_filter == FTYPE_TEXT && f.type == FTYPE_MAP))
+                continue;   // maps stay visible under the Code/Text chip
+        }
         if (!search_lower.empty()) {
             std::string name_lower = f.name;
             for (auto& c : name_lower) c = (char)tolower((unsigned char)c);
@@ -1734,6 +1951,7 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
     st.sel_name = fe.name;
     st.sel_path = fe.full_path;
     st.sel_size = fe.size;
+    const ContentProbe content = probe_file_content(fe.full_path);
 
     switch (fe.type) {
     case FTYPE_TEXTURE: {
@@ -1976,7 +2194,36 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
         st.scene_loading = true;          // loading screen (see main frame)
         st.scene_loading_frames = 3.0f;
         st.scene_loading_msg = fe.name;
-        st.scene = av::scene_load(fe.full_path);
+        // Source exported/edited outside Ruby is valid input too. Compile it
+        // to a sibling temporary protobuf for the scene loader, then keep the
+        // original path as the save target so Ctrl+S turns it into a playable
+        // binary scene in place.
+        if (content.decoded_markup && content.protobuf_type == "scene") {
+            std::ifstream source(fe.full_path, std::ios::binary);
+            st.text_preview_content.assign(std::istreambuf_iterator<char>(source), {});
+            st.text_edit_buffer = st.text_preview_content;
+            st.text_is_decoded_markup = true;
+            st.text_protobuf_type = "scene";
+            try {
+                const std::string binary = filerift::recode_markup(st.text_edit_buffer, "scene");
+                const fs::path temporary = fe.full_path + ".ruby-open.tmp";
+                { std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+                  if (!out) throw std::runtime_error("cannot create temporary scene file");
+                  out.write(binary.data(), static_cast<std::streamsize>(binary.size())); }
+                st.scene = av::scene_load(temporary.string());
+                std::error_code cleanup_error;
+                fs::remove(temporary, cleanup_error);
+                st.scene.filepath = fe.full_path;
+                st.scene.filename = fe.name;
+            } catch (const std::exception& error) {
+                st.scene = av::SceneData{};
+                st.status_msg = "Could not compile decoded scene: " + std::string(error.what());
+            }
+        } else {
+            st.scene = av::scene_load(fe.full_path);
+            st.text_is_decoded_markup = false;
+            st.text_protobuf_type = "scene";
+        }
         // Reset scene editor state
         st.selected_object     = -1;
         st.scene_selection.clear();
@@ -2027,7 +2274,7 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
             st.scene_text_dirty = false;
 
             // Read scene binary bytes and decode to text markup
-            {
+            if (!content.decoded_markup) {
                 std::ifstream f_in(fe.full_path, std::ios::binary);
                 if (f_in) {
                     std::string bytes((std::istreambuf_iterator<char>(f_in)), std::istreambuf_iterator<char>());
@@ -2071,6 +2318,22 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
         }
     } break;
 
+    case FTYPE_MAP: {
+        std::string err;
+        if (mapedit::map_editor_open(st.map_editor, fe.full_path, &err)) {
+            st.preview_type = PREVIEW_MAP;
+            st.status_msg = "Loaded world map: " + fe.name + " (" +
+                            std::to_string(st.map_editor.map.zones.size()) + " zones, " +
+                            std::to_string(st.map_editor.map.node_index.size()) + " nodes)";
+            log_file_event("MapRead", "Loaded world map: " + fe.name);
+            mapedit::map_editor_fit_view(st.map_editor);
+        } else {
+            st.status_msg = "Failed to load map: " + err;
+            log_file_event("MapRead", "ERROR: " + err);
+            st.preview_type = PREVIEW_TEXT;
+            st.text_preview_content = "Failed to parse world map:\n" + err;
+        }
+    } break;
 
     case FTYPE_AUDIO: {
         st.preview_type = PREVIEW_AUDIO;
@@ -2094,19 +2357,20 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
         st.preview_type = PREVIEW_TEXT;
         st.text_preview_content.clear();
         st.text_is_binary = false;
+        st.text_protobuf_type = content.protobuf_type;
+        st.text_is_decoded_markup = content.decoded_markup;
 
         auto dot = fe.full_path.rfind('.');
         std::string ext = (dot != std::string::npos) ? fe.full_path.substr(dot) : "";
         for (auto& c : ext) c = (char)tolower((unsigned char)c);
-        bool is_protobuf = (ext == ".scl" || ext == ".gdata" || ext == ".gstate" || 
-                            ext == ".gplayer" || ext == ".gopt" || ext == ".sounds" || 
-                            ext == ".scmap" || ext == ".atlas" || ext == ".fnt");
+        bool is_protobuf = !st.text_protobuf_type.empty() && !content.decoded_markup;
         if (is_protobuf) {
             std::ifstream f(fe.full_path, std::ios::binary);
             if (f) {
                 std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
                 f.close();
-                st.text_preview_content = filerift::decode_protobuf(bytes, ext.substr(1));
+                st.text_preview_content = filerift::decode_protobuf(bytes, st.text_protobuf_type);
+                st.text_is_decoded_markup = true;
                 st.status_msg = "Decoded " + fe.name + " via FileRift";
                 log_file_event("FileDecode", "Decoded binary Protobuf to markup: " + fe.name + " (" + format_size(fe.size) + ")");
             } else {
@@ -2399,16 +2663,38 @@ static void draw_file_browser(ViewerState& st) {
             st.selected_idx = i;
             select_file(st, f);
         }
-        if (f.is_dir && !f.vendor_scn.empty()) {
-            // Right-click: preview the whole folder as a vendor scene pack.
-            if (ImGui::BeginPopupContextItem()) {
+        // Right-click any row → global browser context menu (file/folder actions).
+        // There must be exactly ONE BeginPopupContextItem per row; the old
+        // vendor_scn-only popup is merged into this menu below.
+        if (ImGui::BeginPopupContextItem()) {
+            if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN " Open")) {
+                st.selected_idx = i;
+                select_file(st, f);
+            }
+            if (ImGui::MenuItem("Open in File Explorer")) {
+                // Folders open themselves; files open their containing folder.
+                std::string target = f.is_dir ? f.full_path
+                                              : fs::path(f.full_path).parent_path().string();
+                os_external::open_in_file_manager(target);
+            }
+            if (!f.is_dir && ImGui::MenuItem("Reveal Containing Folder")) {
+                os_external::open_in_file_manager(fs::path(f.full_path).parent_path().string());
+            }
+            // Merged vendor scene-pack action (folders that hold a demo .scn).
+            if (f.is_dir && !f.vendor_scn.empty()) {
                 if (ImGui::MenuItem(ICON_FA_LAYER_GROUP " Preview folder as scene pack")) {
                     std::string pack_name = fs::path(f.vendor_scn).filename().string();
                     open_vendor_scn(st, f.vendor_scn, pack_name);
                 }
-                if (ImGui::MenuItem("Open folder")) select_file(st, f);
-                ImGui::EndPopup();
             }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Copy Path")) ImGui::SetClipboardText(f.full_path.c_str());
+            if (ImGui::MenuItem("Copy Name")) ImGui::SetClipboardText(f.name.c_str());
+            ImGui::Separator();
+            if (ImGui::MenuItem(ICON_FA_ARROWS_ROTATE " Refresh")) { refresh_directory(st); apply_filters(st); }
+            ImGui::EndPopup();
+        }
+        if (f.is_dir && !f.vendor_scn.empty()) {
             // Small purple pack badge at the row's right edge.
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.50f, 0.88f, 1.0f));
@@ -2952,6 +3238,15 @@ static void draw_texture_preview(ViewerState& st) {
     {
         const bool can_edit = st.tex_edit_valid;
         const bool small_grid = can_edit && st.tex_edit_w <= 100 && st.tex_edit_h <= 100;
+        // REMASTER: the edit tools used to be a bare row of SameLine() buttons
+        // that overflowed the right edge on narrow windows (the "buggy top
+        // panel"). Host them in a fixed-height toolbar strip that clips its own
+        // content and scrolls horizontally, so it never overlaps the canvas.
+        const float toolbar_h = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f;
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, th_alpha(g_theme.panel_alt, 0.65f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, ImGui::GetStyle().WindowPadding.y));
+        ImGui::BeginChild("##tex_toolbar", ImVec2(0, toolbar_h), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, th_alpha(g_theme.surface_hover, 0.55f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, g_theme.surface_hover);
@@ -3091,10 +3386,13 @@ static void draw_texture_preview(ViewerState& st) {
 
         ImGui::SameLine();
         if (st.tex_edit_dirty && can_edit)
-            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.20f, 1.0f), "(modified)");
+            ImGui::TextColored(g_theme.warning, "(modified)");
         else if (can_edit)
             ImGui::TextDisabled("(original)");
-        ImGui::PopStyleColor(3);
+        ImGui::PopStyleColor(3);       // Button / ButtonHovered / ButtonActive
+        ImGui::EndChild();             // ##tex_toolbar
+        ImGui::PopStyleVar();          // WindowPadding
+        ImGui::PopStyleColor();        // ChildBg
     }
     
     ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -3771,13 +4069,10 @@ static void draw_object_inspector(ViewerState& st) {
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame the selection in the Visual viewport");
     ImGui::SameLine();
     if (ImGui::Button(ICON_FA_COPY " Duplicate")) {
-        snapshot_scene(st);
-        size_t new_idx = 0;
-        if (av::scene_duplicate_object(st.scene, (size_t)obj_idx, &new_idx)) {
-            select_scene_object(st, (int)new_idx);
-            st.scene_dirty = true;
-            st.status_msg = "Duplicated object.";
-        }
+        // Fix #3: use the same path as Ctrl+D (copy→paste) so ground-mesh
+        // caches are resynchronized after the insert.
+        duplicate_scene_selection(st);
+        st.status_msg = "Duplicated object.";
     }
     if (from_library) {
         if (ImGui::Button(ICON_FA_LINK " Materialize Template")) {
@@ -3799,6 +4094,8 @@ static void draw_object_inspector(ViewerState& st) {
         st.scene_selection.clear();
         st.selected_object = (removed < (int)st.scene.objects.size()) ? removed : (int)st.scene.objects.size() - 1;
         sync_scene_object_editor(st);
+        // Fix #3b: deletion shifts all higher-index ground-cache entries.
+        resync_scene_ground_meshes(st);
         st.scene_dirty = true;
         st.status_msg = "Deleted object #" + std::to_string(removed) + ".";
     }
@@ -3890,6 +4187,14 @@ static void draw_scene_inspector(ViewerState& st) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.48f, 0.48f, 0.52f, 1.0f));
                 ImGui::TextUnformatted(o.template_name.c_str());
                 ImGui::PopStyleColor();
+            }
+            if (o.is_dimension_object) {
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.55f, 1.0f, 0.9f));
+                ImGui::TextUnformatted("  [DIM]");
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("DimensionObject — only visible in-game while the Dimension Rift powerup is active");
             }
             ImGui::PopID();
         };
@@ -4820,6 +5125,45 @@ static std::string gm_build_swdm_text(const ViewerState& st) {
     return boulder::serialize_swdm(gm);
 }
 
+// Append a DimensionObject component to an object — the exact byte layout the
+// vanilla game writes (ClassName + Identifier, empty payload). Tagged objects
+// only appear in-game while the Dimension Rift powerup is active.
+static void gm_append_dimension_component(av::SceneObject& obj) {
+    int instance_id = 1;
+    for (const auto& c : obj.components)
+        instance_id = std::max(instance_id, c.type_id + 1);
+    proto::Writer w;
+    w.write_string_field(1, "DimensionObject");
+    w.write_varint_field(2, static_cast<uint64_t>(instance_id));
+    av::SceneComponent comp;
+    comp.type_name = "DimensionObject";
+    comp.type_id = instance_id;
+    comp.raw_data = w.to_string();
+    obj.components.push_back(std::move(comp));
+}
+
+// Terrain height at world X: scan every ground mesh in the open scene and
+// return the topmost world Y within `tolerance` units of x. Returns -1e9
+// when no terrain is near the sample (callers fall back to the camera Y).
+static float scene_terrain_top_y(const ViewerState& st, float x, float tolerance) {
+    float best = -1e9f;
+    for (const auto& obj : st.scene.objects) {
+        if (obj.ground_meshes.empty()) continue;
+        const float s = std::abs(obj.scale_x * obj.template_scaling);
+        for (const auto& gm : obj.ground_meshes) {
+            const float* p = gm.positions.data();
+            for (size_t i = 0; i + 2 < gm.positions.size(); i += 3) {
+                const float wx = obj.pos_x + p[i] * s;
+                if (std::fabs(wx - x) <= tolerance) {
+                    const float wy = obj.pos_y + p[i + 1] * s;
+                    if (wy > best) best = wy;
+                }
+            }
+        }
+    }
+    return best;
+}
+
 // Inject a freshly generated GroundMesh object into the open scene.
 // Returns the new object index or -1 on failure.
 static int gm_add_to_scene(ViewerState& st) {
@@ -4863,8 +5207,12 @@ static int gm_add_to_scene(ViewerState& st) {
     snapshot_scene(st);
     av::SceneObject obj = std::move(parsed.objects[0]);
     obj.name = st.gm_obj_name[0] ? st.gm_obj_name : av::scene_fresh_identifier(st.scene);
+    if (st.gm_dimension_object)
+        gm_append_dimension_component(obj);   // rift-gated mesh
     // Spawn under the camera focus (X/Y) so the new ground mesh appears where
     // the user is looking; keep the depth layer chosen in the generator.
+    // No frame_scene_selection() here: the mesh lands at the camera's look
+    // point, so forcing the camera to it would jerk the view for nothing.
     obj.pos_x = st.camera.target[0];
     obj.pos_y = st.camera.target[1];
     st.scene.objects.push_back(std::move(obj));
@@ -4879,9 +5227,9 @@ static int gm_add_to_scene(ViewerState& st) {
     select_scene_object(st, idx);
     st.scene_dirty = true;
     st.status_msg = "Added ground mesh '" + std::string(st.gm_obj_name) + "' to scene.";
-    // Jump to the Visual editor and frame the new mesh so it can be grabbed.
+    // Jump to the Visual editor; the mesh already sits at the camera's look
+    // point so it is visible without re-framing the camera.
     switch_scene_tab(st, 1);
-    frame_scene_selection(st);
     return idx;
 }
 
@@ -4974,8 +5322,11 @@ static bool gm_regenerate_object_geometry(ViewerState& st, int idx, std::string*
         return fail("Generated mesh failed to parse.");
 
     av::SceneObject& target = st.scene.objects[idx];
+    const bool was_dim = target.is_dimension_object;
     av::SceneObject fresh = std::move(parsed.objects[0]);
     target.components = std::move(fresh.components);
+    if (was_dim || st.gm_dimension_object)
+        gm_append_dimension_component(target);   // keep/promote the rift gate
     target.pos_z = st.gm_z;               // depth layer chosen in the editor
     av::scene_refresh(st.scene);
     // The re-parsed geometry (SurfaceMesh / FrontMesh / hats) wins over what
@@ -5624,8 +5975,26 @@ static av::SceneObject build_pod_object(const std::string& pod_path, const std::
     av::SceneObject obj;
     obj.template_name = "SceneObject";
     obj.name = identifier;
-    proto::Writer payload;   // ModelComponent{ Name: 1 }
+    proto::Writer payload;   // ModelComponent{ Name: 1, ..., DiffuseColor: 8 }
     payload.write_string_field(1, stem);
+    payload.write_float_field(2, 0.0f);             // YRotation
+    payload.write_float_field(3, 0.0f);             // EmissionFactor
+    payload.write_float_field(4, 0.0f);             // XRotation
+    proto::Writer shc;                              // ShatterColor (black)
+    shc.write_float_field(1, 0); shc.write_float_field(2, 0);
+    shc.write_float_field(3, 0); shc.write_float_field(4, 1);
+    payload.write_nested_field(5, shc);
+    proto::Writer org;                              // Origin (0,0,0)
+    org.write_float_field(1, 0); org.write_float_field(2, 0);
+    org.write_float_field(3, 0);
+    payload.write_nested_field(6, org);
+    payload.write_varint_field(7, 0);               // Transparent
+    // DiffuseColor MUST be white: a missing color message defaults to alpha 0
+    // in the real game, rendering the model fully invisible.
+    proto::Writer dfc;                              // DiffuseColor (white)
+    dfc.write_float_field(1, 1); dfc.write_float_field(2, 1);
+    dfc.write_float_field(3, 1); dfc.write_float_field(4, 1);
+    payload.write_nested_field(8, dfc);
     proto::Writer wrapper;   // Component{ ClassName, Identifier:101, ModelComponent }
     wrapper.write_string_field(1, "Model");
     wrapper.write_varint_field(2, 101);
@@ -5665,30 +6034,43 @@ static void obj_browser_add(ViewerState& st, const std::string& path, bool is_po
         return;
     }
     snapshot_scene(st);
+    // Fix #1: preserve mesh_name BEFORE the move so the cache load and
+    // status messages are not reading from a moved-from string.
     av::SceneObject obj = build_pod_object(path, av::scene_fresh_identifier(st.scene));
-    // Spawn where the user is looking (camera focus), so the fresh object
-    // appears right in front of the view instead of at the world origin.
+    const std::string mesh_name = obj.mesh_name; // stable copy
+    // Spawn where the camera is looking (its target IS the look-at point) and
+    // snap the model onto the terrain so it stands on the ground instead of
+    // floating in the air. No camera re-frame: the object appears centered in
+    // the current view by construction.
     obj.pos_x = st.camera.target[0];
-    obj.pos_y = st.camera.target[1];
     obj.pos_z = st.camera.target[2];
+    const float terrain_y = scene_terrain_top_y(st, obj.pos_x, 150.0f);
+    obj.pos_y = (terrain_y > -1e8f) ? terrain_y : st.camera.target[1];
     st.scene.objects.push_back(std::move(obj));
     av::scene_refresh(st.scene);
     const fs::path scene_dir = fs::path(st.scene.filepath).parent_path();
-    if (load_scene_model_to_cache(st, obj.mesh_name, scene_dir.string())) {
-        const int idx = static_cast<int>(st.scene.objects.size()) - 1;
-        select_scene_object(st, idx);
-        st.scene_dirty = true;
-        st.status_msg = "Added model '" + obj.mesh_name + "' to scene.";
+    const int idx = static_cast<int>(st.scene.objects.size()) - 1;
+    select_scene_object(st, idx);
+    st.scene_dirty = true;
+    if (load_scene_model_to_cache(st, mesh_name, scene_dir.string())) {
+        // The POD origin may sit feet_offset ABOVE the visual feet (center
+        // origin); lift the object so its feet stand on the terrain instead
+        // of sinking into it. Feet-origin PODs report ~0 and stay put.
+        if (terrain_y > -1e8f) {
+            auto hit = st.scene_model_cache.find(mesh_name);
+            if (hit != st.scene_model_cache.end()) {
+                const float fo = av::pod_feet_offset(hit->second);
+                const float s = std::abs(st.scene.objects[idx].scale_x *
+                                         st.scene.objects[idx].template_scaling);
+                if (fo > 0.0f) st.scene.objects[idx].pos_y += fo * s;
+            }
+        }
+        st.status_msg = "Added model '" + mesh_name + "' to scene.";
     } else {
-        // Model couldn't be resolved — keep the object but report it.
-        const int idx = static_cast<int>(st.scene.objects.size()) - 1;
-        select_scene_object(st, idx);
-        st.scene_dirty = true;
-        st.status_msg = "Added '" + obj.mesh_name + "' (model file not found locally).";
+        st.status_msg = "Added '" + mesh_name + "' (model file not found locally).";
     }
-    // Jump to the Visual editor and frame the new object so it can be grabbed.
+    // Jump to the Visual editor; the object is already centered in the view.
     switch_scene_tab(st, 1);
-    frame_scene_selection(st);
 }
 
 // ── Ground Mesh Generator: live 3D preview ──
@@ -6316,6 +6698,11 @@ static void draw_ground_mesh_generator(ViewerState& st) {
         gm_depth_changed = true;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Build the top/surface cap mesh on flat-top segments");
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Dimension Obj", &st.gm_dimension_object))
+        gm_depth_changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Tag the generated mesh as a DimensionObject: in-game it only appears\nwhile the Dimension Rift powerup is active (hidden otherwise).");
 
     // Any depth/extrusion change rebuilds the live preview (if visible).
     if (gm_depth_changed) st.gm_sketch_dirty = true;
@@ -6439,15 +6826,43 @@ static void template_add_to_scene(ViewerState& st, const std::string& template_n
     // dir points from target toward the eye (into the view).
     const float dir[3] = {cosp * sinf(yaw), sinf(pitch), cosp * cosf(yaw)};
     const float k = std::max(8.0f, st.camera.distance * 0.22f);
+    // Spawn along the camera's view ray (where the user is looking), snapped
+    // onto the terrain surface so the template stands on the ground.
     obj.pos_x = st.camera.target[0] + dir[0] * k;
-    obj.pos_y = st.camera.target[1] + dir[1] * k;
     obj.pos_z = st.camera.target[2] + dir[2] * k;
+    const float terrain_y = scene_terrain_top_y(st, obj.pos_x, 150.0f);
+    obj.pos_y = (terrain_y > -1e8f) ? terrain_y
+                                    : st.camera.target[1] + dir[1] * k;
     av::scene_refresh(st.scene);
+    // Fix #2: after scene_refresh() template components are resolved, so
+    // mesh_name and background_name are now populated. Load GPU caches that
+    // obj_browser_add already loads but template creation skips.
+    const fs::path scene_dir = fs::path(st.scene.filepath).parent_path();
+    {
+        // Re-fetch after refresh — idx is stable (objects only grows here).
+        const auto& resolved = st.scene.objects[idx];
+        if (!resolved.mesh_name.empty())
+            load_scene_model_to_cache(st, resolved.mesh_name, scene_dir.string());
+        if (!resolved.background_name.empty())
+            load_scene_background_texture(st, resolved.background_name, scene_dir.string());
+        if (!resolved.ground_meshes.empty())
+            resync_scene_ground_meshes(st);
+        // Lift POD templates by their feet offset (center-origin models would
+        // otherwise sink into the terrain after the Y snap above).
+        if (terrain_y > -1e8f && !resolved.mesh_name.empty() &&
+            resolved.ground_meshes.empty()) {
+            auto hit = st.scene_model_cache.find(resolved.mesh_name);
+            if (hit != st.scene_model_cache.end()) {
+                const float fo = av::pod_feet_offset(hit->second);
+                const float s = std::abs(resolved.scale_x * resolved.template_scaling);
+                if (fo > 0.0f) st.scene.objects[idx].pos_y += fo * s;
+            }
+        }
+    }
     select_scene_object(st, (int)idx);
     st.scene_dirty = true;
     st.status_msg = "Added template '" + template_name + "' to scene (components inherited).";
     switch_scene_tab(st, 1);
-    frame_scene_selection(st);
 }
 
 // ── Object Browser window (SMM2-style palette) ──
@@ -6863,6 +7278,14 @@ static void draw_scene_visualizer(ViewerState& st) {
     // Flat toolbar styling: no resting chrome — hover gets a soft fill and only
     // selected/active tools carry a strong accent background, so the rendered
     // scene stays the strongest element (less chrome competition around it).
+    // Keep the command strip a fixed height.  Previously its long row of
+    // buttons wrapped at narrower window sizes, which moved the image after
+    // the FBO dimensions had already been calculated.  That produced a
+    // displaced viewport and an apparent blank/void area while dragging.
+    ImGui::BeginChild("##SceneToolbar", ImVec2(0.0f, 44.0f),
+                      ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_HorizontalScrollbar |
+                      ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, th_alpha(g_theme.surface_hover, 0.55f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, g_theme.surface_hover);
@@ -7092,6 +7515,9 @@ static void draw_scene_visualizer(ViewerState& st) {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Toggle PostFX (bloom / DOF / HD grade / vignette)");
 
+    ImGui::PopStyleColor(3);
+    ImGui::EndChild();
+
     ImVec2 avail = ImGui::GetContentRegionAvail();
     // Logical viewport size drives all UI/picking/overlay math.
     int w = (int)avail.x;
@@ -7251,7 +7677,7 @@ static void draw_scene_visualizer(ViewerState& st) {
             const auto& light = *ranked.light;
             for (int axis = 0; axis < 3; ++axis) {
                 lpos[point_count][axis] = light.pos[axis];
-                lcol[point_count][axis] = std::min(light.color[axis] * ranked.intensity, 2.5f);
+                lcol[point_count][axis] = std::min(light.color[axis] * ranked.intensity, 1.5f);
             }
             lrad[point_count] = std::max(1.0f, light.radius);
             ++point_count;
@@ -7310,6 +7736,13 @@ static void draw_scene_visualizer(ViewerState& st) {
             continue;
         bool rendered = false;
 
+        // Dimension objects (DimensionObject component) are invisible in the
+        // vanilla game unless the Dimension Rift powerup is active. Ghost them
+        // (faint + translucent) until the "Dimension Rift" toggle reveals them.
+        const bool dim_ghost = obj.is_dimension_object && !st.scene_dimension_rift;
+        float dim_col[4] = {0.75f, 0.55f, 1.0f, 0.07f};   // faint violet ghost
+        float dim_hi[4]  = {0.55f, 0.80f, 1.0f, 0.35f};  // selected ghost (still see-through)
+
         float obj_mat[16];
         swk::object_render_matrix(obj, obj_mat);   // incl. ModelComponent Y-rotation
 
@@ -7325,7 +7758,9 @@ static void draw_scene_visualizer(ViewerState& st) {
                     gm.texture_id = 0;
                 }
 
-                float* col = (idx == st.selected_object) ? highlight : white;
+                float* col = (idx == st.selected_object)
+                                  ? (dim_ghost ? dim_hi : highlight)
+                                  : (dim_ghost ? dim_col : white);
                 av::render_mesh(gm, obj_mat, col, false);
                 rendered = true;
 
@@ -7405,7 +7840,9 @@ static void draw_scene_visualizer(ViewerState& st) {
                     mat_color[0] = m.diffuse[0]; mat_color[1] = m.diffuse[1]; mat_color[2] = m.diffuse[2];
                     mat_color[3] = m.opacity;
                 }
-                float* col = (idx == st.selected_object) ? highlight : mat_color;
+                float* col = (idx == st.selected_object)
+                                  ? (dim_ghost ? dim_hi : highlight)
+                                  : (dim_ghost ? dim_col : mat_color);
                 av::render_mesh(gm, final_matrix, col, false);
                 rendered = true;
 
@@ -7423,7 +7860,9 @@ static void draw_scene_visualizer(ViewerState& st) {
                     gm.texture_id = 0;
                 }
 
-                float* col = (idx == st.selected_object) ? highlight : white;
+                float* col = (idx == st.selected_object)
+                                  ? (dim_ghost ? dim_hi : highlight)
+                                  : (dim_ghost ? dim_col : white);
                 av::render_mesh(gm, obj_mat, col, false);
                 rendered = true;
 
@@ -7452,9 +7891,10 @@ static void draw_scene_visualizer(ViewerState& st) {
                 av::mat4_translate(marker_t, obj.pos_x, obj.pos_y, obj.pos_z);
                 av::mat4_multiply(marker_matrix, marker_t, marker_s);
                 float proxy_color[4] = {0.45f, 0.55f, 0.70f, obj.hidden ? 0.12f : 0.30f};
+                if (dim_ghost) proxy_color[3] *= 0.18f;   // dimension ghosts stay ghostly
                 if (is_scene_selected(st, idx)) {
                     proxy_color[0] = 0.25f; proxy_color[1] = 0.72f; proxy_color[2] = 1.0f;
-                    proxy_color[3] = 0.95f;
+                    proxy_color[3] = dim_ghost ? 0.35f : 0.95f;
                 }
                 av::render_mesh(st.scene_proxy_mesh, marker_matrix, proxy_color, false);
                 rendered = true;
@@ -7467,9 +7907,10 @@ static void draw_scene_visualizer(ViewerState& st) {
                 av::mat4_translate(marker_t, obj.pos_x, obj.pos_y, obj.pos_z);
                 av::mat4_multiply(marker_matrix, marker_t, marker_s);
                 float proxy_color[4] = {0.95f, 0.48f, 0.16f, obj.hidden ? 0.18f : 0.50f};
+                if (dim_ghost) proxy_color[3] *= 0.18f;   // dimension ghosts stay ghostly
                 if (is_scene_selected(st, idx)) {
                     proxy_color[0] = 0.25f; proxy_color[1] = 0.72f; proxy_color[2] = 1.0f;
-                    proxy_color[3] = 0.95f;
+                    proxy_color[3] = dim_ghost ? 0.35f : 0.95f;
                 }
                 av::render_mesh(st.scene_proxy_mesh, marker_matrix, proxy_color, false);
                 rendered = true;
@@ -8416,7 +8857,6 @@ static void draw_scene_visualizer(ViewerState& st) {
             st.camera.target[2] += uz * delta.y * scale;
         }
     }
-    ImGui::PopStyleColor(3);
 }
 
 // ============================================================================
@@ -8581,9 +9021,9 @@ static void draw_text_preview(ViewerState& st) {
     std::string ext = (dot != std::string::npos) ? st.sel_path.substr(dot) : "";
     for (auto& c : ext) c = (char)tolower((unsigned char)c);
     
-    bool is_protobuf = (ext == ".scene" || ext == ".scl" || ext == ".gdata" || ext == ".gstate" || 
-                        ext == ".gplayer" || ext == ".gopt" || ext == ".sounds" || 
-                        ext == ".scmap" || ext == ".atlas" || ext == ".fnt");
+    // Content probing records the actual schema when the file is opened. This
+    // keeps Save correct for extensionless/renamed decoded assets as well.
+    const bool is_protobuf = !st.text_protobuf_type.empty() && st.text_is_decoded_markup;
     bool is_gmesh = (ext == ".gmesh");
 
     // Initialize edit buffer on file change
@@ -8610,7 +9050,7 @@ static void draw_text_preview(ViewerState& st) {
         if (is_protobuf) {
             auto start = std::chrono::high_resolution_clock::now();
             try {
-                std::string binary_data = filerift::recode_markup(st.text_edit_buffer, ext.substr(1));
+                std::string binary_data = filerift::recode_markup(st.text_edit_buffer, st.text_protobuf_type);
                 std::ofstream out(st.sel_path, std::ios::binary | std::ios::trunc);
                 if (!out) throw std::runtime_error("failed to open output file");
                 out.write(binary_data.data(), binary_data.size());
@@ -9264,6 +9704,12 @@ static void draw_bottom_panel(ViewerState& st) {
 // UI: Center panel dispatcher
 // ============================================================================
 
+// Defined later in this file; forward-declared so the PREVIEW_MAP handler can
+// launch the Scene Creator / Procedural Generator dialogs when a map node
+// requests a new scene (map editor ↔ scene tooling fusion).
+static void open_scene_creator(ViewerState& st);
+static void open_procedural_generator(ViewerState& st);
+
 static void draw_center_panel(ViewerState& st) {
     if (st.preview_type == PREVIEW_SCENE) {
         ImGui::PushStyleColor(ImGuiCol_ChildBg, g_theme.panel_alt);
@@ -9336,6 +9782,56 @@ static void draw_center_panel(ViewerState& st) {
             }
             break;
         case PREVIEW_AUDIO:   draw_audio_player(st);     break;
+        case PREVIEW_MAP:
+            draw_map_editor(st.map_editor);
+            if (st.map_editor.open_scene_request) {
+                std::string lvl = st.map_editor.open_scene_level;
+                st.map_editor.open_scene_request = false;
+                std::string dir = fs::path(st.map_editor.map.filepath).parent_path().string();
+                std::string p = (dir.empty()) ? (lvl + ".scene")
+                                              : (dir + "/" + lvl + ".scene");
+                std::error_code ec;
+                if (fs::exists(p, ec)) {
+                    FileEntry fe;
+                    fe.name = lvl + ".scene";
+                    fe.full_path = p;
+                    fe.is_dir = false;
+                    fe.size = 0;
+                    fe.type = FTYPE_SCENE;
+                    select_file(st, fe);
+                } else {
+                    st.map_editor.status = "Scene not found next to map: " + lvl;
+                    st.map_editor.status_timer = 4.0f;
+                }
+            }
+            // Node asked to CREATE its scene from a template → open the Scene
+            // Creator pre-filled with the level name, output dir (next to the
+            // .scmap), and map-linked so create() writes the node's scene back
+            // into this map.
+            if (st.map_editor.create_scene_request) {
+                std::string lvl = st.map_editor.create_scene_level;
+                st.map_editor.create_scene_request = false;
+                std::string dir = fs::path(st.map_editor.map.filepath).parent_path().string();
+                open_scene_creator(st);
+                SceneCreatorDialogState& d = st.scene_creator;
+                if (!dir.empty())
+                    std::snprintf(d.output_path, sizeof(d.output_path), "%s", dir.c_str());
+                std::snprintf(d.level_name, sizeof(d.level_name), "%s", lvl.c_str());
+                std::snprintf(d.scene_namespace, sizeof(d.scene_namespace), "%s", lvl.c_str());
+                std::snprintf(d.map_path, sizeof(d.map_path), "%s",
+                              st.map_editor.map.filepath.c_str());
+                d.link_to_map = true;
+            }
+            // Node asked to GENERATE its scene procedurally → open the
+            // Procedural Generator pre-filled with the level name.
+            if (st.map_editor.gen_scene_request) {
+                std::string lvl = st.map_editor.gen_scene_level;
+                st.map_editor.gen_scene_request = false;
+                open_procedural_generator(st);
+                if (!lvl.empty())
+                    std::snprintf(st.proc_gen_name, sizeof(st.proc_gen_name), "%s", lvl.c_str());
+            }
+            break;
         default: {
             ImVec2 avail = ImGui::GetContentRegionAvail();
             ImVec2 text_size = ImGui::CalcTextSize("Select a file on the left to preview");
@@ -9455,12 +9951,14 @@ static void draw_properties_panel(ViewerState& st) {
 
     if (ImGui::CollapsingHeader("File", ImGuiTreeNodeFlags_DefaultOpen)) {
     ImGui::Text("%s%s", st.sel_name.c_str(),
-                st.preview_type == PREVIEW_SCENE && st.scene_dirty ? " *" : "");
+                (st.preview_type == PREVIEW_SCENE && st.scene_dirty) ||
+                (st.preview_type == PREVIEW_MAP && st.map_editor.dirty) ? " *" : "");
     ImGui::TextDisabled("%s  |  %s", format_size(st.sel_size).c_str(), filetype_label(
         st.preview_type == PREVIEW_TEXTURE ? FTYPE_TEXTURE :
         st.preview_type == PREVIEW_MODEL   ? FTYPE_MODEL   :
         st.preview_type == PREVIEW_SCENE   ? FTYPE_SCENE   :
-        st.preview_type == PREVIEW_AUDIO   ? FTYPE_AUDIO   : FTYPE_OTHER,
+        st.preview_type == PREVIEW_AUDIO   ? FTYPE_AUDIO   :
+        st.preview_type == PREVIEW_MAP     ? FTYPE_MAP     : FTYPE_OTHER,
         st.sel_path.c_str()));
     ImGui::TextDisabled("Path");
     std::string visible_path = st.sel_path;
@@ -10479,19 +10977,33 @@ static void apply_selected_theme(int theme_idx, float font_scale) {
     // than overriding it, so the widget stays legible on HiDPI monitors.
     io.FontGlobalScale = font_scale / std::max(1.0f, g_state.display_scale);
 
+    // ── Modern, sleek, professional palettes ────────────────────────────────
+    // Dark: deep neutral-slate backgrounds, subtle borders, one confident
+    // indigo/azure accent, high-contrast text. Light: clean paper neutrals with
+    // the same accent family so both variants read consistently.
     g_theme = theme_idx == 1
         ? RubyTheme{
-            ImVec4(0.885f,0.90f,0.915f,1), ImVec4(0.955f,0.962f,0.972f,1), ImVec4(0.925f,0.935f,0.950f,1),
-            ImVec4(0.83f,0.855f,0.885f,1), ImVec4(0.77f,0.805f,0.85f,1), ImVec4(0.62f,0.70f,0.80f,1),
-            ImVec4(0.60f,0.63f,0.68f,1), ImVec4(0.10f,0.12f,0.15f,1), ImVec4(0.42f,0.46f,0.52f,1),
-            ImVec4(0.08f,0.42f,0.76f,1), ImVec4(0.78f,0.48f,0.06f,1), ImVec4(0.78f,0.18f,0.20f,1),
-            ImVec4(0.08f,0.55f,0.30f,1), ImVec4(0.15f,0.48f,0.82f,0.30f), false}
+            // background            panel                    panel_alt
+            ImVec4(0.94f,0.945f,0.955f,1), ImVec4(0.985f,0.988f,0.992f,1), ImVec4(0.915f,0.923f,0.936f,1),
+            // surface               surface_hover            surface_active
+            ImVec4(0.90f,0.912f,0.928f,1), ImVec4(0.845f,0.865f,0.895f,1), ImVec4(0.78f,0.812f,0.86f,1),
+            // border                text                     text_muted
+            ImVec4(0.80f,0.815f,0.838f,1), ImVec4(0.12f,0.135f,0.165f,1), ImVec4(0.44f,0.475f,0.53f,1),
+            // accent                warning                  error
+            ImVec4(0.20f,0.46f,0.90f,1), ImVec4(0.86f,0.55f,0.10f,1), ImVec4(0.83f,0.24f,0.26f,1),
+            // success               selection                dark
+            ImVec4(0.13f,0.58f,0.36f,1), ImVec4(0.20f,0.46f,0.90f,0.28f), false}
         : RubyTheme{
-            ImVec4(0.075f,0.082f,0.095f,1), ImVec4(0.105f,0.115f,0.132f,1), ImVec4(0.13f,0.14f,0.16f,1),
-            ImVec4(0.16f,0.175f,0.20f,1), ImVec4(0.21f,0.235f,0.27f,1), ImVec4(0.25f,0.32f,0.42f,1),
-            ImVec4(0.25f,0.27f,0.31f,1), ImVec4(0.91f,0.92f,0.94f,1), ImVec4(0.55f,0.59f,0.65f,1),
-            ImVec4(0.25f,0.58f,0.92f,1), ImVec4(0.95f,0.64f,0.20f,1), ImVec4(0.94f,0.32f,0.34f,1),
-            ImVec4(0.34f,0.76f,0.48f,1), ImVec4(0.25f,0.58f,0.92f,0.42f), true};
+            // background            panel                    panel_alt
+            ImVec4(0.070f,0.076f,0.088f,1), ImVec4(0.098f,0.106f,0.122f,1), ImVec4(0.122f,0.132f,0.150f,1),
+            // surface               surface_hover            surface_active
+            ImVec4(0.150f,0.162f,0.185f,1), ImVec4(0.196f,0.214f,0.248f,1), ImVec4(0.242f,0.268f,0.312f,1),
+            // border                text                     text_muted
+            ImVec4(0.205f,0.222f,0.258f,1), ImVec4(0.905f,0.918f,0.940f,1), ImVec4(0.520f,0.560f,0.622f,1),
+            // accent                warning                  error
+            ImVec4(0.345f,0.560f,0.980f,1), ImVec4(0.960f,0.660f,0.235f,1), ImVec4(0.945f,0.360f,0.380f,1),
+            // success               selection                dark
+            ImVec4(0.300f,0.780f,0.520f,1), ImVec4(0.345f,0.560f,0.980f,0.35f), true};
 
     const RubyTheme& T = g_theme;
     const bool dark = T.dark;
@@ -10499,38 +11011,41 @@ static void apply_selected_theme(int theme_idx, float font_scale) {
     // Standardized geometry for both themes — compact, professional, not
     // "rounded-everything".
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowPadding     = ImVec2(10, 8);
-    style.FramePadding      = ImVec2(7, 4);
-    style.ItemSpacing       = ImVec2(7, 4);
-    style.ItemInnerSpacing  = ImVec2(5, 4);
-    style.IndentSpacing     = 16.0f;
-    style.ScrollbarSize     = 12.0f;
-    style.GrabMinSize       = 10.0f;
-    style.CellPadding       = ImVec2(6, 4);
+    style.WindowPadding     = ImVec2(12, 10);
+    style.FramePadding      = ImVec2(9, 5);
+    style.ItemSpacing       = ImVec2(8, 6);
+    style.ItemInnerSpacing  = ImVec2(6, 5);
+    style.IndentSpacing     = 18.0f;
+    style.ScrollbarSize     = 11.0f;
+    style.GrabMinSize       = 11.0f;
+    style.CellPadding       = ImVec2(7, 5);
     style.WindowTitleAlign  = ImVec2(0.0f, 0.5f);
     style.WindowMenuButtonPosition = ImGuiDir_None;
-    style.WindowRounding    = 6.0f;
-    style.ChildRounding     = 4.0f;
-    style.FrameRounding     = 4.0f;
-    style.GrabRounding      = 3.0f;
-    style.PopupRounding     = 6.0f;
-    style.ScrollbarRounding = 4.0f;
-    style.TabRounding       = 4.0f;
-    style.WindowBorderSize  = 1.0f;
+    style.WindowRounding    = 7.0f;
+    style.ChildRounding     = 6.0f;
+    style.FrameRounding     = 5.0f;
+    style.GrabRounding      = 4.0f;
+    style.PopupRounding     = 7.0f;
+    style.ScrollbarRounding = 6.0f;
+    style.TabRounding       = 5.0f;
     style.ChildBorderSize   = 1.0f;
     style.FrameBorderSize   = 0.0f;
     style.PopupBorderSize   = 1.0f;
     style.TabBorderSize     = 0.0f;
     style.WindowBorderSize  = 1.0f;
     style.SeparatorTextBorderSize = 1.0f;
+    style.SeparatorTextAlign   = ImVec2(0.0f, 0.5f);
+    style.SeparatorTextPadding = ImVec2(18, 4);
+    style.DisabledAlpha        = 0.45f;
 
     // Derived shades from the semantic palette (theme-safe by construction).
     const ImVec4 border       = T.border;
     const ImVec4 accent       = T.accent;
-    const ImVec4 accent_hover = dark ? th_mix(accent, T.text, 0.18f) : th_mix(accent, ImVec4(0,0,0,1), 0.25f);
-    const ImVec4 surface_hot  = dark ? th_mix(T.surface_active, accent, 0.45f) : th_mix(T.surface_active, accent, 0.55f);
-    const ImVec4 tab_active   = dark ? th_mix(T.surface_active, accent, 0.35f) : th_mix(T.surface_active, accent, 0.30f);
+    const ImVec4 accent_hover = dark ? th_mix(accent, T.text, 0.18f) : th_mix(accent, ImVec4(0,0,0,1), 0.22f);
+    const ImVec4 surface_hot  = dark ? th_mix(T.surface_active, accent, 0.40f) : th_mix(T.surface_active, accent, 0.42f);
+    const ImVec4 tab_active   = dark ? th_mix(T.surface_active, accent, 0.30f) : th_mix(T.surface_active, accent, 0.26f);
     const ImVec4 frame_hot    = th_mix(T.surface, T.surface_hover, 0.5f);
+    (void)frame_hot;
     const ImVec4 popup_bg     = dark ? th_mix(T.panel, T.surface, 0.18f) : th_mix(T.panel, ImVec4(1,1,1,1), 0.3f);
 
     ImVec4* c = style.Colors;
@@ -10539,53 +11054,54 @@ static void apply_selected_theme(int theme_idx, float font_scale) {
     c[ImGuiCol_WindowBg]             = T.background;
     c[ImGuiCol_ChildBg]              = T.panel;
     c[ImGuiCol_PopupBg]              = popup_bg;
-    c[ImGuiCol_Border]               = border;
+    c[ImGuiCol_Border]               = th_alpha(border, dark ? 0.85f : 0.9f);
     c[ImGuiCol_BorderShadow]         = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_FrameBg]              = T.surface;
+    c[ImGuiCol_FrameBg]              = th_alpha(T.surface, dark ? 0.85f : 1.0f);
     c[ImGuiCol_FrameBgHovered]       = T.surface_hover;
     c[ImGuiCol_FrameBgActive]        = T.surface_active;
     c[ImGuiCol_TitleBg]              = T.panel_alt;
-    c[ImGuiCol_TitleBgActive]        = dark ? th_mix(T.surface_active, accent, 0.30f) : th_mix(T.surface_active, accent, 0.25f);
+    c[ImGuiCol_TitleBgActive]        = dark ? th_mix(T.panel_alt, accent, 0.18f) : th_mix(T.panel_alt, accent, 0.16f);
     c[ImGuiCol_TitleBgCollapsed]     = T.panel_alt;
-    c[ImGuiCol_MenuBarBg]            = T.panel_alt;
-    c[ImGuiCol_ScrollbarBg]          = th_alpha(T.background, dark ? 0.55f : 0.85f);
-    c[ImGuiCol_ScrollbarGrab]        = T.surface;
-    c[ImGuiCol_ScrollbarGrabHovered] = T.surface_hover;
-    c[ImGuiCol_ScrollbarGrabActive]  = T.surface_active;
+    c[ImGuiCol_MenuBarBg]            = dark ? th_mix(T.panel_alt, T.background, 0.35f) : T.panel_alt;
+    c[ImGuiCol_ScrollbarBg]          = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_ScrollbarGrab]        = th_alpha(T.surface_active, dark ? 0.55f : 0.70f);
+    c[ImGuiCol_ScrollbarGrabHovered] = th_alpha(T.surface_active, dark ? 0.80f : 0.90f);
+    c[ImGuiCol_ScrollbarGrabActive]  = accent;
     c[ImGuiCol_CheckMark]            = accent;
-    c[ImGuiCol_SliderGrab]           = T.surface_hover;
+    c[ImGuiCol_SliderGrab]           = th_mix(T.surface_hover, accent, 0.35f);
     c[ImGuiCol_SliderGrabActive]     = accent;
     c[ImGuiCol_Button]               = T.surface;
     c[ImGuiCol_ButtonHovered]        = T.surface_hover;
     c[ImGuiCol_ButtonActive]         = surface_hot;
-    c[ImGuiCol_Header]               = T.surface;
+    c[ImGuiCol_Header]               = th_alpha(T.surface, dark ? 0.85f : 0.9f);
     c[ImGuiCol_HeaderHovered]        = T.surface_hover;
     c[ImGuiCol_HeaderActive]         = T.surface_active;
-    c[ImGuiCol_Separator]            = border;
+    c[ImGuiCol_Separator]            = th_alpha(border, dark ? 0.7f : 0.8f);
     c[ImGuiCol_SeparatorHovered]     = accent_hover;
     c[ImGuiCol_SeparatorActive]      = accent;
-    c[ImGuiCol_ResizeGrip]           = th_alpha(border, 0.30f);
-    c[ImGuiCol_ResizeGripHovered]    = th_alpha(accent, 0.70f);
+    c[ImGuiCol_ResizeGrip]           = th_alpha(border, 0.0f);
+    c[ImGuiCol_ResizeGripHovered]    = th_alpha(accent, 0.55f);
     c[ImGuiCol_ResizeGripActive]     = accent;
     c[ImGuiCol_Tab]                  = T.panel_alt;
     c[ImGuiCol_TabHovered]           = T.surface_hover;
     c[ImGuiCol_TabActive]            = tab_active;
     c[ImGuiCol_TabUnfocused]         = T.panel_alt;
-    c[ImGuiCol_TabUnfocusedActive]   = T.surface;
+    c[ImGuiCol_TabUnfocusedActive]   = th_mix(T.panel_alt, T.surface, 0.5f);
     c[ImGuiCol_TabSelectedOverline]  = accent;
     c[ImGuiCol_TabDimmed]            = T.panel_alt;
-    c[ImGuiCol_TabDimmedSelected]    = T.surface;
+    c[ImGuiCol_TabDimmedSelected]    = th_mix(T.panel_alt, T.surface, 0.5f);
+    c[ImGuiCol_TabDimmedSelectedOverline] = th_alpha(accent, 0.5f);
     c[ImGuiCol_TableHeaderBg]        = T.panel_alt;
     c[ImGuiCol_TableBorderStrong]    = border;
     c[ImGuiCol_TableBorderLight]     = th_alpha(border, 0.5f);
     c[ImGuiCol_TableRowBg]           = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_TableRowBgAlt]        = dark ? ImVec4(1, 1, 1, 0.025f) : ImVec4(0, 0, 0, 0.025f);
+    c[ImGuiCol_TableRowBgAlt]        = dark ? ImVec4(1, 1, 1, 0.020f) : ImVec4(0, 0, 0, 0.030f);
     c[ImGuiCol_TextSelectedBg]       = T.selection;
     c[ImGuiCol_DragDropTarget]       = accent;
     c[ImGuiCol_NavCursor]            = accent;
     c[ImGuiCol_NavWindowingHighlight]= accent;
     c[ImGuiCol_NavWindowingDimBg]    = ImVec4(0, 0, 0, 0.18f);
-    c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0, 0, 0, dark ? 0.45f : 0.35f);
+    c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0, 0, 0, dark ? 0.55f : 0.35f);
 }
 
 static fs::path workspace_layout_path() {
@@ -11488,6 +12004,558 @@ static void blender_shutdown(ViewerState& st) {
     if (st.blender_daemon.joinable()) st.blender_daemon.join();
 }
 
+static void open_scene_creator(ViewerState& st) {
+    SceneCreatorDialogState& dialog = st.scene_creator;
+    dialog.open         = true;
+    dialog.request_open = true;
+    dialog.error.clear();
+    const std::string directory = st.current_dir.empty()
+        ? fs::current_path().string()
+        : st.current_dir;
+    std::snprintf(dialog.output_path, sizeof(dialog.output_path), "%s", directory.c_str());
+}
+
+// ── Procedural Scene Generator (v2) ──────────────────────────────────────
+// Advanced algorithm: Perlin/fBm/ridged noise + biome presets harvested from
+// real scene files (textures, tree/rock sets, water colors, torch composites).
+// Generates a full level, writes it next to the open scene, and loads it.
+static void open_procedural_generator(ViewerState& st) {
+    st.proc_gen_open = true;
+    st.proc_gen_request = true;
+    st.proc_gen_status.clear();
+}
+
+static void proc_gen_generate(ViewerState& st) {
+    sgen::TerrainOptions opt;
+    opt.biome = (sgen::Biome)std::clamp(st.proc_gen_biome, 0,
+                                         (int)sgen::Biome::Count - 1);
+    opt.seed = st.proc_gen_seed;
+    opt.width = std::max(600.0f, st.proc_gen_width);
+    opt.height = std::max(200.0f, st.proc_gen_height);
+    opt.platform_count = std::clamp(st.proc_gen_platforms, 2, 24);
+    opt.add_water = st.proc_gen_water;
+    opt.spill_torches = st.proc_gen_torches;
+    opt.mountains = st.proc_gen_mountains;
+    opt.islands = st.proc_gen_islands;
+    opt.deco_density = st.proc_gen_deco;
+    opt.scene_name = st.proc_gen_name;
+
+    sgen::Result r = sgen::generate_biome_scene(opt);
+    if (!r.ok()) {
+        st.proc_gen_status = "Generation failed: " + r.error;
+        return;
+    }
+
+    // Write next to the open scene (or the browser directory).
+    std::string dir = st.scene.filepath.empty()
+        ? (st.current_dir.empty() ? fs::current_path().string() : st.current_dir)
+        : fs::path(st.scene.filepath).parent_path().string();
+    std::string name(st.proc_gen_name[0] ? st.proc_gen_name : "procedural_scene");
+    std::string path = (fs::path(dir) / (name + ".scene")).string();
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) { st.proc_gen_status = "Cannot write " + path; return; }
+        out.write(r.scene_bytes.data(), static_cast<std::streamsize>(r.scene_bytes.size()));
+    }
+
+    // Load it into the editor (same flow as a freshly created scene).
+    st.current_dir = dir;
+    refresh_directory(st);
+    apply_filters(st);
+    FileEntry entry;
+    entry.name = name + ".scene";
+    entry.full_path = path;
+    entry.is_dir = false;
+    std::error_code ec;
+    entry.size = static_cast<size_t>(fs::file_size(path, ec));
+    entry.type = FTYPE_SCENE;
+    select_file(st, entry);
+    st.status_msg = "Procedural scene '" + name + "' generated (" +
+                    std::to_string(r.objects) + " objects, seed " +
+                    std::to_string(st.proc_gen_seed) + ").";
+    st.proc_gen_open = false;
+    st.proc_gen_request = false;
+    st.proc_gen_status = "Generated: " + path;
+    log_file_event("Procedural", "Generated " + path + " | biome=" +
+                   sgen::biome_name(opt.biome) + " seed=" +
+                   std::to_string(st.proc_gen_seed) + " objects=" +
+                   std::to_string(r.objects));
+}
+
+static void draw_procedural_generator(ViewerState& st) {
+    if (!st.proc_gen_open) return;
+    if (st.proc_gen_request) {
+        ImGui::OpenPopup("  " ICON_FA_MOUNTAIN_SUN "  Procedural Scene Generator");
+        st.proc_gen_request = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(520, 640), ImGuiCond_FirstUseEver);
+    if (!ImGui::BeginPopupModal("  " ICON_FA_MOUNTAIN_SUN "  Procedural Scene Generator",
+                                &st.proc_gen_open, ImGuiWindowFlags_NoCollapse)) {
+        return;
+    }
+
+    ImGui::TextColored(g_theme.accent, "Base the scene on a real Swordigo biome");
+    ImGui::TextDisabled("Textures, water colors, tree/rock sets, torch style and light "
+                        "colors are harvested from the actual shipped scenes.");
+    ImGui::Spacing();
+
+    // ── Biome preset picker ──
+    const char* preview = sgen::biome_name((sgen::Biome)st.proc_gen_biome);
+    if (ImGui::BeginCombo("Biome", preview)) {
+        for (int b = 0; b < (int)sgen::Biome::Count; ++b) {
+            const sgen::BiomeSpec& spec = sgen::biome_spec((sgen::Biome)b);
+            if (ImGui::Selectable(spec.name, st.proc_gen_biome == b))
+                st.proc_gen_biome = b;
+            if (st.proc_gen_biome == b) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    const sgen::BiomeSpec& bio = sgen::biome_spec((sgen::Biome)st.proc_gen_biome);
+    ImGui::TextDisabled("ground: %s / %s  ·  bg: %s", bio.ground_top,
+                        bio.ground_front, bio.background);
+    ImGui::Spacing();
+
+    // ── World parameters ──
+    if (ImGui::CollapsingHeader("World", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::InputScalar("Seed", ImGuiDataType_U32, &st.proc_gen_seed);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(ICON_FA_SHUFFLE " Random")) {
+            uint64_t rng = (uint64_t)time(nullptr) ^ 0x5DEECE66Dull;
+            st.proc_gen_seed = (uint32_t)sgen::rng_next(rng);
+        }
+        ImGui::SliderFloat("Width", &st.proc_gen_width, 800.0f, 16000.0f, "%.0f");
+        ImGui::SliderFloat("Height range", &st.proc_gen_height, 200.0f, 3000.0f, "%.0f");
+        ImGui::SliderInt("Platform strips", &st.proc_gen_platforms, 2, 24);
+        ImGui::SliderFloat("Decoration density", &st.proc_gen_deco, 0.0f, 2.0f, "%.1f");
+    }
+
+    // ── Features ──
+    if (ImGui::CollapsingHeader("Features", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Water sheet", &st.proc_gen_water);
+        ImGui::Checkbox("Torches + glow lights on walkable edges", &st.proc_gen_torches);
+        ImGui::Checkbox("Mountain ridges (ridged multifractal)", &st.proc_gen_mountains);
+        ImGui::Checkbox("Island hats on even platforms", &st.proc_gen_islands);
+    }
+
+    // ── Output ──
+    if (ImGui::CollapsingHeader("Output", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::InputText("Scene name", st.proc_gen_name, sizeof(st.proc_gen_name));
+        ImGui::TextDisabled("Saved next to the open scene (or the current folder).");
+    }
+
+    ImGui::Separator();
+    if (!st.proc_gen_status.empty()) {
+        ImGui::TextWrapped("%s", st.proc_gen_status.c_str());
+        ImGui::Spacing();
+    }
+    ImGui::TextDisabled("NPCs/entities are NOT generated — add characters yourself "
+                        "afterwards; the terrain, decor and lights are ready.");
+    if (ImGui::Button(ICON_FA_WAND_MAGIC_SPARKLES "  Generate & Open", ImVec2(-1, 32))) {
+        proc_gen_generate(st);
+    }
+    ImGui::EndPopup();
+}
+
+
+static void draw_scene_creator_dialog(ViewerState& st) {
+    SceneCreatorDialogState& dialog = st.scene_creator;
+    if (!dialog.open) return;
+    if (dialog.request_open) {
+        ImGui::OpenPopup("  " ICON_FA_WAND_MAGIC_SPARKLES "  New Swordigo Scene");
+        dialog.request_open = false;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(820, 740), ImGuiCond_FirstUseEver);
+    if (!ImGui::BeginPopupModal("  " ICON_FA_WAND_MAGIC_SPARKLES "  New Swordigo Scene",
+                                &dialog.open, ImGuiWindowFlags_NoCollapse)) {
+        return;
+    }
+
+    ImGui::TextColored(g_theme.accent, ICON_FA_WAND_MAGIC_SPARKLES "  Scene Creator");
+    ImGui::TextWrapped("Generate a gameplay-compatible Swordigo scene from a template. "
+                       "Every scene gets a canonical DirectionalLight triple, "
+                       "spawn_default, Background, ground collision mesh, and correct Bounds — "
+                       "all evidence-backed from 118 decoded shipped scenes.");
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    if (ImGui::BeginTabBar("##sc_tabs")) {
+
+        // ── Tab 1: Template & Identity ────────────────────────────────────
+        if (ImGui::BeginTabItem(ICON_FA_LAYER_GROUP "  Template")) {
+            ImGui::Spacing();
+            ImGui::TextDisabled("SCENE TEMPLATE");
+            // Template combo — maps to scenecreate::SceneTemplate enum order
+            static const char* kTemplateLabels[] = {
+                "Minimal — bare starter (ground + spawn + light)",
+                "Standard — outdoor story scene (default)",
+                "Outdoor — wide open world (large bounds)",
+                "Indoor — house / shop (compact bounds + point lights)",
+                "Dungeon — cave / jail / ice (medium bounds, cave bg)",
+                "Boss Arena — arena scale + portal exits",
+                "Portal Hub — transition / hub (portal objects)",
+                "Menu Scene — attract / idle (menu.scene pattern)",
+            };
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##template", &dialog.scene_template, kTemplateLabels,
+                             IM_ARRAYSIZE(kTemplateLabels))) {
+                // Auto-fill background if user hasn't typed one yet
+                if (!dialog.background[0]) {
+                    const auto t = static_cast<scenecreate::SceneTemplate>(dialog.scene_template);
+                    std::snprintf(dialog.background, sizeof(dialog.background), "%s",
+                                  scenecreate::template_default_background(t));
+                }
+            }
+            ImGui::Spacing();
+
+            // Template summary card
+            {
+                ImGui::BeginChild("##tpl_summary", ImVec2(0, 90), ImGuiChildFlags_Borders);
+                const auto t = static_cast<scenecreate::SceneTemplate>(dialog.scene_template);
+                ImGui::TextColored(g_theme.accent, ICON_FA_CIRCLE_INFO "  Auto-generated objects");
+                ImGui::BulletText("Background (BackgroundComponent, field 1602)");
+                ImGui::BulletText("DirectionalLight triple (Type 2/1/4, field 1042)");
+                ImGui::BulletText("world_base (GroundPolygon+GroundMesh+Collision)");
+                ImGui::BulletText("spawn_default (SpawnPointComponent, field 4010)");
+                if (dialog.scene_template >= 5 /*BossArena*/ || dialog.scene_template == 6 /*Portal*/)
+                    ImGui::BulletText("Portal exits (PortalComponent, SpecialType:2)");
+                (void)t;
+                ImGui::EndChild();
+            }
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("IDENTITY & OUTPUT");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint("##output_path", "Output folder or .scene path",
+                                     dialog.output_path, sizeof(dialog.output_path));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Enter a directory to place <level>.scene, or an explicit .scene path.");
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
+            ImGui::InputTextWithHint("##level_name", "Level name (e.g. my_level)", dialog.level_name,
+                                     sizeof(dialog.level_name));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint("##ns", "Namespace (e.g. my_mod)", dialog.scene_namespace,
+                                     sizeof(dialog.scene_namespace));
+            ImGui::TextDisabled("Level name → runtime ID.  Namespace → ObjectLibrary tag (no spaces/dots).");
+            ImGui::EndTabItem();
+        }
+
+        // ── Tab 2: Visuals (Background, Ground, Base Mesh) ───────────────
+        if (ImGui::BeginTabItem(ICON_FA_IMAGE "  Visuals")) {
+            ImGui::Spacing();
+            ImGui::SeparatorText("Background object");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint("##bg", "Background texture stem (e.g. grasslandsbackground_day)",
+                                     dialog.background, sizeof(dialog.background));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Observed stems across 118 scenes:\n"
+                                  "  grasslandsbackground_day  cavesbackground2\n"
+                                  "  townbackground  fire_background  graveyardback\n"
+                                  "(leave blank to use the template default)");
+            ImGui::TextDisabled("BackgroundComponent payload field 1602, inner TextureName field 10.");
+
+            ImGui::Spacing();
+            ImGui::SeparatorText("Starter ground mesh");
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.48f);
+            ImGui::InputTextWithHint("##gtop",  "Surface texture (e.g. fire_grass)",
+                                     dialog.ground_top, sizeof(dialog.ground_top));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint("##gside", "Side texture (e.g. graveyard_ground)",
+                                     dialog.ground_side, sizeof(dialog.ground_side));
+            ImGui::DragFloat3("Platform W / H / Depth", dialog.platform_size,
+                              1.0f, 8.0f, 10000.0f, "%.0f");
+            ImGui::TextDisabled("Boulder generates: GroundPolygon(980)+GroundMesh(981)+GroundMeshGenerator(982)"
+                                "+CollisionShape(983,IsGround:1)+TextureMapping(984,985).");
+
+            ImGui::Spacing();
+            ImGui::SeparatorText("Optional base Model (decoration)");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint("##mesh", "Model .pod stem (optional)",
+                                     dialog.base_mesh, sizeof(dialog.base_mesh));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Leave blank to omit. Extension (.pod) is stripped automatically.");
+            ImGui::EndTabItem();
+        }
+
+        // ── Tab 3: World Spawn ───────────────────────────────────────────
+        if (ImGui::BeginTabItem(ICON_FA_LOCATION_DOT "  Spawn")) {
+            ImGui::Spacing();
+            ImGui::TextDisabled("PLAYABLE ENTRY POINT (spawn_default)");
+            ImGui::TextWrapped("Ruby creates the conventional 'spawn_default' object "
+                               "(SpawnPointComponent payload field 4010, FacingDirection field 8). "
+                               "The engine uses this spawn when entering from a portal or on continue.");
+            ImGui::Spacing();
+            ImGui::DragFloat3("Spawn X / Y / Z", dialog.spawn, 1.0f, -100000.0f, 100000.0f, "%.1f");
+            ImGui::Text("Facing direction");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Right (1)", dialog.facing == 1))  dialog.facing = 1;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Left (-1)", dialog.facing == -1)) dialog.facing = -1;
+            ImGui::Spacing();
+            ImGui::BeginChild("##spawn_card", ImVec2(0, 100), ImGuiChildFlags_Borders);
+            ImGui::TextColored(g_theme.success, ICON_FA_LOCATION_DOT "  spawn_default");
+            ImGui::BulletText("SpawnPointComponent — payload field 4010");
+            ImGui::BulletText("FacingDirection field 8 = %d  (1=right, -1=left)", dialog.facing);
+            ImGui::BulletText("Position: %.1f, %.1f, %.1f",
+                              dialog.spawn[0], dialog.spawn[1], dialog.spawn[2]);
+            ImGui::BulletText("SpawnOffset (0, 0, 0) — field 18");
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+
+        // ── Tab 4: Lighting ──────────────────────────────────────────────
+        if (ImGui::BeginTabItem(ICON_FA_LIGHTBULB "  Lighting")) {
+            ImGui::Spacing();
+            ImGui::TextDisabled("DIRECTIONAL LIGHT TRIPLE (canonical — docs/scenecreator/03)");
+            ImGui::TextWrapped("Every Swordigo scene has exactly one DirectionalLight object "
+                               "with three LightComponent (field 1042) sub-components at IDs 101/103/105. "
+                               "Type 2 = Key sun, Type 1 = Ambient fill, Type 4 = Black shadow contrast.");
+            ImGui::Spacing();
+            ImGui::Checkbox("Show light overrides", &dialog.light_advanced);
+            ImGui::BeginDisabled(!dialog.light_advanced);
+            ImGui::SliderFloat("Key light intensity (Type 2)", &dialog.key_intensity,   0.0f, 5.0f);
+            ImGui::ColorEdit3("Key light color",  dialog.key_color);
+            ImGui::SliderFloat("Ambient intensity  (Type 1)", &dialog.ambient_intensity, 0.0f, 2.0f);
+            ImGui::SliderFloat("Shadow fill        (Type 4)", &dialog.shadow_intensity,  0.0f, 3.0f);
+            ImGui::EndDisabled();
+            ImGui::Spacing();
+            // Live preview card
+            ImGui::BeginChild("##light_card", ImVec2(0, 120), ImGuiChildFlags_Borders);
+            ImGui::TextColored(g_theme.accent, ICON_FA_LIGHTBULB "  DirectionalLight");
+            ImGui::BulletText("comp 101 — LightComponent Type:2 Intensity:%.2f  (key/sun)",
+                              dialog.light_advanced ? dialog.key_intensity : 3.0f);
+            ImGui::BulletText("comp 103 — LightComponent Type:1 Intensity:%.2f  (ambient)",
+                              dialog.light_advanced ? dialog.ambient_intensity : 0.3f);
+            ImGui::BulletText("comp 105 — LightComponent Type:4 Intensity:%.2f  Color:(0,0,0) (shadow)",
+                              dialog.light_advanced ? dialog.shadow_intensity : 0.4f);
+            ImGui::BulletText("Object Depth = 620.097656  (canonical for all 118 scenes)");
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+
+        // ── Tab 5: Bounds ────────────────────────────────────────────────
+        if (ImGui::BeginTabItem(ICON_FA_BOX "  Bounds")) {
+            ImGui::Spacing();
+            ImGui::TextDisabled("SCENE BOUNDS (root field 3 — required, 118/118 shipped scenes)");
+            ImGui::TextWrapped("SceneBounds is a 20-byte protobuf sub-message (four fixed32 floats: X, Y, Width, Height). "
+                               "Without it Camera.ResetFocus() has nothing to clamp — a new scene will appear to have a broken camera. "
+                               "By default Ruby derives bounds from the template category.");
+            ImGui::Spacing();
+            ImGui::Checkbox("Override template bounds", &dialog.bounds_override);
+            ImGui::BeginDisabled(!dialog.bounds_override);
+            ImGui::DragFloat4("X / Y / Width / Height", dialog.bounds, 10.0f, -50000.0f, 50000.0f, "%.0f");
+            ImGui::EndDisabled();
+            if (!dialog.bounds_override) {
+                const auto t = static_cast<scenecreate::SceneTemplate>(dialog.scene_template);
+                switch (t) {
+                case scenecreate::SceneTemplate::Outdoor:
+                    ImGui::TextColored(g_theme.success, "Using Outdoor preset: X=-3500 Y=-500 W=5500 H=2000"); break;
+                case scenecreate::SceneTemplate::Standard:
+                    ImGui::TextColored(g_theme.success, "Using Standard preset: X=-3500 Y=-1000 W=5500 H=2500"); break;
+                case scenecreate::SceneTemplate::Indoor:
+                    ImGui::TextColored(g_theme.success, "Using Indoor preset: X=-450 Y=-300 W=1750 H=1000"); break;
+                case scenecreate::SceneTemplate::Dungeon:
+                    ImGui::TextColored(g_theme.success, "Using Dungeon preset: X=-2900 Y=-1200 W=4000 H=2200"); break;
+                case scenecreate::SceneTemplate::BossArena:
+                    ImGui::TextColored(g_theme.success, "Using BossArena preset: X=-3500 Y=-500 W=7000 H=3000"); break;
+                case scenecreate::SceneTemplate::Portal:
+                    ImGui::TextColored(g_theme.success, "Using Portal preset: X=-1600 Y=-500 W=3200 H=1500"); break;
+                default:
+                    ImGui::TextColored(g_theme.success, "Derived from ground AABB + 200 px margin"); break;
+                }
+            }
+            ImGui::EndTabItem();
+        }
+
+        // ── Tab 6: Portals ───────────────────────────────────────────────
+        if (ImGui::BeginTabItem(ICON_FA_DOOR_OPEN "  Portals")) {
+            ImGui::Spacing();
+            ImGui::TextDisabled("PORTAL OBJECTS (docs/scenecreator/04 §2)");
+            ImGui::TextWrapped("Each portal = Portal (id 101) + CollisionShape (id 102, SpecialType:2) "
+                               "+ SpawnPoint (id 105). Object name = 'spawn_from_<destination>'. "
+                               "Add a matching 'spawn_from_<this_scene>' in the destination scene.");
+            ImGui::Spacing();
+            if (dialog.portal_count < SceneCreatorDialogState::kMaxPortals) {
+                if (ImGui::Button(ICON_FA_PLUS "  Add Portal")) {
+                    SceneCreatorPortalEntry& pe = dialog.portals[dialog.portal_count++];
+                    pe = SceneCreatorPortalEntry{};
+                    pe.y = 56.0f;
+                }
+            }
+            ImGui::SameLine();
+            if (dialog.portal_count > 0) {
+                if (ImGui::Button(ICON_FA_TRASH "  Remove Last"))
+                    dialog.portal_count--;
+            }
+            ImGui::Spacing();
+            for (int pi = 0; pi < dialog.portal_count; ++pi) {
+                auto& pe = dialog.portals[pi];
+                ImGui::PushID(pi);
+                char hdr[64];
+                std::snprintf(hdr, sizeof(hdr), "Portal %d: spawn_from_%s",
+                              pi + 1, pe.destination[0] ? pe.destination : "?");
+                if (ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::InputTextWithHint("##dest", "Destination scene stem (e.g. grass_part1)",
+                                            pe.destination, sizeof(pe.destination));
+                    ImGui::InputTextWithHint("##spname", "SpawnPointName (blank = default)",
+                                            pe.spawn_name, sizeof(pe.spawn_name));
+                    ImGui::Checkbox("TapToEnter", &pe.tap_to_enter);
+                    ImGui::DragFloat2("Position X/Y", &pe.x, 1.0f);
+                    ImGui::DragFloat2("Touch rect W/H", &pe.rect_w, 1.0f, 10.0f, 1000.0f);
+                    ImGui::Text("Facing"); ImGui::SameLine();
+                    if (ImGui::RadioButton("Right##p", pe.facing == 1))  pe.facing = 1;
+                    ImGui::SameLine();
+                    if (ImGui::RadioButton("Left##p",  pe.facing == -1)) pe.facing = -1;
+                }
+                ImGui::PopID();
+            }
+            if (dialog.portal_count == 0)
+                ImGui::TextDisabled("No portals — add them here or in the scene editor after creation.");
+            ImGui::EndTabItem();
+        }
+
+        // ── Tab 7: Map Link ──────────────────────────────────────────────
+        if (ImGui::BeginTabItem(ICON_FA_MAP "  Map")) {
+            ImGui::Spacing();
+            ImGui::Checkbox("Link this scene to a world map project", &dialog.link_to_map);
+            ImGui::BeginDisabled(!dialog.link_to_map);
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint("##mappath", "World map (.scmap)", dialog.map_path,
+                                     sizeof(dialog.map_path));
+            ImGui::EndDisabled();
+            ImGui::Spacing();
+            ImGui::TextWrapped("The .swscene sidecar records this link without touching the vanilla .scene protobuf.");
+            ImGui::Spacing();
+            ImGui::BeginChild("##manifest_card", ImVec2(0, 180), ImGuiChildFlags_Borders);
+            ImGui::TextDisabled("GENERATED PROJECT MANIFEST (.swscene)");
+            ImGui::BulletText("scene = %s.scene", dialog.level_name[0] ? dialog.level_name : "new_level");
+            ImGui::BulletText("level_name = %s", dialog.level_name);
+            ImGui::BulletText("namespace = %s", dialog.scene_namespace);
+            ImGui::BulletText("template = %s",
+                              scenecreate::template_label(
+                                  static_cast<scenecreate::SceneTemplate>(dialog.scene_template)));
+            ImGui::BulletText("map_link_enabled = %s", dialog.link_to_map ? "true" : "false");
+            ImGui::BulletText("map_path = %s", dialog.link_to_map && dialog.map_path[0]
+                              ? dialog.map_path : "(none)");
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+
+        ImGui::EndTabBar();
+    }
+
+    // Error display
+    if (!dialog.error.empty()) {
+        ImGui::Spacing();
+        ImGui::TextColored(g_theme.error, ICON_FA_TRIANGLE_EXCLAMATION "  %s",
+                           dialog.error.c_str());
+    }
+
+    // Bottom bar
+    const bool identity_ready   = dialog.level_name[0] && dialog.scene_namespace[0] &&
+                                  dialog.output_path[0];
+    const bool dimensions_ready = dialog.platform_size[0] >= 32.0f &&
+                                  dialog.platform_size[1] >= 8.0f  &&
+                                  dialog.platform_size[2] >= 8.0f;
+    ImGui::Separator();
+    // Quick summary of what will be created
+    char creates[256];
+    std::snprintf(creates, sizeof(creates), "Creates: Background + DirectionalLight + world_base + spawn_default%s%s%s",
+                  dialog.base_mesh[0]   ? " + base_mesh"   : "",
+                  dialog.portal_count   ? " + portals"     : "",
+                  dialog.link_to_map    ? " + map link"    : "");
+    ImGui::TextDisabled("%s", creates);
+
+    ImGui::SameLine(ImGui::GetWindowWidth() - 280.0f);
+    if (ImGui::Button("Cancel", ImVec2(100, 0))) {
+        dialog.open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!identity_ready || !dimensions_ready);
+    if (ImGui::Button(ICON_FA_WAND_MAGIC_SPARKLES "  Create Scene", ImVec2(160, 0))) {
+        scenecreate::Options options;
+        options.output_path     = dialog.output_path;
+        options.level_name      = dialog.level_name;
+        options.scene_namespace = dialog.scene_namespace;
+        options.scene_template  = static_cast<scenecreate::SceneTemplate>(dialog.scene_template);
+        options.base_mesh              = dialog.base_mesh;
+        options.background             = dialog.background;
+        options.ground_top_texture     = dialog.ground_top;
+        options.ground_side_texture    = dialog.ground_side;
+        options.map_path               = dialog.map_path;
+        options.platform_width  = dialog.platform_size[0];
+        options.platform_height = dialog.platform_size[1];
+        options.platform_depth  = dialog.platform_size[2];
+        options.spawn_x         = dialog.spawn[0];
+        options.spawn_y         = dialog.spawn[1];
+        options.spawn_z         = dialog.spawn[2];
+        options.spawn_facing    = dialog.facing;
+        options.link_to_map     = dialog.link_to_map;
+
+        // DirectionalLight overrides
+        if (dialog.light_advanced) {
+            options.key_light   = { 2, dialog.key_intensity,
+                                    dialog.key_color[0], dialog.key_color[1],
+                                    dialog.key_color[2], 1.0f };
+            options.ambient     = { 1, dialog.ambient_intensity, 1, 1, 1, 1 };
+            options.shadow_fill = { 4, dialog.shadow_intensity, 0, 0, 0, 1 };
+        }
+
+        // Bounds override
+        if (dialog.bounds_override) {
+            options.bounds_x = dialog.bounds[0];
+            options.bounds_y = dialog.bounds[1];
+            options.bounds_w = dialog.bounds[2];
+            options.bounds_h = dialog.bounds[3];
+        }
+
+        // Portals
+        for (int pi = 0; pi < dialog.portal_count; ++pi) {
+            const auto& pe = dialog.portals[pi];
+            if (!pe.destination[0]) continue;
+            scenecreate::PortalParams pp;
+            pp.destination  = pe.destination;
+            pp.spawn_name   = pe.spawn_name;
+            pp.tap_to_enter = pe.tap_to_enter;
+            pp.x            = pe.x;
+            pp.y            = pe.y;
+            pp.rect_w       = pe.rect_w;
+            pp.rect_h       = pe.rect_h;
+            pp.facing       = pe.facing;
+            options.portals.push_back(pp);
+        }
+
+        scenecreate::Result result;
+        std::string error;
+        if (scenecreate::create(options, result, error)) {
+            dialog.open = false;
+            ImGui::CloseCurrentPopup();
+            st.current_dir = fs::path(result.scene_path).parent_path().string();
+            refresh_directory(st);
+            apply_filters(st);
+            FileEntry entry;
+            entry.name      = fs::path(result.scene_path).filename().string();
+            entry.full_path = result.scene_path;
+            entry.is_dir    = false;
+            std::error_code ec;
+            entry.size = static_cast<size_t>(fs::file_size(result.scene_path, ec));
+            entry.type = FTYPE_SCENE;
+            select_file(st, entry);
+            st.status_msg = "Created playable scene '" + entry.name + "' with " +
+                            std::to_string(result.object_count) + " starter objects.";
+            log_file_event("SceneCreate", "Created scene from scratch: " + result.scene_path +
+                           " | manifest=" + result.manifest_path);
+        } else {
+            dialog.error = error;
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::EndPopup();
+}
+
 static void draw_settings_dialog(ViewerState& st) {
     if (!st.show_settings) return;
 
@@ -11548,6 +12616,9 @@ static void draw_settings_dialog(ViewerState& st) {
             ImGui::Checkbox("Dynamic Lighting (Lambert)", &st.scene_lighting_enabled);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("The full Lambert equation (hemisphere ambient + directional/point diffuse). Turn OFF to see the raw texture \u00d7 material color — the diagnostic that separates \"the texture is dark\" from \"the lighting is wrong\".");
+            ImGui::Checkbox("Dimension Rift (reveal dim objects)", &st.scene_dimension_rift);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Objects tagged DimensionObject only appear in-game while the Dimension Rift powerup is active (e.g. the obj5#5 bridge in lowergrove_part1).\nOFF: they render as faint violet ghosts. ON: fully visible — exactly like using the rift powerup.");
             ImGui::Checkbox("Normal View (debug)", &st.scene_normals_debug);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Color = world-space normal (RGB = N*0.5+0.5). Surfaces whose normals point INTO the mesh show purple/blue instead of their surface tint — the classic \"black wood\" inverted-normal symptom.");
@@ -11814,7 +12885,8 @@ static bool handle_shortcuts(ViewerState& st) {
         st.workspace_layout_dirty = true;
     }
 
-    // Ctrl+S — save current scene (if scene is loaded and has a path)
+    // Ctrl+S — save the CURRENTLY ACTIVE editor (global across editor systems).
+    // Consume the trigger once, then dispatch on st.preview_type.
     if (st.scene_save_requested || (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S))) {
         st.scene_save_requested = false;
         if (st.preview_type == PREVIEW_SCENE && !st.scene.filepath.empty()) {
@@ -11853,6 +12925,35 @@ static bool handle_shortcuts(ViewerState& st) {
             st.scene_save_msg_timer = 4.0f;
             log_file_event("SceneSave", saved ? "Saved scene (Ctrl+S): " + st.scene.filename
                                                : "ERROR: " + save_error);
+        } else if (st.preview_type == PREVIEW_MAP && st.map_editor.loaded) {
+            // World-map editor: byte-exact .scmap save via map_loader.
+            std::string err;
+            const bool saved = mapedit::map_editor_save(st.map_editor, &err);
+            if (saved) {
+                st.map_editor.dirty = false;
+                st.map_editor.status = "Saved (byte-exact)";
+            } else {
+                st.map_editor.status = "Save failed: " + err;
+            }
+            st.map_editor.status_timer = 4.0f;
+            log_file_event("MapSave", saved ? "Saved map (Ctrl+S)" : "ERROR: " + err);
+            return false;
+        } else if (st.preview_type == PREVIEW_TEXTURE && st.tex_edit_dirty &&
+                   st.tex_edit_valid && !st.tex_edit_src.empty()) {
+            // Texture editor: mirror the Save button's "Overwrite Source" branch —
+            // containers (.tex/.pvr) go through tex_edit_save_tex, plain images
+            // (PNG) through tex_edit_save_png. Same helpers the manual Save uses.
+            const bool ok = tex_edit_is_container(st)
+                                ? tex_edit_save_tex(st, st.tex_edit_src)
+                                : tex_edit_save_png(st, st.tex_edit_src);
+            if (ok) {
+                st.tex_edit_dirty = false;
+                st.status_msg = "Saved back to " + st.tex_edit_src;
+                log_file_event("TextureEdit", "Overwrote (Ctrl+S): " + st.tex_edit_src);
+            } else {
+                st.status_msg = "Overwrite failed: " + st.tex_edit_src;
+            }
+            return false;
         }
     }
 
@@ -11876,6 +12977,86 @@ static bool handle_shortcuts(ViewerState& st) {
     }
     if (st.preview_type == PREVIEW_SCENE && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D))
         duplicate_scene_selection(st);
+
+    // Ctrl+C — copy the selected map node (world-map editor). Synced with the
+    // scene copy above so Ctrl+C works across editor systems.
+    if (st.preview_type == PREVIEW_MAP && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) {
+        auto& m = st.map_editor;
+        if (m.sel_zone >= 0 && m.sel_zone < (int)m.map.zones.size() &&
+            m.sel_node >= 0 && m.sel_node < (int)m.map.zones[m.sel_zone].nodes.size()) {
+            m.node_clipboard = m.map.zones[m.sel_zone].nodes[m.sel_node];
+            m.node_clipboard_valid = true;
+            m.status = "Copied node '" + m.node_clipboard.level_name + "'";
+            m.status_timer = 4.0f;
+        }
+        return false;
+    }
+    // Ctrl+V — paste the copied node into the selected zone (world-map editor).
+    // The edit goes through the generic markup tree (m.map.root) then
+    // map_rebuild/map_validate so the byte-exact .scmap save stays intact.
+    if (st.preview_type == PREVIEW_MAP && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V)) {
+        auto& m = st.map_editor;
+        if (!m.node_clipboard_valid) {
+            m.status = "Nothing to paste — copy a node first (Ctrl+C)";
+            m.status_timer = 4.0f;
+            return false;
+        }
+        if (m.sel_zone < 0 || m.sel_zone >= (int)m.map.zones.size()) {
+            m.status = "Paste target: select a zone first";
+            m.status_timer = 4.0f;
+            return false;
+        }
+        // Find the sel_zone-th "Zone" block in the generic tree. The typed
+        // overlay (m.map.zones) and the root "Zone" blocks share the same order.
+        mapedit::MkBlock* zoneBlock = nullptr;
+        {
+            int zi = 0;
+            for (auto& b : m.map.root) {
+                if (b.type == "Zone") {
+                    if (zi == m.sel_zone) { zoneBlock = &b; break; }
+                    ++zi;
+                }
+            }
+        }
+        if (!zoneBlock) {
+            m.status = "Paste failed: zone block not found";
+            m.status_timer = 4.0f;
+            return false;
+        }
+        // Unique level name: clipboard name + "_copy" (incremented until free).
+        const mapedit::MapNodeData& src = m.node_clipboard;
+        std::string base = src.level_name.empty() ? "node" : src.level_name;
+        std::string new_name = base + "_copy";
+        int suffix = 1;
+        while (m.map.node_index.count(new_name)) {
+            new_name = base + "_copy" + std::to_string(++suffix);
+        }
+        // Add a fresh Node message to the zone block and copy scalar fields.
+        // NOTE: portals are intentionally NOT replicated — duplicating portal
+        // targets/directions is fiddly and would create ambiguous graph edges;
+        // the pasted node is a clean copy of the node's own scalar fields.
+        mapedit::MkField* nf = mapedit::mk_add_msg(*zoneBlock, "Node");
+        if (nf) {
+            mapedit::mk_msg_set_str(*nf, "LevelName", new_name);
+            if (!src.title.empty())  mapedit::mk_msg_set_str(*nf, "Title", src.title);
+            if (!src.music.empty())  mapedit::mk_msg_set_str(*nf, "Music", src.music);
+            mapedit::mk_msg_set_int(*nf, "Type", src.type);
+            mapedit::mk_msg_set_int(*nf, "Hidden", src.hidden ? 1 : 0);
+            mapedit::mk_msg_set_int(*nf, "ExperienceLevel", src.experience_level);
+            mapedit::mk_msg_set_int(*nf, "NumTreasures", src.num_treasures);
+            mapedit::mk_msg_set_int(*nf, "HasPortal", src.has_portal ? 1 : 0);
+            mapedit::mk_msg_set_int(*nf, "IgnoreInStatistics", src.ignore_in_statistics ? 1 : 0);
+            mapedit::map_rebuild(m.map);
+            mapedit::map_validate(m.map);
+            m.dirty = true;
+            m.status = "Pasted node '" + new_name + "' (portals not copied)";
+            m.status_timer = 4.0f;
+        } else {
+            m.status = "Paste failed: could not add node";
+            m.status_timer = 4.0f;
+        }
+        return false;
+    }
 
     if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
         if (st.selected_idx > 0) {
@@ -12057,12 +13238,17 @@ int main(int argc, char* argv[]) {
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
     SDL_Window* window = SDL_CreateWindow(WIN_TITLE, WIN_W, WIN_H,
-                                          SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                                          SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+                                          SDL_WINDOW_BORDERLESS | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_Quit();
         return 1;
     }
+    // Best-effort: compositors that support SDL hit testing provide native
+    // drag/resize behavior for the custom title bar. The app remains usable
+    // on platforms which do not expose it.
+    SDL_SetWindowHitTest(window, ruby_window_hit_test, nullptr);
 
     // Ruby window icon — same launcher icon, from embedded assets (permanent fix)
     {
@@ -12369,7 +13555,26 @@ int main(int argc, char* argv[]) {
         // Draw top Blender-style main menu bar
         bool open_about = false;
         if (ImGui::BeginMainMenuBar()) {
+            // Brand the application in the same palette and compact visual
+            // language as the editor, rather than leaving the OS window title
+            // as the only "Ruby / Swordigo Studio" identity.
+            ImGui::PushStyleColor(ImGuiCol_Text, g_theme.accent);
+            ImGui::TextUnformatted(ICON_FA_GEM "  RUBY");
+            ImGui::PopStyleColor();
+            ImGui::SameLine(0.0f, 5.0f);
+            ImGui::TextDisabled("SWORDIGO STUDIO");
+            ImGui::SameLine(0.0f, 10.0f);
+            ImGui::TextDisabled("|");
+            ImGui::SameLine(0.0f, 6.0f);
             if (ImGui::BeginMenu("File")) {
+                if (ImGui::BeginMenu("Create")) {
+                    if (ImGui::MenuItem(ICON_FA_WAND_MAGIC_SPARKLES "  Scene..."))
+                        open_scene_creator(g_state);
+                    if (ImGui::MenuItem(ICON_FA_MOUNTAIN_SUN "  Procedural Scene..."))
+                        open_procedural_generator(g_state);
+                    ImGui::EndMenu();
+                }
+                ImGui::Separator();
                 if (ImGui::MenuItem("Open Vanilla Assets Folder")) {
                     std::error_code ec;
                     g_state.current_dir = expand_home("~/.local/share/swordigo-desktop/assets/resources/");
@@ -12526,6 +13731,40 @@ int main(int argc, char* argv[]) {
                 }
                 ImGui::EndMenu();
             }
+
+            // Native-looking window controls, owned and styled by Ruby. They
+            // sit in the same app bar instead of consuming a separate OS
+            // title strip above the workspace.
+            constexpr float kWindowButtonW = 34.0f;
+            const float controls_x = std::max(ImGui::GetCursorPosX() + 12.0f,
+                                              ImGui::GetWindowWidth() - kWindowButtonW * 3.0f - 7.0f);
+            ImGui::SetCursorPosX(controls_x);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 3.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2.0f, 0.0f));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, g_theme.surface_hover);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, g_theme.surface_active);
+            if (ImGui::Button(ICON_FA_WINDOW_MINIMIZE "##window_min", ImVec2(kWindowButtonW, 24.0f)))
+                SDL_MinimizeWindow(window);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimize");
+            ImGui::SameLine();
+            const bool maximized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
+            if (ImGui::Button(maximized ? "\xe2\x9d\x90##window_restore" : "\xe2\x96\xa1##window_max", ImVec2(kWindowButtonW, 24.0f))) {
+                if (maximized) SDL_RestoreWindow(window);
+                else SDL_MaximizeWindow(window);
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(maximized ? "Restore" : "Maximize");
+            ImGui::SameLine();
+            ImGui::PopStyleColor(3);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.14f, 0.65f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.88f, 0.18f, 0.22f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.68f, 0.10f, 0.13f, 1.0f));
+            if (ImGui::Button(ICON_FA_XMARK "##window_close", ImVec2(kWindowButtonW, 24.0f)))
+                running = false;
+            ImGui::PopStyleColor(3);
+            ImGui::PopStyleVar(3);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close");
             ImGui::EndMainMenuBar();
         }
 
@@ -12564,9 +13803,9 @@ int main(int argc, char* argv[]) {
         if (g_mcp_console_open)
             draw_mcp_console();
 
+        draw_scene_creator_dialog(g_state);
+        draw_procedural_generator(g_state);
         draw_settings_dialog(g_state);
-
-
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
@@ -12580,7 +13819,9 @@ int main(int argc, char* argv[]) {
         ImGui::Begin("##MainWindow", nullptr, wflags);
 
         float total_h = ImGui::GetContentRegionAvail().y;
-        float content_h = total_h - STATUS_BAR_H;
+        // Never request a child taller than its host.  This matters while a
+        // window is being resized or restored on a small display.
+        float content_h = std::max(1.0f, total_h - STATUS_BAR_H);
 
         ImGui::BeginChild("ContentArea", ImVec2(0, content_h));
 
@@ -12645,22 +13886,33 @@ int main(int argc, char* argv[]) {
         }
 
         // Center editor — flexes to swallow all remaining width.
-        const float editor_w = std::max(MIN_EDITOR_W, available_w - xcur - w_inspector - (show_inspector_now ? split : 0.0f));
+        // Side panels are already dropped above when space is tight.  Do not
+        // force MIN_EDITOR_W here: doing so made CenterPanel wider than its
+        // parent below that threshold, creating horizontal dead space.
+        const float editor_w = std::max(1.0f, available_w - xcur - w_inspector -
+                                        (show_inspector_now ? split : 0.0f));
         ImGui::SetCursorPos(ImVec2(xcur, 0.0f));
         ImGui::BeginChild("CenterPanel", ImVec2(editor_w, content_h));
 
-        float center_panel_total_h = ImGui::GetContentRegionAvail().y;
-        const float max_bottom_h = std::max(120.0f, center_panel_total_h - MIN_EDITOR_H - split);
-        g_state.bottom_panel_height = std::clamp(g_state.bottom_panel_height, 120.0f, max_bottom_h);
-        float bottom_panel_h = g_state.show_bottom_panel ? g_state.bottom_panel_height : 0.0f;
-        float top_part_h = std::max(MIN_EDITOR_H, center_panel_total_h - bottom_panel_h -
-                                    (g_state.show_bottom_panel ? split : 0.0f));
+        float center_panel_total_h = std::max(1.0f, ImGui::GetContentRegionAvail().y);
+        // Preserve a usable preview before allowing the optional bottom panel.
+        // On short windows it is temporarily suppressed rather than forcing
+        // children outside their parent (the old source of vertical voids).
+        constexpr float kAbsoluteMinPreviewH = 80.0f;
+        const float max_bottom_h = std::max(0.0f, center_panel_total_h -
+                                                   kAbsoluteMinPreviewH - split);
+        const bool show_bottom_now = g_state.show_bottom_panel && max_bottom_h >= 120.0f;
+        if (show_bottom_now)
+            g_state.bottom_panel_height = std::clamp(g_state.bottom_panel_height, 120.0f, max_bottom_h);
+        float bottom_panel_h = show_bottom_now ? g_state.bottom_panel_height : 0.0f;
+        float top_part_h = std::max(1.0f, center_panel_total_h - bottom_panel_h -
+                                    (show_bottom_now ? split : 0.0f));
 
         ImGui::BeginChild("TopPartPreview", ImVec2(0, top_part_h));
         draw_center_panel(g_state);
         ImGui::EndChild();
 
-        if (g_state.show_bottom_panel) {
+        if (show_bottom_now) {
             ImGui::InvisibleButton("##bottom_splitter", ImVec2(-1.0f, split));
             if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
             if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {

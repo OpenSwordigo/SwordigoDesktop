@@ -99,6 +99,11 @@ public:
     void begin_frame();
     void end_frame();     // renders ImGui draw data into the GL context
 
+    // The ImGui context this GUI owns (with the shared SDL3/GL3 backend).
+    // Used by the boot loading screen so it draws on the SAME context/backend
+    // rather than creating a second one. Null until init() runs.
+    void* imgui_context() const { return m_imgui_ctx; }
+
     // Toggle visibility (called on F3)
     void toggle_visible() { m_visible = !m_visible; }
     bool is_visible()     const { return m_visible; }

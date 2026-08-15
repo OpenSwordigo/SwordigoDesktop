@@ -187,6 +187,9 @@ static int      s_sre_last_driven_frame  = -1;
  * Exported to the host and printed with the frame diagnostics so we can
  * verify the world-simulation drive is active without spamming stderr. */
 volatile uint64_t g_sre_world_drive_count = 0;
+volatile uint64_t g_sre_world_gate_evals   = 0;  /* gate evaluations (debug) */
+volatile uint64_t g_sre_scene_object_count = 0;  /* active objects in Scene+0x110 list (~2/sec) */
+volatile uint64_t g_sre_scene_object_removals = 0; /* objects observed leaving the list */
 
 /* GameState pointer — exported so host can directly read/write game state.
  * This is a GUEST pointer (offset from guest memory base).
@@ -219,19 +222,47 @@ static void sp_addref(void* pn) {
  * heap memory when a refcount block has been partially reclaimed. */
 static int sp_vtable_is_valid(uint64_t vtable) {
     if (!vtable || (vtable & 7) != 0) return 0;
-    if (vtable >= 0x16b6a80ULL && vtable < 0x16DC000ULL) return 1; /* .data.rel.ro */
-    if (vtable >= 0x1583480ULL && vtable < 0x15A2000ULL) return 1; /* .rodata */
+    /* Valid C++ vtable region for guest objects. libswordigo.so loads at guest
+     * base 0x1000000, so these are base + RVA. Section bounds verified against
+     * the live ARM64 binary (readelf -SW libswordigo.so, v1.4.12):
+     *   .rodata       RVA 0x583480 .. 0x5A1145
+     *   .data.rel.ro  RVA 0x6b6a80 .. 0x6DBFC0   (WA — most SceneObject vtables)
+     *   .data         RVA 0x6e8000 .. 0x6e8a60   (relocated runtime vtable ptrs)
+     * The PREVIOUS two narrow windows (…5A2000 and …6DC000) left a hole between
+     * .rodata's end and .data.rel.ro, and excluded .data — so legitimate
+     * pickup-object vtables (sword, keys, collectibles) failed validation, the
+     * destruction guard fired, and dispose()/destroy() was SKIPPED. The object
+     * was never removed from the scene → visual duplicates left behind, growing
+     * per-frame work (lag), and re-collectable "unlimited" resources.
+     * Use ONE contiguous window .rodata..end-of-.data (matching the range the
+     * sibling sre_Proto_SceneObject_Destroy guard already uses), plus the SRE
+     * guest image and relay-cave arenas. */
+    /* .rodata (RTTI/type_info + spilled vtables) 0x1583480..0x15a1148 and
+     * .data.rel.ro (nearly all Caver::* class vtables) 0x16b6a80..0x16dc000.
+     * The old single window 0x1583480..0x16e9000 spanned the gap between them
+     * AND ran past the last real vtable into .got/.data — accepting garbage
+     * (over-loose). Use the two exact, contiguous section windows so the guard
+     * accepts every legitimate SceneObject/component vtable (pickups: sword,
+     * keys, collectibles) and nothing else. Mirrors sre_is_valid_vtable_ptr. */
+    if (vtable >= 0x1583480ULL && vtable < 0x15a1148ULL) return 1; /* .rodata (0x583480..0x5a1145) */
+    if (vtable >= 0x16b6a80ULL && vtable < 0x16dc000ULL) return 1; /* .data.rel.ro (0x6b6a80..0x6dbfc0, Caver::* vtables 0x6b8ec0..0x6dbfb8) */
+    if (vtable >= 0x2000000ULL && vtable < 0x2300000ULL) return 1; /* libsre.so guest vtables */
     /* SRE relay-cave vtables (TrampolineMgr arena 0x3000000–0x3100000) */
     if (vtable >= 0x3000000ULL && vtable < 0x3100000ULL) return 1;
     return 0;
 }
 
+extern int sre_is_valid_vtable_ptr(uint64_t vtable);  /* defined in sre_init.c */
+extern int sre_is_valid_code_ptr(uint64_t addr);      /* defined in sre_init.c */
+
 static int sp_code_is_valid(uint64_t fn) {
     if (!fn || (fn & 3) != 0) return 0;
-    if (fn >= 0x1203e90ULL && fn < 0x1584000ULL) return 1;      /* .text */
-    if (fn >= 0x3000000ULL && fn < 0x3100000ULL) return 1;      /* relay arena */
-    if (fn >= 0x2000000ULL && fn < 0x2300000ULL) return 1;      /* libsre.so guest */
-    return 0;
+    /* Delegate to the single canonical validator (sre_init.c) so this stays in
+     * lock-step with .plt/.text/libsre/relay bounds and can never drift. The
+     * old body used .text-only (0x1203e90..0x1583478), which rejected
+     * PLT-dispatched dispose/destroy thunks (0x11f33d0..0x1203e90) → the
+     * shared_ptr release skipped the real destroy and leaked the object. */
+    return sre_is_valid_code_ptr(fn);
 }
 
 static void sp_release(void* pn) {
@@ -387,9 +418,15 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
                     if (g_sre_GUIEffect_FadeOut) g_sre_GUIEffect_FadeOut((void*)dmg_effect, 0.0f);
                     if (g_sre_GUIEffect_FadeIn) g_sre_GUIEffect_FadeIn((void*)dmg_effect, 0.6f);
                 }
-                /* Re-read HP after potential effect calls */
+                /* BUG FIX: Re-read HP and health_bar AFTER effect calls.
+                 * GUIEffect calls may indirectly trigger overlay teardown during scene
+                 * transitions. Re-validate both pointers before SetCurrentHealth.
+                 * Previously: health_bar re-read assumed overlay_ptr was still valid
+                 * but the double-deref could yield 0 → NULL deref in SetCurrentHealth. */
                 cur_hp = *(int*)(gamestate + 0xA8);
-                health_bar = *(uint64_t*)(*(uint64_t*)(this_ + 0x100) + 0x1E8);
+                uint64_t new_overlay = *(uint64_t*)(this_ + 0x100);
+                health_bar = new_overlay ? *(uint64_t*)(new_overlay + 0x1E8) : 0;
+                if (!health_bar) goto do_effects;  /* overlay freed during effect — bail */
             }
             
             if (g_sre_HealthBar_SetCurrentHealth) g_sre_HealthBar_SetCurrentHealth((void*)health_bar, cur_hp);
@@ -481,11 +518,8 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
         uint64_t coin_bar = *(uint64_t*)(*(uint64_t*)(this_ + 0x100) + 0x238);
         if (coin_bar != 0) {
             int coins = *(int*)(gamestate + 0xB0);
-            if (coins == 0 && g_sre_player_coins > 0) {
-                /* Neglect zero-reset of coins, write back last known coins */
-                *(int*)(gamestate + 0xB0) = g_sre_player_coins;
-                coins = g_sre_player_coins;
-            }
+            /* Zero is a valid balance. Do not restore a previous frame's value:
+             * doing so contaminated new saves and made spending to zero fail. */
             if (g_sre_CoinBar_SetCurrentCoins) g_sre_CoinBar_SetCurrentCoins((void*)coin_bar, coins);
             g_sre_player_coins = coins;
             
@@ -626,13 +660,44 @@ void sre_GameSceneView_Update(void* self, float deltaTime) {
             if (scene && (uint64_t)scene > 0x10000) {
                 uint64_t scene_vt = *(uint64_t*)scene;
                 if (scene_vt && (scene_vt & 7) == 0) {
+                    g_sre_world_gate_evals++;
                     int frame = *(int*)((char*)scene + 0x310);
-                    if ((uint64_t)scene != s_sre_last_driven_scene ||
-                        frame == s_sre_last_driven_frame) {
+                    int drive = ((uint64_t)scene != s_sre_last_driven_scene ||
+                                 frame == s_sre_last_driven_frame);
+                    /* Debug: sparse gate log when SRE_WORLD_DEBUG=1 (every ~240 evals) */
+                    if ((g_sre_world_gate_evals & 0xFF) == 1) {
+                        static int s_world_dbg = -1;
+                        if (s_world_dbg < 0) s_world_dbg = getenv("SRE_WORLD_DEBUG") != NULL;
+                        if (s_world_dbg) {
+                            fprintf(stderr, "[SRE/World] eval=%llu scene=%p vt=%llx frame=%d last_frame=%d drive=%d loading=%d\n",
+                                    (unsigned long long)g_sre_world_gate_evals, scene,
+                                    (unsigned long long)scene_vt, frame, s_sre_last_driven_frame,
+                                    drive, g_sre_scene_loading);
+                        }
+                    }
+                    if (drive) {
                         g_sre_world_drive_count++;
                         typedef void (*pfn_gsc_update)(void*, float);
                         ((pfn_gsc_update)(g_swordigo_base + 0x349d84))((void*)ctrl_ptr, deltaTime);
                         frame = *(int*)((char*)scene + 0x310);
+                    }
+                    /* Object-count census (debug, ~2/sec): walk the active-object
+                     * circular list at Scene+0x110. The same list the removal
+                     * loop drains, so a shrinking count proves destruction runs. */
+                    if ((g_sre_world_gate_evals % 120) == 7) {
+                        uint64_t* head = (uint64_t*)((char*)scene + 0x110);
+                        uint64_t* node = (uint64_t*)*head;
+                        uint64_t count = 0;
+                        uint64_t guard = 0;
+                        while (node && node != head && guard < 50000) {
+                            count++;
+                            node = (uint64_t*)*node;
+                            guard++;
+                        }
+                        if (guard < 50000 && g_sre_scene_object_count > count) {
+                            g_sre_scene_object_removals += (g_sre_scene_object_count - count);
+                        }
+                        g_sre_scene_object_count = count;
                     }
                     s_sre_last_driven_scene = (uint64_t)scene;
                     s_sre_last_driven_frame = frame;
@@ -698,12 +763,22 @@ void sre_SceneLoadingView_InitWithGameState(void* self, void* state_ptr, void* m
         g_orig_SceneLoadingView_InitWithGameState(self, state_ptr, map_node_ptr);
     }
     fprintf(stderr, "[SRE/Scene] SceneLoadingView::InitWithGameState finished successfully.\n");
+
+    /* BUG FIX: Always clear scene_loading flag on ALL exit paths.
+     * Previously: if the original crashed or longjmp-escaped, flag stayed 1
+     * permanently → world-update drive suppressed forever → game froze.
+     * Fix: clear unconditionally here (the setjmp recovery in Scene::FinishLoad
+     * also clears it, so double-clearing is safe). */
+    g_sre_scene_loading = 0;
 }
 
 typedef void (*pfn_orig_GameSceneController_InitWithScene)(void* self, void* scene_ptr);
 pfn_orig_GameSceneController_InitWithScene g_orig_GameSceneController_InitWithScene = 0;
 
 void sre_GameSceneController_InitWithScene(void* self, void* scene_ptr) {
+    if (!self) return;
+    extern volatile uint64_t g_sre_hero_obj;
+    g_sre_hero_obj = 0; /* Hero pointer is re-initialized for the new scene */
     fprintf(stderr, "[SRE/Scene] GameSceneController::InitWithScene starting (ctrl=%p, scene=%p)...\n", self, scene_ptr);
     if (g_orig_GameSceneController_InitWithScene) {
         g_orig_GameSceneController_InitWithScene(self, scene_ptr);
@@ -714,9 +789,19 @@ void sre_GameSceneController_InitWithScene(void* self, void* scene_ptr) {
 typedef void (*pfn_orig_Scene_FinishLoad)(void* self);
 pfn_orig_Scene_FinishLoad g_orig_Scene_FinishLoad = 0;
 
+/* JOB 1 (menu->game transition freeze): capture the Scene* that just finished
+ * loading. When the menu-launched GotoLevel stalls the NavController transition
+ * inside __do_upcast (0x54c6d4), the current-VC chain still points at the menu
+ * VC, so the frame loop can't reach the new scene through nav_ctrl+0x50. This
+ * global gives the frame-loop bypass a DIRECT, reliable handle to the live
+ * scene so it can drive Scene::Update itself and unfreeze the world. */
+volatile uint64_t g_sre_finishloaded_scene = 0;
+
 void sre_Scene_FinishLoad(void* self) {
     if (!self) return;
     fprintf(stderr, "[SRE/Scene] Scene::FinishLoad starting (scene=%p)...\n", self);
+    /* Publish the freshly-loaded scene for the JOB 1 world-drive bypass. */
+    g_sre_finishloaded_scene = (uint64_t)self;
 
     /* CRITICAL: raise scene loading flag BEFORE calling original.
      * This suppresses all lua_resume calls in ProgramState::Update for the
@@ -1054,8 +1139,6 @@ call_orig:
  * Address: 0x47462c (v1.4.12 ARM64)
  * =============================================================================
  */
-extern int sre_is_valid_vtable_ptr(uint64_t vtable);
-
 uint64_t sre_SceneObject_ComponentWithInterface(void* self, int64_t interface_id) {
     if (!self) return 0;
 
@@ -1076,10 +1159,13 @@ uint64_t sre_SceneObject_ComponentWithInterface(void* self, int64_t interface_id
         uint64_t vtable = *(uint64_t*)comp_addr;
         if (!sre_is_valid_vtable_ptr(vtable)) continue;
 
-        /* Validate HasInterface function pointer at vtable[20] (offset +160) */
+        /* Validate HasInterface function pointer at vtable[20] (offset +160).
+         * Must land in libswordigo .plt/.text (RVA 0x1f33d0..0x583478). The old
+         * window (base+0x100000..base+0x700000) was both too loose at the top
+         * (ran into .rodata/.data.rel.ro data) and too tight at the bottom
+         * (excluded PLT-dispatched HasInterface thunks). */
         uint64_t fn_has_interface = *(uint64_t*)(vtable + 160);
-        if (!fn_has_interface || fn_has_interface < (g_swordigo_base + 0x100000) ||
-            fn_has_interface >= (g_swordigo_base + 0x700000)) continue;
+        if (!sre_is_valid_code_ptr(fn_has_interface)) continue;
 
         typedef int (*pfn_HasInterface)(uint64_t self, int64_t id);
         pfn_HasInterface fn = (pfn_HasInterface)fn_has_interface;
@@ -1130,14 +1216,21 @@ void sre_Proto_SceneObject_Clear(void* this_) {
             *comp_count = 0;
         }
         /* Belt-and-suspenders: if array pointer at +32 is outside guest heap,
-         * null both pointer and count so original's loop guard can't fire. */
+         * null both pointer and count so original's loop guard can't fire.
+         * BUG FIX: previous bounds 0x10000000-0xE0000000 were ARM32 Unicorn
+         * ranges. ARM64 Dynarmic guest heap spans a much wider virtual range.
+         * Use the same canonical validity check as sre_is_valid_vtable_ptr:
+         * accept anything >= 0x10000 and < 48-bit canonical max, reject null,
+         * reject misaligned (must be 8-byte aligned for a component array). */
         uint64_t* arr_ptr = (uint64_t*)(t + 32);
         if (*arr_ptr != 0 &&
-            (*arr_ptr < 0x10000000ULL || *arr_ptr > 0xE0000000ULL)) {
+            (((*arr_ptr) & 7) != 0 ||
+             (*arr_ptr) < 0x10000ULL ||
+             (*arr_ptr) >= 0x0000800000000000ULL)) {
             fprintf(stderr,
                     "[SRE/Proto] SceneObject::Clear: corrupt array ptr "
-                    "+32 = 0x%lx (obj=%p) — zeroed\n",
-                    (unsigned long)*arr_ptr, this_);
+                    "+32 = 0x%llx (obj=%p) — zeroed\n",
+                    (unsigned long long)*arr_ptr, this_);
             *arr_ptr = 0;
             *comp_count = 0;
         }
@@ -1213,29 +1306,56 @@ void sre_Proto_SceneObject_Destroy(void* this_) {
     int count = *(int*)(base + 0x2c);
     bool bad = count < 0 || count > MAX_PROTO_COMPONENT_COUNT;
 
-    /* Proto objects and their repeated-field arrays are guest heap objects. */
+    /* Proto objects and their repeated-field arrays are guest heap objects.
+     * BUG FIX: the previous bounds 0x20000000..0xe0000000 were stale ARM32
+     * Unicorn heap ranges — every sibling guard (sre_Proto_SceneObject_Clear,
+     * sre_ComponentOutletBase_Connect) was already migrated to the canonical
+     * ARM64 check. Mirror it here: reject null / misaligned / below 0x10000 /
+     * beyond the 48-bit canonical max. Under ARM64 Dynarmic the guest heap
+     * spans a far wider virtual range than the old window, so the stale test
+     * false-flagged legitimate arrays and skipped teardown (proto leak). */
     if (count > 0 && (!array_addr || (array_addr & 7) != 0 ||
-                      array_addr < 0x20000000ULL || array_addr >= 0xe0000000ULL))
+                      array_addr < 0x10000ULL || array_addr >= 0x0000800000000000ULL))
         bad = true;
 
     if (!bad && array_addr && count > 0 && g_swordigo_base) {
         uint64_t* components = (uint64_t*)array_addr;
+        /* Section bounds verified against the live ARM64 binary
+         * (readelf -SW libswordigo.so, v1.4.12; guest VA = base + RVA):
+         *   .text        RVA 0x203e90 .. 0x583478  (executable destructors)
+         *   .rodata      RVA 0x583480 .. 0x5a1145  (a few RTTI/spilled vtables)
+         *   .data.rel.ro RVA 0x6b6a80 .. 0x6dbfc0  (nearly all class vtables)
+         * BUG FIX: the previous single vtable window base+0x583480..0x6e8000
+         * spanned the whole gap between .rodata and .data.rel.ro AND ran into
+         * .got/.data — it was both over-loose (accepted non-vtable data) and,
+         * because .data.rel.ro is where real component vtables live, it DID at
+         * least cover them, but sibling guards using the split .rodata-only
+         * window silently rejected pickup vtables. Use the two exact section
+         * windows so legitimate component vtables pass and garbage does not. */
+        const uint64_t plt_lo  = g_swordigo_base + 0x1f33d0ULL;  /* .plt thunks (GOT-dispatched destructors) */
+        const uint64_t plt_hi  = g_swordigo_base + 0x203e90ULL;
         const uint64_t text_lo = g_swordigo_base + 0x203e90ULL;
-        const uint64_t text_hi = g_swordigo_base + 0x583480ULL;
-        const uint64_t ro_lo = g_swordigo_base + 0x583480ULL;
-        const uint64_t ro_hi = g_swordigo_base + 0x6e8000ULL;
+        const uint64_t text_hi = g_swordigo_base + 0x583478ULL;
+        const uint64_t rodata_lo = g_swordigo_base + 0x583480ULL;
+        const uint64_t rodata_hi = g_swordigo_base + 0x5a1148ULL;
+        const uint64_t drr_lo = g_swordigo_base + 0x6b6a80ULL;
+        const uint64_t drr_hi = g_swordigo_base + 0x6dc000ULL;
 
         for (int i = 0; i < count; ++i) {
             uint64_t component = components[i];
+            /* Canonical ARM64 heap-pointer validity (see array_addr note above):
+             * reject null / misaligned / below 0x10000 / beyond 48-bit max.
+             * The old 0x20000000..0xe0000000 window was stale ARM32 Unicorn. */
             if (!component || (component & 7) != 0 ||
-                component < 0x20000000ULL || component >= 0xe0000000ULL) {
+                component < 0x10000ULL || component >= 0x0000800000000000ULL) {
                 bad = true;
                 break;
             }
 
             uint64_t vtable = *(uint64_t*)component;
             bool vtable_ok = vtable && (vtable & 7) == 0 &&
-                ((vtable >= ro_lo && vtable < ro_hi) ||
+                ((vtable >= rodata_lo && vtable < rodata_hi) ||
+                 (vtable >= drr_lo && vtable < drr_hi) ||
                  (vtable >= 0x2000000ULL && vtable < 0x2300000ULL) ||
                  (vtable >= 0x3000000ULL && vtable < 0x3100000ULL));
             if (!vtable_ok) {
@@ -1245,7 +1365,8 @@ void sre_Proto_SceneObject_Destroy(void* this_) {
 
             uint64_t destructor = ((uint64_t*)vtable)[1];
             bool destructor_ok = destructor && (destructor & 3) == 0 &&
-                ((destructor >= text_lo && destructor < text_hi) ||
+                ((destructor >= plt_lo && destructor < plt_hi) ||
+                 (destructor >= text_lo && destructor < text_hi) ||
                  (destructor >= 0x2000000ULL && destructor < 0x2300000ULL) ||
                  (destructor >= 0x3000000ULL && destructor < 0x3100000ULL));
             if (!destructor_ok) {
@@ -1321,22 +1442,27 @@ uint64_t sre_ComponentOutletBase_Connect(void* this_, void* a2) {
     }
 
     /* Validate vtable slot 1 (byte offset +8): the identifier-getter function.
-     * Must be within libswordigo.so .text range (0x1203e90 – 0x1584000). */
+     * Must be within libswordigo.so executable range (.plt + .text + libsre/relay).
+     * BUG FIX: previous lower bound 0x203e90 excluded the PLT stub range
+     * (0x1F62D0 – 0x203e90). Virtual calls through PLT thunks are valid ARM64
+     * call targets and were incorrectly being blocked, causing legitimate
+     * ComponentOutletBase connections to fail silently for PLT-dispatched methods. */
     uint64_t fn_slot1 = *(uint64_t*)(vtable + 8);
-    if (fn_slot1 < (g_swordigo_base + 0x203e90) ||
-        fn_slot1 >= (g_swordigo_base + 0x584000)) {
+    bool fn1_ok = sre_is_valid_code_ptr(fn_slot1);
+    if (!fn1_ok) {
         fprintf(stderr,
-                "[SRE/Outlet] Connect: vtable[1]=0x%llx out of .text (this=%p) — blocked\n",
+                "[SRE/Outlet] Connect: vtable[1]=0x%llx out of .text/.plt (this=%p) — blocked\n",
                 (unsigned long long)fn_slot1, this_);
         return 0;
     }
 
-    /* Validate vtable slot 4 (byte offset +32): the connect-setter function. */
+    /* Validate vtable slot 4 (byte offset +32): the connect-setter function.
+     * BUG FIX: same PLT lower-bound fix as vtable[1] above. */
     uint64_t fn_slot4 = *(uint64_t*)(vtable + 32);
-    if (fn_slot4 < (g_swordigo_base + 0x203e90) ||
-        fn_slot4 >= (g_swordigo_base + 0x584000)) {
+    bool fn4_ok = sre_is_valid_code_ptr(fn_slot4);
+    if (!fn4_ok) {
         fprintf(stderr,
-                "[SRE/Outlet] Connect: vtable[4]=0x%llx out of .text (this=%p) — blocked\n",
+                "[SRE/Outlet] Connect: vtable[4]=0x%llx out of .text/.plt (this=%p) — blocked\n",
                 (unsigned long long)fn_slot4, this_);
         return 0;
     }

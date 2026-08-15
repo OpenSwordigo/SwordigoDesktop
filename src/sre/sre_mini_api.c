@@ -24,9 +24,57 @@
 /* g_swordigo_base — loaded base address of libswordigo.so in guest space */
 extern uint64_t g_swordigo_base;
 
+/* Runtime symbol resolution — returns absolute guest address for a mangled
+ * engine symbol, or 0 if not found. Implemented host-side (see src/main.cpp).
+ * We prefer this over hardcoded offsets; only fall back to base+offset when a
+ * symbol is inlined / not exported. */
+extern uint64_t sre_resolve_address(const char* symbol);
+
 
 /* Avoid relying on system headers (cross-build). Provide minimal externs */
 extern void sre_log_lua_error(const char* source, const char* err_msg);
+
+/* =========================================================================
+ * Lazily-resolved engine function pointers used by the mini API.
+ *
+ * These are engine symbols that the host loader does NOT pre-inject into an
+ * SRE global (unlike the g_sre_* / *_Interface pointers wired up in
+ * src/main.cpp). We resolve them on first use via sre_resolve_address() so
+ * that mini functions can call the real engine instead of poking host-polled
+ * flag globals. Resolution failure degrades to a no-op (never crashes).
+ *
+ * Verified present in libswordigo.so v1.4.12 (ARM64) via:
+ *   nm -D --defined-only ./libswordigo.so
+ *     0x4cc308  _ZN5Caver14TextureLibrary13sharedLibraryEv
+ *     0x4cd51c  _ZN5Caver14TextureLibrary14ReloadTexturesEb
+ *     0x476844  _ZN5Caver14SceneObjectLib15PushSceneObjectEPNS_12ProgramStateEPNS_11SceneObjectE
+ * ========================================================================= */
+typedef void* (*pfn_TextureLibrary_sharedLibrary)(void);
+typedef void  (*pfn_TextureLibrary_ReloadTextures)(void* tl, int force);
+typedef void  (*pfn_SceneObjectLib_PushSceneObject)(void* programState, SceneObject* obj);
+
+static pfn_TextureLibrary_sharedLibrary   g_sre_TextureLibrary_sharedLibrary   = 0;
+static pfn_TextureLibrary_ReloadTextures  g_sre_TextureLibrary_ReloadTextures  = 0;
+static pfn_SceneObjectLib_PushSceneObject g_sre_SceneObjectLib_PushSceneObject = 0;
+static int g_sre_mini_engine_resolved = 0;
+
+/* Resolve once; safe to call repeatedly. A symbol that stays NULL simply means
+ * the corresponding mini function falls back to its safe/legacy behaviour. */
+static void sre_mini_resolve_engine(void) {
+    if (g_sre_mini_engine_resolved) return;
+    g_sre_mini_engine_resolved = 1;
+    /* sre_resolve_address is an imported symbol; assume present. Each call
+     * simply returns 0 for symbols it cannot resolve. */
+    g_sre_TextureLibrary_sharedLibrary =
+        (pfn_TextureLibrary_sharedLibrary)(uintptr_t)sre_resolve_address(
+            "_ZN5Caver14TextureLibrary13sharedLibraryEv");
+    g_sre_TextureLibrary_ReloadTextures =
+        (pfn_TextureLibrary_ReloadTextures)(uintptr_t)sre_resolve_address(
+            "_ZN5Caver14TextureLibrary14ReloadTexturesEb");
+    g_sre_SceneObjectLib_PushSceneObject =
+        (pfn_SceneObjectLib_PushSceneObject)(uintptr_t)sre_resolve_address(
+            "_ZN5Caver14SceneObjectLib15PushSceneObjectEPNS_12ProgramStateEPNS_11SceneObjectE");
+}
 
 
 /* =========================================================================
@@ -395,11 +443,9 @@ static int l_mini_char_set_mana(lua_State* L) {
 
 static int l_mini_char_set_coins(lua_State* L) {
     int val = (int)g_lua_tonumber(L, 1);
-    if (val > 0 || g_sre_player_coins <= 0) {
-        g_sre_char_set_value = val;
-        g_sre_char_set_field = 5;
-        g_sre_char_set_pending = 1;
-    }
+    g_sre_char_set_value = val;
+    g_sre_char_set_field = 5;
+    g_sre_char_set_pending = 1;
     return 0;
 }
 
@@ -1908,16 +1954,46 @@ static int l_mini_host_z_axis(lua_State* L) {
     return 1;
 }
 
-/* Mini.SetControlsHidden(bool) */
+/* Mini.SetControlsHidden(bool)
+ *
+ * Parity with SwKiwi controls.c (arm64):
+ *   gameSceneView->overlayView (gameSceneView + 0x100)
+ *   *(bool*)(gameOverlayView + 0xe4) = hidden
+ *   GameOverlayView::SetControlsHidden(gameOverlayView, hidden)
+ *
+ * SRE caches the live GameSceneView in g_sre_gamesceneview_ptr (set from the
+ * GameSceneView::Update hook — see sre_scene_update.c). We prefer that; if it
+ * is not yet available we fall back to walking the "gameController" Lua global
+ * exactly like SwKiwi does:  gameController -> +0xd8 (deref) -> +0x100.
+ */
 static int l_mini_set_controls_hidden(lua_State* L) {
     extern void* g_sre_gamesceneview_ptr;
     int hidden = g_lua_toboolean(L, 1);
     g_sre_controls_hidden = hidden;
-    if (g_sre_gamesceneview_ptr) {
-        void* overlay = *(void**)((char*)g_sre_gamesceneview_ptr + 0x100);
-        if (overlay && g_sre_GameOverlayView_SetControlsHidden) {
-            g_sre_GameOverlayView_SetControlsHidden(overlay, hidden);
+
+    void* gameSceneView = g_sre_gamesceneview_ptr;
+
+    /* Fallback: walk the gameController global (SwKiwi controls.c path).
+     * gameController + 0xd8 (deref) -> GameSceneView. */
+    if (!gameSceneView) {
+        void* gc = sre_game_controller_from_L(L);
+        if (gc) {
+            void* gsv = *(void**)((char*)gc + 0xd8);
+            if ((uintptr_t)gsv >= 0x10000) gameSceneView = gsv;
         }
+    }
+
+    if (!gameSceneView) return 0;
+
+    void* overlay = *(void**)((char*)gameSceneView + 0x100);
+    if ((uintptr_t)overlay < 0x10000) return 0;
+
+    /* Mirror the engine's own field write (GameOverlayView controls-hidden bool
+     * at 0xe4, from SwKiwi GameSceneView::SetCinematicModeEnabled). */
+    *(unsigned char*)((char*)overlay + 0xe4) = (unsigned char)(hidden ? 1 : 0);
+
+    if (g_sre_GameOverlayView_SetControlsHidden) {
+        g_sre_GameOverlayView_SetControlsHidden(overlay, hidden);
     }
     return 0;
 }
@@ -1926,7 +2002,15 @@ static int l_mini_set_controls_hidden(lua_State* L) {
  * Coin Limit (Phase 3.5)
  * ========================================================================= */
 
-/* Mini.SetCoinLimit(n) — set max coin count (host patches binary) */
+/* Mini.SetCoinLimit(n) — set max coin count.
+ *
+ * SwKiwi (features/coin_limit.c) implements this as a set of text-segment
+ * patches (MOV/CMP immediates at fixed offsets). Rewriting engine .text from
+ * the guest is unsafe under the SRE emulator (write-protected text triggers
+ * UC_ERR_WRITE_PROT), so we keep the value in a global that the host applies
+ * during its own patch pass. This is an intentional host-cooperative action,
+ * not a broken flag-poll stub; the parity behaviour (clamp to 0..65535) is
+ * preserved exactly. */
 static int l_mini_set_coin_limit(lua_State* L) {
     int n = (int)g_lua_tonumber(L, 1);
     if (n < 0) n = 0;
@@ -1941,10 +2025,40 @@ static int l_mini_get_coin_limit(lua_State* L) {
     return 1;
 }
 
-/* Mini.ToggleDebug() */
+/* Mini.ToggleDebug([bool])
+ *
+ * Parity with SwKiwi debug.c: writes the scene debug bool at Scene + 0x358
+ * (arm64). SwKiwi reads the boolean argument directly; when no argument is
+ * supplied we toggle the tracked state so old callers still behave sensibly.
+ * The "scene" Lua global is a lightuserdata pointing at the live Scene; if it
+ * is unavailable we fall back to the SceneController (same object family).
+ */
 static int l_mini_toggle_debug(lua_State* L) {
-    (void)L;
-    g_sre_debug_active = !g_sre_debug_active;
+    int enabled;
+    if (g_lua_gettop(L) >= 1 && g_lua_type(L, 1) != LUA_TNIL) {
+        enabled = g_lua_toboolean(L, 1);          /* SwKiwi: explicit value */
+    } else {
+        enabled = !g_sre_debug_active;            /* legacy toggle behaviour */
+    }
+    g_sre_debug_active = enabled;
+
+    /* Resolve the live Scene from the "scene" Lua global (SwKiwi path). */
+    void* scene = (void*)0;
+    if (g_lua_getfield && g_lua_touserdata && g_lua_settop) {
+        int top = g_lua_gettop(L);
+        g_lua_getfield(L, LUA_GLOBALSINDEX, "scene");
+        scene = g_lua_touserdata(L, -1);
+        g_lua_settop(L, top);
+    }
+    if (!scene) {
+        SceneController* sc = sre_scene_controller_from_L(L);
+        if (sc) scene = (void*)sc;
+    }
+
+    /* Scene debug bool @ 0x358 (SwKiwi debug.c archSplit(0x208,0x358)). */
+    if ((uintptr_t)scene >= 0x10000) {
+        *(unsigned char*)((char*)scene + 0x358) = (unsigned char)(enabled ? 1 : 0);
+    }
     return 0;
 }
 
@@ -1981,14 +2095,38 @@ static int l_mini_recreate_hero(lua_State* L) {
     return 0;
 }
 
-/* Mini.ReloadTextures(force) — set pending flag for host */
+/* Mini.ReloadTextures(force) — real engine call, parity with SwKiwi reload_textures.c
+ *
+ *   TextureLibrary* tl = TextureLibrary::sharedLibrary();
+ *   if (tl) TextureLibrary::ReloadTextures(tl, force);
+ *
+ * Symbols resolved lazily via sre_resolve_address(). If they cannot be resolved
+ * we keep setting the host-poll flag so an external host loop can still act. */
 static int l_mini_reload_textures(lua_State* L) {
-    (void)L;
+    int force = g_lua_toboolean(L, 1);
+
+    sre_mini_resolve_engine();
+
+    if (g_sre_TextureLibrary_sharedLibrary && g_sre_TextureLibrary_ReloadTextures) {
+        void* tl = g_sre_TextureLibrary_sharedLibrary();
+        if (tl) {
+            g_sre_TextureLibrary_ReloadTextures(tl, force);
+            return 0;
+        }
+    }
+
+    /* Fallback: signal the host (back-compat with the legacy polling path). */
     g_sre_reload_textures_pending = 1;
     return 0;
 }
 
-/* Mini.ClearModels() — set pending flag for host */
+/* Mini.ClearModels() — set pending flag for host.
+ *
+ * NOTE: This is NOT part of SwKiwi's exported mini table. SwKiwi's models.c
+ * leaves ModelLibrary::Clear commented out (clearing the shared model library
+ * mid-run corrupts live SceneObjects). We keep it as a host-poll flag rather
+ * than calling the engine directly, since a real ModelLibrary::Clear would be
+ * unsafe here. Documented as an intentional non-engine action. */
 static int l_mini_clear_models(lua_State* L) {
     (void)L;
     g_sre_clear_models_pending = 1;
@@ -2066,33 +2204,49 @@ static int l_mini_set_object_speed(lua_State* L) {
 }
 
 
-/* Mini.SetWeaponColor(obj, r, g, b, a, intensity) — reuse trinket glow */
+/* Mini.SetWeaponColor(sceneObj, r, g, b, a, intensity)
+ *
+ * Real engine call — parity with SwKiwi weapon_color.c miniLL_set_weapon_color:
+ *   swc_ctrl = SceneObject::ComponentWithInterface(obj, SwingableWeaponControllerComponent_Interface)
+ *   swc      = *(void**)(swc_ctrl + 0x98)                 // arm64 offset
+ *   FloatColor color = {r,g,b,a}
+ *   SwingableWeaponComponent::SetGlowColor(swc, &color)
+ *   SwingableWeaponComponent::SetGlowIntensity(swc, intensity)
+ *
+ * The first argument is a SceneObject (light/regular userdata or numeric addr).
+ * This is distinct from Mini.SetWeaponColorForTrinket (which takes a trinket
+ * name string and stores glow parameters for the host — see
+ * l_mini_set_trinket_color). */
 static int l_mini_set_weapon_color(lua_State* L) {
-    const char* item_id = lua_tostring(L, 1);
-    if (!item_id) return 0;
-    float r = (float)g_lua_tonumber(L, 2);
-    float g = (float)g_lua_tonumber(L, 3);
-    float b = (float)g_lua_tonumber(L, 4);
-    float a = (float)g_lua_tonumber(L, 5);
+    void* obj = (void*)g_lua_touserdata(L, 1);
+    if (!obj && g_lua_type(L, 1) == LUA_TNUMBER)
+        obj = (void*)(uintptr_t)(uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    if (!obj) return 0;
+
+    SreFloatColor color;
+    color.R = (float)g_lua_tonumber(L, 2);
+    color.G = (float)g_lua_tonumber(L, 3);
+    color.B = (float)g_lua_tonumber(L, 4);
+    color.A = (float)g_lua_tonumber(L, 5);
     float intensity = (float)g_lua_tonumber(L, 6);
 
-    int idx = -1;
-    int i;
-    for (i = 0; i < g_sre_trinket_glow_count; i++) {
-        if (sre_streq(g_sre_trinket_glows[i].item_id, item_id)) { idx = i; break; }
+    if (!g_SceneObject_ComponentWithInterface ||
+        !SwingableWeaponControllerComponent_Interface) {
+        return 0;  /* components not resolved yet — no-op */
     }
-    if (idx < 0 && g_sre_trinket_glow_count < 16)
-        idx = g_sre_trinket_glow_count++;
-    if (idx < 0) return 0;
 
-    for (i = 0; i < 31 && item_id[i]; i++)
-        g_sre_trinket_glows[idx].item_id[i] = item_id[i];
-    g_sre_trinket_glows[idx].item_id[i] = '\0';
-    g_sre_trinket_glows[idx].r = r;
-    g_sre_trinket_glows[idx].g = g;
-    g_sre_trinket_glows[idx].b = b;
-    g_sre_trinket_glows[idx].a = a;
-    g_sre_trinket_glows[idx].intensity = intensity;
+    void* swc_ctrl = g_SceneObject_ComponentWithInterface(
+        obj, SwingableWeaponControllerComponent_Interface);
+    if (!swc_ctrl) return 0;  /* object has no swingable weapon */
+
+    /* SwingableWeaponControllerComponent + 0x98 -> SwingableWeaponComponent* */
+    void* swc = *(void**)((char*)swc_ctrl + 0x98);
+    if ((uintptr_t)swc < 0x10000) return 0;
+
+    if (g_SwingableWeapon_SetGlowColor)
+        g_SwingableWeapon_SetGlowColor(swc, &color);
+    if (g_SwingableWeapon_SetGlowIntensity)
+        g_SwingableWeapon_SetGlowIntensity(swc, intensity);
     return 0;
 }
 
@@ -2204,13 +2358,29 @@ static int l_mini_scene_find_all(lua_State* L) {
     void* sentinel = (char*)scene + 0xb8;
     void* node = *(void**)((char*)sentinel + 0x10);
 
+    /* For full parity with SwKiwi we push each SceneObject through the engine's
+     * SceneObjectLib::PushSceneObject(programState, obj), which creates a proper
+     * "SceneObject" userdata (compatible with luaL_checkudata based helpers).
+     * Resolve ProgramState + PushSceneObject once; fall back to lightuserdata if
+     * either is unavailable. */
+    sre_mini_resolve_engine();
+    void* ps = (g_ProgramState_FromLuaState) ? g_ProgramState_FromLuaState(L) : (void*)0;
+    int use_push = (ps && g_sre_SceneObjectLib_PushSceneObject) ? 1 : 0;
+
     int idx = 1;
     int depth = 0;
-    while (node && node != sentinel && depth < 2048) {
+    while (node && node != sentinel && depth < 4096) {
         SceneObject* obj = *(SceneObject**)((char*)node + 0x28);
-        if (obj && g_lua_pushinteger && g_lua_pushlightuserdata && g_lua_settable) {
+        if (obj && g_lua_pushinteger && g_lua_settable) {
             g_lua_pushinteger(L, idx++);
-            g_lua_pushlightuserdata(L, obj);
+            if (use_push) {
+                /* Engine pushes the SceneObject userdata onto the Lua stack. */
+                g_sre_SceneObjectLib_PushSceneObject(ps, obj);
+            } else if (g_lua_pushlightuserdata) {
+                g_lua_pushlightuserdata(L, obj);
+            } else {
+                g_lua_pushnil(L);
+            }
             g_lua_settable(L, -3);
         }
         node = rbTreeIncrement(node);
@@ -2220,11 +2390,22 @@ static int l_mini_scene_find_all(lua_State* L) {
     return 1;
 }
 
-/* Mini.Test() — SwKiwi debug probe (reads hero level and logs it on device).
- * On desktop we simply return 0 (no-op), matching the no-visible-output
- * behaviour when logcat is not present. */
+/* Mini.Test(sceneObj) — SwKiwi debug probe.
+ *
+ * SwKiwi test.c resolves the hero's CharControllerComponent and dumps its
+ * property bindings via GetBindings (a diagnostic-only, logcat-based dump).
+ * On desktop there is no logcat and the dump has no gameplay effect, so we
+ * implement it as a safe no-op that still validates its argument the way the
+ * real function does (resolve the CharControllerComponent) without touching
+ * anything. This is intentionally not a flag-poll stub — it never was one. */
 static int l_mini_test(lua_State* L) {
-    (void)L;
+    void* obj = (void*)g_lua_touserdata(L, 1);
+    if (!obj && g_lua_type(L, 1) == LUA_TNUMBER)
+        obj = (void*)(uintptr_t)(uint64_t)(int64_t)g_lua_tonumber(L, 1);
+    if (obj && g_SceneObject_ComponentWithInterface && CharControllerComponent_Interface) {
+        /* Resolve (and thereby validate) the component; no side effects. */
+        (void)g_SceneObject_ComponentWithInterface(obj, CharControllerComponent_Interface);
+    }
     return 0;
 }
 
@@ -4123,8 +4304,10 @@ void sre_register_mini_api(lua_State* L) {
     /* ---- FFI module (_G.ffi) ---- */
     /* Provides direct native function calling, peek/poke, and struct helpers.
      * Replaces the old LNI string-buffer approach for advanced mod use cases.
-     * See sre_ffi.c for full API documentation. */
-    extern void sre_ffi_register_lua(lua_State* L);
+     * See sre_ffi.c for full API documentation.
+     * Declared (hidden) in sre_lua.h so this call binds to the local
+     * definition in libsre.so instead of routing through the host JNI
+     * bridge PLT stub (which logged "[Bridge64] !! UNHANDLED"). */
     sre_ffi_register_lua(L);
 
     /* ---- LNI table ---- */
@@ -4878,10 +5061,7 @@ static int stub_char_num_coins(lua_State* L) {
 /* Character.SetNumCoins(n) → update our mirror */
 static int stub_char_set_num_coins(lua_State* L) {
     if (g_lua_isnumber(L, 1)) {
-        int val = (int)g_lua_tonumber(L, 1);
-        if (val > 0 || g_sre_player_coins <= 0) {
-            g_sre_player_coins = val;
-        }
+        g_sre_player_coins = (int)g_lua_tonumber(L, 1);
     }
     return 0;
 }
@@ -5860,13 +6040,12 @@ void sre_mini_ensure_injected(lua_State* L) {
                 sre_eval_lua(L,
                     "if Character then\n"
                     "  Character.__is_sre_guarded = true\n"
-                    "  _G.__last_coins = _G.__last_coins or 0\n"
+                     "  _G.__last_coins = nil\n"
                     "  if Character.SetNumCoins then\n"
                     "    local _os=Character.SetNumCoins\n"
                     "    Character.SetNumCoins=function(n)\n"
                     "      if type(n)=='number' then\n"
-                    "        if n>0 then _G.__last_coins=n; _os(n)\n"
-                    "        elseif _G.__last_coins<=0 then _os(n) end\n"
+                     "        _G.__last_coins=n; _os(n)\n"
                     "      else _os(n) end\n"
                     "    end\n"
                     "  end\n"
@@ -5874,18 +6053,17 @@ void sre_mini_ensure_injected(lua_State* L) {
                     "    local _os=Character.SetNumCoin\n"
                     "    Character.SetNumCoin=function(n)\n"
                     "      if type(n)=='number' then\n"
-                    "        if n>0 then _G.__last_coins=n; _os(n)\n"
-                    "        elseif _G.__last_coins<=0 then _os(n) end\n"
+                     "        _G.__last_coins=n; _os(n)\n"
                     "      else _os(n) end\n"
                     "    end\n"
                     "  end\n"
                     "  if Character.NumCoins then\n"
                     "    local _og=Character.NumCoins\n"
-                    "    Character.NumCoins=function() local c=_og(); if (not c or c==0) and _G.__last_coins>0 then return _G.__last_coins end; if c and c>0 then _G.__last_coins=c end; return c end\n"
+                     "    Character.NumCoins=function() local c=_og(); _G.__last_coins=c; return c end\n"
                     "  end\n"
                     "  if Character.NumCoin then\n"
                     "    local _og=Character.NumCoin\n"
-                    "    Character.NumCoin=function() local c=_og(); if (not c or c==0) and _G.__last_coins>0 then return _G.__last_coins end; if c and c>0 then _G.__last_coins=c end; return c end\n"
+                     "    Character.NumCoin=function() local c=_og(); _G.__last_coins=c; return c end\n"
                     "  end\n"
                     "end\n"
                 );

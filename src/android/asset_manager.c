@@ -315,7 +315,51 @@ AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
     FILE* fp = NULL;
     extern int resolve_vfs_path(const char* original_path, char* out_resolved_path, int max_len);
     if (resolve_vfs_path(filename, resolved, sizeof(resolved))) {
-        fp = fopen(resolved, "rb");
+        /* try_open (not bare fopen) so a resolved path ending in a bare ".tex"
+         * or "_2x" still resolves to the real on-disk ".tex.png" / ".pvr" /
+         * 1x variant. Without this the guest's ".tex" requests (e.g.
+         * ui_game_atlas_2x.tex, font_megalopolis_14_2x_2x.tex) missed the
+         * extension-remapping fallbacks and were served as /dev/null DUMMY
+         * files, giving the font/UI atlas 0 bytes → FontText built a garbage
+         * CharacterInfo vector and the frame stalled with draws=0 (black
+         * screen). */
+        fp = try_open(resolved);
+    }
+
+    /* Second chance: run the full smart_search remapping against the base
+     * asset dir. resolve_vfs_path may have pointed us at a mod/profile
+     * subfolder that lacks the base texture; smart_search knows the
+     * .tex/.tex.png/.pvr and _2x↔1x equivalences and the flat-layout leaf
+     * fallbacks. */
+    if (!fp) {
+        fp = smart_search(g_mgr.base_path, filename);
+    }
+
+    /* Third chance — direct base-game assets/resources/<filename> fallback.
+     * REGRESSION FIX (black screen / draws=0): when an active profile/mod is
+     * selected (e.g. "5eb0d662-...(Copy)"), resolve_vfs_path builds
+     * profile-prefixed candidates (mods/<mod>/resources/<profile>/X and
+     * resources/<profile>/X) that do NOT contain base assets like
+     * ui_game_atlas_2x.atlas. try_open only remaps TEXTURE extensions
+     * (.tex/.pvr/.tex.png) — it does nothing for ".atlas" — and smart_search's
+     * base is the profile dir, so the sprite/glyph ATLAS metadata file was
+     * never found and served as a 0-byte /dev/null DUMMY. With empty atlas
+     * metrics, Caver::FontText::AddText read a garbage glyph count and
+     * vector<CharacterInfo>::_M_insert_aux requested a ~256-384MB allocation
+     * → St9bad_alloc → abort/unwind every frame → nothing ever rendered
+     * (draws=0, black screen). The base game assets ALWAYS ship these files
+     * (Android AssetManager falls back mod-overlay -> base-APK); mirror that
+     * here by trying the canonical base path last. Uses try_open so a base
+     * ".tex" still benefits from the texture-extension remaps too. */
+    if (!fp) {
+        extern char* get_user_data_dir_c(void);
+        const char* ddir = get_user_data_dir_c();
+        if (ddir && ddir[0]) {
+            char basepath[640];
+            snprintf(basepath, sizeof(basepath), "%s/assets/resources/%s", ddir, filename);
+            fp = try_open(basepath);
+            if (fp) printf("[AssetMgr] FOUND(base-APK fallback): %s\n", basepath);
+        }
     }
 
     /* NEVER return NULL — use /dev/null dummy to prevent gzdopen(0) crash.

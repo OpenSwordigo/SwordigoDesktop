@@ -186,6 +186,12 @@ void sre_ProgramState_destructor(void* self);
 
 void sre_open_swkiwi_libs(lua_State* L);
 
+/* Native FFI Lua module (defined in sre_ffi.c).
+ * Declared hidden so intra-libsre.so callers (e.g. sre_mini_api.c) bind
+ * directly to the local definition instead of emitting a GOT/PLT indirection
+ * that the host JNI bridge would catch as "[Bridge64] !! UNHANDLED". */
+__attribute__((visibility("hidden"))) void sre_ffi_register_lua(lua_State* L);
+
 /* =========================================================================
  * Recovery stack — public API for cross-unit use
  * =========================================================================

@@ -70,6 +70,14 @@ pfn_lua_error       g_lua_error = 0;
 typedef float (*pfn_getSpeedMultiplier)(void* sceneObject);
 pfn_getSpeedMultiplier g_getSpeedMultiplier = 0;
 
+/* Destruction-debug counters (read by host for diagnosing the timed-destruction
+ * bug: sleep()/wait() Lua coroutine timers must fire for script-driven object
+ * removal). Host prints them via [SRE/FrameDiag] when enabled. */
+volatile uint64_t g_sre_ps_ticks          = 0;  /* ProgramState::Update entries */
+volatile uint64_t g_sre_ps_suspended_seen = 0;  /* states with active sleep timers */
+volatile uint64_t g_sre_ps_timer_fires    = 0;  /* sleep timers fired -> lua_resume */
+volatile uint64_t g_sre_ps_resume_errors  = 0;  /* lua_resume returned an error */
+
 /* ========== sre_init_lua — called by host to set up function pointers ========== */
 
 /* Struct passed from host with all resolved addresses */
@@ -421,9 +429,9 @@ void sre_lua_call_safe(lua_State* L, int nargs, int nresults) {
  * Unlike sre_lua_call_safe (which replaces lua_call entirely with pcall),
  * this function wraps the ORIGINAL lua_resume with setjmp recovery.
  *
- * The host patches all BL instructions in libswordigo.so that target
- * lua_resume to instead target this function. The original lua_resume
- * function bytes are NOT modified — g_lua_resume still works.
+ * The host patches the lua_resume function entry through TrampolineMgr.
+ * g_lua_resume is changed to the pre-patch relay, so this wrapper can call
+ * the original implementation without recursion.
  *
  * This catches Lua errors from:
  *   - ProgramState::Update (timer-based coroutine resumption) — THE WASTELANDS FIX
@@ -1221,6 +1229,7 @@ typedef void (*pfn_orig_Update)(void* self, float deltaTime);
 pfn_orig_Update g_orig_ProgramState_Update = 0;
 
 void sre_ProgramState_Update(void* self, float deltaTime) {
+    g_sre_ps_ticks++;
     /* L is needed throughout this function (timer countdown, lua_resume).
      * Declare it unconditionally here. */
     lua_State* L = PS_GET(self, PS_LUA_STATE, lua_State*);
@@ -1267,6 +1276,7 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
         /* Ghidra lines 339-350: timer countdown + coroutine resume */
         int isSuspended = PS_GET(self, PS_IS_SUSPENDED, int);
         if (isSuspended == 1) {
+            g_sre_ps_suspended_seen++;
             float timer = PS_GET(self, PS_SLEEP_TIME, float);
             timer -= scaledDelta * speedScaling;
             PS_SET(self, PS_SLEEP_TIME, float, timer);
@@ -1291,8 +1301,10 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
                 if (my_depth < 0) {
                     if (g_lua_sethook) g_lua_sethook(L, (lua_Hook)sre_lua_timeout_hook, LUA_MASKCOUNT, 100000);
                     int r = g_lua_resume(L, 0);
+                    g_sre_ps_timer_fires++;
                     if (g_lua_sethook) g_lua_sethook(L, NULL, 0, 0);
                     if (r != LUA_YIELD) {
+                        if (r != 0) g_sre_ps_resume_errors++;
                         if (r != 0 && g_lua_tolstring && g_lua_gettop) {
                             void* sceneObj = PS_GET(self, PS_SCENE_OBJECT, void*);
                             const char* obj_id = sre_scene_object_identifier((SceneObject*)sceneObj);
@@ -1322,9 +1334,11 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
                 } else {
                     if (g_lua_sethook) g_lua_sethook(L, (lua_Hook)sre_lua_timeout_hook, LUA_MASKCOUNT, 100000);
                     int r = g_lua_resume(L, 0);
+                    g_sre_ps_timer_fires++;
                     if (g_lua_sethook) g_lua_sethook(L, NULL, 0, 0);
                     recovery_pop(my_depth);
                     if (r != LUA_YIELD) {
+                        if (r != 0) g_sre_ps_resume_errors++;
                         if (r != 0 && g_lua_tolstring && g_lua_gettop) {
                             void* sceneObj = PS_GET(self, PS_SCENE_OBJECT, void*);
                             const char* obj_id = sre_scene_object_identifier((SceneObject*)sceneObj);
@@ -1438,6 +1452,11 @@ void sre_ProgramState_Update(void* self, float deltaTime) {
         /* else: budget expired — skip child iteration for this frame. */
 
 child_update_done:
+        /* Recovery-stack invariant: depth here equals the depth on entry. The
+         * child-iteration block's recovery_push is always matched by a
+         * recovery_pop on both its setjmp-fired and normal-completion paths
+         * (and the isSuspended block earlier is likewise balanced), so no
+         * push is outstanding at this label. */
         /* Restore: the original only iterates/cleans children, it never
          * modifies isSuspended for *this* when we passed isSuspended=0.
          * So restoring is always safe and correct. */
@@ -1446,6 +1465,9 @@ child_update_done:
     return;
 
 child_update:
+    /* Recovery-stack invariant: depth here equals the depth on entry. This
+     * fast path is reached via `goto child_update` taken BEFORE any
+     * recovery_push, so nothing is outstanding to pop. */
     /* Scene loading fast path: skip lua_resume but still propagate to children
      * so the state tree stays consistent. No mutex taken here. */
     if (g_orig_ProgramState_Update != 0) {

@@ -137,6 +137,10 @@ pfn_ManaBar_SetCurrentMana g_sre_ManaBar_SetCurrentMana = 0;
 
 pfn_CoinBar_SetCurrentCoins g_sre_CoinBar_SetCurrentCoins = 0;
 
+/* NOTE: sre_GameOverlayView_SetControlsHidden is defined in sre_gui_native.c
+ * (the version that also hides the individual touch-control buttons and honors
+ * g_sre_controls_hidden). The duplicate stub that used to live here was a link
+ * conflict and referenced an undeclared g_orig_* symbol; removed. */
 pfn_GameOverlayView_SetControlsHidden g_sre_GameOverlayView_SetControlsHidden = 0;
 pfn_GameOverlayView_SetShowsUseButton g_sre_GameOverlayView_SetShowsUseButton = 0;
 pfn_GameOverlayView_SetSkillButtonDisabled g_sre_GameOverlayView_SetSkillButtonDisabled = 0;
@@ -223,11 +227,21 @@ void sre_caver_init(uint64_t swordigo_base) {
     /* All component interfaces and helper pointers are dynamically resolved
      * and injected by the host loader in main.cpp before sre_init is called.
      * We no longer use hardcoded offsets here to prevent stack crashes. */
+
+    /* GameSceneController::CreateHeroObjectAt — native host-side pointer used by
+     * the dummy-player spawn path (l_swd_spawn_dummy_hero), sre_mini_api.c, and
+     * the RakNet remote-hero ghost. Resolve it here, early and independent of
+     * RakNet init, so SpawnDummyHero works before/without any multiplayer session.
+     * Symbol: _ZN5Caver19GameSceneController18CreateHeroObjectAtERKNS_7Vector3Eib
+     * nm-verified offset 0x348e94 (v1.4.12 ARM64). */
+    if (!g_sre_CreateHeroObjectAt) g_sre_CreateHeroObjectAt = (pfn_CreateHeroObjectAt)(swordigo_base + 0x348e94);
+
     (void)swordigo_base;
 }
 
 /* Our guest-side CameraController::Update hook function */
 void sre_CameraController_Update(void* self, float dt) {
+    if (!self) return;
     if (g_orig_CameraController_Update) {
         g_orig_CameraController_Update(self, dt);
     }
@@ -344,25 +358,47 @@ void sre_CameraController_Update(void* self, float dt) {
 
 /* Our guest-side SceneGrid::UpdateVisibleAreasWithCamera hook function */
 void sre_SceneGrid_UpdateVisibleAreasWithCamera(void* self, void* camera) {
+    /* BUG FIX: Guard both pointers before ANY access.
+     * During scene unload, SceneGrid may already be freed when this hook fires
+     * (the camera update runs after scene objects are invalidated).
+     * Original call with a freed 'self' is equally dangerous — skip both.
+     * Null camera can also cause crash inside the original's frustum culling. */
+    if (!self || !camera) return;
+    /* Basic pointer sanity: must be heap-range, 8-byte aligned */
+    uint64_t self_addr   = (uint64_t)self;
+    uint64_t camera_addr = (uint64_t)camera;
+    if ((self_addr   & 7) || self_addr   < 0x10000ULL || self_addr   >= 0x0000800000000000ULL) return;
+    if ((camera_addr & 7) || camera_addr < 0x10000ULL || camera_addr >= 0x0000800000000000ULL) return;
+
     if (g_orig_SceneGrid_UpdateVisibleAreasWithCamera) {
         g_orig_SceneGrid_UpdateVisibleAreasWithCamera(self, camera);
     }
 
     if (g_sre_cam_active) {
+        /* BUG FIX: Clamp layer_count before use.
+         * `*(int*)self` reads the first 4 bytes of SceneGrid as an int. If the
+         * SceneGrid is partially freed or corrupted, this can be a very large
+         * positive value, causing the loop to walk gigabytes of memory.
+         * Swordigo scenes have at most ~10 scroll layers; cap at 32. */
         int layer_count = *(int*)self;
-        if (layer_count > 0) {
-            char** array = *(char***)((char*)self + 8);
-            if (array) {
-                for (int i = 0; i < layer_count; i++) {
-                    char* layer = array[i * 2]; // boost::shared_ptr is 16 bytes, index by i*2
-                    if (layer) {
-                        *(float*)(layer + 0x38) = -1000000.0f; // x
-                        *(float*)(layer + 0x3c) = -1000000.0f; // y
-                        *(float*)(layer + 0x40) = 2000000.0f;  // width
-                        *(float*)(layer + 0x44) = 2000000.0f;  // height
-                    }
-                }
-            }
+        if (layer_count <= 0 || layer_count > 32) return;
+
+        char** array = *(char***)((char*)self + 8);
+        if (!array) return;
+        /* Validate the array pointer itself */
+        uint64_t arr_addr = (uint64_t)array;
+        if (arr_addr < 0x10000ULL || arr_addr >= 0x0000800000000000ULL) return;
+
+        for (int i = 0; i < layer_count; i++) {
+            char* layer = array[i * 2]; /* boost::shared_ptr is 16 bytes, index by i*2 */
+            if (!layer) continue;
+            /* Validate layer pointer before writing */
+            uint64_t layer_addr = (uint64_t)layer;
+            if (layer_addr < 0x10000ULL || layer_addr >= 0x0000800000000000ULL) continue;
+            *(float*)(layer + 0x38) = -1000000.0f; /* x */
+            *(float*)(layer + 0x3c) = -1000000.0f; /* y */
+            *(float*)(layer + 0x40) = 2000000.0f;  /* width */
+            *(float*)(layer + 0x44) = 2000000.0f;  /* height */
         }
     }
 }
