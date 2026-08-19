@@ -140,9 +140,21 @@ All technical documentation, reverse-engineering analyses, and API specification
 * **[Misc & Logs](docs/misc/)**: Diagnostic traces, platform compatibility matrices, build guides.
 
 ---
+## 7. Contributors & Credits
+Super thanks to our awesome developer's who made this project possible! OpenSwordigo is nothing without them.
+* ManoK , MrSinup ,TheCorrectSynovian , Raijin - Direct Contributors
+* Daniel Spaniel , Its Just Some Dude , Kizion - Contribution to Swordigo Reverse engineering
+* SwordiForge Community - Keeping the modding scene alive upto date!
+* Coropatasy and Redstell - Helping out to create stylesheet's for FileRift format
 
-## 7. License and Copyright
+### OPENSOURCE PROJECTS WHICH BUILT THE FOUNDATION FOR MODDING SWORDIGO ###
+* Filerift by Daniel Spaeniel
+* SwMini/SwKiwi - IJSD/Kizion
+
+---
+
+## 8. License and Copyright
 
 * **SwordigoDesktop Engine & SRE Codebase**: Released under the [GNU General Public License v2.0 or later](LICENSE).
-* **ufbx** (FBX importer, [github.com/bqqqqqq/ufbx](https://github.com/bqqqqqq/ufbx)): MIT-licensed single-file FBX loader, vendored in `src/tools/ufbx/`.
+* **ufbx** (FBX importer, [Click to get!](https://github.com/ufbx/ufbx)): MIT-licensed single-file FBX loader, vendored in `src/tools/ufbx/`.
 * **Swordigo Game Assets**: Original game assets, binaries, and trademarks remain the intellectual property of Touch Foo / Ville Mäkynen. This compatibility layer requires user-supplied game data files.
