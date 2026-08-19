@@ -142,14 +142,14 @@ All technical documentation, reverse-engineering analyses, and API specification
 ---
 ## 7. Contributors & Credits
 Super thanks to our awesome developer's who made this project possible! OpenSwordigo is nothing without them.
-* ManoK , MrSinup ,TheCorrectSynovian , Raijin - Direct Contributors
-* Daniel Spaniel , Its Just Some Dude , Kizion - Contribution to Swordigo Reverse engineering
-* SwordiForge Community - Keeping the modding scene alive upto date!
-* Coropatasy and Redstell - Helping out to create stylesheet's for FileRift format
+* **ManoK , MrSinup ,TheCorrectSynovian , Raijin** - Direct Contributors
+* **Daniel Spaniel , IJSD , Kiziyon** - Contribution to Swordigo Reverse engineering
+* **SwordiForge** - Keeping the modding scene alive upto date!
+* **Coropatasy** and **Redstell** - Helping out to create stylesheet's for FileRift format
 
 ### OPENSOURCE PROJECTS WHICH BUILT THE FOUNDATION FOR MODDING SWORDIGO ###
-* Filerift by Daniel Spaeniel
-* SwMini/SwKiwi - IJSD/Kizion
+* **Filerift** by Daniel Spaeniel
+* **SwMini/SwKiwi** - IJSD/Kiziyon
 
 ---
 
