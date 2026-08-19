@@ -12,27 +12,68 @@ A precise guide for developers to build SwordigoDesktop with the Dynarmic JIT ba
 - **Cross-compiler**: `aarch64-linux-gnu-gcc` (for building libsre.so)
 - **CMake**: 3.12+ (for building Dynarmic)
 - **Make**: GNU Make
-
 ### Install Dependencies
 
-**Fedora / RHEL:**
+#### Fedora / RHEL
+
 ```bash
-sudo dnf install unicorn-devel SDL3-devel SDL3_image-devel openal-soft-devel \
-    mesa-libGL-devel zlib-devel libvorbis-devel gcc-aarch64-linux-gnu cmake gcc-c++
+sudo dnf install \
+    unicorn-devel \
+    SDL3-devel SDL3_image-devel \
+    openal-soft-devel \
+    mesa-libGL-devel \
+    zlib-devel \
+    libvorbis-devel \
+    vulkan-headers vulkan-loader-devel \
+    boost-devel \
+    mpg123-devel \
+    ffmpeg-free-devel \
+    gcc-aarch64-linux-gnu \
+    cmake gcc-c++
 ```
 
-**Ubuntu / Debian (24.04+):**
+### Ubuntu / Mint
+
 ```bash
-sudo apt install libunicorn-dev libsdl3-dev libsdl3-image-dev libopenal-dev \
-    libgl-dev zlib1g-dev libvorbis-dev gcc-aarch64-linux-gnu cmake g++
+sudo apt update && sudo apt install -y \
+    libunicorn-dev \
+    libsdl3-dev libsdl3-image-dev \
+    libopenal-dev \
+    libgl-dev \
+    zlib1g-dev \
+    libvorbis-dev \
+    libvulkan-dev \
+    libboost-all-dev \
+    libmpg123-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libavfilter-dev \
+    libavdevice-dev \
+    libswresample-dev \
+    libswscale-dev \
+    gcc-aarch64-linux-gnu \
+    cmake g++
 ```
 
-**Arch Linux:**
+### Arch Linux
+
 ```bash
-sudo pacman -S unicorn sdl3 sdl3_image openal mesa zlib libvorbis cmake
-# Install aarch64-linux-gnu-gcc from AUR
-yay -S aarch64-linux-gnu-gcc
+sudo pacman -Syu --needed \
+    unicorn \
+    sdl3 sdl3_image \
+    openal \
+    libglvnd \
+    zlib \
+    libvorbis \
+    vulkan-headers vulkan-icd-loader \
+    boost \
+    mpg123 \
+    ffmpeg \
+    aarch64-linux-gnu-gcc \
+    cmake gcc
 ```
+
 
 ---
 
