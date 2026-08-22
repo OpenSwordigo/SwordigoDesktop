@@ -940,10 +940,15 @@ int ParsePVRv2Format(uint32_t flags, uint32_t& gl_format, uint32_t& gl_type, int
 			
 		case 0x93: // VG_sRGB_565
 		case 0xa7: // VG_sBGR_565
-		case 0x15: // OGL_RGB_565
+		case 0x13: // OGL_RGB_565
 			c0 = 'r'; c1 = 'g'; c2 = 'b'; c3 = 0;
 			d0 = 5; d1 = 6; d2 = 5; d3 = 0;
 			gl_format = 0x1907; gl_type = 0x8363; bpp = 2;
+			return 10;
+		case 0x15: // OGL_RGB_888
+			c0 = 'r'; c1 = 'g'; c2 = 'b'; c3 = 0;
+			d0 = 8; d1 = 8; d2 = 8; d3 = 0;
+			gl_format = 0x1907; bpp = 3;
 			return 10;
 			
 		case 0x95: // VG_sRGBA_4444
@@ -957,7 +962,6 @@ int ParsePVRv2Format(uint32_t flags, uint32_t& gl_format, uint32_t& gl_type, int
 			
 		case 0x94: // VG_sRGBA_5551
 		case 0xa9: // VG_sBGRA_5551
-		case 0x13: // OGL_RGBA_5551
 		case 0x11: // OGL_RGBA_5551
 			c0 = 'r'; c1 = 'g'; c2 = 'b'; c3 = 'a';
 			d0 = 5; d1 = 5; d2 = 5; d3 = 1;

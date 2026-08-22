@@ -15,6 +15,7 @@
 #include "sre.h"
 #include "sre_lua.h"
 #include "sre_caver.h"
+#include "lstate.h"  /* lua_State layout (L->nCcalls) for sre_eval_lua */
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -460,6 +461,16 @@ float g_sre_run_speed = 1.0f;
 float g_sre_jump_height = 1.0f;
 int   g_sre_move_direction = 0;  /* 0=stopped, -1=left, 1=right */
 volatile float g_sre_z_walk_axis = 0.0f;
+volatile float g_sre_x_walk_axis = 0.0f;  /* A/D strafe axis for z-walk */
+/* Host-written WASD-mode latch (0/1). Set by the host when the user presses
+ * L while the freecam (camera override) is active; auto-cleared when the
+ * camera is turned off. The z-walk poll only acts when Thronfield is
+ * detected OR this latch is set — vanilla stays untouched. */
+volatile int g_sre_zwalk_f5l = 0;
+/* Host-written frame dt in seconds (game-speed scaled). The z-walk poll uses
+ * it to step the Z axis in units/sec instead of units/frame, so strafing is
+ * speed-consistent with the walk speed instead of 60x too fast. */
+volatile float g_sre_host_dt = 0.016f;
 
 static void* sre_get_hero_cc(lua_State* L);
 
@@ -1300,6 +1311,26 @@ static int l_btn_new(lua_State* L) {
     }
     if (!id) return 0;
     if (!label) label = "";
+    /* DIAG: log every button creation + globals state (Thronfield delete nil hunt) */
+    {
+        static int s_diag_btn = 0;
+        if (s_diag_btn++ < 64) {
+            int bc_ok = 0, mb_ok = 0, oc_ok = 0;
+            if (g_lua_getfield && g_lua_type) {
+                g_lua_getfield(L, LUA_GLOBALSINDEX, "ButtonController");
+                bc_ok = g_lua_type(L, -1) == 5;
+                g_lua_settop(L, -2);
+                g_lua_getfield(L, LUA_GLOBALSINDEX, "MiniButton");
+                mb_ok = g_lua_type(L, -1) == 5;
+                g_lua_settop(L, -2);
+                g_lua_getfield(L, LUA_GLOBALSINDEX, "OverlayController");
+                oc_ok = g_lua_type(L, -1) == 5;
+                g_lua_settop(L, -2);
+            }
+            fprintf(stderr, "[SRE/Diag] l_btn_new id=%s label=%s args=%d BC=%d MiniBtn=%d OC=%d\n",
+                    id, label, top, bc_ok, mb_ok, oc_ok);
+        }
+    }
     /* Reject IDs that cannot fit the slot buffer: storing a truncated id makes
      * the button permanently unfindable (sre_find_btn compares the full string)
      * AND each New with the same long id allocates a fresh slot, silently
@@ -1375,6 +1406,11 @@ static int l_btn_new(lua_State* L) {
 /* ButtonController.Delete(id) */
 static int l_btn_delete(lua_State* L) {
     const char* id = sre_get_btn_id(L, 1);
+    { /* DIAG: was delete reached at all? (Thronfield delete nil hunt) */
+        static int s_diag_del = 0;
+        if (s_diag_del++ < 16)
+            fprintf(stderr, "[SRE/Diag] l_btn_delete id=%s\n", id ? id : "(nil)");
+    }
     volatile SreBtnSlot* btn = sre_find_btn(id);
     if (btn) {
         btn->active = 0;
@@ -1385,6 +1421,85 @@ static int l_btn_delete(lua_State* L) {
 }
 
 /* ButtonController.DeleteAll() */
+/* Non-static wrappers for extras button lifecycle hooks */
+void sre_button_set_all_hidden(int hidden) {
+    g_sre_btn_globally_hidden = hidden;
+    g_sre_btn_dirty = 1;
+}
+
+void sre_button_remove_all(void) {
+    int i;
+    for (i = 0; i < SRE_BTN_MAX; i++) {
+        g_sre_buttons[i].active = 0;
+    }
+    g_sre_btn_delete_all = 1;
+    g_sre_btn_dirty = 1;
+}
+
+/* =========================================================================
+ * Button lifecycle hooks — auto-hide/show buttons during game state changes.
+ * Adapted from Kiwi Lawncher's hooks.c.
+ * ========================================================================= */
+
+static int g_btn_lifecycle_enabled = 1;
+
+void sre_button_lifecycle_set_enabled(int enabled) { g_btn_lifecycle_enabled = enabled; }
+
+void sre_button_lifecycle_on_cinematic_mode(int enabled) {
+    if (!g_btn_lifecycle_enabled) return;
+    sre_button_set_all_hidden(enabled);
+}
+
+void sre_button_lifecycle_on_menu_load(void) {
+    if (!g_btn_lifecycle_enabled) return;
+    sre_button_set_all_hidden(1);
+}
+
+void sre_button_lifecycle_on_menu_disappear(void) {
+    if (!g_btn_lifecycle_enabled) return;
+    sre_button_set_all_hidden(0);
+}
+
+void sre_button_lifecycle_on_pause(void) {
+    if (!g_btn_lifecycle_enabled) return;
+    sre_button_set_all_hidden(1);
+}
+
+void sre_button_lifecycle_on_unpause(void) {
+    if (!g_btn_lifecycle_enabled) return;
+    sre_button_set_all_hidden(0);
+}
+
+void sre_button_lifecycle_on_portal_in(void) {
+    if (!g_btn_lifecycle_enabled) return;
+    sre_button_set_all_hidden(1);
+}
+
+void sre_button_lifecycle_on_portal_out(void) {
+    if (!g_btn_lifecycle_enabled) return;
+    sre_button_set_all_hidden(0);
+}
+
+void sre_button_lifecycle_on_skill_picker_load(void) {
+    if (!g_btn_lifecycle_enabled) return;
+    sre_button_set_all_hidden(1);
+}
+
+void sre_button_lifecycle_on_skill_picker_destroy(void) {
+    if (!g_btn_lifecycle_enabled) return;
+    sre_button_set_all_hidden(0);
+}
+
+void sre_button_lifecycle_on_game_over(void) {
+    if (!g_btn_lifecycle_enabled) return;
+    sre_button_remove_all();
+}
+
+void sre_button_lifecycle_on_scene_destruct(void) {
+    if (!g_btn_lifecycle_enabled) return;
+    sre_button_remove_all();
+}
+
 static int l_btn_delete_all(lua_State* L) {
     int i;
     (void)L;
@@ -1954,6 +2069,35 @@ static int l_mini_host_z_axis(lua_State* L) {
     return 1;
 }
 
+/* Mini.HostXAxis() → number (-1..1) — host keyboard X-walk axis.
+ * +1 while D is held (right), -1 while A is held (left), else 0. */
+static int l_mini_host_x_axis(lua_State* L) {
+    (void)L;
+    g_lua_pushnumber(L, (lua_Number)g_sre_x_walk_axis);
+    return 1;
+}
+
+/* Mini.ZWalkF5L() → number (0 or 1) — host WASD-mode latch.
+ * 1 only after the user pressed L while the freecam was active (see main.cpp).
+ * The z-walk poll treats this as an override: enabled = Thronfield OR ZWalkF5L. */
+static int l_mini_zwalk_f5l(lua_State* L) {
+    (void)L;
+    g_lua_pushnumber(L, (lua_Number)(g_sre_zwalk_f5l ? 1 : 0));
+    return 1;
+}
+
+/* Mini.HostDt() → number — host frame dt in seconds (game-speed scaled).
+ * Used by the z-walk poll to convert per-frame Z steps into units/sec so
+ * strafing speed matches the walk speed instead of being frame-rate bound. */
+static int l_mini_host_dt(lua_State* L) {
+    (void)L;
+    double dt = (double)g_sre_host_dt;
+    if (dt < 0.001) dt = 0.001;
+    if (dt > 0.1)   dt = 0.1;
+    g_lua_pushnumber(L, dt);
+    return 1;
+}
+
 /* Mini.SetControlsHidden(bool)
  *
  * Parity with SwKiwi controls.c (arm64):
@@ -2251,6 +2395,217 @@ static int l_mini_set_weapon_color(lua_State* L) {
 }
 
 /* =========================================================================
+ * GameController.* (Throndigo / SwMini surface)
+ *
+ * The engine binary has the C++ methods (Caver::GameSceneController::
+ * GameControlButtonDown) but never registers a Lua table — that's a SwMini
+ * surface SRE must provide. From the Ghidra decompile of 0x44bc24:
+ *   Down(1) → CharControllerComponent::StartMovingToDirection(-1)
+ *   Down(2) → StartMovingToDirection(1)
+ *   Down(3) → StartJumping (if CanJump)
+ *   Down(4) → Swing (if CanSwing)
+ *   Down(5) → Use, else Pickup
+ * Up(1) → StopMovingToDirection(-1); Up(2) → StopMovingToDirection(1);
+ * Up(3) → StopJumping.
+ * We resolve the hero's CharControllerComponent (same path as Mini.Character)
+ * and call the real engine methods via the resolved function pointers.
+ * ========================================================================= */
+
+/* GameController.GameControlButtonDown(btn) — parity with engine 0x44bc24 */
+static int l_gc_button_down(lua_State* L) {
+    int btn = (int)g_lua_tonumber(L, 1);
+    void* cc = sre_get_hero_cc(L);
+    if (!cc) return 0;
+    switch (btn) {
+    case 1:
+        if (g_sre_CharController_StartMovingToDirection)
+            g_sre_CharController_StartMovingToDirection(cc, -1);
+        break;
+    case 2:
+        if (g_sre_CharController_StartMovingToDirection)
+            g_sre_CharController_StartMovingToDirection(cc, 1);
+        break;
+    case 3:
+        if (g_sre_CharController_CanJump && g_sre_CharController_CanJump(cc) &&
+            g_sre_CharController_StartJumping)
+            g_sre_CharController_StartJumping(cc);
+        break;
+    case 4:
+        if (g_sre_CharController_CanSwing && g_sre_CharController_CanSwing(cc) &&
+            g_sre_CharController_Swing)
+            g_sre_CharController_Swing(cc);
+        break;
+    case 5:
+        if (g_sre_CharController_CanUse && g_sre_CharController_CanUse(cc)) {
+            if (g_sre_CharController_Use) g_sre_CharController_Use(cc);
+        } else if (g_sre_CharController_CanPickup && g_sre_CharController_CanPickup(cc)) {
+            /* Pickup not exposed as a direct ptr; fall through to Use. */
+            if (g_sre_CharController_Use) g_sre_CharController_Use(cc);
+        }
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
+/* GameController.GameControlButtonUp(btn) — parity with engine 0x44d1f4 */
+static int l_gc_button_up(lua_State* L) {
+    int btn = (int)g_lua_tonumber(L, 1);
+    void* cc = sre_get_hero_cc(L);
+    if (!cc) return 0;
+    switch (btn) {
+    case 1:
+        if (g_sre_CharController_StopMovingToDirection)
+            g_sre_CharController_StopMovingToDirection(cc, -1);
+        break;
+    case 2:
+        if (g_sre_CharController_StopMovingToDirection)
+            g_sre_CharController_StopMovingToDirection(cc, 1);
+        break;
+    case 3:
+        if (g_sre_CharController_StopJumping)
+            g_sre_CharController_StopJumping(cc);
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
+/* =========================================================================
+ * CollectableItem.* / AnimationController.* / EntityController.* shims
+ *
+ * The engine registers these Lua tables PER-SCENE via each component's
+ * RegisterLibrary (CollectableItemComponent::RegisterLibrary is a thunk to
+ * the generic lib registrar) — in scenes with no such components the table
+ * is nil. The mod (Throndigo) calls them unconditionally, so SRE provides
+ * fallbacks that are only installed when the engine didn't register one.
+ *
+ * CollectableItemComponent layout (IDA 0x261928 InitWithComponent /
+ * 0x261B10 SaveToProtobufMessage, verified):
+ *   +0x70 Type (int), +0x74 Value (int)
+ *   +0x78 ItemName std::string (data ptr @ +0x78, len @ +0x80)
+ *   +0x88 RequiresPickup (byte)
+ *   +0x90 OnCollect Program (shared_ptr)
+ * ========================================================================= */
+
+/* Read a std::string's bytes from the component at 'data_off' (data ptr)
+ * and 'len_off' (length). Returns pointer to a NUL-terminated copy in a
+ * static buffer, or NULL. Length is clamped so a corrupt length can't
+ * walk the address space. */
+static const char* sre_read_comp_string(void* comp, int data_off, int len_off) {
+    static char s_buf[128];
+    if (!comp) return NULL;
+    uintptr_t data = *(uintptr_t*)((char*)comp + data_off);
+    int len = *(int*)((char*)comp + len_off);
+    if (data < 0x10000ULL || data >= 0x0000800000000000ULL) return NULL;
+    if (len <= 0 || len >= (int)sizeof(s_buf)) return NULL;
+    memcpy(s_buf, (void*)data, (size_t)len);
+    s_buf[len] = '\0';
+    return s_buf;
+}
+
+/* CollectableItem.RequiresPickup(item) → bool (component +0x88) */
+static int l_collectable_requires_pickup(lua_State* L) {
+    SceneObject* obj = (SceneObject*)g_lua_touserdata(L, 1);
+    void* comp = obj ? sre_scene_object_component(obj, CollectableItemComponent_Interface) : (void*)0;
+    if (comp) {
+        g_lua_pushboolean(L, *(unsigned char*)((char*)comp + 0x88) ? 1 : 0);
+    } else {
+        g_lua_pushboolean(L, 0);  /* no component → instant pickup */
+    }
+    return 1;
+}
+
+/* CollectableItem.ItemName(item) → string (component +0x78) */
+static int l_collectable_item_name(lua_State* L) {
+    SceneObject* obj = (SceneObject*)g_lua_touserdata(L, 1);
+    void* comp = obj ? sre_scene_object_component(obj, CollectableItemComponent_Interface) : (void*)0;
+    const char* name = comp ? sre_read_comp_string(comp, 0x78, 0x80) : NULL;
+    if (!name) name = "";
+    g_lua_pushstring(L, name);
+    return 1;
+}
+
+/* CollectableItem.SetItemIdentifier(item, id) — no-op (rarely used by mods). */
+static int l_collectable_set_item_identifier(lua_State* L) {
+    (void)L;
+    return 0;
+}
+
+/* AnimationController.BlendToAnimation(obj, anim) — the engine's C++ method
+ * exists but the Lua table is missing in scenes without animated entities.
+ * Safe no-op: the SCL safety wrapper already pcall-guards the call site. */
+static int l_animctrl_blend(lua_State* L) {
+    (void)L;
+    return 0;
+}
+
+/* EntityController.StartSwing(obj, anim, dur) — safe no-op shim. */
+static int l_entityctrl_start_swing(lua_State* L) {
+    (void)L;
+    return 0;
+}
+
+/* =========================================================================
+ * SceneObject.Destroy / SceneObject.SetAlwaysActive — real engine parity
+ * =========================================================================
+ * The engine registers the SceneObject table per-scene via RegisterLibrary
+ * (a thunk), so in mod scenes the table can exist without destroy/
+ * setAlwaysActive. The Lua hook (sre_hook_obj) falls back to these when the
+ * engine's __index dispatcher returns nil.
+ *
+ * Engine behavior verified by disassembly (libswordigo.so v1.4.12 ARM64):
+ *   destroy(obj)        0x477018  → store byte 1 at obj+0xE8 (destroyed flag)
+ *   setAlwaysActive     0x47704c  → ProgramState::BoolAtStackIndex(2),
+ *                                   then SceneObject::SetAlwaysActive(obj, b)
+ */
+typedef void (*pfn_SceneObject_SetAlwaysActive)(void* obj, int active);
+static pfn_SceneObject_SetAlwaysActive g_sre_SceneObject_SetAlwaysActive = 0;
+
+/* SceneObject.Destroy(obj) — engine parity (0x477018). */
+static int l_so_destroy(lua_State* L) {
+    SceneObject* obj = (SceneObject*)g_lua_touserdata(L, 1);
+    if (obj) *(unsigned char*)((char*)obj + 0xE8) = 1;
+    return 0;
+}
+
+/* SceneObject.SetAlwaysActive(obj, active) — engine parity (0x47704c). */
+static int l_so_set_always_active(lua_State* L) {
+    SceneObject* obj = (SceneObject*)g_lua_touserdata(L, 1);
+    if (obj) {
+        if (!g_sre_SceneObject_SetAlwaysActive) {
+            g_sre_SceneObject_SetAlwaysActive =
+                (pfn_SceneObject_SetAlwaysActive)(uintptr_t)sre_resolve_address(
+                    "_ZN5Caver11SceneObject15SetAlwaysActiveEb");
+        }
+        if (g_sre_SceneObject_SetAlwaysActive) {
+            int active = (g_lua_toboolean && g_lua_toboolean(L, 2)) ? 1 : 0;
+            g_sre_SceneObject_SetAlwaysActive(obj, active);
+        }
+    }
+    return 0;
+}
+
+/* l_so_get_real_mt(obj) — return the REAL SceneObject metatable, bypassing
+ * __metatable protection. The engine's lua_getmetatable (0x4E8E24) is stock
+ * Lua 5.1: for userdata/table it pushes the actual metatable and NEVER checks
+ * __metatable (verified in IDA decomp). Only the Lua getmetatable LIBRARY
+ * respects __metatable — debug.getmetatable included — so the Lua-side hook
+ * sees a string and bails. Use the C API directly: this is the ONLY reliable
+ * way to reach the real metatable in mod scenes (Thronfield). */
+static int l_so_get_real_mt(lua_State* L) {
+    if (!g_lua_getmetatable) return 0;
+    if (g_lua_getmetatable(L, 1)) {
+        if (g_lua_type && g_lua_type(L, -1) == LUA_TTABLE)
+            return 1;
+        g_lua_settop(L, 0);
+    }
+    return 0;
+}
+
+/* =========================================================================
  * CameraController.* (SwKiwi alias functions)
  * ========================================================================= */
 
@@ -2313,6 +2668,32 @@ static int l_camctrl_get_up_vector(lua_State* L) {
     g_lua_pushnumber(L, (double)g_sre_cam_up_z);
     g_lua_setfield(L, -2, "z");
     return 1;
+}
+
+/* CameraController.SetOffset(x, y, z) — Throndigo calls this with 3 args
+ * (the engine's own SetPositionOffset takes a Vector3). Same effect. */
+static int l_camctrl_set_offset(lua_State* L) {
+    g_sre_cam_x = (float)g_lua_tonumber(L, 1);
+    g_sre_cam_y = (float)g_lua_tonumber(L, 2);
+    g_sre_cam_z = (float)g_lua_tonumber(L, 3);
+    g_sre_cam_set_pending = 1;
+    return 0;
+}
+
+/* CameraController.GetOffset() → x, y, z (3 values — Throndigo does
+ * `local x, y, z = CameraController.GetOffset()`). */
+static int l_camctrl_get_offset(lua_State* L) {
+    (void)L;
+    g_lua_pushnumber(L, (double)g_sre_cam_x);
+    g_lua_pushnumber(L, (double)g_sre_cam_y);
+    g_lua_pushnumber(L, (double)g_sre_cam_z);
+    return 3;
+}
+
+/* CameraController.DisableOptimizations(bool) — no-op stub (parity). */
+static int l_camctrl_disable_optimizations(lua_State* L) {
+    (void)L;
+    return 0;
 }
 
 /* Helper: Red-Black Tree increment (matching SwKiwi scene_find_all.c) */
@@ -3847,6 +4228,170 @@ static int l_fs_attributes(lua_State* L) {
 }
 
 /* =========================================================================
+ * Atomic FS operations — crash-safe file persistence for DB saves.
+ *
+ * fs.write_atomic(path, data)
+ *   1. Copy current file to path.bak (backup rotation)
+ *   2. Write data to path.tmp (staging)
+ *   3. rename(path.tmp, path) — POSIX atomic on same filesystem
+ *   If step 2 or 3 fails, .bak still has the previous good version.
+ *   Returns true on success, false on failure.
+ *
+ * fs.read_safe(path)
+ *   Tries to read path → falls back to path.bak → falls back to path.tmp.
+ *   Returns the first file that loads without errors, or nil.
+ * ========================================================================= */
+
+/* Backup: copy src to dst. Returns 1 on success, 0 on failure. */
+static int atomic_copy(const char* src, const char* dst) {
+    SRE_FS_FILE* fin = fopen(src, "rb");
+    if (!fin) return 0;
+    SRE_FS_FILE* fout = fopen(dst, "wb");
+    if (!fout) { fclose(fin); return 0; }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fin)) > 0)
+        fwrite(buf, 1, n, fout);
+    int ok = !ferror(fin) && !ferror(fout);
+    fclose(fin);
+    fclose(fout);
+    return ok;
+}
+
+/* fs.write_atomic(path, data) — crash-safe write with backup rotation */
+static int l_fs_write_atomic(lua_State* L) {
+    const char* path = lua_tostring(L, 1);
+    size_t len = 0;
+    const char* data = NULL;
+    if (g_lua_tolstring) data = g_lua_tolstring(L, 2, (sre_size_t*)&len);
+    else { data = lua_tostring(L, 2); if (data) len = strlen(data); }
+    if (!path || !data) { g_lua_pushboolean(L, 0); return 1; }
+
+    char real_path[512], bak_path[516], tmp_path[516];
+    char tbuf[512];
+    const char* real = sre_api_minipath_translate(path, tbuf, 512);
+    if (!real) real = path;
+    snprintf(real_path, sizeof(real_path), "%s", real);
+    snprintf(bak_path, sizeof(bak_path), "%s.bak", real_path);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", real_path);
+
+    /* Step 1: backup current file (non-fatal — first save has no .bak) */
+    atomic_copy(real_path, bak_path);
+
+    /* Step 2: write to .tmp */
+    SRE_FS_FILE* fp = fopen(tmp_path, "wb");
+    if (!fp) { g_lua_pushboolean(L, 0); return 1; }
+    size_t w = fwrite(data, 1, len, fp);
+    fclose(fp);
+    if (w != len) { g_lua_pushboolean(L, 0); return 1; }
+
+    /* Step 3: atomic rename (.tmp → final) */
+    int ok = (rename(tmp_path, real_path) == 0);
+    if (!ok) {
+        /* rename failed (cross-device?); try copy+delete fallback */
+        ok = atomic_copy(tmp_path, real_path);
+        if (ok) remove(tmp_path);
+    }
+    g_lua_pushboolean(L, ok);
+    return 1;
+}
+
+/* fs.read_safe(path) — read with crash recovery (path → path.bak → path.tmp) */
+static int l_fs_read_safe(lua_State* L) {
+    const char* path = lua_tostring(L, 1);
+    if (!path) { g_lua_pushnil(L); return 1; }
+
+    char real_path[512], bak_path[516], tmp_path[516];
+    char tbuf[512];
+    const char* real = sre_api_minipath_translate(path, tbuf, 512);
+    if (!real) real = path;
+    snprintf(real_path, sizeof(real_path), "%s", real);
+    snprintf(bak_path, sizeof(bak_path), "%s.bak", real_path);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", real_path);
+
+    /* Try main file */
+    SRE_FS_FILE* fp = fopen(real_path, "rb");
+    if (fp) {
+        /* Quick integrity check: file must not be empty and must start with '{' */
+        char first = 0;
+        if (fread(&first, 1, 1, fp) == 1 && first == '{') {
+            fseek(fp, 0, SEEK_END);
+            long sz = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            if (sz > 0) {
+                char* buf = (char*)malloc((size_t)sz + 1);
+                if (buf) {
+                    size_t n = fread(buf, 1, (size_t)sz, fp);
+                    fclose(fp);
+                    buf[n] = '\0';
+                    g_lua_pushlstring(L, buf, n);
+                    free(buf);
+                    return 1;
+                }
+            }
+            fclose(fp);
+        } else {
+            fclose(fp);
+        }
+    }
+
+    /* Try .bak file */
+    fp = fopen(bak_path, "rb");
+    if (fp) {
+        fseek(fp, 0, SEEK_END);
+        long sz = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        if (sz > 0) {
+            char* buf = (char*)malloc((size_t)sz + 1);
+            if (buf) {
+                size_t n = fread(buf, 1, (size_t)sz, fp);
+                fclose(fp);
+                buf[n] = '\0';
+                /* Recover: write .bak content back to main file */
+                SRE_FS_FILE* fout = fopen(real_path, "wb");
+                if (fout) { fwrite(buf, 1, n, fout); fclose(fout); }
+                g_lua_pushlstring(L, buf, n);
+                free(buf);
+                fprintf(stderr, "[SRE/DB] Recovered from backup: %s\n", bak_path);
+                return 1;
+            }
+        }
+        fclose(fp);
+    }
+
+    /* Try .tmp file (partial write from crashed save) */
+    fp = fopen(tmp_path, "rb");
+    if (fp) {
+        fseek(fp, 0, SEEK_END);
+        long sz = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        if (sz > 10) { /* require at least some data */
+            char* buf = (char*)malloc((size_t)sz + 1);
+            if (buf) {
+                size_t n = fread(buf, 1, (size_t)sz, fp);
+                fclose(fp);
+                buf[n] = '\0';
+                /* Validate it's parseable Lua table */
+                if (buf[0] == '{') {
+                    g_lua_pushlstring(L, buf, n);
+                    free(buf);
+                    fprintf(stderr, "[SRE/DB] Recovered from partial write: %s\n", tmp_path);
+                    return 1;
+                }
+                free(buf);
+            } else {
+                fclose(fp);
+            }
+        } else {
+            fclose(fp);
+        }
+    }
+
+    g_lua_pushnil(L);
+    return 1;
+}
+
+/* =========================================================================
  * C-Backed TOML Parser Module for Lua
  * ========================================================================= */
 #include "toml.h"
@@ -4050,6 +4595,47 @@ static int stub_itemdrop_item_identifier(lua_State* L);
  * Registration — inject Mini/LNI tables into a Lua state
  * ========================================================================= */
 
+/* sre_ensure_sceneobject_fallbacks — re-add SceneObject.Destroy /
+ * SceneObject.SetAlwaysActive if the engine's per-scene RegisterLibrary
+ * re-registered the SceneObject table without them (mod scenes).
+ * Safe to call repeatedly; only fills in missing keys. */
+static void sre_ensure_sceneobject_fallbacks(lua_State* L) {
+    if (!g_lua_getfield || !g_lua_type || !g_lua_settop || !g_lua_pushcclosure || !g_lua_setfield) return;
+    /* Always expose the raw C fallbacks as globals — the sre_hook_obj Lua
+     * chunk falls back to these when the engine's per-scene __index dispatcher
+     * returns nil for destroy/setAlwaysActive (mod scenes like Thronfield).
+     * Re-registered on every lua_call so a scene reload can't wipe them. */
+    g_lua_pushcclosure(L, l_so_destroy, 0);
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "__sre_so_destroy");
+    g_lua_pushcclosure(L, l_so_set_always_active, 0);
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "__sre_so_set_always_active");
+    g_lua_pushcclosure(L, l_so_get_real_mt, 0);
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "__sre_get_real_mt");
+
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "SceneObject");
+    if (g_lua_type(L, -1) == 5 /* LUA_TTABLE */) {
+        g_lua_getfield(L, -1, "Destroy");
+        if (g_lua_type(L, -1) == 0 /* LUA_TNIL */) {
+            g_lua_settop(L, -2);
+            g_lua_pushcclosure(L, l_so_destroy, 0);
+            g_lua_setfield(L, -2, "Destroy");
+        } else {
+            g_lua_settop(L, -2);
+        }
+        g_lua_getfield(L, -1, "SetAlwaysActive");
+        if (g_lua_type(L, -1) == 0 /* LUA_TNIL */) {
+            g_lua_settop(L, -2);
+            g_lua_pushcclosure(L, l_so_set_always_active, 0);
+            g_lua_setfield(L, -2, "SetAlwaysActive");
+        } else {
+            g_lua_settop(L, -2);
+        }
+        g_lua_settop(L, -2); /* pop SceneObject */
+    } else {
+        g_lua_settop(L, -2);
+    }
+}
+
 /*
  * sre_register_mini_api — Register Mini.* and LNI.* tables
  *
@@ -4072,6 +4658,15 @@ void sre_register_mini_api(lua_State* L) {
 
     g_lua_pushcclosure(L, l_mini_host_z_axis, 0);
     g_lua_setfield(L, -2, "HostZAxis");
+
+    g_lua_pushcclosure(L, l_mini_host_x_axis, 0);
+    g_lua_setfield(L, -2, "HostXAxis");
+
+    g_lua_pushcclosure(L, l_mini_zwalk_f5l, 0);
+    g_lua_setfield(L, -2, "ZWalkF5L");
+
+    g_lua_pushcclosure(L, l_mini_host_dt, 0);
+    g_lua_setfield(L, -2, "HostDt");
 
     g_lua_pushcclosure(L, l_mini_set_controls_hidden, 0);
     g_lua_setfield(L, -2, "SetControlsHidden");
@@ -4299,16 +4894,44 @@ void sre_register_mini_api(lua_State* L) {
     extern void sre_scene_shifter_register_lua(lua_State* L);
     sre_scene_shifter_register_lua(L);
 
-    g_lua_setfield(L, LUA_GLOBALSINDEX, "Mini");  /* _G.Mini = table */
+    /* ---- FFI module (_G.ffi) ----
+     * FFI is now a CLOSED-SOURCE feature living in libsre-extras.so
+     * (src/sre-extras-closed-source/sre_ffi.c, libffi-backed). SRE core no
+     * longer ships a real FFI engine — it registers only the safe stub
+     * _G.ffi surface here (pure-math functions work for real; dispatch /
+     * memory-access functions are safe no-ops). When libsre-extras.so is
+     * present, its miniLL_open_memory() calls sre_ffi_register_lua(L) to
+     * overwrite this stub table with the real libffi-backed one. */
+    extern void sre_extras_stub_register_ffi(lua_State* L);
+    sre_extras_stub_register_ffi(L);
 
-    /* ---- FFI module (_G.ffi) ---- */
-    /* Provides direct native function calling, peek/poke, and struct helpers.
-     * Replaces the old LNI string-buffer approach for advanced mod use cases.
-     * See sre_ffi.c for full API documentation.
-     * Declared (hidden) in sre_lua.h so this call binds to the local
-     * definition in libsre.so instead of routing through the host JNI
-     * bridge PLT stub (which logged "[Bridge64] !! UNHANDLED"). */
-    sre_ffi_register_lua(L);
+    /* ---- Optional extras (real _G.ffi + Mini.MemoryAddress + Raijin sig FFI)
+     * If the host loaded libsre-extras.so, its miniLL_open_memory guest
+     * address is stored in g_sre_extras_miniLL_open_memory; call it and
+     * merge the returned memory library table into Mini (stack top).
+     * That path also (re)registers the real _G.ffi via sre_ffi_register_lua.
+     * Otherwise register the safe stub surface (sre_extras_stubs.c). */
+    extern void* g_sre_extras_miniLL_open_memory;
+    if (g_sre_extras_miniLL_open_memory) {
+        ((int (*)(lua_State*))g_sre_extras_miniLL_open_memory)(L);
+        /* stack: Mini, lib — merge lib entries into Mini.
+         * Standard idiom: [Mini,lib,key,value] → dup key (-2),
+         * dup value (-2 after the key dup), rawset(Mini), pop value. */
+        g_lua_pushnil(L);
+        while (g_lua_next(L, -2)) {
+            /* stack: Mini, lib, key, value */
+            g_lua_pushvalue(L, -2);  /* dup key → key is now at -2 */
+            g_lua_pushvalue(L, -2);  /* dup value (now at -2) */
+            g_lua_rawset(L, -6);     /* Mini[key] = value */
+            g_lua_settop(L, -2);     /* pop remaining value (settop(-2)=pop 1), keep key */
+        }
+        g_lua_settop(L, -2);         /* pop lib — Mini stays on top */
+    } else {
+        extern void sre_extras_stub_register_lua(lua_State* L);
+        sre_extras_stub_register_lua(L);
+    }
+
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "Mini");  /* _G.Mini = table */
 
     /* ---- LNI table ---- */
     g_lua_createtable(L, 0, 5);  /* LNI = {} */
@@ -4668,12 +5291,84 @@ void sre_register_mini_api(lua_State* L) {
     g_lua_setfield(L, LUA_GLOBALSINDEX, "Keyboard");
 
 
+    /* ---- GameController table (Throndigo: GameControlButtonDown/Up) ---- */
+    g_lua_createtable(L, 0, 2);
+    g_lua_pushcclosure(L, l_gc_button_down, 0);
+    g_lua_setfield(L, -2, "GameControlButtonDown");
+    g_lua_pushcclosure(L, l_gc_button_up, 0);
+    g_lua_setfield(L, -2, "GameControlButtonUp");
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "GameController");
+
+    /* ---- Mega table (Throndigo: Mega.FindAll() → all scene objects).
+     * SwMini surface; engine has nothing. Alias the existing
+     * Mini.SceneFindAll (RB-tree walk, pushes proper SceneObject userdata
+     * via the engine's SceneObjectLib::PushSceneObject). */
+    g_lua_createtable(L, 0, 1);
+    g_lua_pushcclosure(L, l_mini_scene_find_all, 0);
+    g_lua_setfield(L, -2, "FindAll");
+    g_lua_setfield(L, LUA_GLOBALSINDEX, "Mega");
+
+    /* ---- CollectableItem table — only if the engine didn't register it
+     * (the engine registers it per-scene via RegisterLibrary thunk). ---- */
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "CollectableItem");
+    if (g_lua_type(L, -1) == 0 /* LUA_TNIL */) {
+        g_lua_settop(L, -2);
+        g_lua_createtable(L, 0, 3);
+        g_lua_pushcclosure(L, l_collectable_requires_pickup, 0);
+        g_lua_setfield(L, -2, "RequiresPickup");
+        g_lua_pushcclosure(L, l_collectable_item_name, 0);
+        g_lua_setfield(L, -2, "ItemName");
+        g_lua_pushcclosure(L, l_collectable_set_item_identifier, 0);
+        g_lua_setfield(L, -2, "SetItemIdentifier");
+        g_lua_setfield(L, LUA_GLOBALSINDEX, "CollectableItem");
+    } else {
+        g_lua_settop(L, -2);
+    }
+
+    /* ---- AnimationController table — only if missing ---- */
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "AnimationController");
+    if (g_lua_type(L, -1) == 0 /* LUA_TNIL */) {
+        g_lua_settop(L, -2);
+        g_lua_createtable(L, 0, 1);
+        g_lua_pushcclosure(L, l_animctrl_blend, 0);
+        g_lua_setfield(L, -2, "BlendToAnimation");
+        g_lua_setfield(L, LUA_GLOBALSINDEX, "AnimationController");
+    } else {
+        g_lua_settop(L, -2);
+    }
+
+    /* ---- EntityController table — only if missing ---- */
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "EntityController");
+    if (g_lua_type(L, -1) == 0 /* LUA_TNIL */) {
+        g_lua_settop(L, -2);
+        g_lua_createtable(L, 0, 1);
+        g_lua_pushcclosure(L, l_entityctrl_start_swing, 0);
+        g_lua_setfield(L, -2, "StartSwing");
+        g_lua_setfield(L, LUA_GLOBALSINDEX, "EntityController");
+    } else {
+        g_lua_settop(L, -2);
+    }
+
+    /* ---- SceneObject table — add real Destroy/SetAlwaysActive only if the
+     * engine's per-scene registration left them missing (mod scenes).
+     * NOTE: the engine re-registers the SceneObject global table per scene
+     * (RegisterLibrary), silently dropping these fallbacks, so
+     * sre_ensure_sceneobject_fallbacks() is ALSO called from the
+     * already-injected branch of sre_mini_ensure_injected on every lua_call. ---- */
+    sre_ensure_sceneobject_fallbacks(L);
+
     /* ---- CameraController table (SwKiwi alias for Mini.Camera) ---- */
-    g_lua_createtable(L, 0, 6);
+    g_lua_createtable(L, 0, 9);
     g_lua_pushcclosure(L, l_camctrl_set_position_offset, 0);
     g_lua_setfield(L, -2, "SetPositionOffset");
     g_lua_pushcclosure(L, l_mini_cam_get_position, 0);
     g_lua_setfield(L, -2, "GetPositionOffset");
+    g_lua_pushcclosure(L, l_camctrl_set_offset, 0);
+    g_lua_setfield(L, -2, "SetOffset");
+    g_lua_pushcclosure(L, l_camctrl_get_offset, 0);
+    g_lua_setfield(L, -2, "GetOffset");
+    g_lua_pushcclosure(L, l_camctrl_disable_optimizations, 0);
+    g_lua_setfield(L, -2, "DisableOptimizations");
     g_lua_pushcclosure(L, l_camctrl_set_perspective, 0);
     g_lua_setfield(L, -2, "SetPerspectiveProjection");
     g_lua_pushcclosure(L, l_camctrl_set_up_vector, 0);
@@ -4900,7 +5595,7 @@ void sre_register_mini_api(lua_State* L) {
 #undef SAFE_SET_NUMBER
 
     /* ---- fs (LuaFileSystem) ---- */
-    g_lua_createtable(L, 0, 5);
+    g_lua_createtable(L, 0, 8);
     g_lua_pushcclosure(L, l_fs_mkdir, 0);
     g_lua_setfield(L, -2, "mkdir");
     g_lua_pushcclosure(L, l_fs_rmdir, 0);
@@ -4911,6 +5606,10 @@ void sre_register_mini_api(lua_State* L) {
     g_lua_setfield(L, -2, "attributes");
     g_lua_pushcclosure(L, l_fs_exists, 0);
     g_lua_setfield(L, -2, "exists");
+    g_lua_pushcclosure(L, l_fs_write_atomic, 0);
+    g_lua_setfield(L, -2, "write_atomic");
+    g_lua_pushcclosure(L, l_fs_read_safe, 0);
+    g_lua_setfield(L, -2, "read_safe");
     g_lua_setfield(L, LUA_GLOBALSINDEX, "fs");
 
     /* ---- lfs alias to fs ---- */
@@ -5550,8 +6249,25 @@ static void sre_eval_lua(lua_State* L, const char* code) {
     int base_top = g_lua_gettop(L);
     g_lua_getfield(L, LUA_GLOBALSINDEX, "loadstring");
     if (g_lua_type(L, -1) == 6) { /* LUA_TFUNCTION */
+        /* The engine's Lua shares L->nCcalls between the VM's C-call guard AND
+         * the parser's "syntax levels" counter (llex enterlevel/leavelevel).
+         * When loadstring runs deep inside a scene-load call stack, nCcalls is
+         * already near LUAI_MAXCCALLS (200), so even small injected chunks fail
+         * with "chunk has too many syntax levels" — and because the failure
+         * happens before the chunk's own guard flag is set, the eval retries on
+         * EVERY lua_call, pegging the CPU and stalling boot (Thronfield).
+         * Fix: temporarily zero nCcalls for the PARSE phase only, restore
+         * before executing the chunk so runtime C-call guards stay intact. */
+        /* Keep nCcalls low for BOTH the parse and the chunk execution: the
+         * engine's C-call guard shares this counter, and when injection runs
+         * deep inside a scene-load call chain the budget is already nearly
+         * exhausted — execution would overflow too. Our injected chunks are
+         * trusted, so give them the full budget and restore afterwards. */
+        unsigned short saved_nccalls = L->nCcalls;
+        L->nCcalls = 0;
         g_lua_pushstring(L, code);
-        if (g_lua_pcall(L, 1, 2, 0) == 0) {
+        int load_res = g_lua_pcall(L, 1, 2, 0);
+        if (load_res == 0) {
             if (g_lua_type(L, -2) == 6) {
                 g_lua_settop(L, -2); /* Pop errmsg, leave function */
                 int res = g_lua_pcall(L, 0, 0, 0);
@@ -5564,6 +6280,7 @@ static void sre_eval_lua(lua_State* L, const char* code) {
                 fprintf(stderr, "[SRE/LuaEval] Syntax Error: %s\n", msg ? msg : "unknown");
             }
         }
+        L->nCcalls = saved_nccalls;
     }
     g_lua_settop(L, base_top);
 }
@@ -5767,6 +6484,7 @@ static void sre_load_db_lua(lua_State* L) {
         "DB = {Inventory = {}, SS = 0, Created = os.time(), Music = {},\n"
         "      Enchants = {}, Chests = {}, Weapons = {}, Baubles = {}, Flags = {}}\n"
         "db = {}\n"
+        "local db_dirty = false  -- track unsaved changes\n"
         "local function read_file(path)\n"
         "    if DB and DB.read then return DB.read(path) end\n"
         "    if io and io.open then\n"
@@ -5798,6 +6516,15 @@ static void sre_load_db_lua(lua_State* L) {
         "end\n"
         "local function db_load()\n"
         "    local path = get_save_path()\n"
+        "    -- Use fs.read_safe for crash recovery: tries path → path.bak → path.tmp\n"
+        "    if fs and fs.read_safe then\n"
+        "        local content = fs.read_safe(path)\n"
+        "        if content and content ~= '' and Srlz then\n"
+        "            local ok, result = Srlz.deserialize(content, {safe = true})\n"
+        "            if ok and result then return result end\n"
+        "        end\n"
+        "    end\n"
+        "    -- Fallback: plain read\n"
         "    local content = read_file(path)\n"
         "    if not content or content == '' then return nil end\n"
         "    if not Srlz then return nil end\n"
@@ -5807,9 +6534,21 @@ static void sre_load_db_lua(lua_State* L) {
         "local function db_save()\n"
         "    local path = get_save_path()\n"
         "    if not Srlz then return false end\n"
+        "    -- Only write if dirty (data actually changed) — skips ~90% of idle writes\n"
+        "    if not db_dirty then return true end\n"
         "    local serialized = Srlz.serialize(DB)\n"
-        "    return write_file(path, serialized)\n"
+        "    -- Use atomic write: .tmp → rename → .bak rotation\n"
+        "    local ok = false\n"
+        "    if fs and fs.write_atomic then\n"
+        "        ok = fs.write_atomic(path, serialized)\n"
+        "    else\n"
+        "        ok = write_file(path, serialized)\n"
+        "    end\n"
+        "    if ok then db_dirty = false end\n"
+        "    return ok\n"
         "end\n"
+        "-- Mark DB as dirty whenever a field is set (called by sync loop)\n"
+        "local function db_mark_dirty() db_dirty = true end\n"
         "function db.init()\n"
         "    if Program and Program.Wait then Program.Wait(0.05) end\n"
         "    if Game and Game.CurrentLevelName then\n"
@@ -5822,28 +6561,56 @@ static void sre_load_db_lua(lua_State* L) {
         "        DB = {Inventory = {}, SS = 0, Created = os.time(), Music = {},\n"
         "              Enchants = {}, Chests = {}, Weapons = {}, Baubles = {}, Flags = {}}\n"
         "    end\n"
+        "    db_dirty = true  -- force initial save\n"
         "    if Character and Character.SetNumCoins then\n"
         "        Character.SetNumCoins(DB.SS or 0)\n"
         "    end\n"
-        "    print('DB initialized')\n"
+        "    print('DB initialized (atomic FS backend)')\n"
         "    if Program and Program.NewThread then\n"
         "        Program.NewThread('db_sync_loop', function()\n"
+        "            local prev_ss = DB.SS or 0\n"
         "            while true do\n"
         "                if Character and Character.NumCoins then\n"
-        "                    DB.SS = Character.NumCoins()\n"
+        "                    local ss = Character.NumCoins()\n"
+        "                    if ss ~= prev_ss then\n"
+        "                        DB.SS = ss\n"
+        "                        prev_ss = ss\n"
+        "                        db_mark_dirty()\n"
+        "                    end\n"
         "                end\n"
-        "                db_save()\n"
+        "                db_save()  -- only writes if dirty\n"
         "                if Program and Program.Wait then Program.Wait(0.1) end\n"
         "            end\n"
         "        end)\n"
         "    end\n"
         "    return 1\n"
         "end\n"
-        "function db.save() return db_save() end\n"
-        "function db.load() local l = db_load(); if l then DB = l end; return l end\n"
+        "function db.save() db_dirty = true; return db_save() end\n"
+        "function db.load() local l = db_load(); if l then DB = l; db_dirty = true end; return l end\n"
         "function db.get() return DB end\n"
-        "function db.set(new_db) if new_db and type(new_db) == 'table' then DB = new_db; return true end; return false end\n"
+        "function db.set(new_db) if new_db and type(new_db) == 'table' then DB = new_db; db_dirty = true; return true end; return false end\n"
         "_G.db = db\n");
+}
+
+/* Per-frame Z-walk driver. Called from sre_updateApplication (the guest's
+ * per-frame JNI hook) once per frame. Pcalls _G.sre_zwalk_poll() if the
+ * injection registered it — same pcall-safe context as the Lua console.
+ * No-op when the state isn't ready or the poll function is absent. */
+extern lua_State* g_sre_last_lua_state;
+void sre_mini_zwalk_poll(void) {
+    lua_State* L = g_sre_last_lua_state;
+    if (!L) return;
+    if (!g_lua_getfield || !g_lua_type || !g_lua_pcall || !g_lua_settop) return;
+    int base = g_lua_gettop(L);
+    if (base < 0) return;
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "sre_zwalk_poll");
+    if (g_lua_type(L, -1) == 6 /* LUA_TFUNCTION */) {
+        if (g_lua_pcall(L, 0, 0, 0) != 0 && g_lua_tolstring) {
+            const char* msg = g_lua_tolstring(L, -1, 0);
+            fprintf(stderr, "[SRE/ZWalk] poll error: %s\n", msg ? msg : "unknown");
+        }
+    }
+    g_lua_settop(L, base);
 }
 
 void sre_mini_ensure_injected(lua_State* L) {
@@ -5860,6 +6627,41 @@ void sre_mini_ensure_injected(lua_State* L) {
         g_lua_settop(L, -2); /* pop result */
         if (!has_loadstring) return; /* luaopen_base not yet run — come back later */
     }
+
+    /* Re-entrancy / already-injected guard. sre_lua_call_safe runs
+     * ensure_injected on EVERY lua_call, and the console services it EVERY
+     * frame, so the fast path here must be O(1) and must NOT redo any of the
+     * one-time setup below.
+     *
+     * PERF FIX: sre_open_std_libs() (below) and the heavy sre_eval_lua chunks
+     * are ONE-TIME-PER-STATE work. A regression had sre_open_std_libs() called
+     * unconditionally at the top of this function — so the entire Lua stdlib
+     * set (math/table/os/debug/io) was re-opened every frame and every
+     * lua_call, re-creating tables and re-registering dozens of C functions and
+     * churning the GC. That made the Lua console take seconds per command even
+     * for trivial (non-FFI) commands. The gate below now runs BEFORE any of
+     * that work, so an already-injected state returns immediately.
+     *
+     * We register the state BEFORE running the heavy chunks (not after) because
+     * engine C code invoked from inside our chunks can call lua_call
+     * re-entrantly; early registration makes that re-entrant call hit this
+     * cheap already-injected branch instead of recursing into a second full
+     * injection ("C stack overflow" observed in Thronfield boot). */
+    {
+        for (int qi = 0; qi < g_injected_count; qi++) {
+            if (g_injected_states[qi] == L) return;   /* already injected — O(1) fast path */
+        }
+        if (g_injected_count < MAX_INJECTED_STATES)
+            g_injected_states[g_injected_count++] = L;
+    }
+
+    /* Inject standard Lua libraries (math, table, os, debug, io) FIRST so the
+     * hook chunk below captures debug.getmetatable — the engine's SceneObjectLib
+     * userdata metatable is protected (__metatable), so plain getmetatable can't
+     * read it and the destroy/setAlwaysActive interception never applies.
+     * One-time per state (runs only after the injected-guard above). */
+    extern void sre_open_std_libs(lua_State* L);
+    sre_open_std_libs(L);
 
 
     /* Install sre_hook_obj helper function — only defines the function,
@@ -5889,7 +6691,19 @@ void sre_mini_ensure_injected(lua_State* L) {
          * ------------------------------------------------------------------ */
                 "if not _G.__sre_so_hooked then\n"
         "  _G.__sre_so_hooked = true\n"
-        "  local get_mt = (debug and debug.getmetatable) or getmetatable\n"
+        "  local function get_mt(o)\n"
+        "    -- Prefer the C bypass: the engine's lua_getmetatable returns the\n"
+        "    -- REAL metatable and ignores __metatable protection (verified in\n"
+        "    -- IDA decomp of 0x4E8E24). debug.getmetatable RESPECTS __metatable\n"
+        "    -- and returns a string for protected metatables (Thronfield's\n"
+        "    -- SceneObjectLib), which would make this hook silently no-op.\n"
+        "    if _G.__sre_get_real_mt then\n"
+        "      local rmt = _G.__sre_get_real_mt(o)\n"
+        "      if rmt and type(rmt) == 'table' then return rmt end\n"
+        "    end\n"
+        "    local gm = (debug and debug.getmetatable) or getmetatable\n"
+        "    return gm and gm(o) or nil\n"
+        "  end\n"
         "\n"
         "  local shared_envs = {}\n"
         "  _G.__sre_shared_envs = shared_envs\n"
@@ -5913,31 +6727,48 @@ void sre_mini_ensure_injected(lua_State* L) {
         "        mt.__sre_hooked      = true\n"
         "        mt.__sre_og_index    = og_index\n"
         "        mt.__sre_og_newindex = og_newindex\n"
+        "        -- Resolve a method from the original __index (table or function).\n"
+        "        local function sre_zwalk_og_method(self_obj, key)\n"
+        "          if type(og_index) == 'function' then\n"
+        "            local ok, m = pcall(og_index, self_obj, key)\n"
+        "            if ok then return m end\n"
+        "            return nil\n"
+        "          elseif type(og_index) == 'table' then\n"
+        "            return og_index[key]\n"
+        "          end\n"
+        "          return nil\n"
+        "        end\n"
         "        mt.__index = function(self_obj, key)\n"
         "          local env = shared_envs[self_obj]\n"
         "          if env and env[key] ~= nil then return env[key] end\n"
         "          if key == 'setAlwaysActive' then\n"
         "            return function(self_act, active)\n"
+        "              local m = sre_zwalk_og_method(self_act, key)\n"
+        "              if type(m) == 'function' then return m(self_act, active) end\n"
+        "              -- Prefer the always-registered C fallbacks (survive\n"
+        "              -- per-scene SceneObject table swaps; Thronfield etc.)\n"
+        "              if _G.__sre_so_set_always_active then\n"
+        "                return _G.__sre_so_set_always_active(self_act, active)\n"
+        "              end\n"
         "              if SceneObject and SceneObject.SetAlwaysActive then\n"
-        "                SceneObject.SetAlwaysActive(self_act, active)\n"
+        "                return SceneObject.SetAlwaysActive(self_act, active)\n"
         "              end\n"
         "            end\n"
         "          end\n"
         "          if key == 'destroy' or key == 'Destroy' then\n"
         "            return function(self_act)\n"
         "              shared_envs[self_act] = nil\n"
-        "              if type(og_index) == 'table' and type(og_index[key]) == 'function' then\n"
-        "                return og_index[key](self_act)\n"
-        "              elseif SceneObject and SceneObject.Destroy then\n"
+        "              local m = sre_zwalk_og_method(self_act, key)\n"
+        "              if type(m) == 'function' then return m(self_act) end\n"
+        "              if _G.__sre_so_destroy then\n"
+        "                return _G.__sre_so_destroy(self_act)\n"
+        "              end\n"
+        "              if SceneObject and SceneObject.Destroy then\n"
         "                return SceneObject.Destroy(self_act)\n"
         "              end\n"
         "            end\n"
         "          end\n"
-        "          if type(og_index) == 'function' then\n"
-        "            return og_index(self_obj, key)\n"
-        "          elseif type(og_index) == 'table' then\n"
-        "            return og_index[key]\n"
-        "          end\n"
+        "          return sre_zwalk_og_method(self_obj, key)\n"
         "        end\n"
         "        mt.__newindex = function(self_obj, key, val)\n"
         "          if og_newindex then\n"
@@ -5957,20 +6788,41 @@ void sre_mini_ensure_injected(lua_State* L) {
         "    end\n"
         "    return obj\n"
         "  end\n"
+        "  local wrapped_funcs = {}\n"
         "  _G.__sre_wrap_func = function(func)\n"
         "    if not func or type(func) ~= 'function' then return func end\n"
-        "    return function(...)\n"
+        "    -- Idempotency via a registry keyed by the ORIGINAL function (Lua 5.1\n"
+        "    -- functions work as table keys; they can NOT be indexed like tables).\n"
+        "    -- ensure_injected runs on EVERY lua_call (sre_lua_call_safe), so a\n"
+        "    -- guard that only checks the Scene table would re-wrap the wrapper\n"
+        "    -- each call and the chain would grow unbounded (boot hang). The\n"
+        "    -- registry makes re-wrapping a no-op, while a fresh unwrapped\n"
+        "    -- function installed by the engine's per-scene RegisterLibrary\n"
+        "    -- still gets wrapped.\n"
+        "    local existing = wrapped_funcs[func]\n"
+        "    if existing then return existing end\n"
+        "    local wrapped = function(...)\n"
         "      return _G.sre_hook_obj(func(...))\n"
         "    end\n"
+        "    wrapped_funcs[func] = wrapped\n"
+        "    return wrapped\n"
         "  end\n"
         "  _G.__sre_wrap_scene_table = function(scene_tbl)\n"
-        "    if not scene_tbl or scene_tbl.__sre_wrapped then return end\n"
-        "    scene_tbl.__sre_wrapped = true\n"
+        "    if not scene_tbl then return end\n"
         "    if scene_tbl.CreateObject then\n"
         "      scene_tbl.CreateObject = _G.__sre_wrap_func(scene_tbl.CreateObject)\n"
         "    end\n"
         "    if scene_tbl.Find then\n"
         "      scene_tbl.Find = _G.__sre_wrap_func(scene_tbl.Find)\n"
+        "    end\n"
+        "    scene_tbl.__sre_wrapped = true\n"
+        "    -- Stash the WRAPPED function itself: the C-side freshness check\n"
+        "    -- (sre_mini_ensure_scene_wrapped) compares lua_topointer() of\n"
+        "    -- Scene.CreateObject vs this reference. Catches both table swaps\n"
+        "    -- AND same-table function swaps (engine re-registers CreateObject\n"
+        "    -- as a fresh closure on the SAME table — a marker alone misses it).\n"
+        "    if scene_tbl.CreateObject then\n"
+        "      _G.__sre_wrapped_createobject = scene_tbl.CreateObject\n"
         "    end\n"
         "  end\n"
         "  if _G.Scene then _G.__sre_wrap_scene_table(_G.Scene) end\n"
@@ -5985,6 +6837,25 @@ void sre_mini_ensure_injected(lua_State* L) {
         if (g_injected_states[i] == L) {
             /* Re-patch C stubs (cheap, no-op if already set) */
             sre_register_rlsw_stubs(L);
+
+            /* Re-add SceneObject.Destroy/SetAlwaysActive — the engine's
+             * per-scene RegisterLibrary re-registers the SceneObject table
+             * without them; without this re-patch, obj:destroy() falls back
+             * to a nil global and mods (Thronfield) crash on :destroy(). */
+            sre_ensure_sceneobject_fallbacks(L);
+
+            /* Re-wrap Scene/Find/New — a scene reload (mod boot or portal)
+             * can replace the global Scene table, silently dropping the
+             * sre_hook_obj wrapper and breaking obj:destroy() on objects
+             * created after the reload. The wrap guard (__sre_wrapped /
+             * __sre_so_hooked) makes this idempotent. */
+            sre_eval_lua(L,
+                "if _G.__sre_so_hooked then\n"
+                "  if _G.Scene then _G.__sre_wrap_scene_table(_G.Scene) end\n"
+                "  if _G.Find then _G.Find = _G.__sre_wrap_func(_G.Find) end\n"
+                "  if _G.New then _G.New = _G.__sre_wrap_func(_G.New) end\n"
+                "end\n"
+            );
 
             /* Check if ItemDrop needs proxy installation */
             int need_proxy = 1;
@@ -6075,10 +6946,6 @@ void sre_mini_ensure_injected(lua_State* L) {
         }
     }
 
-    /* Inject standard Lua libraries (math, table, os, debug, io) */
-    extern void sre_open_std_libs(lua_State* L);
-    sre_open_std_libs(L);
-
     /* Inject Caver engine API (hero, components, health, transform, etc.) */
     extern void sre_open_caver_lib(lua_State* L);
     sre_open_caver_lib(L);
@@ -6109,101 +6976,190 @@ void sre_mini_ensure_injected(lua_State* L) {
     extern void sre_register_raknet_lib(lua_State* L);
     sre_register_raknet_lib(L);
 
-    /* Port of redstell's front/back Z-walk mod (hiro.scl): W/S drive Z-depth
-     * movement using the exact same game API calls (GameControlButtonDown/Up,
-     * ModelTransformController.SetRotationAngle, hero velocity/position,
-     * Camera.JumpToFocus, Entity.SetFacingDirection). Reads the host keyboard
-     * axis via Mini.HostZAxis() and runs as a per-frame coroutine so the
-     * press/hold/release semantics match the original onTouch/onHeld handlers.
-     * Spawned lazily: only once Program.NewThread is available (the game
-     * registers the Program table during RegisterProgramLibrary), and retried
-     * on later lua_calls via sre_ensure_zwalk_loop(). */
+    /* ---- SRE Z-Walk (keyboard W/A/S/D → Throndigo hiro.scl parity) ----
+     *
+     * The original Throndigo mod drives Z-depth movement with 4 on-screen
+     * d-pad buttons (left/right/front/back). SRE maps the keyboard to those
+     * same buttons: W=front, S=back, A=left, D=right. Each button's
+     * onTouch / onHeld / onHeldFinish handlers below are a faithful port of
+     * hiro.scl's oc.menu button handlers (same rotation, velocity,
+     * position, GameControlButtonDown/Up, Camera.JumpToFocus,
+     * Entity.SetFacingDirection, CameraMode-aware Z direction).
+     *
+     * DRIVER: unlike the old Program.NewThread coroutine (which was nil —
+     * the engine registers no Program.NewThread, so the z-walk never
+     * started), this registers _G.sre_zwalk_poll(), a plain function that
+     * sre_updateApplication calls once per frame (same pcall-safe context
+     * as the Lua console). No coroutines, no NewThread dependency.
+     *
+     * CONFIG: _G.sre_zwalk_cfg = { x_speed=10, z_speed=12, rot=90 } — tweak
+     * from the console. z_speed is in units/sec (dt-scaled via Mini.HostDt)
+     * so strafing speed is frame-rate independent and matches the walk speed.
+     * CameraMode: honors the mod's _G.CameraMode global (1 or 2), default 1.
+     */
     sre_eval_lua(L,
-        "_G.sre_ensure_zwalk_loop = function()\n"
-        "  if _G.__sre_zwalk_started then return end\n"
-        "  if not (Program and Program.NewThread) then return end\n"
-        "  _G.__sre_zwalk_started = true\n"
-        "  local function sre_zwalk_hero()\n"
-        "    local h = rawget(_G, 'hero')\n"
-        "    if h and type(h) == 'userdata' then return h end\n"
-        "    if Scene and Scene.Find then\n"
-        "      local ok, r = pcall(Scene.Find, 'hero')\n"
-        "      if ok and r and type(r) == 'userdata' then return r end\n"
-        "    end\n"
-        "    return nil\n"
+        "_G.sre_zwalk_cfg = _G.sre_zwalk_cfg or { x_speed = 10, z_speed = 12, rot = 90 }\n"
+        "_G.sre_zwalk_state = _G.sre_zwalk_state or { front=false, back=false, left=false, right=false }\n"
+        "local function sre_zwalk_hero()\n"
+        "  local h = rawget(_G, 'hero')\n"
+        "  if h and type(h) == 'userdata' then return h end\n"
+        "  if Scene and Scene.Find then\n"
+        "    local ok, r = pcall(Scene.Find, 'hero')\n"
+        "    if ok and r and type(r) == 'userdata' then return r end\n"
         "  end\n"
-        "  local function sre_zwalk_safe(fn)\n"
-        "    local ok, err = pcall(fn)\n"
-        "    if not ok then print('sre_zwalk:', err) end\n"
-        "    return ok\n"
-        "  end\n"
-        "  Program.NewThread('sre_zwalk_loop', function()\n"
-        "    local prev_front = false\n"
-        "    local prev_back = false\n"
-        "    while true do\n"
-        "      local axis = 0\n"
-        "      if Mini and Mini.HostZAxis then\n"
-        "        local ok, v = pcall(Mini.HostZAxis)\n"
-        "        if ok and type(v) == 'number' then axis = v end\n"
-        "      end\n"
-        "      local hero = sre_zwalk_hero()\n"
-        "      local in_game = true\n"
-        "      if Game and Game.CurrentLevelName then\n"
-        "        local ok, lvl = pcall(Game.CurrentLevelName)\n"
-        "        if ok and (lvl == 'menu' or lvl == 'hero') then in_game = false end\n"
-        "      end\n"
-        "      local front = axis > 0.5\n"
-        "      local back = axis < -0.5\n"
-        "      if hero and in_game then\n"
-        "        if front and not prev_front then\n"
-        "          sre_zwalk_safe(function()\n"
-        "            GameController.GameControlButtonDown(2)\n"
-        "            hero:setVelocity(Vector3.New(-10, hero:velocity():y(), 0))\n"
-        "          end)\n"
-        "        elseif back and not prev_back then\n"
-        "          sre_zwalk_safe(function()\n"
-        "            GameController.GameControlButtonDown(1)\n"
-        "            hero:setVelocity(Vector3.New(10, hero:velocity():y(), 0))\n"
-        "          end)\n"
-        "        end\n"
-        "        if front then\n"
-        "          sre_zwalk_safe(function()\n"
-        "            ModelTransformController.SetRotationAngle(hero, 90)\n"
-        "            hero:setVelocity(Vector3.New(-10, hero:velocity():y(), 0))\n"
-        "            hero:setPosition(hero:position() + Vector3.New(0, 0, -10))\n"
-        "            Camera.JumpToFocus()\n"
-        "            Entity.SetFacingDirection(hero, 0)\n"
-        "          end)\n"
-        "        elseif back then\n"
-        "          sre_zwalk_safe(function()\n"
-        "            ModelTransformController.SetRotationAngle(hero, 90)\n"
-        "            hero:setVelocity(Vector3.New(10, hero:velocity():y(), 0))\n"
-        "            hero:setPosition(hero:position() + Vector3.New(0, 0, 10))\n"
-        "            Camera.JumpToFocus()\n"
-        "            Entity.SetFacingDirection(hero, 0)\n"
-        "          end)\n"
-        "        end\n"
-        "        if prev_front and not front then\n"
-        "          sre_zwalk_safe(function() GameController.GameControlButtonUp(2) end)\n"
-        "        end\n"
-        "        if prev_back and not back then\n"
-        "          sre_zwalk_safe(function() GameController.GameControlButtonUp(1) end)\n"
-        "        end\n"
-        "      else\n"
-        "        if prev_front then\n"
-        "          sre_zwalk_safe(function() GameController.GameControlButtonUp(2) end)\n"
-        "        end\n"
-        "        if prev_back then\n"
-        "          sre_zwalk_safe(function() GameController.GameControlButtonUp(1) end)\n"
-        "        end\n"
-        "      end\n"
-        "      prev_front = front\n"
-        "      prev_back = back\n"
-        "      if Program and Program.Wait then pcall(Program.Wait, 0) end\n"
-        "    end\n"
-        "  end)\n"
+        "  return nil\n"
         "end\n"
-        "sre_ensure_zwalk_loop()\n"
+        "local function sre_zwalk_safe(fn)\n"
+        "  local ok, err = pcall(fn)\n"
+        "  if not ok then print('sre_zwalk:', err) end\n"
+        "  return ok\n"
+        "end\n"
+        "local function sre_zwalk_in_game()\n"
+        "  if Game and Game.CurrentLevelName then\n"
+        "    local ok, lvl = pcall(Game.CurrentLevelName)\n"
+        "    if ok and (lvl == 'menu' or lvl == 'hero') then return false end\n"
+        "  end\n"
+        "  return true\n"
+        "end\n"
+        "local function sre_zwalk_cam_mode()\n"
+        "  local m = rawget(_G, 'CameraMode')\n"
+        "  if type(m) == 'number' and (m == 1 or m == 2) then return m end\n"
+        "  return 1\n"
+        "end\n"
+        "local function sre_zwalk_axis()\n"
+        "  local z, x = 0, 0\n"
+        "  if Mini and Mini.HostZAxis then\n"
+        "    local ok, v = pcall(Mini.HostZAxis)\n"
+        "    if ok and type(v) == 'number' then z = v end\n"
+        "  end\n"
+        "  if Mini and Mini.HostXAxis then\n"
+        "    local ok, v = pcall(Mini.HostXAxis)\n"
+        "    if ok and type(v) == 'number' then x = v end\n"
+        "  end\n"
+        "  return z, x\n"
+        "end\n"
+        "-- Button handlers (hiro.scl parity + corrections).\n"
+        "-- W/S walk forward/back via the engine buttons (mod's front/back\n"
+        "-- mapping). A/D strafe via the mod's velocity + position scheme, so\n"
+        "-- the hero ALWAYS moves — with three fixes vs the old implementation:\n"
+        "--   1. Z direction signs now match hiro.scl (A = screen-left, D =\n"
+        "--      screen-right in both camera modes — was reversed before).\n"
+        "--   2. Z step is dt-scaled (Mini.HostDt, units/sec) instead of a raw\n"
+        "--      per-frame step (was ~60x walk speed).\n"
+        "--   3. Facing is mirrored (A faces +rot, D faces 360-rot) so the\n"
+        "--      model faces its movement direction (was same angle both ways).\n"
+        "local handlers = {}\n"
+        "local function sre_zwalk_dt()\n"
+        "  local dt = 1 / 60\n"
+        "  if Mini and Mini.HostDt then\n"
+        "    local ok, v = pcall(Mini.HostDt)\n"
+        "    if ok and type(v) == 'number' and v > 0 then dt = v end\n"
+        "  end\n"
+        "  return dt\n"
+        "end\n"
+        "handlers.front_touch = function(h)\n"
+        "  local m = sre_zwalk_cam_mode()\n"
+        "  ModelTransformController.SetRotationAngle(h, 0)\n"
+        "  if m == 2 then GameController.GameControlButtonDown(2) else GameController.GameControlButtonDown(1) end\n"
+        "end\n"
+        "handlers.back_touch = function(h)\n"
+        "  local m = sre_zwalk_cam_mode()\n"
+        "  ModelTransformController.SetRotationAngle(h, 0)\n"
+        "  if m == 1 then GameController.GameControlButtonDown(2) else GameController.GameControlButtonDown(1) end\n"
+        "end\n"
+        "handlers.left_touch = function(h)\n"
+        "  local m = sre_zwalk_cam_mode()\n"
+        "  local cfg = _G.sre_zwalk_cfg\n"
+        "  ModelTransformController.SetRotationAngle(h, cfg.rot)\n"
+        "  if m == 2 then GameController.GameControlButtonDown(2) else GameController.GameControlButtonDown(1) end\n"
+        "  h:setVelocity(Vector3.New(-cfg.x_speed, h:velocity():y(), 0))\n"
+        "end\n"
+        "handlers.right_touch = function(h)\n"
+        "  local m = sre_zwalk_cam_mode()\n"
+        "  local cfg = _G.sre_zwalk_cfg\n"
+        "  ModelTransformController.SetRotationAngle(h, 360 - cfg.rot)\n"
+        "  if m == 1 then GameController.GameControlButtonDown(2) else GameController.GameControlButtonDown(1) end\n"
+        "  h:setVelocity(Vector3.New(cfg.x_speed, h:velocity():y(), 0))\n"
+        "end\n"
+        "handlers.front_hold = function(h) Camera.JumpToFocus() end\n"
+        "handlers.back_hold = function(h) Camera.JumpToFocus() end\n"
+        "handlers.left_hold = function(h)\n"
+        "  local m = sre_zwalk_cam_mode()\n"
+        "  local cfg = _G.sre_zwalk_cfg\n"
+        "  ModelTransformController.SetRotationAngle(h, cfg.rot)\n"
+        "  h:setVelocity(Vector3.New(-cfg.x_speed, h:velocity():y(), 0))\n"
+        "  local dz = cfg.z_speed * sre_zwalk_dt()\n"
+        "  if m == 2 then dz = -dz end  -- screen-left: mode1 +Z, mode2 -Z (hiro.scl parity)\n"
+        "  h:setPosition(h:position() + Vector3.New(0, 0, dz))\n"
+        "  Camera.JumpToFocus()\n"
+        "end\n"
+        "handlers.right_hold = function(h)\n"
+        "  local m = sre_zwalk_cam_mode()\n"
+        "  local cfg = _G.sre_zwalk_cfg\n"
+        "  ModelTransformController.SetRotationAngle(h, 360 - cfg.rot)\n"
+        "  h:setVelocity(Vector3.New(cfg.x_speed, h:velocity():y(), 0))\n"
+        "  local dz = cfg.z_speed * sre_zwalk_dt()\n"
+        "  if m == 1 then dz = -dz end  -- screen-right: mode1 -Z, mode2 +Z (hiro.scl parity)\n"
+        "  h:setPosition(h:position() + Vector3.New(0, 0, dz))\n"
+        "  Camera.JumpToFocus()\n"
+        "end\n"
+        "handlers.release = function()\n"
+        "  sre_zwalk_safe(function() GameController.GameControlButtonUp(1) end)\n"
+        "  sre_zwalk_safe(function() GameController.GameControlButtonUp(2) end)\n"
+        "end\n"
+        "-- Thronfield (SwMini) detection via strings/actions in the mod's own\n"
+        "-- scl scripts (verified absent in vanilla):\n"
+        "--   hiro.scl sets the global CameraMode = 1 (also used by the cam-mode\n"
+        "--   logic below); oc.scl defines the global oc = {} UI framework.\n"
+        "local function sre_zwalk_detect_thronfield()\n"
+        "  if rawget(_G, 'CameraMode') ~= nil then return true end\n"
+        "  if type(rawget(_G, 'oc')) == 'table' then return true end\n"
+        "  return false\n"
+        "end\n"
+        "_G.sre_zwalk_poll = function()\n"
+        "  -- WASD mode enable: Thronfield detected OR host F5→L latch.\n"
+        "  -- When off, do ABSOLUTELY nothing (no hero motion, no rotations,\n"
+        "  -- no buttons, no z init) — vanilla A/D left/right stay untouched.\n"
+        "  local thron = sre_zwalk_detect_thronfield()\n"
+        "  local f5l = 0\n"
+        "  if Mini and Mini.ZWalkF5L then\n"
+        "    local ok, v = pcall(Mini.ZWalkF5L)\n"
+        "    if ok and type(v) == 'number' then f5l = v end\n"
+        "  end\n"
+        "  if not (thron or (f5l and f5l ~= 0)) then\n"
+        "    local st = _G.sre_zwalk_state\n"
+        "    if st.front or st.back or st.left or st.right then handlers.release() end\n"
+        "    st.front, st.back, st.left, st.right = false, false, false, false\n"
+        "    return\n"
+        "  end\n"
+        "  local z, x = sre_zwalk_axis()\n"
+        "  local h = sre_zwalk_hero()\n"
+        "  local st = _G.sre_zwalk_state\n"
+        "  local front = z > 0.5\n"
+        "  local back  = z < -0.5\n"
+        "  local left  = x < -0.5\n"
+        "  local right = x > 0.5\n"
+        "  if not h or not sre_zwalk_in_game() then\n"
+        "    if st.front or st.back or st.left or st.right then handlers.release() end\n"
+        "    st.front, st.back, st.left, st.right = false, false, false, false\n"
+        "    return\n"
+        "  end\n"
+        "  -- Press edges\n"
+        "  if front and not st.front then st.front = true; sre_zwalk_safe(function() handlers.front_touch(h) end) end\n"
+        "  if back  and not st.back  then st.back  = true; sre_zwalk_safe(function() handlers.back_touch(h) end)  end\n"
+        "  if left  and not st.left  then st.left  = true; sre_zwalk_safe(function() handlers.left_touch(h) end)  end\n"
+        "  if right and not st.right then st.right = true; sre_zwalk_safe(function() handlers.right_touch(h) end) end\n"
+        "  -- Holds\n"
+        "  if front then sre_zwalk_safe(function() handlers.front_hold(h) end) end\n"
+        "  if back  then sre_zwalk_safe(function() handlers.back_hold(h) end)  end\n"
+        "  if left  then sre_zwalk_safe(function() handlers.left_hold(h) end)  end\n"
+        "  if right then sre_zwalk_safe(function() handlers.right_hold(h) end) end\n"
+        "  -- Release edges\n"
+        "  if st.front and not front then st.front = false; sre_zwalk_safe(handlers.release) end\n"
+        "  if st.back  and not back  then st.back  = false; sre_zwalk_safe(handlers.release) end\n"
+        "  if st.left  and not left  then st.left  = false; sre_zwalk_safe(handlers.release) end\n"
+        "  if st.right and not right then st.right = false; sre_zwalk_safe(handlers.release) end\n"
+        "end\n"
     );
 
     /* Register luasocket, luamime, luafilesystem, and toml in package.preload */
@@ -6570,5 +7526,100 @@ void sre_mini_ensure_injected(lua_State* L) {
     /* Cache this state */
     if (g_injected_count < MAX_INJECTED_STATES) {
         g_injected_states[g_injected_count++] = L;
+    }
+}
+
+/* sre_mini_ensure_injected_light — safe post-scene-load refresh.
+ *
+ * Called from Scene::FinishLoad AFTER the engine's per-scene RegisterLibrary
+ * pass. Runs ONLY the cheap already-injected branch of the full function:
+ * C-stub re-patch, destroy/setAlwaysActive fallback globals, and the
+ * idempotent Scene/Find/New re-wrap eval. It deliberately does NOT call
+ * sre_open_std_libs or any heavy injection chunk — running the full
+ * ensure_injected at this point froze boot (menu loaded, scene=(none) forever,
+ * blank screen; observed in Thronfield boot).
+ *
+ * Purpose: mod scripts (Thronfield's hiro.scl) run their main loop as
+ * lua_resume coroutines, which bypass the lua_call-triggered re-wrap in
+ * sre_lua_call_safe. If the engine swapped the global Scene table during
+ * load, objects they create are unhooked and obj:destroy() is nil. This
+ * re-wraps Scene/Find/New and re-registers the C fallbacks so freshly
+ * created objects resolve destroy() even inside resumed coroutines. */
+void sre_mini_ensure_injected_light(lua_State* L) {
+    if (!L) return;
+    int i;
+    for (i = 0; i < g_injected_count; i++) {
+        if (g_injected_states[i] == L) {
+            sre_register_rlsw_stubs(L);
+            sre_ensure_sceneobject_fallbacks(L);
+            sre_eval_lua(L,
+                "if _G.__sre_so_hooked then\n"
+                "  if _G.Scene then _G.__sre_wrap_scene_table(_G.Scene) end\n"
+                "  if _G.Find then _G.Find = _G.__sre_wrap_func(_G.Find) end\n"
+                "  if _G.New then _G.New = _G.__sre_wrap_func(_G.New) end\n"
+                "end\n"
+            );
+            return;
+        }
+    }
+}
+
+/* sre_mini_ensure_scene_wrapped — C-only freshness check for the Scene wrap.
+ *
+ * Called from sre_lua_resume_safe before EVERY coroutine resume (mod scripts
+ * like Thronfield's hiro.scl run their main loop as resumed coroutines, which
+ * bypass the lua_call-triggered re-wrap). Cheap: reads the __sre_wrapped
+ * marker on the Scene table via C API — NO loadstring, NO eval — and only
+ * falls back to the light re-wrap when the marker is missing (i.e. the engine
+ * swapped the Scene table during a level transition).
+ *
+ * The marker is set by __sre_wrap_scene_table in the hook chunk. Freshly
+ * wrapped tables get it; engine-replaced tables don't. */
+void sre_mini_ensure_scene_wrapped(lua_State* L) {
+    if (!L || !g_lua_getfield || !g_lua_type || !g_lua_settop || !g_lua_toboolean || !g_lua_topointer)
+        return;
+
+    /* sre_lua_resume_safe passes the coroutine THREAD; globals live on the
+     * main state. Resolve it via g->mainthread (same offsets the console
+     * target refresh uses in sre_lua_resume_safe). */
+    if (((lu_byte*)L)[8] == LUA_TTHREAD) {
+        uint64_t lg = (uint64_t)*(void**)((char*)L + 32);
+        if (lg >= 0x1000000ULL && lg < 0x30000000ULL) {
+            lua_State* mainL = *(lua_State**)((char*)lg + 176);
+            if (mainL) L = mainL;
+        }
+    }
+
+    /* Only meaningful once the hook is installed. */
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "__sre_so_hooked");
+    if (g_lua_type(L, -1) != LUA_TBOOLEAN || !g_lua_toboolean(L, -1)) {
+        g_lua_settop(L, 0);
+        return;
+    }
+    g_lua_settop(L, 0);
+
+    /* Compare the CURRENT Scene.CreateObject against the stashed wrapped
+     * reference. If they differ, the engine replaced either the Scene table
+     * or the CreateObject closure since our last wrap → re-wrap (idempotent).
+     * A marker alone is insufficient: the engine can re-register CreateObject
+     * as a fresh function on the SAME table, leaving the marker intact while
+     * dropping the wrapper. */
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "Scene");
+    if (g_lua_type(L, -1) != LUA_TTABLE) {
+        g_lua_settop(L, 0);
+        return;
+    }
+    g_lua_getfield(L, -1, "CreateObject");
+    int co_type = g_lua_type(L, -1);
+    const void* cur_co = (co_type == LUA_TFUNCTION) ? g_lua_topointer(L, -1) : NULL;
+    g_lua_settop(L, 0);
+
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "__sre_wrapped_createobject");
+    int wr_type = g_lua_type(L, -1);
+    const void* wrapped_co = (wr_type == LUA_TFUNCTION) ? g_lua_topointer(L, -1) : NULL;
+    g_lua_settop(L, 0);
+
+    if (!wrapped_co || cur_co != wrapped_co) {
+        sre_mini_ensure_injected_light(L);
     }
 }

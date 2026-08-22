@@ -142,21 +142,11 @@ void sre_PlayMusicWithName(void* self, void* name_ref, int restart) {
     char* data = *(char**)name_ref;
     if (!data) return;
 
-    /* Length read at name_ref + 8.
-     * ABI NOTE: this assumes the libc++ std::string layout {char* data; size_t
-     * len; ...}. It does NOT match the GNU COW _Rep layout the CppString hooks
-     * (sre_string.c) implement, where the length lives in the _Rep header at
-     * data-8 (SRE_REP(data)->length). Reading it from the _Rep here would be
-     * more consistent, but sre_music.c is a freestanding TU that does not
-     * include sre.h and sre_is_empty_sentinel() is a static in sre_string.c,
-     * so we keep the name_ref+8 read guarded by the strlen fallback below,
-     * which makes any layout/short/long value safe. Left as-is intentionally. */
-    sre_u64 len = *(sre_u64*)((char*)name_ref + 8);
-    if (len == 0 || len >= 255) {
-        /* Fallback: compute string length directly from null terminator */
-        len = 0;
-        while (data[len] && len < 255) len++;
-    }
+    /* The engine uses GNU COW std::string, whose object contains only the data
+     * pointer. Do not read name_ref+8 as a libc++ length: it belongs to the
+     * next object and can make us consume arbitrary track-name bytes. */
+    sre_u64 len = 0;
+    while (data[len] && len < 255) len++;
     if (len == 0) return;
 
     /* Build name string */

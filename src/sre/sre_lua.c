@@ -108,8 +108,86 @@ typedef struct {
 } SreLuaAddrs;
 
 extern void sre_mini_ensure_injected(lua_State* L);
+extern void sre_mini_ensure_scene_wrapped(lua_State* L);
 extern void sre_log_lua_error(const char* source, const char* err_msg);
 extern lua_State* g_sre_last_lua_state;
+
+/* Defined below (ProgramState::Execute section) — forward decl for the
+ * console-target guards used by sre_lua_resume_safe / servicers. */
+static int sre_state_is_valid_game_state(lua_State* L);
+
+/* ---- Live-state registry ---------------------------------------------
+ * The game destroys and recreates lua_States during play (scene churn,
+ * script cleanup). The console's cached g_sre_last_lua_state is cleared by
+ * the ProgramState destructor hook, but nothing re-captured the NEW state
+ * afterwards in an idle scene (no Execute/Resume fires) — so subsequent
+ * console commands hung with pending=1 forever.
+ *
+ * Fix: sre_luaL_newstate records every state the engine creates, the
+ * destructor evicts destroyed ones, and sre_updateApplication re-locks the
+ * console onto the newest live game-ready state when the cache is empty.
+ */
+#define SRE_STATE_RING_SIZE 24
+static lua_State* g_sre_state_ring[SRE_STATE_RING_SIZE] = {0};
+static int g_sre_state_ring_head = 0;   /* next write slot */
+volatile uint64_t g_sre_state_creations = 0;   /* diag */
+volatile uint64_t g_sre_state_evictions = 0;   /* diag */
+
+/* sre_luaL_newstate — wraps the vendored luaL_newstate (which the engine's
+ * luaL_newstate is patched to call) to record every newly created state.
+ *
+ * NOTE: we must NOT call luaL_newstate() by name here — the engine's copy is
+ * patched to jump to this wrapper, so a PLT call would recurse forever.
+ * Instead the host resolves libsre's OWN vendored luaL_newstate (never
+ * patched) and stores it in g_orig_luaL_newstate. */
+typedef lua_State* (*pfn_luaL_newstate_orig)(void);
+pfn_luaL_newstate_orig g_orig_luaL_newstate = 0;
+typedef void (*pfn_lua_close_orig)(lua_State* L);
+pfn_lua_close_orig g_orig_lua_close = 0;
+
+lua_State* sre_luaL_newstate(void) {
+    lua_State* L = g_orig_luaL_newstate ? g_orig_luaL_newstate() : NULL;
+    if (L) {
+        g_sre_state_ring[g_sre_state_ring_head] = L;
+        g_sre_state_ring_head = (g_sre_state_ring_head + 1) % SRE_STATE_RING_SIZE;
+        g_sre_state_creations++;
+    }
+    return L;
+}
+
+/* sre_state_evict — drop a destroyed state from the registry. */
+void sre_state_evict(lua_State* L) {
+    int i;
+    for (i = 0; i < SRE_STATE_RING_SIZE; i++) {
+        if (g_sre_state_ring[i] == L) {
+            g_sre_state_ring[i] = NULL;
+            g_sre_state_evictions++;
+        }
+    }
+}
+
+/* sre_lua_close — wraps the vendored lua_close (which the engine's lua_close
+ * is patched to call) to evict the state from the registry when the game
+ * closes it directly (outside the ProgramState destructor path). Same
+ * recursion-avoidance as sre_luaL_newstate: call through g_orig_lua_close. */
+void sre_lua_close(lua_State* L) {
+    if (L) sre_state_evict(L);
+    if (g_orig_lua_close) g_orig_lua_close(L);
+}
+
+/* sre_find_live_game_state — newest first scan of the registry for a state
+ * that is still alive and exposes the game API. Used by the console servicer
+ * to re-lock after the previous target was destroyed. */
+static lua_State* sre_find_live_game_state(void) {
+    int i;
+    for (i = 1; i <= SRE_STATE_RING_SIZE; i++) {
+        int idx = (g_sre_state_ring_head - i + SRE_STATE_RING_SIZE) % SRE_STATE_RING_SIZE;
+        lua_State* L = g_sre_state_ring[idx];
+        if (L && sre_state_is_valid_game_state(L))
+            return L;
+    }
+    return NULL;
+}
 
 void sre_init_lua(SreLuaAddrs* addrs) {
     g_lua_pcall       = (pfn_lua_pcall)addrs->lua_pcall;
@@ -471,13 +549,87 @@ static void sre_lua_timeout_hook(lua_State* L, lua_Debug* ar) {
     }
 }
 
+/* ─── Guest-fault recovery flag ───────────────────────────────────────────
+ * The host (main.cpp) sets this to 1 immediately after clearing a Dynarmic
+ * guest fault (g_emulator_64->clear_faulted()). sre_lua_resume_safe checks
+ * it on the next coroutine resume: when set, it resets the Lua VM state to
+ * a safe baseline and returns LUA_ERRRUN instead of trying to resume through
+ * the corrupted CallInfo stack left by the bad lua_CFunction dereference.
+ *
+ * Host writes via symbol:
+ *   uint64_t addr = get_symbol_vaddr(&g_sre_mod, "g_sre_lua_vm_faulted");
+ *   *(volatile int*)(g_guest_memory + addr) = 1;
+ * ─────────────────────────────────────────────────────────────────────────── */
+volatile int g_sre_lua_vm_faulted = 0;
+
+/* Emergency reset: wind L back to a safe baseline for Lua 5.1.
+ * Lua 5.1 uses a flat CallInfo array (base_ci..end_ci), not a linked list.
+ * We reset ci to base_ci (the outermost frame) and clear the value stack.
+ * Does NOT call luaF_close/GC — avoids double-free on corrupted upvalues.
+ * Called immediately AFTER a guest-fault clear before the next lua_resume. */
+static void sre_lua_emergency_reset(lua_State* L) {
+    if (!L) return;
+    /* Reset to the outermost call frame (base_ci = &base_ci[0]) */
+    if (L->base_ci) {
+        L->ci = L->base_ci;
+    }
+    /* Reset value stack to just the base slot — discard all pending values
+     * without invoking GC or __gc metamethods. */
+    if (L->stack) {
+        L->top  = L->stack + 1;  /* leave room for one sentinel slot */
+        L->base = L->stack + 1;
+    }
+    L->nCcalls = 0;
+    L->status  = 0;  /* LUA_OK — safe to resume again (or mark completed) */
+    fprintf(stderr, "[SRE/LuaFault] Emergency Lua 5.1 VM reset on state %p\n", (void*)L);
+}
+
 int sre_lua_resume_safe(lua_State* L, int narg) {
     if (!g_lua_resume) {
         /* Should never happen — lua_resume not resolved */
         return 2;  /* LUA_ERRRUN */
     }
 
+    /* ─── Guest-fault recovery ──────────────────────────────────────────────
+     * If the host signalled that a Dynarmic guest fault just occurred (likely
+     * a bad lua_CFunction pointer was called), perform an emergency reset on
+     * this coroutine BEFORE acquiring the mutex. This clears corrupted CallInfo
+     * frames so the next resume starts from a sane baseline rather than trying
+     * to continue through corrupted state → bridge SIGSEGV. */
+    if (g_sre_lua_vm_faulted) {
+        g_sre_lua_vm_faulted = 0;
+        if (L) sre_lua_emergency_reset(L);
+        /* Return LUA_ERRRUN — the caller (ProgramState::Update) will mark
+         * the coroutine as completed and not resume it again. */
+        return 2;  /* LUA_ERRRUN */
+    }
+
     pthread_mutex_lock(&g_lua_mutex);
+
+    /* Console target refresh: coroutine resumes happen every frame during
+     * gameplay, so this keeps a live game-ready MAIN state available even
+     * after scene transitions (where Execute may not fire again). Only run
+     * the (cheap-ish) probe when we currently lack a valid target. The
+     * resumed L is a thread; its global_State.mainthread is the owner. */
+    if (!g_sre_last_lua_state && L) {
+        lua_State* mainL = NULL;
+        if (((lu_byte*)L)[8] == LUA_TTHREAD) {
+            uint64_t lg = (uint64_t)*(void**)((char*)L + 32);
+            if (lg >= 0x1000000ULL && lg < 0x30000000ULL)
+                mainL = *(lua_State**)((char*)lg + 176);  /* g->mainthread */
+        }
+        if (mainL && sre_state_is_valid_game_state(mainL))
+            g_sre_last_lua_state = mainL;
+    }
+
+    /* Refresh the Scene/Find/New wrap freshness BEFORE resuming. Mod scripts
+     * (Thronfield's hiro.scl) run their main loop as resumed coroutines — the
+     * lua_call-triggered re-wrap in sre_lua_call_safe never fires for them.
+     * If the engine swapped the global Scene table during a level transition
+     * (no lua_call in between), objects they create are unhooked and
+     * obj:destroy() is nil. This is a cheap C-only marker check; it only
+     * evals when the wrap marker is actually missing. */
+    sre_mini_ensure_scene_wrapped(L);
 
     /* Save Lua VM state for recovery */
     CallInfo* saved_ci = L->ci;
@@ -952,7 +1104,11 @@ static void sre_collect_returns(lua_State* L, int base) {
     g_lua_console_result[pos] = 0;
 }
 
+volatile uint64_t g_sre_console_entry = 0;  /* diag */
+volatile uint64_t g_sre_console_exit_ok = 0;  /* diag */
+
 static void sre_run_console(lua_State* L) {
+    g_sre_console_entry++;
     if (!g_lua_getfield || !g_lua_pcall || !g_lua_pushstring || !g_lua_gettop) {
         sre_strcopy(g_lua_console_result, "ERR: Lua API not resolved", CONSOLE_BUF_SIZE);
         g_lua_console_status = 2;
@@ -1053,6 +1209,7 @@ static void sre_run_console(lua_State* L) {
         g_lua_console_result[2] = 0;
     }
     g_lua_console_status = 1;
+    g_sre_console_exit_ok++;
 }
 
 
@@ -1064,19 +1221,70 @@ static void sre_run_console(lua_State* L) {
  * Symbol: _ZN5Caver12ProgramState7ExecuteEi
  * SwMini: patches/panic.c
  */
+/* ---- Defensive lua_State validation for the console ----
+ * The console must only ever run on a LIVE, GAME-READY lua_State. The game
+ * creates and destroys ProgramStates (and their Lua states) during play; if
+ * g_sre_last_lua_state is left pointing at a destroyed or wrong (child/UI)
+ * state, sre_run_console would pcall on freed memory → GC corruption →
+ * remarkupvals spin → console "stops working" after the first commands.
+ *
+ * Guards applied here:
+ *   1. Only capture states that expose the game's Scene scripting API.
+ *   2. Clear the captured pointer whenever ANY ProgramState is destroyed.
+ *   3. Re-validate before every console service in sre_updateApplication.
+ */
+static int sre_state_is_valid_game_state(lua_State* L) {
+    static int s_diag_shown = 0;
+    if (!L) { if (!s_diag_shown) { fprintf(stderr, "[SRE/Validate] NULL state\n"); s_diag_shown = 1; } return 0; }
+    if (((lu_byte*)L)[8] != LUA_TTHREAD) {
+        if (!s_diag_shown) { fprintf(stderr, "[SRE/Validate] tt=%d (want %d) L=%p\n", ((lu_byte*)L)[8], LUA_TTHREAD, (void*)L); s_diag_shown = 1; }
+        return 0;
+    }
+    uint64_t lg = (uint64_t)*(void**)((char*)L + 32);
+    if (lg < 0x1000000ULL || lg >= 0x30000000ULL) {
+        if (!s_diag_shown) { fprintf(stderr, "[SRE/Validate] bad l_G=0x%llx L=%p\n", (unsigned long long)lg, (void*)L); s_diag_shown = 1; }
+        return 0;
+    }
+    if (!g_lua_getfield || !g_lua_type || !g_lua_settop || !g_lua_gettop) {
+        if (!s_diag_shown) { fprintf(stderr, "[SRE/Validate] lua api not resolved\n"); s_diag_shown = 1; }
+        return 0;
+    }
+    int base = g_lua_gettop(L);
+    if (base < 0) { if (!s_diag_shown) { fprintf(stderr, "[SRE/Validate] bad gettop\n"); s_diag_shown = 1; } return 0; }
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "Scene");
+    int t = g_lua_type(L, -1);
+    int ok = (t == LUA_TTABLE || t == LUA_TUSERDATA ||
+              t == LUA_TLIGHTUSERDATA || t == LUA_TFUNCTION);
+    if (!ok && !s_diag_shown) {
+        fprintf(stderr, "[SRE/Validate] Scene type=%d (L=%p) — state rejected\n", t, (void*)L);
+        s_diag_shown = 1;
+    }
+    g_lua_settop(L, base);
+    return ok;
+}
+
+volatile uint64_t g_sre_exec_entries = 0;  /* diag */
+volatile uint64_t g_sre_exec_console_seen = 0;  /* diag */
+
 void sre_ProgramState_Execute(void* self, int stackIndex) {
     lua_State* L = PS_GET(self, PS_LUA_STATE, lua_State*);
     
     pthread_mutex_lock(&g_lua_mutex);
 
-    /* Capture the lua_State for the host and console */
-    g_sre_last_lua_state = L;
+    /* Capture the lua_State for the host and console — only if it is a
+     * live, game-ready state (has the Scene API). Child/UI states must not
+     * hijack the console's target. */
+    if (sre_state_is_valid_game_state(L)) {
+        g_sre_last_lua_state = L;
+    }
+    g_sre_exec_entries++;
 
     /* Lazy Mini.* injection — ensure mod API exists before script runs */
     extern void sre_mini_ensure_injected(lua_State* L);
     sre_mini_ensure_injected(L);
     /* Check for pending console command */
-    if (g_lua_console_pending && L) {
+    if (g_lua_console_pending && L && sre_state_is_valid_game_state(L)) {
+        g_sre_exec_console_seen++;
         g_lua_console_pending = 0;
         sre_run_console(L);
     }
@@ -1119,12 +1327,32 @@ void sre_ProgramState_Execute(void* self, int stackIndex) {
         /* Not a thread — use pcall for error catching */
         int result = g_lua_pcall(L, stackIndex, 0, 0);
         recovery_pop(my_depth);
-        
+
         if (result == 0) {
             pthread_mutex_unlock(&g_lua_mutex);
             return;
         }
-        
+
+        /* Surface script errors instead of swallowing them silently. Item
+         * collection handlers (HeroEntityComponent::HandleItemCollection →
+         * ProgramState::Execute(state,2)) only flag the SceneObject for
+         * removal via Lua obj:destroy() at the END of the handler — a silent
+         * mid-script error aborts it and the pickup stays in the scene
+         * forever. Log (capped) so the failing call is diagnosable. */
+        {
+            static int s_exec_err_logged = 0;
+            if (s_exec_err_logged < 32) {
+                s_exec_err_logged++;
+                const char* err_msg =
+                    (g_lua_tolstring && g_lua_gettop && g_lua_gettop(L) > 0)
+                        ? g_lua_tolstring(L, -1, 0) : NULL;
+                fprintf(stderr,
+                        "[SRE/Lua] ProgramState::Execute error (status %d, "
+                        "state=%p): %s\n",
+                        result, self, err_msg ? err_msg : "(no message)");
+            }
+        }
+
         /* Clean up the stack as the engine would */
         g_lua_settop(L, -2);
     } else {
@@ -1148,6 +1376,14 @@ void sre_ProgramState_Resume(void* self, int stackIndex) {
     lua_State* L = PS_GET(self, PS_LUA_STATE, lua_State*);
 
     pthread_mutex_lock(&g_lua_mutex);
+
+    /* Keep the console's target state fresh: Resume fires regularly during
+     * gameplay, so a live game-ready state is always available to the console
+     * even after scene transitions (where Execute may not fire again). Only
+     * states exposing the game API are captured. */
+    if (sre_state_is_valid_game_state(L)) {
+        g_sre_last_lua_state = L;
+    }
 
     /* Lazy Mini.* injection for coroutine states */
     extern void sre_mini_ensure_injected(lua_State* L);
@@ -1499,16 +1735,47 @@ typedef void (*pfn_orig_updateApp)(void* env, void* obj);
 pfn_orig_updateApp g_orig_updateApplication = 0;
 volatile uint64_t g_sre_update_application_ticks = 0;
 
+volatile uint64_t g_sre_console_service_entries = 0;  /* diag */
+volatile uint64_t g_sre_console_pending_seen     = 0;  /* diag */
+volatile uint64_t g_sre_console_runs             = 0;  /* diag */
+
 void sre_updateApplication(void* env, void* obj) {
     g_sre_update_application_ticks++;
     /* 1. Service Lua console & Mini injection BEFORE the frame tick */
     if (g_sre_last_lua_state) {
-        extern void sre_mini_ensure_injected(lua_State* L);
-        sre_mini_ensure_injected(g_sre_last_lua_state);
+        g_sre_console_service_entries++;
+        if (!sre_state_is_valid_game_state(g_sre_last_lua_state)) {
+            /* Stale/wrong state (destroyed or child/UI) — drop it so we never
+             * pcall on freed memory; a future Execute re-captures a good one.
+             * The pending command stays queued (pending flag untouched). */
+            g_sre_last_lua_state = NULL;
+        } else {
+            extern void sre_mini_ensure_injected(lua_State* L);
+            sre_mini_ensure_injected(g_sre_last_lua_state);
 
-        if (g_lua_console_pending) {
+            if (g_lua_console_pending) {
+                g_sre_console_pending_seen++;
+                g_lua_console_pending = 0;
+                g_sre_console_runs++;
+                sre_run_console(g_sre_last_lua_state);
+            }
+        }
+    }
+    /* Lost our target (state destroyed)? Re-lock onto the newest live
+     * game-ready state from the creation registry — the game keeps the
+     * current scene's main state alive across the swap, so the console
+     * keeps working instead of hanging on a pending command forever. */
+    if (!g_sre_last_lua_state && g_lua_console_pending) {
+        lua_State* fresh = sre_find_live_game_state();
+        if (fresh) {
+            g_sre_last_lua_state = fresh;
+            extern void sre_mini_ensure_injected(lua_State* L);
+            sre_mini_ensure_injected(fresh);
+            g_sre_console_service_entries++;
+            g_sre_console_pending_seen++;
             g_lua_console_pending = 0;
-            sre_run_console(g_sre_last_lua_state);
+            g_sre_console_runs++;
+            sre_run_console(fresh);
         }
     }
 
@@ -1532,6 +1799,12 @@ void sre_updateApplication(void* env, void* obj) {
         /* 3. Dispatch PC-safe frame tick (sre_frame_loop.c) */
         extern void sre_frame_update(void* env, void* obj, float dt);
         sre_frame_update(env, obj, dt);
+
+        /* 4. Per-frame Z-walk poll (W/A/S/D → Throndigo parity). Runs in the
+         *    same pcall-safe context as the console; no-op unless the z-walk
+         *    was injected. */
+        extern void sre_mini_zwalk_poll(void);
+        sre_mini_zwalk_poll();
     }
 }
 
@@ -1585,18 +1858,21 @@ void sre_ProgramState_destructor(void* self) {
     /* Evict the closed lua_State from the injection cache so that if the
      * guest allocator recycles this pointer for a new state, the new state
      * gets fully initialized by sre_mini_ensure_injected instead of being
-     * silently skipped as "already injected". */
-    void* parent = *(void**)((char*)self + 8);
-    if (parent == NULL) {
-        /* Root ProgramState — it owns the lua_State */
-        lua_State* L = *(lua_State**)self;
-        if (L != NULL) {
-            extern void sre_mini_remove_injected(lua_State* L);
-            sre_mini_remove_injected(L);
-            if (L == g_sre_last_lua_state) {
-                g_sre_last_lua_state = NULL;
-            }
+     * silently skipped as "already injected".
+     *
+     * Clear g_sre_last_lua_state for EVERY destroyed ProgramState (root or
+     * child): a stale pointer here would make the console pcall on freed
+     * memory → GC corruption → remarkupvals spin → console death. */
+    lua_State* L = *(lua_State**)self;
+    if (L != NULL) {
+        extern void sre_mini_remove_injected(lua_State* L);
+        sre_mini_remove_injected(L);
+        if (L == g_sre_last_lua_state) {
+            g_sre_last_lua_state = NULL;
         }
+        /* Drop destroyed states from the creation registry so the console
+         * never re-locks onto freed memory. */
+        sre_state_evict(L);
     }
 
     if (g_orig_ProgramState_destructor) {

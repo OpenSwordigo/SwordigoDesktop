@@ -303,6 +303,11 @@ extern void (*g_Camera_SetPerspectiveProjection)(void* camera, float fov, float 
 extern void (*g_orig_CameraController_Update)(void* self, float dt);
 void sre_CameraController_Update(void* self, float dt);
 
+/* Live CameraController instance pointer, refreshed every frame by the Update
+ * hook. 0 until the first camera update fires. Read from host or expose to the
+ * console/FFI to reach the active camera safely (no blind pointer walking). */
+extern volatile void* g_sre_camera_ctrl;
+
 /* =========================================================================
  * SceneObject field accessors  (ARM64 offsets from SwKiwi scene_object.c)
  * =========================================================================

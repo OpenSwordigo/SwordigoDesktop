@@ -122,4 +122,15 @@ int pick_scene_object(const std::vector<av::SceneObject>& objects,
                       bool show_hidden, const av::Camera& cam, int w, int h,
                       const ImVec2& viewport_pos, const ImVec2& mouse);
 
+/// Pick the ground mesh (sub-mesh of an object) under the cursor across ALL
+/// objects.  This is the "select a mesh" path (object picking selects whole
+/// objects; this drills into an object's embedded ground meshes).  A mesh is a
+/// candidate when the cursor lands inside one of its triangles on screen; the
+/// front-most (nearest to the camera eye) wins.  Returns true and fills
+/// @p out_object / @p out_mesh (0-based indices), or false on empty space.
+bool pick_scene_ground_mesh(const std::vector<av::SceneObject>& objects,
+                            bool show_hidden, const av::Camera& cam, int w, int h,
+                            const ImVec2& viewport_pos, const ImVec2& mouse,
+                            int& out_object, int& out_mesh);
+
 } // namespace swk

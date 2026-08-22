@@ -20,7 +20,8 @@ int copy_and_relocate(uint8_t* dest_cave, uint8_t* src_orig, uint64_t cave_vaddr
         uint64_t cave_pc = cave_vaddr + i * 4;
 
         // ADR or ADRP
-        if ((insn & 0x9F000000) == 0x90000000) {
+        if ((insn & 0x9F000000) == 0x10000000 ||
+            (insn & 0x9F000000) == 0x90000000) {
             bool is_adrp = (insn & 0x80000000) != 0;
             int32_t immlo = (insn >> 29) & 3;
             int32_t immhi = (insn >> 5) & 0x7FFFF;

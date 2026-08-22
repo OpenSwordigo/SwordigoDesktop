@@ -63,7 +63,7 @@ struct TrampolineEntry {
     uint64_t    replacement;    // guest address of the SRE handler (0 = NOP-out)
     uint64_t    cave_vaddr;     // relay cave address (0 = NOP-out)
     int         insns_saved;
-    uint8_t     saved_bytes[16];// original guest bytes overwritten by the B trampoline
+    uint8_t     saved_bytes[64];// original guest bytes overwritten by the patch
     int         patch_bytes;    // number of bytes in saved_bytes actually patched (0 = none)
 };
 
@@ -72,6 +72,7 @@ public:
     static constexpr uint64_t ARENA_BASE = 0x3000000ULL;
     static constexpr uint64_t ARENA_END  = 0x3100000ULL;
     static constexpr uint64_t SLOT_SIZE  = 64ULL;
+    static constexpr int MAX_PATCH_BYTES = 64;
 
     static TrampolineMgr& instance() {
         static TrampolineMgr s;
@@ -79,6 +80,10 @@ public:
     }
 
     void init(uint8_t* guest_mem, uint64_t load_base) {
+        // Several installation phases run after SRE initialization. Rebinding the
+        // same guest image must not erase the registry or invalidate relays.
+        if (m_initialized && m_mem == guest_mem && m_load_base == load_base)
+            return;
         m_mem         = guest_mem;
         m_load_base   = load_base;
         m_next_cave   = ARENA_BASE;
@@ -113,27 +118,57 @@ public:
                       bool        allow_replace     = false)
     {
         if (!m_initialized) { die(name, "init() not called"); return false; }
-        if (!target_vaddr || !replacement) {
+        if (!target_vaddr || !replacement || (target_vaddr & 3) || (replacement & 3)) {
             fprintf(stderr, "[TrampolineMgr] SKIP %s: null address\n", name);
             return false;
         }
         if (insns_to_save < 1) insns_to_save = 1;
-
-        // DEDUP: refuse a second hook on the same target unless explicitly allowed.
-        if (!allow_replace && find_entry(target_vaddr) != nullptr) {
-            fprintf(stderr,
-                "[TrampolineMgr] SKIP %s: duplicate hook — target 0x%lx already hooked "
-                "(pass allow_replace=true to override)\n", name, target_vaddr);
+        if (insns_to_save * 4 > MAX_PATCH_BYTES) {
+            fprintf(stderr, "[TrampolineMgr] SKIP %s: patch span too large\n", name);
             return false;
         }
+        if ((uint64_t)(insns_to_save + 1) * 4 > SLOT_SIZE) {
+            fprintf(stderr, "[TrampolineMgr] SKIP %s: relay does not fit cave slot\n", name);
+            return false;
+        }
+
+        // Never relocate an already-patched entry: that would save the previous B
+        // instruction as the "original" and create a chained/corrupt relay.
+        if (TrampolineEntry* existing = find_entry(target_vaddr)) {
+            if (existing->replacement == replacement) {
+                if (g_orig_guest_addr)
+                    *(uint64_t*)(m_mem + g_orig_guest_addr) = existing->cave_vaddr;
+                fprintf(stdout, "[TrampolineMgr] KEEP  %-44s  target=0x%lx already installed\n",
+                        name, target_vaddr);
+                return true;
+            }
+            fprintf(stderr,
+                "[TrampolineMgr] SKIP %s: target 0x%lx already has replacement 0x%lx\n",
+                name, target_vaddr, existing->replacement);
+            return false;
+        }
+        (void)allow_replace;
 
         uint64_t cave = alloc_cave(name);
         if (!cave) return false;
 
+        int64_t branch_imm = 0;
+        if (!encode_b(replacement, target_vaddr, &branch_imm)) {
+            fprintf(stderr, "[TrampolineMgr] ABORT %s: replacement out of B range\n", name);
+            m_next_cave -= SLOT_SIZE;
+            return false;
+        }
+
+        // Snapshot the patch site before writing either the cave or target. This
+        // keeps relay construction independent of any later patch/bridge write.
+        uint8_t original_bytes[MAX_PATCH_BYTES]{};
+        const size_t original_size = (size_t)insns_to_save * 4;
+        memcpy(original_bytes, m_mem + target_vaddr, original_size);
+
         // 1. Relocate the first insns_to_save instructions into the cave. If any
         //    relocated form is out of range / unsupported, ABORT: roll back the
         //    cave allocation and leave guest memory untouched (no half-written patch).
-        int relocated = copy_and_relocate(m_mem + cave, m_mem + target_vaddr,
+        int relocated = copy_and_relocate(m_mem + cave, original_bytes,
                                           cave, target_vaddr, insns_to_save);
         if (relocated < 0) {
             fprintf(stderr,
@@ -148,8 +183,12 @@ public:
         uint64_t ret_slot = cave + (uint64_t)insns_to_save * 4;
         uint32_t* t = (uint32_t*)(m_mem + ret_slot);
         int64_t ret_offset = (int64_t)(target_vaddr + (uint64_t)insns_to_save * 4) - (int64_t)ret_slot;
-        int64_t ret_imm = ret_offset / 4;
-        t[0] = 0x14000000 | (ret_imm & 0x3FFFFFF);
+        if (!encode_b(target_vaddr + (uint64_t)insns_to_save * 4, ret_slot, &ret_offset)) {
+            fprintf(stderr, "[TrampolineMgr] ABORT %s: relay return out of B range\n", name);
+            m_next_cave -= SLOT_SIZE;
+            return false;
+        }
+        t[0] = 0x14000000 | ((uint64_t)ret_offset & 0x3FFFFFF);
 
         // 3. Save the original bytes we are about to overwrite (patch size = 4),
         //    then write the direct-branch trampoline at the original function.
@@ -160,23 +199,58 @@ public:
         entry.cave_vaddr   = cave;
         entry.insns_saved  = insns_to_save;
         entry.patch_bytes  = 4;
-        memcpy(entry.saved_bytes, m_mem + target_vaddr, 4);
+        memcpy(entry.saved_bytes, original_bytes, 4);
 
-        int64_t offset = (int64_t)replacement - (int64_t)target_vaddr;
-        int64_t imm = offset / 4;
-        uint32_t* tr = (uint32_t*)(m_mem + target_vaddr);
-        tr[0] = 0x14000000 | (imm & 0x3FFFFFF);
-
-        // 4. Set g_orig_* pointer in libsre.so guest memory
+        // 4. Publish the call-through relay before making the replacement
+        // reachable. A concurrently executing hook can never observe g_orig=0.
         if (g_orig_guest_addr)
             *(uint64_t*)(m_mem + g_orig_guest_addr) = cave;
 
-        // If replacing, drop the old entry for this target first.
-        if (allow_replace) remove_entry(target_vaddr);
+        uint32_t* tr = (uint32_t*)(m_mem + target_vaddr);
+        tr[0] = 0x14000000 | ((uint64_t)branch_imm & 0x3FFFFFF);
+
         m_entries.push_back(entry);
         fprintf(stdout,
             "[TrampolineMgr] HOOK  %-44s  target=0x%lx  replacement=0x%lx  relay=0x%lx  (saved %d insn%s)\n",
             name, target_vaddr, replacement, cave, insns_to_save, insns_to_save == 1 ? "" : "s");
+        return true;
+    }
+
+    // Build a call-through relay without patching the target. The relay and
+    // g_orig pointer are published only after relocation and the return branch
+    // have both been validated.
+    bool install_relay(const char* name, uint64_t target_vaddr,
+                       uint64_t g_orig_guest_addr, int insns_to_save = 1) {
+        if (!m_initialized) { die(name, "init() not called"); return false; }
+        if (!target_vaddr || !g_orig_guest_addr || (target_vaddr & 3) || insns_to_save < 1)
+            return false;
+        if ((uint64_t)(insns_to_save + 1) * 4 > SLOT_SIZE) return false;
+
+        uint64_t cave = alloc_cave(name);
+        if (!cave) return false;
+
+        uint8_t original_bytes[MAX_PATCH_BYTES]{};
+        const size_t original_size = (size_t)insns_to_save * 4;
+        memcpy(original_bytes, m_mem + target_vaddr, original_size);
+        if (copy_and_relocate(m_mem + cave, original_bytes,
+                              cave, target_vaddr, insns_to_save) < 0) {
+            m_next_cave -= SLOT_SIZE;
+            return false;
+        }
+
+        uint64_t ret_slot = cave + (uint64_t)insns_to_save * 4;
+        int64_t ret_imm = 0;
+        if (!encode_b(target_vaddr + (uint64_t)insns_to_save * 4,
+                      ret_slot, &ret_imm)) {
+            m_next_cave -= SLOT_SIZE;
+            return false;
+        }
+        *(uint32_t*)(m_mem + ret_slot) =
+            0x14000000 | ((uint64_t)ret_imm & 0x3FFFFFF);
+        *(uint64_t*)(m_mem + g_orig_guest_addr) = cave;
+        m_entries.push_back({ name, 0, 0, cave, insns_to_save, {}, 0 });
+        fprintf(stdout, "[TrampolineMgr] RELAY %-44s target=0x%lx relay=0x%lx\n",
+                name, target_vaddr, cave);
         return true;
     }
 
@@ -218,10 +292,22 @@ public:
     // NOP-out N instructions; no cave allocated
     bool install_hook_noop(const char* name, uint64_t target_vaddr, int num_insns) {
         if (!m_initialized) { die(name, "init() not called"); return false; }
-        if (!target_vaddr) { fprintf(stderr, "[TrampolineMgr] SKIP NOP %s: null\n", name); return false; }
+        if (!target_vaddr || (target_vaddr & 3) || num_insns < 1 || num_insns * 4 > MAX_PATCH_BYTES) {
+            fprintf(stderr, "[TrampolineMgr] SKIP NOP %s: invalid span\n", name); return false;
+        }
+        if (find_entry(target_vaddr)) {
+            fprintf(stderr, "[TrampolineMgr] SKIP NOP %s: duplicate target\n", name);
+            return false;
+        }
+        TrampolineEntry entry{};
+        entry.name = name;
+        entry.target_vaddr = target_vaddr;
+        entry.insns_saved = num_insns;
+        entry.patch_bytes = num_insns * 4;
+        memcpy(entry.saved_bytes, m_mem + target_vaddr, (size_t)entry.patch_bytes);
         uint32_t* code = (uint32_t*)(m_mem + target_vaddr);
         for (int i = 0; i < num_insns; i++) code[i] = 0xD503201F;
-        m_entries.push_back({ name, target_vaddr, 0, 0, num_insns, {}, 0 });
+        m_entries.push_back(entry);
         fprintf(stdout, "[TrampolineMgr] NOP   %-44s  @ 0x%lx  (%d insns)\n",
                 name, target_vaddr, num_insns);
         return true;
@@ -272,6 +358,20 @@ private:
 
     static void die(const char* ctx, const char* msg) {
         fprintf(stderr, "[TrampolineMgr] FATAL (%s): %s\n", ctx, msg);
+    }
+
+    static bool encode_b(uint64_t destination, uint64_t source, int64_t* imm_out) {
+        if ((destination & 3) || (source & 3)) return false;
+        int64_t delta = (int64_t)destination - (int64_t)source;
+        if ((delta & 3) || !fits_signed(delta / 4, 26)) return false;
+        *imm_out = delta / 4;
+        return true;
+    }
+
+    static bool fits_signed(int64_t v, int bits) {
+        const int64_t lo = -((int64_t)1 << (bits - 1));
+        const int64_t hi = ((int64_t)1 << (bits - 1)) - 1;
+        return v >= lo && v <= hi;
     }
 
     uint64_t alloc_cave(const char* name) {

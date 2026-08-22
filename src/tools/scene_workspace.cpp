@@ -450,61 +450,86 @@ int pick_scene_object(const std::vector<av::SceneObject>& objects,
                       bool show_hidden, const av::Camera& cam, int w, int h,
                       const ImVec2& viewport_pos, const ImVec2& mouse) {
     int best = -1;
-    float best_depth = 1e30f;
+    float best_score = 1e30f;   // pixel distance to the object's screen box
+    float best_depth = 1e30f;   // eye distance (tie-break: nearest wins)
 
     for (int index = 0; index < (int)objects.size(); ++index) {
         const auto& obj = objects[index];
         if (obj.hidden && !show_hidden) continue;
 
-        // World-space center + bounds radius of the object.
-        float center[3] = {obj.pos_x, obj.pos_y, obj.pos_z};
-        float radius = 0.0f;
-        bool has_geometry = false;
+        // Only objects with actual drawable content are pickable in the
+        // viewport. Invisible meta objects (Background sky, DirectionalLight,
+        // glow lights, spawn points, trigger/utility shapes, camera volumes)
+        // are skipped so clicks pass through to real content — and clicking
+        // truly empty space deselects instead of grabbing the sky or a light.
+        const bool has_ground = !obj.ground_meshes.empty();
+        const bool in_cache = !obj.mesh_name.empty() && model_cache &&
+                              model_cache->count(obj.mesh_name) > 0;
+        if (!has_ground && !in_cache && !obj.is_portal) continue;
 
-        const std::string model_name = obj.mesh_name.empty() ? obj.background_name : obj.mesh_name;
-        if (model_cache) {
-            const auto it = model_cache->find(model_name);
-            if (it != model_cache->end()) {
-                const float s = std::abs(obj.scale_x * obj.template_scaling);
-                center[0] += it->second.center_x * s;
-                center[1] += it->second.center_y * s;
-                center[2] += it->second.center_z * s;
-                radius = std::max(radius, it->second.radius * s);
-                has_geometry = true;
-            }
+        // World-space AABB of the object (tight for ground meshes, box for
+        // cached models, fixed 80-unit pick box for portals without a model).
+        float wmin[3] = {1e30f, 1e30f, 1e30f};
+        float wmax[3] = {-1e30f, -1e30f, -1e30f};
+        const auto extend = [&](float x, float y, float z) {
+            wmin[0] = std::min(wmin[0], x); wmin[1] = std::min(wmin[1], y); wmin[2] = std::min(wmin[2], z);
+            wmax[0] = std::max(wmax[0], x); wmax[1] = std::max(wmax[1], y); wmax[2] = std::max(wmax[2], z);
+        };
+        if (in_cache) {
+            const auto& m = model_cache->find(obj.mesh_name)->second;
+            const float s = std::abs(obj.scale_x * obj.template_scaling);
+            const float cx = obj.pos_x + m.center_x * s;
+            const float cy = obj.pos_y + m.center_y * s;
+            const float cz = obj.pos_z + m.center_z * s;
+            const float r  = m.radius * s;
+            extend(cx - r, cy - r, cz - r);
+            extend(cx + r, cy + r, cz + r);
         }
         for (const auto& gm : obj.ground_meshes) {
             const float s = std::abs(obj.scale_x * obj.template_scaling);
-            const float cx = (gm.min_x + gm.max_x) * 0.5f * s + obj.pos_x;
-            const float cy = (gm.min_y + gm.max_y) * 0.5f * s + obj.pos_y;
-            const float cz = (gm.min_z + gm.max_z) * 0.5f * s + obj.pos_z;
-            const float dx = (gm.max_x - gm.min_x) * 0.5f * s;
-            const float dy = (gm.max_y - gm.min_y) * 0.5f * s;
-            const float dz = (gm.max_z - gm.min_z) * 0.5f * s;
-            const float r = std::sqrt(dx*dx + dy*dy + dz*dz);
-            if (r > radius) { center[0] = cx; center[1] = cy; center[2] = cz; radius = r; }
-            has_geometry = true;
+            extend(obj.pos_x + gm.min_x * s, obj.pos_y + gm.min_y * s, obj.pos_z + gm.min_z * s);
+            extend(obj.pos_x + gm.max_x * s, obj.pos_y + gm.max_y * s, obj.pos_z + gm.max_z * s);
+        }
+        if (wmin[0] > wmax[0]) {
+            // No geometry resolved (e.g. portal) — a generous fixed pick box.
+            const float s = std::abs(obj.scale_x * obj.template_scaling);
+            extend(obj.pos_x - 40.0f * s, obj.pos_y - 40.0f * s, obj.pos_z - 40.0f * s);
+            extend(obj.pos_x + 40.0f * s, obj.pos_y + 40.0f * s, obj.pos_z + 40.0f * s);
         }
 
-        // Project center; proxy-only objects use a comfortable fixed radius.
-        ImVec2 sp;
-        if (!world_to_screen(cam, w, h, viewport_pos, center, sp)) continue;
-        float rad_px = has_geometry ? 12.0f : 16.0f;
-        if (radius > 0.0f) {
-            float right[3], up[3], fwd[3];
-            camera_basis(cam, right, up, fwd);
-            const float probe[3] = {center[0] + right[0]*radius, center[1] + right[1]*radius,
-                                    center[2] + right[2]*radius};
-            ImVec2 sp2;
-            if (world_to_screen(cam, w, h, viewport_pos, probe, sp2))
-                rad_px = std::max(rad_px, std::hypotf(sp2.x - sp.x, sp2.y - sp.y));
+        // Project all 8 AABB corners and build the screen-space box.
+        const float c[8][3] = {
+            {wmin[0], wmin[1], wmin[2]}, {wmax[0], wmin[1], wmin[2]},
+            {wmin[0], wmax[1], wmin[2]}, {wmax[0], wmax[1], wmin[2]},
+            {wmin[0], wmin[1], wmax[2]}, {wmax[0], wmin[1], wmax[2]},
+            {wmin[0], wmax[1], wmax[2]}, {wmax[0], wmax[1], wmax[2]},
+        };
+        bool any = false;
+        float smin_x = 1e30f, smin_y = 1e30f, smax_x = -1e30f, smax_y = -1e30f;
+        for (int i = 0; i < 8; ++i) {
+            ImVec2 sp;
+            if (!world_to_screen(cam, w, h, viewport_pos, c[i], sp)) continue;
+            any = true;
+            smin_x = std::min(smin_x, sp.x); smin_y = std::min(smin_y, sp.y);
+            smax_x = std::max(smax_x, sp.x); smax_y = std::max(smax_y, sp.y);
         }
-        const float d = std::hypotf(mouse.x - sp.x, mouse.y - sp.y);
-        if (d > rad_px) continue;
+        if (!any) continue;
 
-        // Prefer the candidate nearest the eye (z-ordering).
-        float right[3], up[3], fwd[3];
-        camera_basis(cam, right, up, fwd);
+        // Hit score: 0 when the cursor is inside the (unpadded) box, else the
+        // pixel distance to the nearest edge. A 10 px pad makes small objects
+        // forgiving to click without inflating big ones.
+        const float pad = 10.0f;
+        float score;
+        if (mouse.x >= smin_x && mouse.x <= smax_x && mouse.y >= smin_y && mouse.y <= smax_y) {
+            score = 0.0f;
+        } else {
+            const float dx = std::max({smin_x - pad - mouse.x, mouse.x - smax_x - pad, 0.0f});
+            const float dy = std::max({smin_y - pad - mouse.y, mouse.y - smax_y - pad, 0.0f});
+            score = std::sqrt(dx * dx + dy * dy);
+        }
+        if (score > 0.0f) continue;   // outside the padded box
+
+        // Prefer the candidate nearest the eye (z-ordering) among hits.
         const float yaw   = cam.yaw * kPi / 180.0f;
         const float pitch = cam.pitch * kPi / 180.0f;
         const float cp = cosf(pitch);
@@ -513,11 +538,72 @@ int pick_scene_object(const std::vector<av::SceneObject>& objects,
             cam.target[1] + cam.distance * sinf(pitch),
             cam.target[2] + cam.distance * cp * cosf(yaw)
         };
-        const float dxc = center[0]-eye[0], dyc = center[1]-eye[1], dzc = center[2]-eye[2];
-        const float depth = dxc*dxc + dyc*dyc + dzc*dzc;
-        if (depth < best_depth) { best_depth = depth; best = index; }
+        const float cx = (wmin[0] + wmax[0]) * 0.5f;
+        const float cy = (wmin[1] + wmax[1]) * 0.5f;
+        const float cz = (wmin[2] + wmax[2]) * 0.5f;
+        const float depth = (cx-eye[0])*(cx-eye[0]) + (cy-eye[1])*(cy-eye[1]) + (cz-eye[2])*(cz-eye[2]);
+        // Prefer a strict interior hit over a padded-edge hit, then nearest eye.
+        if (score < best_score - 1e-4f ||
+            (std::fabs(score - best_score) <= 1e-4f && depth < best_depth)) {
+            best_score = score;
+            best_depth = depth;
+            best = index;
+        }
     }
     return best;
+}
+
+bool pick_scene_ground_mesh(const std::vector<av::SceneObject>& objects,
+                            bool show_hidden, const av::Camera& cam, int w, int h,
+                            const ImVec2& viewport_pos, const ImVec2& mouse,
+                            int& out_object, int& out_mesh) {
+    out_object = out_mesh = -1;
+    float best_eye = 1e30f;
+
+    const float yaw   = cam.yaw * kPi / 180.0f;
+    const float pitch = cam.pitch * kPi / 180.0f;
+    const float cp = cosf(pitch);
+    const float eye[3] = {
+        cam.target[0] + cam.distance * cp * sinf(yaw),
+        cam.target[1] + cam.distance * sinf(pitch),
+        cam.target[2] + cam.distance * cp * cosf(yaw)
+    };
+
+    for (int index = 0; index < (int)objects.size(); ++index) {
+        const auto& obj = objects[index];
+        if (obj.hidden && !show_hidden) continue;
+        if (obj.ground_meshes.empty()) continue;
+        float obj_mat[16];
+        object_world_matrix(obj, obj_mat);
+        for (size_t mi = 0; mi < obj.ground_meshes.size(); ++mi) {
+            const auto& pm = obj.ground_meshes[mi];
+            const int tri = pick_ground_mesh_triangle(pm, obj_mat, cam, w, h,
+                                                      viewport_pos, mouse);
+            if (tri < 0) continue;
+            // Rank by eye distance to the hit triangle's world centroid
+            // (front-most mesh wins — matches the renderer's z-order).
+            const uint32_t ia = pm.indices[tri*3], ib = pm.indices[tri*3+1], ic = pm.indices[tri*3+2];
+            if (ia >= (uint32_t)pm.num_vertices || ib >= (uint32_t)pm.num_vertices ||
+                ic >= (uint32_t)pm.num_vertices) continue;
+            const float la[3] = {pm.positions[ia*3], pm.positions[ia*3+1], pm.positions[ia*3+2]};
+            const float lb[3] = {pm.positions[ib*3], pm.positions[ib*3+1], pm.positions[ib*3+2]};
+            const float lc[3] = {pm.positions[ic*3], pm.positions[ic*3+1], pm.positions[ic*3+2]};
+            float wa[3], wb[3], wc[3];
+            local_to_world(obj_mat, la, wa);
+            local_to_world(obj_mat, lb, wb);
+            local_to_world(obj_mat, lc, wc);
+            const float cx = (wa[0] + wb[0] + wc[0]) / 3.0f;
+            const float cy = (wa[1] + wb[1] + wc[1]) / 3.0f;
+            const float cz = (wa[2] + wb[2] + wc[2]) / 3.0f;
+            const float d = (cx-eye[0])*(cx-eye[0]) + (cy-eye[1])*(cy-eye[1]) + (cz-eye[2])*(cz-eye[2]);
+            if (d < best_eye) {
+                best_eye = d;
+                out_object = index;
+                out_mesh = (int)mi;
+            }
+        }
+    }
+    return out_object >= 0 && out_mesh >= 0;
 }
 
 } // namespace swk

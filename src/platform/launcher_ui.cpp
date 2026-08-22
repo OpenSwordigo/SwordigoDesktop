@@ -13,6 +13,7 @@
 #include "platform/unicorn_dyn.h"
 #include "platform/os_external.h"
 #include "platform/mod_manager.h"
+#include "platform/launcher_config.h"
 #include "platform/swordfare_theme.h"
 
 #include "imgui/imgui.h"
@@ -151,6 +152,7 @@ static ImFont* g_font_heading = nullptr;
 
 static std::vector<ModInfo> g_mods;
 static bool g_mods_scanned = false;
+static int  g_active_mod_idx = -1;  // index into g_mods of the currently selected mod for VFS
 
 // Mod delete confirmation (separate from the instance one above)
 static bool g_mod_confirm_delete    = false;
@@ -660,11 +662,14 @@ static void DrawSidebar(BinarySelector& selector, int& selected,
 
     // ── Logo / branding ──
     {
-        float logo_area_h = 72.0f;
+        float logo_area_h = 80.0f;
+        float max_w = SIDEBAR_W - 20.0f;
         if (g_tex_logo) {
-            float lh = 36.0f;
-            float lw = lh * ((float)g_tex_logo_w / (float)g_tex_logo_h);
-            ImGui::SetCursorPos(ImVec2(16, (logo_area_h - lh) * 0.5f));
+            // Scale to fill sidebar width, cap height
+            float lw = max_w;
+            float lh = lw * ((float)g_tex_logo_h / (float)g_tex_logo_w);
+            if (lh > 60.0f) { lh = 60.0f; lw = lh * ((float)g_tex_logo_w / (float)g_tex_logo_h); }
+            ImGui::SetCursorPos(ImVec2((SIDEBAR_W - lw) * 0.5f, (logo_area_h - lh) * 0.5f));
             ImGui::Image((ImTextureID)(intptr_t)g_tex_logo, ImVec2(lw, lh));
         } else {
             ImGui::SetCursorPos(ImVec2(16, (logo_area_h - ImGui::GetTextLineHeight()) * 0.5f));
@@ -855,7 +860,7 @@ static void DrawStatusFooter(int selected, const BinarySelector& selector) {
     }
 
     // Right side — hints
-    ImGui::SameLine(ImGui::GetWindowWidth() - 360);
+    ImGui::SameLine(ImGui::GetWindowWidth() - 320);
     ImGui::TextDisabled("  v8.0 Remaster  |  Enter: Launch  |  ESC: Close");
 
     ImGui::End();
@@ -1614,39 +1619,162 @@ static void DrawLibraryPage(BinarySelector& selector, int& selected,
 // Mods page
 // =============================================================================
 
+// --- Helper: find ModInfo by id ---
+static int find_mod_by_id(const std::string& id) {
+    for (int i = 0; i < (int)g_mods.size(); i++)
+        if (g_mods[i].id == id) return i;
+    return -1;
+}
+
+// --- Helper: render a single mod card in a panel ---
+// Returns true if the card was clicked (for selection).
+static bool draw_mod_card(ModInfo& mod, float panel_w, bool in_active, int global_idx, bool is_selected) {
+    bool clicked = false;
+    bool double_clicked = false;
+    ImGui::PushID(global_idx + (in_active ? 10000 : 0));
+
+    // Card background — selected gets VERY bright
+    ImVec4 bg = is_selected
+        ? (in_active ? ImVec4(0.12f, 0.22f, 0.35f, 1.0f) : ImVec4(0.11f, 0.16f, 0.30f, 1.0f))
+        : (in_active ? ImVec4(0.05f, 0.07f, 0.11f, 1.0f) : ImVec4(0.04f, 0.05f, 0.08f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    float card_h = 56.0f;
+    ImGui::BeginChild(("##mc" + std::to_string(global_idx)).c_str(),
+                      ImVec2(panel_w - 8, card_h), ImGuiChildFlags_Borders);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImVec2 ws = ImGui::GetWindowSize();
+
+    // Colors
+    ImU32 accent    = in_active ? IM_COL32(50, 180, 70, 255) : IM_COL32(60, 120, 210, 255);
+    ImU32 sel_accent = in_active ? IM_COL32(100, 240, 120, 255) : IM_COL32(120, 180, 255, 255);
+
+    // Left accent bar (always)
+    dl->AddRectFilled(ImVec2(wp.x, wp.y), ImVec2(wp.x + 5, wp.y + ws.y),
+                      is_selected ? sel_accent : accent, 3.0f);
+
+    // Selection highlight — thick glowing border + bright fill
+    if (is_selected) {
+        // Outer glow
+        dl->AddRect(ImVec2(wp.x - 1, wp.y - 1), ImVec2(wp.x + ws.x + 1, wp.y + ws.y + 1),
+                    sel_accent, 10.0f, 0, 1.0f);
+        // Main border
+        dl->AddRect(ImVec2(wp.x + 0.5f, wp.y + 0.5f),
+                    ImVec2(wp.x + ws.x - 0.5f, wp.y + ws.y - 0.5f),
+                    sel_accent, 8.0f, 0, 3.0f);
+        // Bright fill overlay — much more visible
+        dl->AddRectFilled(ImVec2(wp.x, wp.y), ImVec2(wp.x + ws.x, wp.y + ws.y),
+                          in_active ? IM_COL32(50, 150, 70, 40) : IM_COL32(60, 120, 220, 40));
+    }
+
+    // Icon
+    if (!mod.icon_tex) mod.icon_tex = LoadModIcon(mod);
+    float icon_sz = 38.0f;
+    float icon_x = wp.x + 10, icon_y = wp.y + (card_h - icon_sz) * 0.5f;
+    if (mod.icon_tex)
+        dl->AddImage((ImTextureID)(intptr_t)mod.icon_tex,
+                     ImVec2(icon_x, icon_y), ImVec2(icon_x + icon_sz, icon_y + icon_sz));
+    else {
+        dl->AddRectFilled(ImVec2(icon_x, icon_y), ImVec2(icon_x + icon_sz, icon_y + icon_sz),
+                          IM_COL32(25, 32, 48, 255), 6.0f);
+        dl->AddText(ImVec2(icon_x + 10, icon_y + 10), IM_COL32(100, 120, 160, 200),
+                    ICON_FA_PUZZLE_PIECE);
+    }
+
+    // Text
+    float text_x = icon_x + icon_sz + 8;
+    float text_y = wp.y + 7;
+    dl->AddText(ImVec2(text_x, text_y), ImGui::GetColorU32(ImGuiCol_Text), mod.name.c_str());
+    text_y += ImGui::GetTextLineHeightWithSpacing();
+    char meta[128];
+    snprintf(meta, sizeof(meta), "v%s  by %s",
+             mod.version.c_str(), mod.author.empty() ? "Unknown" : mod.author.c_str());
+    dl->AddText(ImVec2(text_x, text_y), ImGui::GetColorU32(ImGuiCol_TextDisabled), meta);
+
+    // Hover tooltip
+    if (ImGui::IsWindowHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::Text("%s  v%s", mod.name.c_str(), mod.version.c_str());
+        if (!mod.author.empty()) ImGui::TextDisabled("by %s", mod.author.c_str());
+        if (!mod.description.empty()) ImGui::TextWrapped("%s", mod.description.c_str());
+        if (!mod.category.empty()) ImGui::TextDisabled("Category: %s", mod.category.c_str());
+        ImGui::TextDisabled("ID: %s", mod.id.c_str());
+        ImGui::TextDisabled(in_active ? "Status: Active" : "Status: Available");
+        ImGui::EndTooltip();
+    }
+
+    // Click + double-click detection (manual bounds check)
+    ImVec2 mouse_pos = ImGui::GetIO().MousePos;
+    bool mouse_over = (mouse_pos.x >= wp.x && mouse_pos.x <= wp.x + ws.x &&
+                       mouse_pos.y >= wp.y && mouse_pos.y <= wp.y + ws.y);
+    if (mouse_over) {
+        if (ImGui::IsMouseClicked(0)) clicked = true;
+        if (ImGui::IsMouseDoubleClicked(0)) double_clicked = true;
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+    ImGui::PopID();
+
+    // Return double-click as a special signal (caller checks via flag)
+    if (double_clicked) clicked = true;
+    return clicked;
+}
+
+// =============================================================================
+// Mods page — Minecraft resource-pack-style dual-panel selector.
+//
+// Left panel  = "Available Mods"  (installed but not in load order)
+// Right panel = "Active Mods"     (in load order, top = highest priority)
+// Between     = >> << arrow buttons + Up/Down reorder arrows
+// =============================================================================
+
 static void DrawModsPage() {
     if (!g_mods_scanned) ScanMods();
 
+    // Load persistent config
+    static LauncherConfig g_cfg;
+    static bool cfg_loaded = false;
+    if (!cfg_loaded) {
+        g_cfg = launcher_config_load();
+        cfg_loaded = true;
+    }
+    // Sync on rescan
+    static int last_scan_gen = 0;
+    if (!g_mods_scanned) last_scan_gen++;
+
+    // ── Header ──────────────────────────────────────────────────────────────
     ImGui::Spacing();
     if (g_font_heading) ImGui::PushFont(g_font_heading);
-    ImGui::Text(ICON_FA_PUZZLE_PIECE "  Mods");
+    ImGui::Text(ICON_FA_PUZZLE_PIECE "  Resource Packs");
     if (g_font_heading) ImGui::PopFont();
-
     ImGui::SameLine(ImGui::GetContentRegionAvail().x - 470);
     PushSecondaryBtn();
     if (ImGui::Button(ICON_FA_FOLDER_OPEN "  Open Mods Folder", ImVec2(150, 32))) {
         std::string mods_dir = get_user_data_dir() + "/mods";
         os_external::open_in_file_manager(mods_dir);
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open ~/.local/share/swordigo-desktop/mods/");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open mods directory in file manager");
     ImGui::SameLine();
     if (ImGui::Button(ICON_FA_ARROWS_ROTATE "  Rescan", ImVec2(90, 32)))
         g_mods_scanned = false;
     PopSecondaryBtn();
 
-    // Install a Raijin-format mod zip (.zip with icon.png + properties.toml + resources/)
+    // Install zip
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.24f, 0.72f, 0.31f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.85f, 0.40f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.18f, 0.58f, 0.25f, 1.0f));
-    if (ImGui::Button(ICON_FA_FILE_CIRCLE_PLUS "  Install .zip Mod", ImVec2(210, 32))) {
+    if (ImGui::Button(ICON_FA_FILE_CIRCLE_PLUS "  Install .zip", ImVec2(140, 32))) {
         static const SDL_DialogFileFilter filters[] = {{"Mod zip", "zip"}};
         g_mod_zip_dialog_pending = true;
         SDL_ShowOpenFileDialog(mod_zip_dialog_callback, nullptr, g_sdl_window,
                                filters, 1, nullptr, false);
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Install a Raijin-format mod zip:\n  icon.png + properties.toml + resources/");
     ImGui::PopStyleColor(3);
 
     // Install status toast
@@ -1655,21 +1783,10 @@ static void DrawModsPage() {
         ImGui::PushStyleColor(ImGuiCol_Text,
             g_mod_zip_status_ok ? ImVec4(0.24f, 0.72f, 0.31f, 1.0f)
                                 : ImVec4(0.91f, 0.27f, 0.38f, 1.0f));
-        ImGui::TextWrapped("%s%s", g_mod_zip_status_ok ? ICON_FA_CIRCLE_CHECK "  "
-                                                        : ICON_FA_CIRCLE_EXCLAMATION "  ",
-                           g_mod_zip_status.c_str());
+        ImGui::TextWrapped("%s", g_mod_zip_status.c_str());
         ImGui::PopStyleColor();
         if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) g_mod_zip_status.clear();
     }
-
-    ImGui::Spacing();
-    
-    // Local mods search bar
-    static char mods_search[128] = "";
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.063f, 0.082f, 0.120f, 1.0f));
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.4f);
-    ImGui::InputTextWithHint("##modssearch", ICON_FA_MAGNIFYING_GLASS "  Search local mods…", mods_search, sizeof(mods_search));
-    ImGui::PopStyleColor();
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1683,7 +1800,7 @@ static void DrawModsPage() {
         ImGui::SetCursorPos(ImVec2((cw - 220) * 0.5f, 50));
         ImGui::TextDisabled(ICON_FA_BOX_OPEN "  No mods installed.");
         ImGui::SetCursorPosX((cw - 320) * 0.5f);
-        ImGui::TextDisabled("Drop mod folders with mod.json into your mods directory.");
+        ImGui::TextDisabled("Install Raijin-format mod zips (icon.png + properties.toml + resources/).");
         ImGui::SetCursorPosX((cw - 400) * 0.5f + 40);
         ImGui::TextDisabled("Path:  ~/.local/share/swordigo-desktop/mods/");
         ImGui::EndChild();
@@ -1692,128 +1809,229 @@ static void DrawModsPage() {
         return;
     }
 
-    // Mod cards
-    ImGui::BeginChild("##ModsList", ImVec2(-1, -1), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    // ── Split into Available vs Active ───────────────────────────────────────
+    struct ModEntry { int idx; ModInfo* mod; };
+    std::vector<ModEntry> available, active;
     for (int i = 0; i < (int)g_mods.size(); i++) {
-        auto& mod = g_mods[i];
-        
-        if (strlen(mods_search) > 0) {
-            std::string search_str = mods_search;
-            std::transform(search_str.begin(), search_str.end(), search_str.begin(), ::tolower);
-            std::string m_name = mod.name;
-            std::transform(m_name.begin(), m_name.end(), m_name.begin(), ::tolower);
-            std::string m_desc = mod.description;
-            std::transform(m_desc.begin(), m_desc.end(), m_desc.begin(), ::tolower);
-            if (m_name.find(search_str) == std::string::npos && m_desc.find(search_str) == std::string::npos) {
-                continue;
+        if (launcher_config_is_mod_enabled(g_cfg, g_mods[i].id))
+            active.push_back({i, &g_mods[i]});
+        else
+            available.push_back({i, &g_mods[i]});
+    }
+    // Sort active vector by config load order (top = highest priority)
+    std::sort(active.begin(), active.end(), [&](const ModEntry& a, const ModEntry& b) {
+        for (int i = 0; i < (int)g_cfg.mod_load_order.size(); i++) {
+            if (g_cfg.mod_load_order[i] == a.mod->id) return true;   // a comes first
+            if (g_cfg.mod_load_order[i] == b.mod->id) return false;  // b comes first
+        }
+        return false;
+    });
+
+    // ── Panel layout ────────────────────────────────────────────────────────
+    float total_w = ImGui::GetContentRegionAvail().x;
+    float arrow_col_w = 60.0f;
+    float panel_w = (total_w - arrow_col_w) * 0.5f;
+    static std::string selected_mod_id;  // track selected mod by ID (survives reorder)
+    // Resolve current indices from the mod ID (rebuilt every frame from config)
+    int selected_avail = -1, selected_active = -1;
+    if (!selected_mod_id.empty()) {
+        for (int i = 0; i < (int)available.size(); i++)
+            if (available[i].mod->id == selected_mod_id) { selected_avail = i; break; }
+        for (int i = 0; i < (int)active.size(); i++)
+            if (active[i].mod->id == selected_mod_id) { selected_active = i; break; }
+    }
+
+    // ── Headers ─────────────────────────────────────────────────────────────
+    ImGui::TextColored(ImVec4(0.45f, 0.65f, 0.95f, 1.0f),
+        ICON_FA_CHEVRON_LEFT "  Available Mods  (%d)", (int)available.size());
+    ImGui::SameLine(panel_w + arrow_col_w);
+    ImGui::TextColored(ImVec4(0.24f, 0.72f, 0.31f, 1.0f),
+        ICON_FA_CHEVRON_RIGHT "  Active Mods  (%d)  ", (int)active.size());
+    ImGui::SameLine();
+    ImGui::TextDisabled("(top = highest priority)");
+    ImGui::Spacing();
+
+    // ── Left panel (Available) ──────────────────────────────────────────────
+    ImGui::BeginChild("##avail_panel", ImVec2(panel_w, -60), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    for (int i = 0; i < (int)available.size(); i++) {
+        bool sel = (selected_avail == i);
+        if (draw_mod_card(*available[i].mod, panel_w, false, available[i].idx, sel)) {
+            selected_mod_id = available[i].mod->id;
+            // Double-click auto-activates
+            if (ImGui::IsMouseDoubleClicked(0)) {
+                launcher_config_enable_mod(g_cfg, available[i].mod->id);
+                launcher_config_save(g_cfg);
             }
         }
-        ImGui::PushID(i);
-        ImGui::PushStyleColor(ImGuiCol_ChildBg,
-            mod.enabled ? ImVec4(0.063f, 0.082f, 0.120f, 1.0f)
-                        : ImVec4(0.039f, 0.051f, 0.075f, 1.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
-        ImGui::BeginChild(("##mc" + std::to_string(i)).c_str(), ImVec2(-1, 84), ImGuiChildFlags_Borders);
-
-        // Mod icon (icon.png for Raijin mods)
-        if (!mod.icon_tex)
-            mod.icon_tex = LoadModIcon(mod);
-        ImGui::SetCursorPos(ImVec2(14, 14));
-        if (mod.icon_tex) {
-            ImGui::Image((ImTextureID)(intptr_t)mod.icon_tex, ImVec2(56, 56));
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.133f, 0.165f, 0.220f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.133f, 0.165f, 0.220f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.133f, 0.165f, 0.220f, 1.0f));
-            ImGui::Button(ICON_FA_PUZZLE_PIECE "", ImVec2(56, 56));
-            ImGui::PopStyleColor(3);
-        }
-
-        // Enable toggle (top-right)
-        ImGui::SameLine(ImGui::GetWindowWidth() - 96);
-        bool prev = mod.enabled;
-        ImGui::Checkbox("Enabled", &mod.enabled);
-        if (mod.enabled != prev) {
-            if (modman::set_mod_enabled(mod.dir_path, mod.enabled)) {
-                std::string dirname = fs::path(mod.dir_path).filename().string();
-                if (!mod.enabled && dirname[0] != '.') dirname = "." + dirname;
-                else if (mod.enabled && dirname[0] == '.') dirname = dirname.substr(1);
-                mod.dir_path = fs::path(mod.dir_path).parent_path().string() + "/" + dirname;
-            } else {
-                mod.enabled = prev;
-            }
-        }
-
-        // Name + meta
-        ImGui::SetCursorPosX(84);
-        ImGui::BeginGroup();
-        if (!mod.enabled) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.48f, 0.52f, 1.0f));
-        ImGui::Text("%s", mod.name.c_str());
-        if (!mod.enabled) ImGui::PopStyleColor();
-        ImGui::TextDisabled("v%s  ·  by %s",
-            mod.version.c_str(), mod.author.empty() ? "Unknown" : mod.author.c_str());
-        // Category badge
-        if (!mod.category.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.20f, 0.32f, 0.52f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.32f, 0.52f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.20f, 0.32f, 0.52f, 1.0f));
-            ImGui::Button((mod.category + "##cat" + std::to_string(i)).c_str());
-            ImGui::PopStyleColor(3);
-            ImGui::SameLine();
-            ImGui::TextDisabled(mod.is_toml ? ICON_FA_FILE_CIRCLE_PLUS "  Raijin zip" : ICON_FA_FOLDER "  Legacy");
-        }
-        if (!mod.description.empty()) {
-            ImGui::TextDisabled("  %s", mod.description.c_str());
-        }
-        ImGui::EndGroup();
-
-        // Delete button (bottom-right)
-        {
-            float bw = ImGui::GetWindowWidth();
-            ImGui::SetCursorPos(ImVec2(bw - 64, 54));
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.55f, 0.16f, 0.16f, 0.85f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.82f, 0.20f, 0.20f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.60f, 0.12f, 0.12f, 1.0f));
-            if (ImGui::Button(ICON_FA_TRASH)) {
-                g_mod_confirm_delete = true;
-                g_mod_delete_target_idx = i;
-            }
-            ImGui::PopStyleColor(3);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this mod");
-        }
-
-        if (ImGui::IsItemHovered() && !mod.description.empty())
-            ImGui::SetTooltip("%s", mod.description.c_str());
-
-        ImGui::EndChild();
-        ImGui::PopStyleVar();
-        ImGui::PopStyleColor();
         ImGui::Spacing();
-        ImGui::PopID();
+    }
+    if (available.empty()) {
+        ImGui::SetCursorPos(ImVec2(panel_w * 0.5f - 80, 40));
+        ImGui::TextDisabled("All mods are active");
     }
     ImGui::EndChild();
 
-    // Mod delete confirmation modal
+    // ── Center arrows ───────────────────────────────────────────────────────
+    ImGui::SameLine();
+    ImGui::BeginChild("##arrow_col", ImVec2(arrow_col_w, -60), 0);
+    {
+        float btn_w = 44.0f, btn_h = 30.0f;
+        float cx = (arrow_col_w - btn_w) * 0.5f;
+        ImGui::SetCursorPos(ImVec2(cx, 12));
+
+        // Activate (>>)
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.18f, 0.50f, 0.28f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.62f, 0.34f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.14f, 0.42f, 0.22f, 1.0f));
+        if (ImGui::Button(ICON_FA_CHEVRON_RIGHT "##act", ImVec2(btn_w, btn_h))) {
+            if (selected_avail >= 0 && selected_avail < (int)available.size()) {
+                launcher_config_enable_mod(g_cfg, available[selected_avail].mod->id);
+                launcher_config_save(g_cfg);
+            }
+        }
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Activate selected mod");
+
+        ImGui::SetCursorPos(ImVec2(cx, 52));
+        // Deactivate (<<)
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.50f, 0.18f, 0.18f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.65f, 0.22f, 0.22f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.42f, 0.14f, 0.14f, 1.0f));
+        if (ImGui::Button(ICON_FA_CHEVRON_LEFT "##deact", ImVec2(btn_w, btn_h))) {
+            if (selected_active >= 0 && selected_active < (int)active.size()) {
+                launcher_config_disable_mod(g_cfg, active[selected_active].mod->id);
+                selected_mod_id.clear();
+                launcher_config_save(g_cfg);
+            }
+        }
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Deactivate selected mod");
+
+        ImGui::SetCursorPos(ImVec2(cx, 96));
+        // Move up (higher priority = toward index 0)
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.25f, 0.38f, 0.58f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.48f, 0.70f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.20f, 0.32f, 0.50f, 1.0f));
+        if (ImGui::Button(ICON_FA_CHEVRON_LEFT "##up", ImVec2(btn_w, btn_h))) {
+            std::cout << "[Launcher] MOVE UP clicked: selected_mod_id='" << selected_mod_id
+                      << "' selected_active=" << selected_active
+                      << "' active.size=" << active.size() << std::endl;
+            if (selected_active >= 0 && selected_active < (int)active.size()) {
+                std::string id = active[selected_active].mod->id;
+                std::cout << "[Launcher] reorder up: id='" << id << "' delta=-1" << std::endl;
+                bool ok = launcher_config_reorder_mod(g_cfg, id, -1);
+                std::cout << "[Launcher] reorder result: " << (ok ? "OK" : "FAIL") << std::endl;
+                launcher_config_save(g_cfg);
+            } else {
+                std::cout << "[Launcher] MOVE UP: no mod selected!" << std::endl;
+            }
+        }
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Move up (higher priority)");
+
+        ImGui::SetCursorPos(ImVec2(cx, 136));
+        // Move down (lower priority = toward end)
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.38f, 0.25f, 0.58f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.48f, 0.30f, 0.70f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.32f, 0.20f, 0.50f, 1.0f));
+        if (ImGui::Button(ICON_FA_CHEVRON_RIGHT "##dn", ImVec2(btn_w, btn_h))) {
+            std::cout << "[Launcher] MOVE DOWN clicked: selected_mod_id='" << selected_mod_id
+                      << "' selected_active=" << selected_active
+                      << "' active.size=" << active.size() << std::endl;
+            if (selected_active >= 0 && selected_active < (int)active.size()) {
+                std::string id = active[selected_active].mod->id;
+                std::cout << "[Launcher] reorder down: id='" << id << "' delta=1" << std::endl;
+                bool ok = launcher_config_reorder_mod(g_cfg, id, 1);
+                std::cout << "[Launcher] reorder result: " << (ok ? "OK" : "FAIL") << std::endl;
+                launcher_config_save(g_cfg);
+            } else {
+                std::cout << "[Launcher] MOVE DOWN: no mod selected!" << std::endl;
+            }
+        }
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Move down (lower priority)");
+    }
+    ImGui::EndChild();
+
+    // ── Right panel (Active / Load Order) ───────────────────────────────────
+    ImGui::SameLine();
+    ImGui::BeginChild("##active_panel", ImVec2(panel_w, -60), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    for (int i = 0; i < (int)active.size(); i++) {
+        bool sel = (selected_active == i);
+        // Priority number badge (inline with card)
+        float pnum_w = 28.0f;
+        float card_y = ImGui::GetCursorPosY();
+        ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + 6, card_y + 18));
+        ImGui::TextColored(ImVec4(0.24f, 0.72f, 0.31f, 0.9f), "#%d", i + 1);
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(card_y);
+
+        if (draw_mod_card(*active[i].mod, panel_w - pnum_w, true, active[i].idx, sel)) {
+            selected_mod_id = active[i].mod->id;
+            // Double-click auto-deactivates
+            if (ImGui::IsMouseDoubleClicked(0)) {
+                launcher_config_disable_mod(g_cfg, active[i].mod->id);
+                selected_mod_id.clear();
+                launcher_config_save(g_cfg);
+            }
+        }
+        ImGui::Spacing();
+    }
+    if (active.empty()) {
+        ImGui::SetCursorPos(ImVec2(panel_w * 0.5f - 100, 40));
+        ImGui::TextDisabled("No active mods — vanilla will be used");
+    }
+    ImGui::EndChild();
+
+    // ── Footer ──────────────────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextDisabled("Mods override resources in load order. Top mod wins conflicts. Double-click to toggle.");
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 200);
+    if (ImGui::Button(ICON_FA_FLOPPY_DISK "  Save Order", ImVec2(120, 0))) {
+        launcher_config_save(g_cfg);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(ICON_FA_TRASH "  Delete Mod", ImVec2(120, 0))) {
+        // Delete the currently selected mod from either panel
+        int del_idx = -1;
+        if (selected_active >= 0 && selected_active < (int)active.size())
+            del_idx = active[selected_active].idx;
+        else if (selected_avail >= 0 && selected_avail < (int)available.size())
+            del_idx = available[selected_avail].idx;
+        if (del_idx >= 0) {
+            g_mod_confirm_delete = true;
+            g_mod_delete_target_idx = del_idx;
+        }
+    }
+
+    // ── Delete confirmation modal ───────────────────────────────────────────
     if (g_mod_confirm_delete) { ImGui::OpenPopup("Confirm Mod Delete"); g_mod_confirm_delete = false; }
     if (ImGui::BeginPopupModal("Confirm Mod Delete", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Text(ICON_FA_TRIANGLE_EXCLAMATION "  Remove this mod?");
         ImGui::Separator();
-        if (g_mod_delete_target_idx >= 0 && g_mod_delete_target_idx < (int)g_mods.size())
+        if (g_mod_delete_target_idx >= 0 && g_mod_delete_target_idx < (int)g_mods.size()) {
             ImGui::Text("  %s  (v%s)", g_mods[g_mod_delete_target_idx].name.c_str(),
                         g_mods[g_mod_delete_target_idx].version.c_str());
-        ImGui::TextDisabled("  The mod folder will be deleted permanently.");
+            ImGui::TextDisabled("  The mod folder will be deleted permanently.");
+        }
         ImGui::Spacing();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.12f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.18f, 0.18f, 1.0f));
         if (ImGui::Button(ICON_FA_TRASH "  Delete", ImVec2(120, 0))) {
             if (g_mod_delete_target_idx >= 0 && g_mod_delete_target_idx < (int)g_mods.size()) {
                 ModInfo& m = g_mods[g_mod_delete_target_idx];
+                launcher_config_disable_mod(g_cfg, m.id);
                 modman::delete_mod(modman::ModMeta{ m.id, m.name, m.version, m.author,
                                                     m.description, m.category, m.type,
                                                     {}, m.dir_path, m.icon_path,
                                                     m.enabled, m.is_toml });
                 g_mod_delete_target_idx = -1;
                 g_mods_scanned = false;
+                launcher_config_save(g_cfg);
                 ImGui::CloseCurrentPopup();
             }
         }
@@ -1974,7 +2192,7 @@ static void InstallStoreMod(int idx) {
 }
 
 static void DrawModBrowserPage() {
-    // Free GL textures retired by the catalog worker thread (UI thread owns GL).
+    // Free GL textures retired by catalog worker thread
     if (!g_icon_tex_pending_free.empty()) {
         glDeleteTextures((GLsizei)g_icon_tex_pending_free.size(),
                          g_icon_tex_pending_free.data());
@@ -1982,122 +2200,134 @@ static void DrawModBrowserPage() {
     }
     if (!g_catalog_loaded && !g_catalog_loading) LoadCatalogAsync();
 
+    // ── Header ────────────────────────────────────────────────────────────
     ImGui::Spacing();
     if (g_font_heading) ImGui::PushFont(g_font_heading);
-    ImGui::Text(ICON_FA_GLOBE "  Mod Browser");
+    ImGui::Text(ICON_FA_GLOBE "  Mod Store");
     if (g_font_heading) ImGui::PopFont();
 
-    // Catalog source row: optional remote URL + refresh
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 560);
+    // Search bar (full width)
+    ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.063f, 0.082f, 0.120f, 1.0f));
-    ImGui::SetNextItemWidth(320.0f);
-    ImGui::InputTextWithHint("##caturl", "Store URL (https://…) — live Raijin store by default",
-                             g_catalog_url, sizeof(g_catalog_url));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12, 8));
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 320);
+    ImGui::InputTextWithHint("##mbsearch", ICON_FA_MAGNIFYING_GLASS "  Search mods by name, author, or description...",
+                             g_modbrowser_search, sizeof(g_modbrowser_search));
+    ImGui::PopStyleVar(2);
     ImGui::PopStyleColor();
+
+    // Category filter + Refresh on same line
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(160.0f);
+    if (g_modbrowser_cat > (int)g_catalog_categories.size()) g_modbrowser_cat = 0;
+    {
+        std::vector<const char*> cats;
+        cats.push_back("All");
+        for (const auto& c : g_catalog_categories) cats.push_back(c.c_str());
+        ImGui::Combo("##mbcat", &g_modbrowser_cat, cats.data(), (int)cats.size());
+    }
     ImGui::SameLine();
     PushSecondaryBtn();
-    if (ImGui::Button(ICON_FA_ARROWS_ROTATE "  Refresh", ImVec2(100, 0))) {
+    if (ImGui::Button(ICON_FA_ARROWS_ROTATE " Refresh", ImVec2(90, 0))) {
         g_catalog_loaded = false;
         g_catalog_loading = false;
         LoadCatalogAsync();
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reload catalog from the store URL (falls back to the on-disk cache, then the bundled demo)");
     PopSecondaryBtn();
 
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Status line
+    // ── Status ────────────────────────────────────────────────────────────
     if (g_catalog_loading) {
-        ImGui::TextColored(ImVec4(0.82f, 0.60f, 0.13f, 1.0f), "%s  Loading catalog…", ICON_FA_SPINNER);
+        ImGui::TextColored(ImVec4(0.82f, 0.60f, 0.13f, 1.0f), ICON_FA_SPINNER "  Loading catalog...");
     } else if (!g_catalog_error.empty()) {
-        ImGui::TextColored(ImVec4(0.91f, 0.27f, 0.38f, 1.0f), "%s  %s", ICON_FA_TRIANGLE_EXCLAMATION,
-                           g_catalog_error.c_str());
-    } else if (g_catalog_mods.empty()) {
-        ImGui::TextDisabled(ICON_FA_BOX_OPEN "  Catalog is empty.");
+        ImGui::TextColored(ImVec4(0.91f, 0.27f, 0.38f, 1.0f), ICON_FA_TRIANGLE_EXCLAMATION "  %s", g_catalog_error.c_str());
     }
     if (g_catalog_loaded && !g_catalog_mods.empty()) {
-        ImGui::TextDisabled("  %zu mods available  ·  categories: %zu  ·  live Raijin store · Raijin-format zip installs",
-                            g_catalog_mods.size(), g_catalog_categories.size());
+        ImGui::TextDisabled("  %zu mods available  |  %zu categories", g_catalog_mods.size(), g_catalog_categories.size());
     }
     ImGui::Spacing();
 
     if (!g_catalog_loaded || g_catalog_mods.empty()) {
+        float cw = ImGui::GetContentRegionAvail().x;
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.047f, 0.063f, 0.090f, 1.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14.0f);
-        float cw = ImGui::GetContentRegionAvail().x;
         ImGui::BeginChild("##mbempty", ImVec2(cw, 160), ImGuiChildFlags_Borders);
         ImGui::SetCursorPos(ImVec2((cw - 300) * 0.5f, 50));
-        ImGui::TextDisabled(ICON_FA_CLOUD "  Loading the mod catalog…");
-        ImGui::SetCursorPosX((cw - 360) * 0.5f + 20);
-        ImGui::TextDisabled("Fetching the live Raijin store (falls back to disk cache, then bundled demo).");
+        ImGui::TextDisabled(ICON_FA_CLOUD "  Loading the mod store...");
+        ImGui::SetCursorPosX((cw - 400) * 0.5f);
+        ImGui::TextDisabled("Fetching from the live Raijin store (falls back to disk cache, then bundled demo).");
         ImGui::EndChild();
         ImGui::PopStyleVar();
         ImGui::PopStyleColor();
         return;
     }
 
-    // Search + category row
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.063f, 0.082f, 0.120f, 1.0f));
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
-    ImGui::InputTextWithHint("##mbsearch", ICON_FA_MAGNIFYING_GLASS "  Search mods…",
-                             g_modbrowser_search, sizeof(g_modbrowser_search));
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(200.0f);
-    if (g_modbrowser_cat > (int)g_catalog_categories.size()) g_modbrowser_cat = 0;
-    {
-        std::vector<const char*> cats;
-        cats.push_back("All Categories");
-        for (const auto& c : g_catalog_categories) cats.push_back(c.c_str());
-        ImGui::Combo("##mbcat", &g_modbrowser_cat, cats.data(), (int)cats.size());
-    }
+    // Selected mod tracking (by index, resolved within the function)
+    static int g_selected_catalog_mod = -1;
 
-    ImGui::Spacing();
-
-    // Featured banner (first featured mod)
+    // ── Featured banner ───────────────────────────────────────────────────
     {
         const modman::StoreMod* feat = nullptr;
-        for (const auto& m : g_catalog_mods) {
-            if (m.featured) { feat = &m; break; }
+        int feat_idx = -1;
+        for (int i = 0; i < (int)g_catalog_mods.size(); i++) {
+            if (g_catalog_mods[i].featured) { feat = &g_catalog_mods[i]; feat_idx = i; break; }
         }
         if (feat) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             ImVec2 bp = ImGui::GetCursorScreenPos();
             float bw = ImGui::GetContentRegionAvail().x;
-            float bh = 92.0f;
-            dl->AddRectFilled(bp, ImVec2(bp.x + bw, bp.y + bh),
-                              IM_COL32(14, 20, 35, 255), 14.0f);
-            dl->AddRect(bp, ImVec2(bp.x + bw, bp.y + bh),
-                        IM_COL32(233, 69, 96, 60), 14.0f, 0, 1.5f);
-            dl->AddText(ImVec2(bp.x + 18, bp.y + 14),
-                        IM_COL32(233, 69, 96, 255), ICON_FA_STAR "  FEATURED");
+            float bh = 100.0f;
+            // Gradient background
+            dl->AddRectFilled(bp, ImVec2(bp.x + bw, bp.y + bh), IM_COL32(12, 18, 32, 255), 12.0f);
+            dl->AddRect(bp, ImVec2(bp.x + bw, bp.y + bh), IM_COL32(233, 69, 96, 80), 12.0f, 0, 2.0f);
+            // Featured icon
+            if (feat_idx >= 0 && g_catalog_icon_tex[feat_idx]) {
+                dl->AddImage((ImTextureID)(intptr_t)g_catalog_icon_tex[feat_idx],
+                             ImVec2(bp.x + 16, bp.y + 16), ImVec2(bp.x + 64, bp.y + 64));
+            }
+            float text_x = bp.x + (feat_idx >= 0 && g_catalog_icon_tex[feat_idx] ? 80 : 20);
+            dl->AddText(ImVec2(text_x, bp.y + 12), IM_COL32(233, 69, 96, 255), ICON_FA_STAR "  FEATURED");
             dl->AddText(nullptr, ImGui::GetFontSize() + 6.0f,
-                        ImVec2(bp.x + 18, bp.y + 34),
-                        IM_COL32(230, 237, 243, 255), feat->name.c_str());
-            dl->AddText(ImVec2(bp.x + 18, bp.y + 62),
-                        IM_COL32(139, 148, 158, 220),
-                        (feat->description.empty() ? feat->long_description
-                                                   : feat->description).c_str());
-            dl->AddText(ImVec2(bp.x + bw - 210, bp.y + 36),
-                        IM_COL32(88, 166, 255, 220),
-                        ("by " + feat->author + "  ·  v" + feat->version).c_str());
+                        ImVec2(text_x, bp.y + 34), IM_COL32(240, 240, 245, 255), feat->name.c_str());
+            dl->AddText(ImVec2(text_x, bp.y + 64), IM_COL32(150, 160, 175, 220),
+                        (feat->description.empty() ? feat->long_description : feat->description).c_str());
+            dl->AddText(ImVec2(bp.x + bw - 200, bp.y + 40), IM_COL32(88, 166, 255, 220),
+                        ("by " + feat->author + "  |  v" + feat->version).c_str());
+            // Click on banner to select
             ImGui::Dummy(ImVec2(0, bh + 8));
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && feat_idx >= 0) {
+                g_selected_catalog_mod = (g_selected_catalog_mod == feat_idx) ? -1 : feat_idx;
+            }
         }
     }
 
-    // Real mod cards grid
-    float cw = (ImGui::GetContentRegionAvail().x - 20) / 3.0f;
+    float detail_w = (g_selected_catalog_mod >= 0 && g_selected_catalog_mod < (int)g_catalog_mods.size()) ? 340.0f : 0.0f;
+    float gap = detail_w > 0 ? 10.0f : 0.0f;
+    float list_w = ImGui::GetContentRegionAvail().x - detail_w - gap;
+
+    // ── Mod cards grid ────────────────────────────────────────────────────
+    ImGui::BeginChild("##mb_grid", ImVec2(list_w, -40), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_AlwaysVerticalScrollbar);
+
+    float card_pad = 10.0f;
+    float avail_w = ImGui::GetContentRegionAvail().x;
+    int cols = 2;
+    if (avail_w > 900) cols = 3;
+    if (avail_w < 500) cols = 1;
+    float card_w = (avail_w - card_pad * (cols - 1)) / cols;
+
     int shown = 0;
     for (int i = 0; i < (int)g_catalog_mods.size(); i++) {
         const modman::StoreMod& m = g_catalog_mods[i];
 
-        // Search + category filter
+        // Filter
         if (g_modbrowser_cat > 0) {
-            std::string cat = m.category;
             std::string want = g_catalog_categories[g_modbrowser_cat - 1];
-            if (cat != want) continue;
+            if (m.category != want) continue;
         }
         if (strlen(g_modbrowser_search) > 0) {
             std::string s = g_modbrowser_search;
@@ -2107,123 +2337,290 @@ static void DrawModBrowserPage() {
             std::transform(d.begin(), d.end(), d.begin(), ::tolower);
             if (n.find(s) == std::string::npos && d.find(s) == std::string::npos) continue;
         }
-        if (shown % 3 != 0) ImGui::SameLine();
+
+        if (shown % cols != 0) ImGui::SameLine(0, card_pad);
         shown++;
 
+        bool is_sel = (g_selected_catalog_mod == i);
         bool installed = (g_catalog_state[i] == 2);
-        ImVec4 bg_col = installed
-            ? ImVec4(0.063f, 0.088f, 0.114f, 1.0f)
-            : ImVec4(0.047f, 0.063f, 0.090f, 1.0f);
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, bg_col);
-        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
-        ImGui::PushID(i + 1000);
-        ImGui::BeginChild("##mcard", ImVec2(cw, 150), ImGuiChildFlags_Borders);
 
-        // Lazily promote a downloaded icon PNG into a GL texture
+        // Card background
+        ImVec4 bg = is_sel ? ImVec4(0.10f, 0.14f, 0.24f, 1.0f)
+                   : installed ? ImVec4(0.05f, 0.07f, 0.11f, 1.0f)
+                   : ImVec4(0.04f, 0.055f, 0.085f, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.10f, 0.13f, 0.18f, 0.80f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 10.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 10));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, is_sel ? 2.0f : 1.0f);
+        ImGui::PushID(i + 3000);
+
+        float card_h = 150.0f;
+        ImGui::BeginChild(("##mcard" + std::to_string(i)).c_str(),
+                          ImVec2(card_w, card_h), ImGuiChildFlags_Borders);
+
+        // Draw-list: left accent bar only (no separate rect border — child border handles it)
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 wp = ImGui::GetWindowPos();
+        ImVec2 ws = ImGui::GetWindowSize();
+        ImU32 accent = installed ? IM_COL32(50, 180, 70, 255) : IM_COL32(60, 130, 220, 255);
+        if (is_sel) accent = installed ? IM_COL32(80, 230, 100, 255) : IM_COL32(100, 170, 255, 255);
+        dl->AddRectFilled(ImVec2(wp.x, wp.y), ImVec2(wp.x + 4, wp.y + ws.y), accent, 2.0f);
+        if (is_sel) {
+            // Override child border color to accent for selected cards
+            ImGui::PopStyleColor(); // pop generic border color
+            ImU32 bc = installed ? IM_COL32(80, 230, 100, 200) : IM_COL32(100, 170, 255, 200);
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4((bc >> 0) / 255.0f, (bc >> 8) / 255.0f,
+                                                          (bc >> 16) / 255.0f, (bc >> 24) / 255.0f));
+        }
+
+        // Icon (draw-list only — no nested BeginChild, no boundary errors)
         if (!g_catalog_icon_tex[i] && !g_catalog_icon_paths[i].empty()) {
             std::error_code ec2;
             if (fs::exists(g_catalog_icon_paths[i], ec2) &&
-                fs::file_size(g_catalog_icon_paths[i], ec2) > 0) {
-                g_catalog_icon_tex[i] =
-                    LoadTextureFromFile(g_catalog_icon_paths[i].c_str(), nullptr, nullptr);
+                fs::file_size(g_catalog_icon_paths[i], ec2) > 0)
+                g_catalog_icon_tex[i] = LoadTextureFromFile(g_catalog_icon_paths[i].c_str(), nullptr, nullptr);
+        }
+        ImVec2 icon_pos = ImGui::GetCursorScreenPos();
+        if (g_catalog_icon_tex[i]) {
+            dl->AddImage((ImTextureID)(intptr_t)g_catalog_icon_tex[i],
+                         icon_pos, ImVec2(icon_pos.x + 44, icon_pos.y + 44));
+        } else {
+            // Draw placeholder icon directly on draw-list (no nested child!)
+            dl->AddRectFilled(icon_pos, ImVec2(icon_pos.x + 44, icon_pos.y + 44),
+                              IM_COL32(25, 30, 45, 200), 6.0f);
+            dl->AddText(ImVec2(icon_pos.x + 12, icon_pos.y + 14),
+                        IM_COL32(70, 90, 130, 200), ICON_FA_PUZZLE_PIECE);
+        }
+        ImGui::Dummy(ImVec2(44, 44));
+
+        // Name + author — to the right of icon
+        ImGui::SameLine();
+        ImGui::BeginGroup();
+        {
+            ImGui::Text("%s", m.name.c_str());
+            ImGui::TextDisabled("v%s  by %s", m.version.c_str(),
+                                m.author.empty() ? "Unknown" : m.author.c_str());
+        }
+        ImGui::EndGroup();
+
+        // Category badge (top-right, draw-list overlay)
+        if (!m.category.empty()) {
+            ImVec2 csz = ImGui::CalcTextSize(m.category.c_str());
+            float badge_x = wp.x + ws.x - csz.x - 16;
+            dl->AddRectFilled(ImVec2(badge_x, wp.y + 8),
+                              ImVec2(badge_x + csz.x + 10, wp.y + 8 + csz.y + 4),
+                              IM_COL32(35, 45, 65, 220), 5.0f);
+            dl->AddText(ImVec2(badge_x + 5, wp.y + 10),
+                        IM_COL32(140, 160, 200, 240), m.category.c_str());
+        }
+
+        ImGui::Spacing();
+
+        // Description (wraps to card width)
+        std::string desc = m.description.empty() ? m.long_description : m.description;
+        if (!desc.empty()) {
+            ImGui::PushTextWrapPos(wp.x + ws.x - 10);
+            ImGui::TextDisabled("%s", desc.c_str());
+            ImGui::PopTextWrapPos();
+        }
+
+        // Small spacer before button (only if room left, no big gap)
+        float remaining = ws.y - ImGui::GetCursorPosY() - 30;
+        if (remaining > 4.0f)
+            ImGui::Dummy(ImVec2(0, remaining > 20.0f ? 20.0f : remaining));
+
+        // Action button (cursor-based, full width)
+        float btn_w = ws.x - 24;
+        if (g_catalog_state[i] == 0) {
+            ImVec4 btn_col = installed ? ImVec4(0.13f, 0.16f, 0.22f, 0.8f) : ImVec4(0.24f, 0.72f, 0.31f, 1.0f);
+            ImVec4 btn_hov = installed ? ImVec4(0.13f, 0.16f, 0.22f, 0.8f) : ImVec4(0.30f, 0.85f, 0.40f, 1.0f);
+            ImVec4 btn_act = installed ? ImVec4(0.13f, 0.16f, 0.22f, 0.8f) : ImVec4(0.18f, 0.58f, 0.25f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button, btn_col);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, btn_hov);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, btn_act);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+            if (installed) {
+                ImGui::Button((ICON_FA_CHECK "  Installed##" + std::to_string(i)).c_str(), ImVec2(btn_w, 26));
+            } else {
+                if (ImGui::Button((ICON_FA_DOWNLOAD "  Install##" + std::to_string(i)).c_str(), ImVec2(btn_w, 26))) {
+                    InstallStoreMod(i);
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(m.download_url.empty()
+                        ? "No download link. Install the mod zip from the Mods page."
+                        : "Download & install this mod");
             }
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(3);
+        } else if (g_catalog_state[i] == 1) {
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.914f, 0.271f, 0.376f, 1.0f));
+            char pt[32]; snprintf(pt, sizeof(pt), "%d%%", (int)(g_catalog_progress[i] * 100));
+            ImGui::ProgressBar(g_catalog_progress[i], ImVec2(btn_w, 24), pt);
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar();
+        } else if (g_catalog_state[i] == 3) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 0.9f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.82f, 0.20f, 0.20f, 1.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+            if (ImGui::Button((ICON_FA_ARROWS_ROTATE "  Retry##" + std::to_string(i)).c_str(), ImVec2(btn_w, 24)))
+                g_catalog_state[i] = 0;
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(2);
+            if (!g_catalog_fail_reason[i].empty() && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", g_catalog_fail_reason[i].c_str());
         }
 
-        const bool has_icon = g_catalog_icon_tex[i] != 0;
-        const float text_x = has_icon ? 62.0f : 12.0f;
-        if (has_icon) {
-            ImGui::SetCursorPos(ImVec2(10, 10));
-            ImGui::Image((ImTextureID)(intptr_t)g_catalog_icon_tex[i], ImVec2(44, 44));
-            ImGui::SetCursorPosX(text_x);
+        // Click to select
+        ImVec2 mpos = ImGui::GetIO().MousePos;
+        bool mouse_over = (mpos.x >= wp.x && mpos.x <= wp.x + ws.x &&
+                           mpos.y >= wp.y && mpos.y <= wp.y + ws.y);
+        if (mouse_over && ImGui::IsMouseClicked(0)) {
+            g_selected_catalog_mod = (g_selected_catalog_mod == i) ? -1 : i;
         }
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.914f, 0.271f, 0.376f, 0.85f));
-        ImGui::Text("%s", m.category.c_str());
-        ImGui::PopStyleColor();
-        if (m.featured) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.82f, 0.60f, 0.13f, 1.0f), ICON_FA_STAR); }
 
-        ImGui::SetCursorPosX(text_x);
+        ImGui::EndChild();
+        ImGui::PopStyleVar(3); // ChildRounding, WindowPadding, ChildBorderSize
+        ImGui::PopStyleColor(2); // ChildBg, Border
+        ImGui::PopID();
+
+        if (shown % cols != 0 && i < (int)g_catalog_mods.size() - 1) continue;
+    }
+
+    if (shown == 0) {
+        float cw = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPos(ImVec2(cw * 0.5f - 80, 60));
+        ImGui::TextDisabled("No mods match your search");
+    }
+    ImGui::EndChild();
+
+    // ── Detail panel (right side) ─────────────────────────────────────────
+    if (detail_w > 0) {
+        ImGui::SameLine();
+        const modman::StoreMod& m = g_catalog_mods[g_selected_catalog_mod];
+        int si = g_selected_catalog_mod;
+
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.05f, 0.065f, 0.10f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 10.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14, 14));
+        ImGui::BeginChild("##mb_detail", ImVec2(detail_w, -40), ImGuiChildFlags_Borders);
+
+        // Header
+        if (g_catalog_icon_tex[si]) {
+            ImGui::Image((ImTextureID)(intptr_t)g_catalog_icon_tex[si], ImVec2(56, 56));
+            ImGui::SameLine();
+        }
         if (g_font_heading) ImGui::PushFont(g_font_heading);
-        ImGui::Text("%s", m.name.c_str());
+        ImGui::TextWrapped("%s", m.name.c_str());
         if (g_font_heading) ImGui::PopFont();
+        ImGui::TextDisabled("by %s  |  v%s", m.author.empty() ? "Unknown" : m.author.c_str(), m.version.c_str());
 
-        ImGui::SetCursorPosX(text_x);
-        ImGui::TextDisabled("by %s  ·  v%s", m.author.empty() ? "Unknown" : m.author.c_str(),
-                            m.version.c_str());
-        ImGui::SetCursorPosX(text_x);
+        if (!m.category.empty()) {
+            ImGui::TextColored(ImVec4(0.914f, 0.271f, 0.376f, 0.85f), "%s", m.category.c_str());
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Description
+        ImGui::TextWrapped("%s", (!m.description.empty() ? m.description : m.long_description).c_str());
+
+        // Stats
         if (m.rating > 0 || m.installs > 0) {
-            ImGui::TextDisabled(ICON_FA_STAR " %.1f  ·  %s installs", m.rating,
+            ImGui::Spacing();
+            ImGui::TextDisabled(ICON_FA_STAR " %.1f rating  |  %s installs", m.rating,
                                 m.installs >= 1000
                                     ? (std::to_string(m.installs / 1000) + "k").c_str()
                                     : std::to_string(m.installs).c_str());
-        } else {
-            ImGui::TextDisabled("%s", m.description.c_str());
         }
 
-        // Action button
-        ImGui::SetCursorPos(ImVec2(12, 112));
-        if (g_catalog_state[i] == 0) {
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.24f, 0.72f, 0.31f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.85f, 0.40f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.18f, 0.58f, 0.25f, 1.0f));
-            if (ImGui::Button((ICON_FA_DOWNLOAD "  Install##" + std::to_string(i)).c_str(),
-                              ImVec2(cw - 24, 28))) {
-                InstallStoreMod(i);
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Action button (full width)
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 8));
+        if (g_catalog_state[si] == 0) {
+            bool inst = false;
+            for (auto& lm : g_mods) { if (lm.id == m.id) { inst = true; break; } }
+            if (inst) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 0.85f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.82f, 0.20f, 0.20f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.60f, 0.12f, 0.12f, 1.0f));
+                if (ImGui::Button(ICON_FA_TRASH "  Uninstall", ImVec2(-1, 36))) {
+                    for (auto& lm : g_mods) {
+                        if (lm.id == m.id) {
+                            modman::delete_mod(modman::ModMeta{ lm.id, lm.name, lm.version, lm.author,
+                                                                lm.description, lm.category, lm.type,
+                                                                {}, lm.dir_path, lm.icon_path,
+                                                                lm.enabled, lm.is_toml });
+                            g_catalog_state[si] = 0;
+                            g_mods_scanned = false;
+                            break;
+                        }
+                    }
+                }
+                ImGui::PopStyleColor(3);
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.24f, 0.72f, 0.31f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.85f, 0.40f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.18f, 0.58f, 0.25f, 1.0f));
+                if (ImGui::Button(ICON_FA_DOWNLOAD "  Install", ImVec2(-1, 36))) {
+                    InstallStoreMod(si);
+                }
+                ImGui::PopStyleColor(3);
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(m.download_url.empty()
-                    ? "Demo entry — no download link in this catalog.\nInstall the mod zip from the Mods page instead."
-                    : "Download & install this mod (zip → mods/<id>/)");
-            ImGui::PopStyleColor(3);
-        } else if (g_catalog_state[i] == 1) {
+        } else if (g_catalog_state[si] == 1) {
             ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.914f, 0.271f, 0.376f, 1.0f));
-            char pt[32];
-            snprintf(pt, sizeof(pt), "Downloading %d%%", (int)(g_catalog_progress[i] * 100));
-            ImGui::ProgressBar(g_catalog_progress[i], ImVec2(cw - 24, 28), pt);
+            char pt[32]; snprintf(pt, sizeof(pt), "Downloading %d%%", (int)(g_catalog_progress[si] * 100));
+            ImGui::ProgressBar(g_catalog_progress[si], ImVec2(-1, 32), pt);
             ImGui::PopStyleColor();
-        } else if (g_catalog_state[i] == 3) {
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.55f, 0.16f, 0.16f, 0.9f));
+        } else if (g_catalog_state[si] == 3) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 0.9f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.82f, 0.20f, 0.20f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.60f, 0.12f, 0.12f, 1.0f));
-            if (ImGui::Button((ICON_FA_ARROWS_ROTATE "  Retry##" + std::to_string(i)).c_str(),
-                              ImVec2(cw - 24, 28))) {
-                g_catalog_state[i] = 0;
-            }
-            ImGui::PopStyleColor(3);
-            if (!g_catalog_fail_reason[i].empty() && ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", g_catalog_fail_reason[i].c_str());
+            if (ImGui::Button(ICON_FA_ARROWS_ROTATE "  Retry", ImVec2(-1, 36)))
+                g_catalog_state[si] = 0;
+            ImGui::PopStyleColor(2);
+            if (!g_catalog_fail_reason[si].empty())
+                ImGui::TextDisabled("%s", g_catalog_fail_reason[si].c_str());
         } else {
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.133f, 0.165f, 0.220f, 0.60f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.133f, 0.165f, 0.220f, 0.60f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.133f, 0.165f, 0.220f, 0.60f));
-            ImGui::Button((ICON_FA_CHECK "  Installed##" + std::to_string(i)).c_str(),
-                          ImVec2(cw - 24, 28));
-            ImGui::PopStyleColor(3);
-            ImGui::SameLine(cw - 58);
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.55f, 0.16f, 0.16f, 0.85f));
+            // Installed — show uninstall
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 0.85f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.82f, 0.20f, 0.20f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.60f, 0.12f, 0.12f, 1.0f));
-            if (ImGui::Button((ICON_FA_TRASH "##u" + std::to_string(i)).c_str())) {
-                // Uninstall: remove matching local mod dir
+            if (ImGui::Button(ICON_FA_TRASH "  Uninstall", ImVec2(-1, 36))) {
                 for (auto& lm : g_mods) {
                     if (lm.id == m.id) {
                         modman::delete_mod(modman::ModMeta{ lm.id, lm.name, lm.version, lm.author,
                                                             lm.description, lm.category, lm.type,
                                                             {}, lm.dir_path, lm.icon_path,
                                                             lm.enabled, lm.is_toml });
-                        g_catalog_state[i] = 0;
+                        g_catalog_state[si] = 0;
                         g_mods_scanned = false;
                         break;
                     }
                 }
             }
-            ImGui::PopStyleColor(3);
+            ImGui::PopStyleColor(2);
+        }
+        ImGui::PopStyleVar(2);
+
+        // Close button
+        ImGui::Spacing();
+        if (ImGui::Button(ICON_FA_XMARK "  Close", ImVec2(-1, 0))) {
+            g_selected_catalog_mod = -1;
         }
 
         ImGui::EndChild();
-        ImGui::PopID();
-        ImGui::PopStyleVar();
+        ImGui::PopStyleVar(2);
         ImGui::PopStyleColor();
     }
+
+    // ── Footer ────────────────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::TextDisabled("Click a mod card to see details. Install from the detail panel or the card button.");
 
     // Poll background install jobs
     for (int i = 0; i < (int)g_catalog_jobs.size(); i++) {
@@ -2234,8 +2631,7 @@ static void DrawModBrowserPage() {
                 g_catalog_state[i] = 2;
                 g_catalog_progress[i] = 1.0f;
                 g_mods_scanned = false;
-                auto mask = modman::catalog_installed_mask(g_catalog_mods,
-                                                           get_user_data_dir() + "/mods");
+                auto mask = modman::catalog_installed_mask(g_catalog_mods, get_user_data_dir() + "/mods");
                 g_catalog_installed = std::move(mask);
             } else {
                 g_catalog_state[i] = 3;
@@ -2244,8 +2640,6 @@ static void DrawModBrowserPage() {
         }
     }
 }
-
-
 // =============================================================================
 // Profile page — real save stats + skin selector
 // =============================================================================
@@ -2307,7 +2701,13 @@ static void DrawProfilePage() {
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.24f, 0.72f, 0.31f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.85f, 0.40f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.18f, 0.58f, 0.25f, 1.0f));
-            if (ImGui::Button(ICON_FA_CHECK "  Save", ImVec2(90, 30))) g_profile_editing = false;
+            if (ImGui::Button(ICON_FA_CHECK "  Save", ImVec2(90, 30))) {
+                g_profile_editing = false;
+                // Persist username to launcher.toml
+                LauncherConfig lc = launcher_config_load();
+                lc.profile_name = g_profile_username;
+                launcher_config_save(lc);
+            }
             ImGui::PopStyleColor(3);
             ImGui::SameLine();
             PushSecondaryBtn();
@@ -2503,6 +2903,26 @@ static void DrawSettingsPage() {
     ImGui::Spacing();
 
     if (ImGui::BeginTabBar("SettingsTabs")) {
+        // ── Profile tab ──────────────────────────────────────────────────────────
+        if (ImGui::BeginTabItem(ICON_FA_USER "  Profile")) {
+            ImGui::Spacing();
+            ImGui::Text("Player Name");
+            ImGui::SetNextItemWidth(240);
+            ImGui::InputText("##settings_uname", g_profile_username, sizeof(g_profile_username));
+            ImGui::TextDisabled("   Display name shown in the sidebar and launcher.");
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.24f, 0.72f, 0.31f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.85f, 0.40f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.18f, 0.58f, 0.25f, 1.0f));
+            if (ImGui::Button(ICON_FA_CHECK "  Save Profile", ImVec2(160, 32))) {
+                LauncherConfig lc = launcher_config_load();
+                lc.profile_name = g_profile_username;
+                launcher_config_save(lc);
+            }
+            ImGui::PopStyleColor(3);
+            ImGui::EndTabItem();
+        }
+
         // ── Graphics tab ─────────────────────────────────────────────────────────
         if (ImGui::BeginTabItem(ICON_FA_PAINT_BRUSH "  Graphics")) {
             ImGui::Spacing();
@@ -2603,6 +3023,62 @@ static void DrawSettingsPage() {
             ImGui::Spacing();
             ImGui::TextDisabled(ICON_FA_CIRCLE_INFO
                 "  These values will be forwarded to the audio backend in a future update.");
+            ImGui::EndTabItem();
+        }
+
+        // ── Loading Screen tab ─────────────────────────────────────────────────
+        if (ImGui::BeginTabItem(ICON_FA_IMAGE "  Loading Screen")) {
+            ImGui::Spacing();
+            static bool slideshow_enabled = false;
+            static bool slideshow_loaded = false;
+            static bool slideshow_persistent = false;
+            if (!slideshow_loaded) {
+                // Load persistent setting from INI
+                std::string ini_path = get_user_data_dir() + "/settings.ini";
+                std::ifstream ini(ini_path);
+                if (ini.is_open()) {
+                    std::string line;
+                    while (std::getline(ini, line)) {
+                        if (line.find("loading_slideshow") != std::string::npos)
+                            slideshow_enabled = (line.find("=true") != std::string::npos || line.find("=1") != std::string::npos);
+                    }
+                }
+                slideshow_loaded = true;
+            }
+
+            ImGui::Text(ICON_FA_IMAGE "  Background Slideshow");
+            ImGui::TextDisabled("   Cycles through in-game scenery backgrounds every 6 seconds on the boot loading screen.");
+            ImGui::Spacing();
+            if (ImGui::Checkbox("Enable background slideshow", &slideshow_enabled)) {
+                // Save to INI
+                std::string ini_path = get_user_data_dir() + "/settings.ini";
+                std::string content;
+                { std::ifstream ini(ini_path); if (ini.is_open()) content.assign(std::istreambuf_iterator<char>(ini), std::istreambuf_iterator<char>()); }
+                // Replace or append
+                std::string key = "loading_slideshow";
+                std::string val = slideshow_enabled ? "true" : "false";
+                bool found = false;
+                std::istringstream iss(content);
+                std::string new_content, line;
+                while (std::getline(iss, line)) {
+                    if (line.find(key + "=") != std::string::npos) {
+                        new_content += key + "=" + val + "\n";
+                        found = true;
+                    } else {
+                        new_content += line + "\n";
+                    }
+                }
+                if (!found) new_content += key + "=" + val + "\n";
+                std::ofstream out(ini_path);
+                if (out.is_open()) out << new_content;
+            }
+            ImGui::Spacing();
+            ImGui::Text(ICON_FA_IMAGE "  Logo Source");
+            ImGui::TextDisabled("   The loading screen now shows the Swordfare Desktop icon (icon_app.png)");
+            ImGui::TextDisabled("   instead of the vanilla Swordigo title logo.");
+            ImGui::Spacing();
+            ImGui::Text(ICON_FA_PERSON_RUNNING "  Hiro Animation");
+            ImGui::TextDisabled("   Fixed: hiro is now smaller (38% of screen) and positioned at the bottom.");
             ImGui::EndTabItem();
         }
 
@@ -2925,6 +3401,14 @@ LaunchConfig show_launcher(BinarySelector& selector) {
     g_save_status.clear();
     g_confirm_delete  = false;
     g_delete_target_idx = -1;
+
+    // Load persistent config (profile name, accent color, mod order, etc.)
+    {
+        LauncherConfig lc = launcher_config_load();
+        if (!lc.profile_name.empty()) {
+            strncpy(g_profile_username, lc.profile_name.c_str(), sizeof(g_profile_username) - 1);
+        }
+    }
 
     // Pre-select default binary
     const auto& bins = selector.get_binaries();
@@ -3705,6 +4189,18 @@ LaunchConfig show_launcher(BinarySelector& selector) {
             cfg.selected_binary = final_bins[bin_sel].filepath;
             cfg.assets_dir = final_bins[bin_sel].assets_dir;
             cfg.game_type = final_bins[bin_sel].game_type;
+        }
+        // Pass the top-priority mod from the config load order to VFS pre-init.
+        // Always load fresh from disk to reflect any UI changes (enable/disable/reorder).
+        {
+            LauncherConfig fresh_cfg = launcher_config_load();
+            if (!fresh_cfg.mod_load_order.empty()) {
+                cfg.selected_mod = fresh_cfg.mod_load_order[0];
+                std::cout << "[Launcher] Primary VFS mod: " << cfg.selected_mod
+                          << " (" << fresh_cfg.mod_load_order.size() << " mod(s) in load order)" << std::endl;
+            } else {
+                std::cout << "[Launcher] No mods in load order — vanilla mode" << std::endl;
+            }
         }
     }
 

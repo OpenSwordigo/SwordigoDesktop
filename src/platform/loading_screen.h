@@ -5,8 +5,8 @@
 // A self-contained loading screen rendered on the MAIN game window's existing
 // OpenGL 2.1 compatibility context (the same one Display::init creates). It is
 // shown in the gap between window creation and the game's first rendered frame
-// (ELF load → relocate → symbol resolve → applicationDidBecomeActive), which is
-// otherwise a blank/disappeared window.
+// (ELF load → relocate → symbol resolve → applicationDidBecomeActive), which
+// is otherwise a blank/disappeared window.
 //
 // It renders, via Dear ImGui on top of a GL-cleared frame:
 //   * the Swordigo Desktop logo + wordmark,
@@ -53,6 +53,7 @@ public:
     // Thread-safe progress reporting from the boot thread.
     void set_progress(float p01);                 // clamped 0..1
     void set_stage(const std::string& stage);     // e.g. "Relocating symbols"
+    void set_slideshow_mode(bool enabled) { bg_slideshow_mode_ = enabled; }
 
     // Mark the boot as finished; the caller should stop calling frame() after.
     void finish();
@@ -101,6 +102,10 @@ private:
     unsigned int bg_tex_   = 0;
     int          bg_w_     = 0;
     int          bg_h_     = 0;
+    // Slideshow: cycle backgrounds every few seconds.
+    int    bg_slideshow_idx_ = 0;  // current index in kBackgrounds
+    double bg_slideshow_next_ = 0; // next swap time
+    bool   bg_slideshow_mode_ = false; // true = cycle, false = single static
 
     // Soft glow sprite used behind the logo / on the progress fill.
     unsigned int spark_tex_ = 0;

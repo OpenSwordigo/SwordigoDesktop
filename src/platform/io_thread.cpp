@@ -6,6 +6,8 @@
 #include <atomic>
 #include <cstdio>
 #include <iostream>
+#include <string>
+#include <sys/stat.h>   // for mkdir()
 
 struct IOJob {
     enum Type { SAVE, LOAD };
@@ -44,6 +46,28 @@ static void io_thread_loop() {
         }
 
         if (job.type == IOJob::SAVE) {
+            // Auto-create parent directories so paths like
+            // save/snapshots/ss.bin succeed even if the snapshots/ dir
+            // was never explicitly created (e.g. first boot).
+            {
+                std::string dir = job.path;
+                auto pos = dir.find_last_of('/');
+                if (pos != std::string::npos) {
+                    dir = dir.substr(0, pos);
+                    // Walk up and create each component
+                    for (size_t i = 1; i <= dir.size(); ++i) {
+                        if (i == dir.size() || dir[i] == '/') {
+                            std::string component = dir.substr(0, i);
+                            // mkdir() is idempotent on existing dirs
+#ifdef _WIN32
+                            ::mkdir(component.c_str());
+#else
+                            ::mkdir(component.c_str(), 0755);
+#endif
+                        }
+                    }
+                }
+            }
             FILE* f = fopen(job.path.c_str(), "wb");
             if (f) {
                 if (!job.data.empty()) {

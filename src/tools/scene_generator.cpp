@@ -407,17 +407,21 @@ std::string build_light_object(const std::string& name, float x, float y, float 
     return scene_wrap_object(obj);
 }
 
-// SpawnPoint — SpawnPointComponent payload 4010, FacingDirection field 8.
+// SpawnPoint — byte-exact wire format verified against the raw forest_part1
+// bytes (spawn_from_forest_cave0): SpawnPointComponent payload f501 with
+// inner fields 1=FacingDirection (varint) and 2=SpawnOffset (Vector3).
+// (The old payload 4010 / fields 8+18 were the docs-scenecreator numbering
+// and the game could not read them — no spawn would appear.)
 std::string build_spawn_object(const std::string& name, float x, float y, int facing) {
     proto::Writer spc;
-    spc.write_varint_field(8, (uint64_t)facing);  // FacingDirection
+    spc.write_varint_field(1, (uint64_t)facing);  // FacingDirection
     proto::Writer off;
     off.write_float_field(1, 0.0f); off.write_float_field(2, 0.0f); off.write_float_field(3, 0.0f);
-    spc.write_nested_field(18, off);              // SpawnOffset
+    spc.write_nested_field(2, off);               // SpawnOffset
 
     proto::Writer obj;
     obj.write_string_field(2, name);
-    obj.write_bytes_field(3, component("SpawnPoint", 101, 4010, spc).to_string());
+    obj.write_bytes_field(3, component("SpawnPoint", 101, 501, spc).to_string());
     obj.write_nested_field(4, v2(x, y));
     obj.write_float_field(5, 0.0f);
     obj.write_float_field(6, 0.0f);
@@ -565,12 +569,10 @@ std::string build_deco_object_baked_legacy(const Deco& d, const std::string& nam
     wrapper.write_string_field(1, "Model");
     wrapper.write_varint_field(2, 101);
     wrapper.write_nested_field(101, payload);
-    proto::Writer comp;
-    comp.write_bytes_field(3, wrapper.to_string());
 
     proto::Writer obj;
     obj.write_string_field(2, name);
-    obj.write_bytes_field(3, comp.to_string());
+    obj.write_bytes_field(3, wrapper.to_string());  // component directly at f3
     obj.write_nested_field(4, v2(d.x, d.y));
     obj.write_float_field(5, d.z);                  // DEPTH: varies for parallax
     obj.write_float_field(6, d.rot_y);
@@ -630,6 +632,293 @@ std::string build_glow_light(const TorchLight& t, const std::string& name) {
     obj.write_nested_field(8, rect_msg(-30, -30, 60, 60));
     obj.write_varint_field(9, 0);
     return scene_wrap_object(obj);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Decorative portal hub (research-backed, byte-exact vs forest_part1)
+// ─────────────────────────────────────────────────────────────────────────
+
+// Functional portal object — byte-exact layout verified against the raw
+// forest_part1.scene bytes (obj14):
+//   Component 'Model'          id 1   payload f101 ModelComponent (no Name)
+//   Component 'CollisionShape' id 101 payload f120 ShapeComponent{Rectangle}
+//                                     + f121 CollisionShapeComponent
+//   Component 'Portal'         id 104 payload f500 PortalComponent
+// Object: f2 Identifier, f3 components, f4 Position, f5 Depth, f6 Rotation,
+//         f7 Scaling, f8 LocalAabb, f9 Hidden.
+static std::string build_portal_object_bytes(const std::string& name, float x, float y,
+                                             const std::string& destination) {
+    // Component 1: Model (id 1) — empty ModelComponent, exactly like vanilla.
+    proto::Writer model_pay;
+    model_pay.write_float_field(2, 0.0f);                     // YRotation
+    model_pay.write_float_field(3, 0.0f);                     // EmissionFactor
+    model_pay.write_float_field(4, 0.0f);                     // XRotation
+    model_pay.write_nested_field(5, float_color(0, 0, 0, 1)); // ShatterColor
+    model_pay.write_nested_field(6, v3(0, 0, 0));             // Origin
+    model_pay.write_varint_field(7, 0);                       // Transparent
+    model_pay.write_nested_field(8, float_color(1, 1, 1, 1)); // DiffuseColor
+    proto::Writer model_comp = component("Model", 1, 101, model_pay);
+
+    // Component 2: CollisionShape (id 101) — shape rect + collision props.
+    proto::Writer rect;
+    rect.write_float_field(1, -45.0f); rect.write_float_field(2, -200.0f);
+    rect.write_float_field(3, 90.0f);  rect.write_float_field(4, 400.0f);
+    proto::Writer shape_pay;
+    shape_pay.write_nested_field(1, rect);                    // ShapeComponent.Rectangle
+    proto::Writer coll_pay;
+    coll_pay.write_float_field(6, -15.0f);                    // MinDepth
+    coll_pay.write_float_field(7, 15.0f);                     // MaxDepth
+    coll_pay.write_varint_field(8, 2);                        // SpecialType = 2 (portal)
+    coll_pay.write_varint_field(11, 1);                       // Enabled
+    proto::Writer cs_comp;
+    cs_comp.write_string_field(1, "CollisionShape");
+    cs_comp.write_varint_field(2, 101);
+    cs_comp.write_nested_field(120, shape_pay);
+    cs_comp.write_nested_field(121, coll_pay);
+
+    // Component 3: Portal (id 104) — PortalComponent payload f500.
+    proto::Writer portal_pay;
+    portal_pay.write_string_field(1, destination);            // DestinationSceneName
+    portal_pay.write_string_field(2, "");                     // SpawnPointName (default)
+    portal_pay.write_varint_field(3, 0);                      // TapToEnter
+    portal_pay.write_varint_field(4, 101);                    // TriggerShapeId → CollisionShape
+    proto::Writer portal_comp = component("Portal", 104, 500, portal_pay);
+
+    proto::Writer obj;
+    obj.write_string_field(2, name);
+    obj.write_bytes_field(3, model_comp.to_string());
+    obj.write_bytes_field(3, cs_comp.to_string());
+    obj.write_bytes_field(3, portal_comp.to_string());
+    obj.write_nested_field(4, v2(x, y));
+    obj.write_float_field(5, 0.0f);
+    obj.write_float_field(6, 0.0f);
+    obj.write_float_field(7, 1.0f);
+    obj.write_nested_field(8, rect_msg(-45, -200, 90, 400));
+    obj.write_varint_field(9, 0);
+    return scene_wrap_object(obj);
+}
+
+// Visual portal FX — TemplateName 'portal' (game_common.scl). The engine
+// instantiates the swirling portal quad + PortalEffect from the template.
+// Vanilla forest_part1: AABB -100.2/-0.7/202.2/155.4, Depth 0, anchor below
+// the functional portal so the FX quad centers on it.
+static std::string build_portal_fx_object(const std::string& name, float x, float y) {
+    proto::Writer obj;
+    obj.write_string_field(1, "portal");                 // TemplateName
+    obj.write_string_field(2, name);                     // Identifier
+    obj.write_nested_field(4, v2(x, y));
+    obj.write_float_field(5, 0.0f);
+    obj.write_float_field(6, 0.0f);
+    obj.write_float_field(7, 1.0f);
+    obj.write_nested_field(8, rect_msg(-100.2f, -0.7f, 202.2f, 155.4f));
+    obj.write_varint_field(9, 0);
+    return scene_wrap_object(obj);
+}
+
+// Per-biome "brick mesh" palettes for the portal hub, taken from real scene
+// evidence: forest_part1 bakes stoneblock/stonepillair/stoneplatform/treewall
+// clusters at foreground depth +47..+57; fire_part31 uses template
+// 'stonepillairs2/3'; grove uses grove_pole*/grove_hang*/grove_platform1;
+// wasteland has wasteland_ruin1/2. Each entry is {name, template|pod}:
+//   template=true → TemplateName reference (name exists in a library)
+//   template=false → baked Model object (name is a POD the engine loads directly)
+struct HubBrick { const char* name; bool is_template; };
+// NOTE: the flat stoneplatform/stoneplatform_white slabs are deliberately NOT
+// in the palettes — they read as a "mount" and cover the sign/arrow bar next
+// to the portal (user feedback). Only upright blocks/pillars/walls are used.
+static const HubBrick* hub_brick_palette(Biome b, int* count) {
+    static const HubBrick kForest[] = {
+        {"stoneblock", false}, {"stonepillair", false},
+        {"treewall2", false}, {"bush", true}, {"smallrock1", true},
+    };
+    static const HubBrick kGrass[] = {
+        {"stonepile", true}, {"pot", true}, {"rock1", true},
+        {"bush", true}, {"smallrock1", true},
+    };
+    static const HubBrick kGrove[] = {
+        {"grove_pole1", true}, {"grove_pole2", true}, {"grove_platform1", true},
+        {"grove_hang3", true}, {"grove_hang4", true}, {"bush", true},
+    };
+    static const HubBrick kWasteland[] = {
+        {"wasteland_ruin1", false}, {"wasteland_ruin2", false}, {"deadtree1", true},
+        {"deadtree2", true}, {"rock1", true}, {"stonepile", true},
+    };
+    static const HubBrick kIce[] = {
+        {"stoneblock_white", false}, {"stonepillair_white", false},
+        {"icicles1", true}, {"snowy_tree1", false},
+    };
+    static const HubBrick kCave[] = {
+        {"rock1", true}, {"rock2", true}, {"icicle", false},
+        {"icicles1", true}, {"stonepile", true},
+    };
+    static const HubBrick kFire[] = {
+        {"stonepillairs2", true}, {"stonepillairs3", true}, {"stonepillairs4", true},
+        {"stoneblock", false}, {"rock1", true},
+    };
+    static const HubBrick kFlorennum[] = {
+        {"pottery1", false}, {"pottery2", false}, {"stonepillair", false},
+        {"pot", true}, {"stonepile", true},
+    };
+    switch (b) {
+        case Biome::Forest:   *count = (int)(sizeof(kForest)/sizeof(kForest[0]));   return kForest;
+        case Biome::Grove:    *count = (int)(sizeof(kGrove)/sizeof(kGrove[0]));     return kGrove;
+        case Biome::Wasteland:*count = (int)(sizeof(kWasteland)/sizeof(kWasteland[0])); return kWasteland;
+        case Biome::IceCastle:*count = (int)(sizeof(kIce)/sizeof(kIce[0]));         return kIce;
+        case Biome::Cave:     *count = (int)(sizeof(kCave)/sizeof(kCave[0]));       return kCave;
+        case Biome::Fire:     *count = (int)(sizeof(kFire)/sizeof(kFire[0]));       return kFire;
+        case Biome::Florennum:*count = (int)(sizeof(kFlorennum)/sizeof(kFlorennum[0])); return kFlorennum;
+        default:              *count = (int)(sizeof(kGrass)/sizeof(kGrass[0]));     return kGrass;
+    }
+}
+
+// Shared decoration ring around any portal: sign + per-biome brick/stone
+// ruin cluster + shrubs + torches. `flanking` places two torches symmetrically
+// at ±75 (exactly like the vanilla 'portal' template's portal_torch_left/right)
+// instead of a single torch.
+static void append_portal_cluster(std::vector<std::string>& out,
+                                  const PortalHubOptions& o, Biome biome,
+                                  uint64_t& rng, bool flanking) {
+    const std::string base = o.portal_name.empty() ? "portal" : o.portal_name;
+    const float dir = (float)o.facing;
+
+    // Sign pointing back at the portal (background depth, like vanilla
+    // sign_left1 at depth -98.7 near its portal).
+    const float sign_x = o.x + 150.0f * dir;
+    {
+        const char* sign = (o.facing > 0) ? "sign_left" : "sign_right";
+        out.push_back(build_template_object(base + "_sign", sign,
+                                            sign_x, o.y - 25.0f,
+                                            -30.0f, 0.0f, 1.0f));
+    }
+
+    // Brick/stone ruin cluster ringing the portal. Real scenes surround
+    // portals with 6-10 stone meshes at foreground depth (+40..+60) plus a few
+    // background (-90..-20) accents. Bricks are kept clear of the sign so it
+    // stays visible.
+    int nbr = 0;
+    const HubBrick* palette = hub_brick_palette(biome, &nbr);
+    if (nbr > 0) {
+        const int ring = 6 + (int)(rng_float(rng, 0.0f, 4.0f));   // 6..9 bricks
+        for (int i = 0; i < ring; ++i) {
+            const HubBrick& hb = palette[(uint32_t)(rng_next(rng) % (uint64_t)nbr)];
+            Deco d;
+            // Ring around the portal: alternate sides, spread 55..240 units.
+            const float side = (i % 2 == 0) ? 1.0f : -1.0f;
+            d.x = o.x + side * rng_float(rng, 55.0f, 240.0f);
+            // Never cover the sign/arrow bar with a brick.
+            if (std::fabs(d.x - sign_x) < 85.0f) d.x = o.x - side * rng_float(rng, 55.0f, 240.0f);
+            d.y = o.y + rng_float(rng, -6.0f, 6.0f);
+            // Foreground ~65% (+40..+62), background ~35% (-90..-20).
+            d.z = (rng_float(rng, 0.0f, 1.0f) < 0.65f)
+                ? rng_float(rng, 40.0f, 62.0f)
+                : rng_float(rng, -90.0f, -20.0f);
+            d.scale = 0.85f + rng_float(rng, 0.0f, 0.75f);
+            d.rot_y = 0.0f;
+            d.pod   = hb.name;
+            d.name  = base + "_brick" + std::to_string(i + 1);
+            std::string bytes;
+            if (hb.is_template) {
+                bytes = build_template_object(d.name, d.pod, d.x, d.y, d.z, d.rot_y, d.scale);
+            } else {
+                // Baked Model object — how vanilla emits POD-only stone meshes.
+                bytes = build_deco_object_baked_legacy(d, d.name);
+            }
+            if (!bytes.empty()) out.push_back(bytes);
+        }
+    }
+
+    // Bushes/rocks right at the portal mouth.
+    for (int i = 0; i < 3; ++i) {
+        const char* shrub = (i == 1) ? "rock1" : "bush";
+        Deco d;
+        d.x = o.x + dir * rng_float(rng, 30.0f, 90.0f) * (i == 2 ? -1.0f : 1.0f);
+        d.y = o.y + rng_float(rng, -3.0f, 3.0f);
+        d.z = rng_float(rng, 25.0f, 55.0f);
+        d.scale = 0.7f + rng_float(rng, 0.0f, 0.5f);
+        d.rot_y = 0.0f;
+        d.pod   = shrub;
+        d.name  = base + "_shrub" + std::to_string(i + 1);
+        const std::string bytes = build_template_object(d.name, d.pod, d.x, d.y, d.z, d.rot_y, d.scale);
+        if (!bytes.empty()) out.push_back(bytes);
+    }
+
+    // Torches: either one torch opposite the sign, or two flanking the portal
+    // at ±75 (vanilla portal template: portal_torch_left/right at ±75/+40/-70).
+    if (flanking) {
+        for (int i = 0; i < 2; ++i) {
+            TorchLight tl;
+            tl.x = o.x + (i == 0 ? -75.0f : 75.0f);
+            tl.y = o.y + 40.0f;
+            tl.z = -70.0f;
+            tl.glow_r = 0.389f; tl.glow_g = 0.111f; tl.glow_b = 0.111f;
+            const std::string b = build_torch_object(tl, base + "_torch" + std::to_string(i + 1));
+            if (!b.empty()) out.push_back(b);
+        }
+    } else {
+        TorchLight tl;
+        tl.x = o.x - 60.0f * dir;
+        tl.y = o.y + 6.0f;
+        tl.z = 48.0f;
+        tl.glow_r = 0.389f; tl.glow_g = 0.111f; tl.glow_b = 0.111f;
+        const std::string b = build_torch_object(tl, base + "_torch1");
+        if (!b.empty()) out.push_back(b);
+    }
+}
+
+std::vector<std::string> build_portal_hub(const PortalHubOptions& o,
+                                          Biome biome, uint64_t& rng) {
+    std::vector<std::string> out;
+    const std::string dest = o.destination.empty() ? "next_level" : o.destination;
+    const std::string base = o.portal_name.empty() ? "portal" : o.portal_name;
+    const float dir = (float)o.facing;
+
+    // 1. Functional portal (collision + PortalComponent).
+    out.push_back(build_portal_object_bytes(base, o.x, o.y, dest));
+
+    // 2. Visual portal FX quad (slightly below the anchor so it sits on ground).
+    out.push_back(build_portal_fx_object(base + "_fx", o.x, o.y - 10.0f));
+
+    // 3. Return spawn beside the portal — vanilla naming 'spawn_from_<dest>'
+    //    (forest_part1: spawn_from_forest_cave0 at +81/-54 from its portal).
+    out.push_back(build_spawn_object("spawn_from_" + dest,
+                                     o.x + 90.0f * dir, o.y - 50.0f, o.facing));
+
+    // 4. Sign + brick ruin cluster + shrubs + torch.
+    append_portal_cluster(out, o, biome, rng, /*flanking=*/false);
+    return out;
+}
+
+std::vector<std::string> build_game_portal_hub(const PortalHubOptions& o,
+                                               Biome biome, uint64_t& rng) {
+    std::vector<std::string> out;
+    const std::string base = o.portal_name.empty() ? "portal" : o.portal_name;
+
+    // 1. The special world-travel portal MODEL — TemplateName 'portal'
+    //    (game_common.scl): portal.POD + its own GroundPolygon platform +
+    //    Portal.Activate touch script. One per scene, like vanilla.
+    out.push_back(build_portal_fx_object(base, o.x, o.y - 10.0f));
+
+    // 2. Scripted camera focus at the portal: 'cameraFocusShape'
+    //    (scriptarea.scl) → Camera.FocusAtShape(self) on hero enter,
+    //    Camera.ResetFocus() on exit — a dramatic locked shot of the portal.
+    {
+        const float f = 2.0f;   // 1200x600 focus zone
+        proto::Writer obj;
+        obj.write_string_field(1, "cameraFocusShape");          // TemplateName
+        obj.write_string_field(2, base + "_camfocus");          // Identifier
+        obj.write_nested_field(4, v2(o.x, o.y + 40.0f));
+        obj.write_float_field(5, 0.0f);
+        obj.write_float_field(6, 0.0f);
+        obj.write_float_field(7, f);
+        obj.write_nested_field(8, rect_msg(-300.0f * f, -150.0f * f, 600.0f * f, 300.0f * f));
+        obj.write_varint_field(9, 0);
+        out.push_back(scene_wrap_object(obj));
+    }
+
+    // 3. Sign + brick ruin cluster + shrubs + flanking torches (vanilla
+    //    portal template spawns portal_torch_left/right at ±75/+40/-70).
+    append_portal_cluster(out, o, biome, rng, /*flanking=*/true);
+    return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1199,8 +1488,8 @@ Result generate_biome_scene(const TerrainOptions& opt) {
                     d.x = x + (ci? rng_float(drng, 30.0f, 70.0f) : rng_float(drng,-16.0f,16.0f));
                     d.y = gy + rng_float(drng, -4.0f, 4.0f);
                     d.z = biased_depth(15.0f, 120.0f, -75.0f, -10.0f);
-                    d.scale = 0.80f + rng_float(drng, 0.0f, 0.55f);
-                    d.rot_y = (rng_float(drng,0,1.0f) < 0.45f) ? -1.5707963f : 0.0f;
+                    d.scale = opt.randomize_deco_scale ? (0.80f + rng_float(drng, 0.0f, 0.55f)) : 1.0f;
+                    d.rot_y = (opt.randomize_deco_rotation && rng_float(drng,0,1.0f) < 0.45f) ? -1.5707963f : 0.0f;
                     d.pod  = bio.deco_trees[hash_uint((uint32_t)(deco_idx*131+7)) % (unsigned)ntree];
                     d.name = "deco_tree" + std::to_string(++deco_idx);
                     std::string b = build_deco_object(d, d.name);
@@ -1217,7 +1506,7 @@ Result generate_biome_scene(const TerrainOptions& opt) {
                 d.x = x + rng_float(drng, -18.0f, 18.0f);
                 d.y = gy + rng_float(drng, -2.0f, 2.0f);
                 d.z = biased_depth(10.0f, 85.0f, -70.0f, -5.0f);
-                d.scale = 0.60f + rng_float(drng, 0.0f, 0.65f);
+                d.scale = opt.randomize_deco_scale ? (0.60f + rng_float(drng, 0.0f, 0.65f)) : 1.0f;
                 d.rot_y = 0.0f;
                 d.pod  = bio.deco_rocks[hash_uint((uint32_t)(deco_idx*337+13)) % (unsigned)nrock];
                 d.name = "deco_rock" + std::to_string(++deco_idx);
@@ -1234,7 +1523,7 @@ Result generate_biome_scene(const TerrainOptions& opt) {
                 d.x = x + rng_float(drng, -24.0f, 24.0f);
                 d.y = gy + rng_float(drng, -2.0f, 2.0f);
                 d.z = biased_depth(5.0f, 55.0f, -50.0f, -5.0f);
-                d.scale = 0.28f + rng_float(drng, 0.0f, 0.40f);
+                d.scale = opt.randomize_deco_scale ? (0.28f + rng_float(drng, 0.0f, 0.40f)) : 1.0f;
                 d.rot_y = 0.0f;
                 d.pod  = bio.deco_grass[hash_uint((uint32_t)(deco_idx*613+23)) % (unsigned)ngras];
                 d.name = "deco_grass" + std::to_string(++deco_idx);
@@ -1281,6 +1570,66 @@ Result generate_biome_scene(const TerrainOptions& opt) {
             });
         }
     } // end per-platform decoration scatter
+
+    // ── 5b. Portal hub (optional) ─────────────────────────────────────────
+    // Portals anchor at the scene EXTREMES (leftmost/rightmost platform),
+    // never on the center spawn pad:
+    //   • scene-transition portal (build_portal_hub) at one extreme,
+    //   • the special world-travel portal MODEL (build_game_portal_hub —
+    //     the one-per-scene 'portal' template) at the opposite extreme,
+    // each ringed with a per-biome brick/stone ruin cluster, sign, shrubs and
+    // torches.
+    if (opt.add_portal && !bp.platforms.empty()) {
+        auto portal_extreme_anchor = [&](const Platform& plat, int edge,
+                                         float& x, float& gy) -> bool {
+            const TopEdge te = build_top_edge(plat);
+            if (te.pts.size() < 2 || (te.max_x - te.min_x) < 320.0f) return false;
+            x  = (edge < 0) ? te.min_x + 180.0f : te.max_x - 180.0f;
+            gy = ground_y_at(te, x);
+            return gy > -1e8f;
+        };
+        const bool left_first = rng_float(drng, 0.0f, 1.0f) < 0.5f;
+        const int    e0 = left_first ? -1 : 1;
+        const size_t p0 = left_first ? 0 : bp.platforms.size() - 1;
+        const int    e1 = -e0;
+        const size_t p1 = left_first ? bp.platforms.size() - 1 : 0;
+
+        float px = 0.0f, py = 0.0f;
+        // Scene-transition portal at the first extreme.
+        if (portal_extreme_anchor(bp.platforms[p0], e0, px, py)) {
+            PortalHubOptions ph;
+            ph.x = px; ph.y = py + 4.0f;
+            ph.facing = -e0;   // spawn + sign face toward the scene interior
+            ph.destination = opt.portal_destination;
+            ph.portal_name = "portal";
+            const auto hub = build_portal_hub(ph, opt.biome, drng);
+            for (const auto& bytes : hub) {
+                scene.write_bytes_field(1, extract_object_bytes(bytes));
+                ++r.objects;
+            }
+        }
+        // World-travel portal model at the opposite extreme.
+        bool ok2 = false;
+        if (bp.platforms.size() == 1) {
+            // Single platform: place it on the far side of the same strip.
+            ok2 = portal_extreme_anchor(bp.platforms[p0], e1, px, py);
+        } else {
+            ok2 = portal_extreme_anchor(bp.platforms[p1], e1, px, py)
+               || portal_extreme_anchor(bp.platforms[p0], e1, px, py);
+        }
+        if (ok2) {
+            PortalHubOptions ph;
+            ph.x = px; ph.y = py + 4.0f;
+            ph.facing = -e1;   // decos face toward the scene interior
+            ph.destination = opt.portal_destination;
+            ph.portal_name = "portal";
+            const auto hub = build_game_portal_hub(ph, opt.biome, drng);
+            for (const auto& bytes : hub) {
+                scene.write_bytes_field(1, extract_object_bytes(bytes));
+                ++r.objects;
+            }
+        }
+    }
 
     // ── 6. Spawn point ────────────────────────────────────────────────────
     // Find the platform whose X range contains x=0 (scene center) and pick

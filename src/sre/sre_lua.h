@@ -115,6 +115,7 @@ typedef int   (*pfn_lua_rawequal)(lua_State* L, int idx1, int idx2);
 typedef int   (*pfn_lua_equal)(lua_State* L, int idx1, int idx2);
 typedef int   (*pfn_lua_lessthan)(lua_State* L, int idx1, int idx2);
 typedef int   (*pfn_lua_isuserdata)(lua_State* L, int idx);
+typedef void* (*pfn_lua_newuserdata)(lua_State* L, size_t size);
 
 typedef void       (*pfn_lua_xmove)(lua_State* from, lua_State* to, int n);
 typedef lua_State* (*pfn_lua_newthread)(lua_State* L);
@@ -128,6 +129,7 @@ extern pfn_lua_xmove       g_lua_xmove;
 extern pfn_lua_newthread   g_lua_newthread;
 extern pfn_lua_pushthread  g_lua_pushthread;
 extern pfn_lua_sethook     g_lua_sethook;
+extern pfn_lua_newuserdata g_lua_newuserdata;
 extern pfn_lua_pushvalue   g_lua_pushvalue;
 extern pfn_lua_remove      g_lua_remove;
 extern pfn_lua_insert      g_lua_insert;
@@ -186,11 +188,15 @@ void sre_ProgramState_destructor(void* self);
 
 void sre_open_swkiwi_libs(lua_State* L);
 
-/* Native FFI Lua module (defined in sre_ffi.c).
- * Declared hidden so intra-libsre.so callers (e.g. sre_mini_api.c) bind
- * directly to the local definition instead of emitting a GOT/PLT indirection
- * that the host JNI bridge would catch as "[Bridge64] !! UNHANDLED". */
-__attribute__((visibility("hidden"))) void sre_ffi_register_lua(lua_State* L);
+/* Native FFI Lua module.
+ * FFI is now a CLOSED-SOURCE feature: the real libffi-backed engine and
+ * sre_ffi_register_lua() live in libsre-extras.so
+ * (src/sre-extras-closed-source/sre_ffi.c). SRE core registers only the
+ * safe stub _G.ffi surface (sre_extras_stub_register_ffi, in
+ * sre_extras_stubs.c). When the extras module loads, its
+ * miniLL_open_memory() calls sre_ffi_register_lua(L) to overwrite the stub
+ * table with the real one. */
+void sre_extras_stub_register_ffi(lua_State* L);
 
 /* =========================================================================
  * Recovery stack — public API for cross-unit use

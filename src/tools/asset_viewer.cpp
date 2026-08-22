@@ -47,6 +47,8 @@
 #include "tools/scene_loader.h"
 #include "tools/scene_creator.h"
 #include "tools/scene_generator.h"
+#include "tools/scene_generator_v2.h"
+#include "tools/scene_generator_v2_3d.h"
 #include "tools/scene_schemas.h"
 #include "tools/intellij.h"
 #include "tools/boulder.h"
@@ -477,6 +479,19 @@ struct ViewerState {
     bool            postfx_enabled = true;
     av::PostFXParams postfx;
     bool  scene_lights_enabled = true;  // render scene Light/SimpleGlow components (vanilla-faithful default)
+    // STICKY viewport keyboard ownership: set while the 3D viewport is
+    // hovered (or clicked) and KEPT when the mouse leaves — so arrow-nudging
+    // an object keeps working with the cursor resting over a side panel.
+    // Cleared by clicking any other panel, leaving the scene tab, or typing.
+    // While set, ImGui widget keyboard navigation is suspended so WASD /
+    // arrows / +- drive the viewport instead of moving focus between buttons.
+    bool  view_keyboard_focus = false;
+    // Frame stamp of the last time the scene viewport re-latched
+    // view_keyboard_focus. Lets the per-frame fallback clear distinguish
+    // "cursor parked over a side panel" (viewport still drawing, latch must
+    // survive) from "viewport stopped drawing" (tab switch / layout hides it,
+    // latch must be released so the GUI gets its keys back).
+    int   view_keyboard_focus_frame = -1;
     bool  scene_glow_enabled = true;    // emissive glow sprites (bloom feed)
     bool  scene_light_debug = false;    // editor rings: influence radius + emitter cross
     bool  scene_depth_fog_enabled = true; // vanilla atmospheric depth darkening
@@ -525,6 +540,12 @@ struct ViewerState {
     bool  mesh_edit_drag = false;       // currently dragging the selected vertex
     float mesh_edit_plane_y = 0.0f;     // world Y of the vertex-drag plane
 
+    // Triple-tap mesh selection: 3 rapid taps at the same spot drill into the
+    // sub-mesh under the cursor (object picking stays the default).
+    int    scene_tap_count = 0;         // consecutive rapid taps at ~same spot
+    double scene_tap_time = 0.0;        // time of the last tap
+    ImVec2 scene_tap_pos = {};          // screen position of the last tap
+
     // --- Transform gizmo / workspace tooling ---
     bool  scene_show_gizmo = true;      // show the axis gizmo on the selected object
     int   gizmo_axis = -1;              // axis under cursor / being dragged (0=X 1=Y 2=Z)
@@ -565,8 +586,8 @@ struct ViewerState {
     float gm_simplify = 2.5f;
     int   gm_target_points = 0;
     bool  gm_mirror_x = false;          // mirror newly placed points across X
-    float gm_canvas_scale = 1.0f;       // world units per screen px (2D canvas)
-    float gm_canvas_cx = 0.0f, gm_canvas_cy = 0.0f; // canvas world origin
+    bool  gm_snap = false;              // snap new/moved points to a grid
+    float gm_snap_grid = 0.5f;          // snap grid step (world units)
     char  gm_obj_name[96] = "ground_mesh";
     std::vector<boulder::Hat> gm_hats;  // round-hat domes on the sketch
     int   gm_drag_hat = -1;             // hat being moved/resized (-1 = none)
@@ -584,16 +605,37 @@ struct ViewerState {
     double gm_drag_off_y = 0.0;
     av::Camera gm_inline_saved_cam;     // camera snapshot restored on exit
     bool  gm_inline_saved_valid = false;
+    av::SceneData gm_inline_saved_scene; // pre-edit scene snapshot (one-key revert)
+    bool  gm_inline_saved_scene_valid = false;
 
-    // --- Ground Mesh Generator: live 3D preview of the extruded mesh ---
-    bool  gm_show_3d = true;            // split view: 2D sketch | 3D preview
+    // Ground-mesh texture picker: canonical texture stems scanned from the
+    // assets dirs once per scene, plus a free-text fallback for custom names.
+    bool  gm_tex_scanned = false;
+    std::string gm_tex_scan_key;          // scene dir the scan was built for
+    std::vector<std::string> gm_tex_names; // deduped, sorted texture stems
+    char  gm_tex_custom[96] = {};         // custom texture name input
+
+    // --- Ground Mesh Generator: merged 3D sketch canvas (live mesh preview
+    //     rendered behind the editable polygon outline, like the mesh editor) ---
+    bool  gm_show_grid = false;         // optional scale grid on the sketch (off)
     GLuint gm_preview_fbo = 0;
     GLuint gm_preview_fbo_tex = 0;
     int   gm_preview_w = 0, gm_preview_h = 0;
     std::vector<av::GPUMesh> gm_preview_meshes;
     std::vector<GLuint>      gm_preview_textures;
-    av::Camera gm_preview_cam;          // orbit camera for the 3D preview
+    // Simple 2D canvas view (world coord at the canvas CENTER + world-per-px
+    // scale). The live extruded mesh renders behind as a background image.
+    float gm_canvas_scale = 1.0f;       // world units per screen px
+    float gm_canvas_cx = 0.0f, gm_canvas_cy = 0.0f; // world coord at canvas center
+    bool  gm_canvas_framed = false;     // view framed on the current sketch
     bool  gm_preview_valid = false;     // last build succeeded
+
+    // Internal sketch undo/redo: snapshots of (gm_points, gm_hats) pushed
+    // before every discrete edit, capped so the stack can't grow unbounded.
+    std::vector<std::vector<boulder::PolygonPoint>> gm_undo_points;
+    std::vector<std::vector<boulder::Hat>>           gm_undo_hats;
+    std::vector<std::vector<boulder::PolygonPoint>> gm_redo_points;
+    std::vector<std::vector<boulder::Hat>>           gm_redo_hats;
 
     // --- POD preview chrome ---
     bool  model_auto_rotate = false;    // slow turntable orbit (R toggles)
@@ -641,6 +683,7 @@ struct ViewerState {
     float       cam_orbit_speed = 1.0f;
     float       cam_zoom_speed = 1.0f;
     float       cam_pan_speed = 1.0f;
+    float       cam_keyboard_speed = 1.0f; // WASD / arrow camera + nudge multiplier
     bool        cam_invert_x = false;
     bool        cam_invert_y = false;
     bool        tex_pixel_art_mode = true;
@@ -691,7 +734,9 @@ struct ViewerState {
     bool        text_select_mode = false;
     bool        text_edit_modified = false;
     ImFont*     mono_font = nullptr;
-    
+
+
+
     // Bottom panel (Terminal / Logger)
     bool                     show_bottom_panel = false;  // hidden by default, Ctrl+` to open
     bool                     show_asset_browser = true;
@@ -712,6 +757,7 @@ pid_t                    pty_child_pid   = -1;
     // --- Procedural Scene Generator dialog (v2 biome presets) ---
     bool       proc_gen_open = false;
     bool       proc_gen_request = false;
+    bool       proc_gen_use_v2 = true;     // true = v2 generator, false = v1
     int        proc_gen_biome = 0;         // sgen::Biome
     uint32_t   proc_gen_seed = 1337;
     float      proc_gen_width = 4200.0f;
@@ -724,6 +770,32 @@ pid_t                    pty_child_pid   = -1;
     float      proc_gen_deco = 1.0f;
     char       proc_gen_name[96] = "procedural_scene";
     std::string proc_gen_status;
+    // v2-only options (TerrainOptionsV2)
+    bool       proc_gen_v2_bg_terrain = true;   // background silhouette layers
+    bool       proc_gen_v2_fg_terrain = false;  // foreground cliff framing strip
+    bool       proc_gen_v2_z_path = false;      // winding Z-varying terrain path
+    float      proc_gen_v2_z_amp = 30.0f;       // ±Z amplitude of the path
+    int        proc_gen_v2_bg_layers = 2;       // background strip count
+    bool       proc_gen_v2_bg_decos = true;     // deep-Z background scatter
+    bool       proc_gen_v2_fg_decos = true;     // shallow-Z foreground scatter
+    bool       proc_gen_v2_terracing = false;   // stepped/quantized bands
+    float      proc_gen_v2_terrace = 0.5f;      // 0..1 terrace strength
+    bool       proc_gen_v2_overhangs = false;   // cliff-edge ledge juts
+    bool       proc_gen_v2_camera = false;      // camera_follow_y_shape emission (off by default — bounds stay top-profile)
+    // v2-3d options (TerrainOptions3D) — Minecraft-style full-3D world
+    bool       proc_gen_use_3d = false;         // true = v2-3d generator
+    int        proc_gen_3d_rows = 15;           // depth rows behind (z<0)
+    int        proc_gen_3d_front_rows = 5;      // depth rows in front (z>0)
+    float      proc_gen_3d_band = 90.0f;        // row half-band; Z tiles at 2×band
+    float      proc_gen_3d_block = 44.0f;       // block size (X columns + Y grid)
+    bool       proc_gen_3d_caves = true;        // winding carved ravines
+    bool       proc_gen_3d_islands = true;      // floating sky islands
+    bool       proc_gen_3d_far_trees = true;    // parallax forest on depth rows
+    // Decoration randomization + portal (v1 + v2)
+    bool       proc_gen_rand_deco_rot = true;   // trees/bushes may quarter-turn
+    bool       proc_gen_rand_deco_scale = true; // decorations vary in size
+    bool       proc_gen_portal = false;         // single portal + decorated hub
+    char       proc_gen_portal_dest[128] = "next_level";
 
     // --- Scene Editor state ---
     SceneCreatorDialogState scene_creator;
@@ -879,8 +951,16 @@ static void switch_scene_tab(ViewerState& st, int mode) {
     st.scene_preview_tab = mode;
 }
 
+// Internal GMG sketch undo/redo (defined later with the GMG helpers).
+static void gm_push_undo(ViewerState& st);
+static void gm_undo_sketch(ViewerState& st);
+static void gm_redo_sketch(ViewerState& st);
+static void gm_clear_undo(ViewerState& st);
+
 static void open_ground_mesh_studio(ViewerState& st) {
     st.gm_workspace_mode = 0;
+    st.gm_canvas_framed = false;   // reframe the canvas on the current sketch
+    gm_clear_undo(st);             // fresh sketch session — no stale undo steps
     switch_scene_tab(st, 3);
 }
 
@@ -1417,6 +1497,8 @@ static void free_preview_resources(ViewerState& st) {
     st.gm_hats.clear();
     st.gm_hat_dragging = st.gm_hat_resizing = false;
     st.gm_drag_hat = -1;
+    gm_clear_undo(st);
+    st.gm_canvas_framed = false;   // reframe the GMG canvas on a fresh scene
     st.mesh_edit_drag = false;
     st.gizmo_axis = -1;
     st.gizmo_drag = false;
@@ -2758,14 +2840,17 @@ static void draw_model_viewport(ViewerState& st) {
     }
 
     if (!st.fbo) {
-        st.fbo = av::create_fbo(fw, fh, &st.fbo_tex);
+        st.fbo = av::create_fbo_hdr(fw, fh, &st.fbo_tex);
         st.fbo_w = fw; st.fbo_h = fh;
     } else if (fw != st.fbo_w || fh != st.fbo_h) {
-        av::resize_fbo(st.fbo, fw, fh, &st.fbo_tex);
+        av::resize_fbo_hdr(st.fbo, fw, fh, &st.fbo_tex);
         st.fbo_w = fw; st.fbo_h = fh;
     }
 
     av::begin_3d(st.fbo, fw, fh, st.camera);
+    // HDR path: when PostFX owns tone mapping, the mesh shaders emit LINEAR
+    // light into the RGBA16F buffer (no double-ACES / gamma-on-gamma).
+    av::set_inline_tonemap(!(st.postfx_enabled && st.postfx.enabled && st.postfx.hd));
     if (st.show_grid) {
         av::render_grid(st.grid_size, st.model.min_y * st.model_scale);
     }
@@ -5106,6 +5191,7 @@ static bool gm_regenerate_object_geometry(ViewerState& st, int idx, std::string*
 static void gm_apply_to_object(ViewerState& st);          // GMG tab: apply to object
 static bool gm_begin_inline_edit(ViewerState& st);        // inline 2D edit in viewport
 static void gm_end_inline_edit(ViewerState& st);
+static void gm_revert_inline_edit(ViewerState& st);       // discard the session
 static void draw_inline_polygon_overlay(ViewerState& st, ImDrawList* overlay,
                                         const ImVec2& pos, int w, int h);
 static void inline_edit_input(ViewerState& st, const ImVec2& pos, int w, int h);
@@ -5234,10 +5320,15 @@ static int gm_add_to_scene(ViewerState& st) {
 }
 
 // Import an existing GroundMesh object's polygon into the sketch editor.
+// The object's own texture + depth metadata is carried over too, so re-applying
+// the sketch keeps the vanilla look (a vanilla mesh edited in 2D must not fall
+// back to the generator's hardcoded default textures / depth).
 static void gm_import_from_scene(ViewerState& st) {
     if (st.selected_object < 0 || st.selected_object >= (int)st.scene.objects.size()) return;
     const auto& obj = st.scene.objects[st.selected_object];
+    gm_push_undo(st);              // the previous sketch stays one Ctrl+Z away
     st.gm_points.clear();
+    bool have_depth = false;
     for (const auto& comp : obj.components) {
         const int payload = comp.payload_field;
         if (payload != 110) continue;   // GroundPolygonComponent
@@ -5249,7 +5340,13 @@ static void gm_import_from_scene(ViewerState& st) {
                 proto::Reader gpc(f.bytes_val);
                 proto::Field g;
                 while (gpc.read_field(g)) {
-                    if (g.field_number != 2 || g.wire_type != proto::WIRE_LEN) continue; // Polygon
+                    if (g.field_number == 4 && g.wire_type == proto::WIRE_I32) {
+                        st.gm_min_depth = g.float_val; have_depth = true; continue;
+                    } else if (g.field_number == 5 && g.wire_type == proto::WIRE_I32) {
+                        st.gm_max_depth = g.float_val; have_depth = true; continue;
+                    } else if (g.field_number != 2 || g.wire_type != proto::WIRE_LEN) {
+                        continue;
+                    }
                     proto::Reader poly(g.bytes_val);
                     proto::Field p;
                     while (poly.read_field(p)) {
@@ -5268,11 +5365,50 @@ static void gm_import_from_scene(ViewerState& st) {
         } catch (...) {}
         if (!st.gm_points.empty()) break;
     }
+    // Carry the object's own textures over (vanilla layout: the first
+    // SurfaceMesh (field 8) is the TOP, later field-8 meshes + the FrontMesh
+    // (field 9) are the side walls). Re-applying then regenerates the mesh
+    // with the SAME materials instead of the generator defaults.
+    {
+        const size_t n = std::min({obj.ground_meshes.size(),
+                                   obj.ground_mesh_textures.size(),
+                                   obj.ground_mesh_fields.size()});
+        std::string top_tex, bottom_tex;
+        for (size_t i = 0; i < n; ++i) {
+            const std::string& tex = obj.ground_mesh_textures[i];
+            if (tex.empty()) continue;
+            const int src_field = obj.ground_mesh_fields[i];
+            if (src_field == 9) {                       // FrontMesh → side walls
+                if (bottom_tex.empty()) bottom_tex = tex;
+            } else if (src_field == 8) {                // SurfaceMesh: first = top
+                if (top_tex.empty()) top_tex = tex;
+                else if (bottom_tex.empty()) bottom_tex = tex;
+            } else if (src_field == 6 && bottom_tex.empty()) { // base
+                bottom_tex = tex;
+            }
+        }
+        if (top_tex.empty()) top_tex = bottom_tex;
+        if (bottom_tex.empty()) bottom_tex = top_tex;
+        if (!top_tex.empty())
+            snprintf(st.gm_top_tex, sizeof(st.gm_top_tex), "%s", top_tex.c_str());
+        if (!bottom_tex.empty())
+            snprintf(st.gm_bottom_tex, sizeof(st.gm_bottom_tex), "%s", bottom_tex.c_str());
+    }
     if (!st.gm_points.empty()) {
         st.gm_sketch_dirty = true;
+        st.gm_canvas_framed = false;     // reframe the GMG canvas on the import
         st.status_msg = "Imported " + std::to_string(st.gm_points.size()) + " points from selected object.";
         // Keep the object's depth as the default Z.
         st.gm_z = obj.pos_z;
+        if (!have_depth) {
+            // No MinDepth/MaxDepth on the polygon — derive the slab from the
+            // parsed mesh extents so the regenerated mesh keeps its thickness.
+            float dmin = 1e30f, dmax = -1e30f;
+            for (const auto& pm : obj.ground_meshes) {
+                dmin = std::min(dmin, pm.min_z); dmax = std::max(dmax, pm.max_z);
+            }
+            if (dmin < 1e29f && dmax > -1e29f) { st.gm_min_depth = dmin; st.gm_max_depth = dmax; }
+        }
     } else {
         st.status_msg = "Selected object has no GroundPolygon to import.";
     }
@@ -5379,6 +5515,10 @@ static bool gm_begin_inline_edit(ViewerState& st) {
         return false;
     }
     snapshot_scene(st);           // one undo step for the whole edit session
+    // Keep a dedicated pre-edit snapshot so a single key/click can DISCARD
+    // the session (revert) regardless of what the undo stack holds.
+    st.gm_inline_saved_scene = st.scene;
+    st.gm_inline_saved_scene_valid = true;
     st.gm_edit_apply_object = sel;
     st.gm_inline_edit = true;
     st.gm_inline_dirty = false;
@@ -5428,7 +5568,7 @@ static bool gm_begin_inline_edit(ViewerState& st) {
 
     st.status_msg = "2D editing '" + st.scene.objects[sel].name +
                     "' — drag vertices \xc2\xb7 right-click an edge to add a node \xc2\xb7 "
-                    "MMB pan / wheel zoom \xc2\xb7 Esc to finish.";
+                    "MMB pan / wheel zoom \xc2\xb7 Esc to finish \xc2\xb7 R to revert.";
     return true;
 }
 
@@ -5454,6 +5594,32 @@ static void gm_end_inline_edit(ViewerState& st) {
         st.gm_inline_saved_valid = false;
     }
     st.status_msg = "Mesh edit finished.";
+}
+
+// Discard the whole inline-edit session and restore the pre-edit scene
+// snapshot — one-key undo for the 2D editor. Ends the session WITHOUT
+// applying the sketch (unlike gm_end_inline_edit, which commits).
+static void gm_revert_inline_edit(ViewerState& st) {
+    if (!st.gm_inline_edit) return;
+    if (st.gm_inline_saved_scene_valid) {
+        st.scene = st.gm_inline_saved_scene;
+        st.gm_inline_saved_scene_valid = false;
+        av::scene_refresh(st.scene);
+        const fs::path scene_dir = fs::path(st.scene.filepath).parent_path();
+        upload_scene_ground_meshes(st, scene_dir.string());
+    }
+    st.gm_inline_edit = false;
+    st.gm_inline_dirty = false;
+    st.gm_edit_apply_object = -1;
+    st.gm_drag_point = -1;
+    st.gm_dragging = false;
+    st.gm_drag_from_insert = false;
+    st.gm_drag_off_x = st.gm_drag_off_y = 0.0;
+    if (st.gm_inline_saved_valid) {          // restore the pre-edit camera view
+        st.camera = st.gm_inline_saved_cam;
+        st.gm_inline_saved_valid = false;
+    }
+    st.status_msg = "Reverted mesh edit \xe2\x80\x94 session changes discarded.";
 }
 
 // Intersect a world ray with the plane spanned by an object matrix's X/Y axes
@@ -5618,12 +5784,17 @@ static void draw_inline_polygon_overlay(ViewerState& st, ImDrawList* overlay,
     // Mode tag + hint bar.
     overlay->AddText(ImVec2(pos.x + (float)w - 120.0f, pos.y + 14.0f),
                      IM_COL32(110, 210, 255, 255), "2D EDIT");
+    // Revert button: discard the whole session and restore the pre-edit mesh.
+    ImGui::SetCursorScreenPos(ImVec2(pos.x + (float)w - 96.0f, pos.y + 34.0f));
+    if (ImGui::SmallButton("Revert (R)")) gm_revert_inline_edit(st);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Discard this edit session and restore the mesh as it was before (Ctrl+Z / R)");
     overlay->AddRectFilled(ImVec2(pos.x, pos.y + (float)h - 24.0f),
                            ImVec2(pos.x + (float)w, pos.y + (float)h),
                            IM_COL32(18, 21, 28, 215));
     overlay->AddText(ImVec2(pos.x + 8.0f, pos.y + (float)h - 20.0f),
                      IM_COL32(160, 175, 195, 255),
-                     "LMB drag vertex \xc2\xb7 RMB edge = new node \xc2\xb7 RMB/Del vertex = remove \xc2\xb7 Esc done");
+                     "LMB drag vertex \xc2\xb7 RMB edge = new node \xc2\xb7 RMB/Del vertex = remove \xc2\xb7 Esc done \xc2\xb7 R revert");
 }
 
 // Input for the inline 2D editor — owns the whole viewport input block while
@@ -5723,6 +5894,13 @@ static void inline_edit_input(ViewerState& st, const ImVec2& pos, int w, int h) 
         st.gm_dragging = false;
         st.gm_inline_dirty = true;
     }
+    // Ctrl+Z or R discards the whole session: restore the pre-edit snapshot
+    // (the one-key "undo everything" for the 2D editor).
+    if ((io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) ||
+        ImGui::IsKeyPressed(ImGuiKey_R)) {
+        gm_revert_inline_edit(st);
+        return;
+    }
     if (ImGui::IsKeyPressed(ImGuiKey_Escape) || ImGui::IsKeyPressed(ImGuiKey_M)) {
         gm_end_inline_edit(st);
         return;
@@ -5793,6 +5971,47 @@ static double gm_polygon_area(const std::vector<boulder::PolygonPoint>& pts) {
 
 static void gm_ensure_ccw(std::vector<boulder::PolygonPoint>& pts) {
     if (gm_polygon_area(pts) < 0.0) std::reverse(pts.begin(), pts.end());
+}
+
+// ── Internal sketch undo/redo ─────────────────────────────────────────────
+// Snapshot the current (points, hats) onto the undo stack before a discrete
+// edit; the redo stack is cleared on every new edit (standard branching).
+static void gm_push_undo(ViewerState& st) {
+    st.gm_undo_points.push_back(st.gm_points);
+    st.gm_undo_hats.push_back(st.gm_hats);
+    if (st.gm_undo_points.size() > 60) {
+        st.gm_undo_points.erase(st.gm_undo_points.begin());
+        st.gm_undo_hats.erase(st.gm_undo_hats.begin());
+    }
+    st.gm_redo_points.clear();
+    st.gm_redo_hats.clear();
+}
+
+static void gm_undo_sketch(ViewerState& st) {
+    if (st.gm_undo_points.empty()) return;
+    st.gm_redo_points.push_back(st.gm_points);
+    st.gm_redo_hats.push_back(st.gm_hats);
+    st.gm_points = st.gm_undo_points.back();
+    st.gm_hats   = st.gm_undo_hats.back();
+    st.gm_undo_points.pop_back();
+    st.gm_undo_hats.pop_back();
+    st.gm_sketch_dirty = true;
+}
+
+static void gm_redo_sketch(ViewerState& st) {
+    if (st.gm_redo_points.empty()) return;
+    st.gm_undo_points.push_back(st.gm_points);
+    st.gm_undo_hats.push_back(st.gm_hats);
+    st.gm_points = st.gm_redo_points.back();
+    st.gm_hats   = st.gm_redo_hats.back();
+    st.gm_redo_points.pop_back();
+    st.gm_redo_hats.pop_back();
+    st.gm_sketch_dirty = true;
+}
+
+static void gm_clear_undo(ViewerState& st) {
+    st.gm_undo_points.clear(); st.gm_undo_hats.clear();
+    st.gm_redo_points.clear(); st.gm_redo_hats.clear();
 }
 
 static void gm_simplify_freehand(ViewerState& st) {
@@ -5969,6 +6188,55 @@ static void obj_browser_scan(ViewerState& st) {
     st.obj_browser_scanned = true;
 }
 
+// Scan the scene + assets dirs for texture files and cache their canonical
+// stems (suffixes stripped) for the ground-mesh texture picker. Runs once per
+// scene (keyed on the scene dir); the list is a flat, sorted, deduped set.
+static void gm_texture_scan(ViewerState& st) {
+    st.gm_tex_names.clear();
+    std::vector<fs::path> roots;
+    if (!st.scene.filepath.empty())
+        roots.push_back(fs::path(st.scene.filepath).parent_path());
+    roots.push_back(fs::path(g_assets_dir) / "resources");
+    roots.push_back(fs::path(expand_home("~/.local/share/swordigo-desktop/assets/resources")));
+    roots.push_back(fs::path(expand_home("~/.local/share/swordigo-desktop/assets")));
+
+    static const char* suffixes[] = {
+        "_2x.tex.png", ".tex.png", "_2x.pvr", ".pvr",
+        "_2x.tex", ".tex", "_2x.png", ".png"
+    };
+    std::set<std::string> seen;
+    std::error_code ec;
+    for (const auto& root : roots) {
+        if (!fs::is_directory(root, ec)) continue;
+        for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+             it != end && !ec; it.increment(ec)) {
+            if (it.depth() > 3) { it.disable_recursion_pending(); continue; }
+            if (!it->is_regular_file(ec)) continue;
+            const std::string fname = it->path().filename().string();
+            std::string lower = fname;
+            for (auto& c : lower) c = (char)tolower((unsigned char)c);
+            const bool is_pvr = lower.size() > 4 &&
+                                lower.compare(lower.size() - 4, 4, ".pvr") == 0;
+            const bool is_png = lower.size() > 4 &&
+                                lower.compare(lower.size() - 4, 4, ".png") == 0;
+            if (!is_pvr && !is_png) continue;
+            std::string stem = fname;
+            for (const char* suf : suffixes) {
+                const std::string s(suf);
+                if (stem.size() > s.size() &&
+                    stem.compare(stem.size() - s.size(), s.size(), s) == 0) {
+                    stem.erase(stem.size() - s.size());
+                    break;
+                }
+            }
+            if (stem.empty()) continue;
+            if (seen.insert(stem).second) st.gm_tex_names.push_back(stem);
+        }
+    }
+    std::sort(st.gm_tex_names.begin(), st.gm_tex_names.end());
+    st.gm_tex_scanned = true;
+}
+
 // Build a SceneObject that references a POD model (ClassName 'Model').
 static av::SceneObject build_pod_object(const std::string& pod_path, const std::string& identifier) {
     const std::string stem = fs::path(pod_path).stem().string();
@@ -6019,7 +6287,9 @@ static void obj_browser_add(ViewerState& st, const std::string& path, bool is_po
         std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         boulder::GroundMesh gm = boulder::parse_ground_mesh(content);
         if (gm.polygon.size() < 3) { st.status_msg = "Invalid .swdm file."; return; }
+        gm_push_undo(st);
         st.gm_points = gm.polygon;
+        st.gm_hats = gm.hats;
         st.gm_min_depth = gm.min_depth;
         st.gm_max_depth = gm.max_depth;
         st.gm_top_angle = gm.top_angle;
@@ -6029,6 +6299,7 @@ static void obj_browser_add(ViewerState& st, const std::string& path, bool is_po
         snprintf(st.gm_bottom_tex, sizeof(st.gm_bottom_tex), "%s", gm.bottom_texture.c_str());
         snprintf(st.gm_obj_name, sizeof(st.gm_obj_name), "%s",
                  fs::path(path).stem().string().c_str());
+        st.gm_canvas_framed = false;   // reframe on the loaded sketch
         gm_add_to_scene(st);
         open_ground_mesh_studio(st);
         return;
@@ -6078,7 +6349,6 @@ static void obj_browser_add(ViewerState& st, const std::string& path, bool is_po
 // side-by-side 3D viewport. Falls back gracefully when the sketch is too
 // small to generate (keeps the last valid preview).
 static void gm_rebuild_preview(ViewerState& st) {
-    st.gm_preview_valid = false;
     if (st.gm_points.size() < 3 || st.scene.filepath.empty()) return;
 
     const std::string swdm = gm_build_swdm_text(st);
@@ -6107,11 +6377,11 @@ static void gm_rebuild_preview(ViewerState& st) {
     const auto& obj = parsed.objects[0];
     if (obj.ground_meshes.empty()) return;
 
-    for (auto& m : st.gm_preview_meshes) av::free_mesh(m);
-    st.gm_preview_meshes.clear();
-    for (auto t : st.gm_preview_textures) if (t) glDeleteTextures(1, &t);
-    st.gm_preview_textures.clear();
-
+    // Build into locals, then swap — a failed build never blanks the canvas
+    // (the last good preview keeps rendering through degenerate mid-edit
+    // states, which is what made the old preview "disappear").
+    std::vector<av::GPUMesh> meshes;
+    std::vector<GLuint>      textures;
     const fs::path scene_dir = fs::path(st.scene.filepath).parent_path();
     for (size_t gi = 0; gi < obj.ground_meshes.size(); ++gi) {
         const auto& mesh = obj.ground_meshes[gi];
@@ -6121,7 +6391,7 @@ static void gm_rebuild_preview(ViewerState& st) {
         const uint32_t* idx_ptr = mesh.indices.empty() ? nullptr : mesh.indices.data();
         av::GPUMesh gm = av::upload_mesh(pos, nrm, uv, mesh.num_vertices,
                                           idx_ptr, (int)mesh.indices.size());
-        st.gm_preview_meshes.push_back(gm);
+        meshes.push_back(gm);
 
         GLuint tex_id = 0;
         const std::string tex_name = gi < obj.ground_mesh_textures.size()
@@ -6155,25 +6425,13 @@ static void gm_rebuild_preview(ViewerState& st) {
                 }
             }
         }
-        st.gm_preview_textures.push_back(tex_id);
+        textures.push_back(tex_id);
     }
 
-    // Frame the preview camera on the mesh bounds.
-    float min_p[3] = {1e9f, 1e9f, 1e9f}, max_p[3] = {-1e9f, -1e9f, -1e9f};
-    for (const auto& mesh : obj.ground_meshes) {
-        min_p[0] = std::min(min_p[0], mesh.min_x); min_p[1] = std::min(min_p[1], mesh.min_y);
-        min_p[2] = std::min(min_p[2], mesh.min_z);
-        max_p[0] = std::max(max_p[0], mesh.max_x); max_p[1] = std::max(max_p[1], mesh.max_y);
-        max_p[2] = std::max(max_p[2], mesh.max_z);
-    }
-    st.gm_preview_cam = av::Camera{};
-    st.gm_preview_cam.target[0] = (min_p[0] + max_p[0]) * 0.5f;
-    st.gm_preview_cam.target[1] = (min_p[1] + max_p[1]) * 0.5f;
-    st.gm_preview_cam.target[2] = (min_p[2] + max_p[2]) * 0.5f;
-    const float dx = max_p[0]-min_p[0], dy = max_p[1]-min_p[1], dz = max_p[2]-min_p[2];
-    st.gm_preview_cam.distance = std::max(3.0f, std::sqrt(dx*dx+dy*dy+dz*dz) * 1.6f);
-    st.gm_preview_cam.yaw = -35.0f;
-    st.gm_preview_cam.pitch = 24.0f;
+    for (auto& m : st.gm_preview_meshes) av::free_mesh(m);
+    st.gm_preview_meshes = std::move(meshes);
+    for (auto t : st.gm_preview_textures) if (t) glDeleteTextures(1, &t);
+    st.gm_preview_textures = std::move(textures);
     st.gm_preview_valid = true;
 }
 
@@ -6192,13 +6450,20 @@ static void draw_ground_mesh_generator(ViewerState& st) {
     if (gm_focused && ImGui::IsKeyPressed(ImGuiKey_B) && !io.WantTextInput) st.gm_tool = 3;
     if (gm_focused && ImGui::IsKeyPressed(ImGuiKey_H) && !io.WantTextInput) st.gm_tool = 4;
     if (gm_focused && ImGui::IsKeyPressed(ImGuiKey_Backspace) && !io.WantTextInput && !st.gm_points.empty()) {
+        gm_push_undo(st);
         st.gm_points.pop_back();
         st.gm_sketch_dirty = true;
     }
+    // Sketch undo/redo: Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z (never while typing).
+    if (gm_focused && io.KeyCtrl && !io.WantTextInput) {
+        if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z)) gm_undo_sketch(st);
+        if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z)) gm_redo_sketch(st);
+        if (ImGui::IsKeyPressed(ImGuiKey_Y)) gm_redo_sketch(st);
+    }
 
-    // Rebuild the live 3D preview whenever the sketch / extrusion changed.
+    // Rebuild the live 3D mesh whenever the sketch / extrusion changed.
     // Throttle to ~7 Hz so continuous slider drags don't rebuild every frame.
-    if (st.gm_sketch_dirty && st.gm_show_3d) {
+    if (st.gm_sketch_dirty) {
         static double s_gm_last_rebuild = 0.0;
         const double now = ImGui::GetTime();
         if (now - s_gm_last_rebuild > 0.15 || !st.gm_preview_valid) {
@@ -6226,11 +6491,6 @@ static void draw_ground_mesh_generator(ViewerState& st) {
     // The preview gets a healthy share (and the Mesh tab now spans the full
     // window, so it can be comfortably wide instead of a cramped box).
     float canvas_w = win_avail.x - tools_w - 12.0f;
-    float preview_w = 0.0f;
-    if (st.gm_show_3d) {
-        preview_w = std::clamp(canvas_w * 0.45f, 240.0f, 780.0f);
-        canvas_w -= preview_w + 6.0f;
-    }
     if (canvas_w < 260.0f) canvas_w = 260.0f;
 
     // ── Left tools rail ──
@@ -6249,16 +6509,52 @@ static void draw_ground_mesh_generator(ViewerState& st) {
     tool_button(0, ICON_FA_HAND_POINTER, "Move  (V)");
     tool_button(1, ICON_FA_PLUS, "Add  (E)");
     tool_button(2, ICON_FA_TRASH, "Erase (D)");
+    tool_button(3, ICON_FA_PEN, "Draw  (B)");
     tool_button(4, ICON_FA_MOUNTAIN_SUN, "Hat  (H)");
+    ImGui::Separator();
+    ImGui::TextDisabled("Edit");
+    if (ImGui::Button(ICON_FA_ARROW_ROTATE_LEFT " Undo", ImVec2(tools_w - 14.0f, 22)))
+        gm_undo_sketch(st);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Undo the last sketch edit (Ctrl+Z)");
+    if (ImGui::Button(ICON_FA_ARROW_ROTATE_RIGHT " Redo", ImVec2(tools_w - 14.0f, 22)))
+        gm_redo_sketch(st);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Redo a sketch edit (Ctrl+Y / Ctrl+Shift+Z)");
+    ImGui::Separator();
+    ImGui::TextDisabled("Transform");
+    auto gm_transform = [&](const char* icon, const char* label, auto op) {
+        if (ImGui::Button(icon, ImVec2(tools_w - 14.0f, 22))) {
+            if (!st.gm_points.empty()) {
+                gm_push_undo(st);
+                for (auto& p : st.gm_points) op(p);
+                st.gm_sketch_dirty = true;
+            }
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", label);
+    };
+    gm_transform("Rotate 90\xc2\xb0", "Rotate the sketch 90\xc2\xb0 (CCW)",
+                 [](boulder::PolygonPoint& p) { const double nx = -p.y; p.y = p.x; p.x = nx; });
+    gm_transform("Flip X", "Flip the sketch horizontally (mirror X)",
+                 [](boulder::PolygonPoint& p) { p.x = -p.x; });
+    gm_transform("Flip Y", "Flip the sketch vertically (mirror Y)",
+                 [](boulder::PolygonPoint& p) { p.y = -p.y; });
+    gm_transform("Snap 1.0", "Snap every point to the 1.0 grid",
+                 [](boulder::PolygonPoint& p) { p.x = std::round(p.x); p.y = std::round(p.y); });
     ImGui::Separator();
     ImGui::Checkbox("Mirror X", &st.gm_mirror_x);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Mirror new points across the Y axis");
-    ImGui::Checkbox("3D Preview", &st.gm_show_3d);
+    ImGui::Checkbox("Snap", &st.gm_snap);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Show a live 3D view of the extruded mesh beside the sketch");
-    if (st.gm_show_3d && !st.gm_preview_valid && st.gm_points.size() >= 3)
-        st.gm_sketch_dirty = true;
+        ImGui::SetTooltip("Snap new/moved points to the grid step below");
+    if (st.gm_snap) {
+        ImGui::SetNextItemWidth(tools_w - 14.0f);
+        ImGui::DragFloat("##snapgrid", &st.gm_snap_grid, 0.05f, 0.05f, 20.0f, "%.2f");
+    }
+    ImGui::Checkbox("Grid", &st.gm_show_grid);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show the scale grid on the sketch canvas (off by default)");
     ImGui::Separator();
     ImGui::TextDisabled("%d pts", (int)st.gm_points.size());
     if (st.gm_points.size() >= 3) {
@@ -6266,176 +6562,340 @@ static void draw_ground_mesh_generator(ViewerState& st) {
         ImGui::TextDisabled("depth %.0f", depth);
         ImGui::TextDisabled("top %.0f\xc2\xb0", st.gm_top_angle);
     }
+    if (!st.gm_undo_points.empty())
+        ImGui::TextDisabled("%zu undo step%s", st.gm_undo_points.size(),
+                            st.gm_undo_points.size() == 1 ? "" : "s");
     ImGui::EndChild();
     ImGui::SameLine();
 
-    // ── 2D sketch canvas ──
+    // ── Sketch canvas (plain 2D, live mesh behind) ──
+    // The canvas is a simple 2D view: gm_canvas_cx/cy is the world point at
+    // the canvas CENTER, gm_canvas_scale is world units per screen pixel. The
+    // live extruded mesh renders behind as a background image, so you see the
+    // real mesh while editing the outline on top of it (like the mesh editor).
     ImGui::BeginChild("##gm_canvas_host", ImVec2(canvas_w, canvas_h), ImGuiChildFlags_Borders);
-    ImVec2 canvas_origin = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton("##gm_canvas", ImVec2(canvas_w, canvas_h - 8.0f));
-    // Shared framing: fit the whole sketch polygon into the canvas.
+    const ImVec2 canvas_origin = ImGui::GetCursorScreenPos();
+    const int cw = std::max(4, (int)canvas_w);
+    const int ch = std::max(4, (int)canvas_h - 8);
+    ImGui::InvisibleButton("##gm_canvas", ImVec2((float)cw, (float)ch));
+    const bool canvas_hovered = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Fit the whole sketch into the canvas (F key / Frame button / first time).
+    // Works from the very first point on: a 1-2 point sketch frames with a
+    // padded box so the node you just placed is always on screen (the old
+    // version waited for 3 points, leaving the first nodes invisible).
     auto gm_frame_sketch = [&]() {
         if (st.gm_points.empty()) return;
         double minx = st.gm_points[0].x, maxx = st.gm_points[0].x;
         double miny = st.gm_points[0].y, maxy = st.gm_points[0].y;
-        for (auto& p : st.gm_points) {
+        for (const auto& p : st.gm_points) {
             minx = std::min(minx, p.x); maxx = std::max(maxx, p.x);
             miny = std::min(miny, p.y); maxy = std::max(maxy, p.y);
         }
-        st.gm_canvas_cx = (minx + maxx) / 2.0;
-        st.gm_canvas_cy = (miny + maxy) / 2.0;
-        st.gm_canvas_scale = std::clamp((float)(0.8 * canvas_w / std::max(maxx - minx, maxy - miny)),
-                                        0.05f, 50.0f);
+        st.gm_canvas_cx = (float)((minx + maxx) * 0.5);
+        st.gm_canvas_cy = (float)((miny + maxy) * 0.5);
+        const float ex = std::max((float)(maxx - minx), 40.0f);
+        const float ey = std::max((float)(maxy - miny), 40.0f);
+        st.gm_canvas_scale = std::clamp(0.8f * std::min((float)cw / ex, (float)ch / ey),
+                                        0.0005f, 500.0f);
+        st.gm_canvas_framed = true;
     };
-    const bool canvas_hovered = ImGui::IsItemHovered();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (!st.gm_canvas_framed && !st.gm_points.empty())
+        gm_frame_sketch();
+    if (do_frame_key) gm_frame_sketch();
 
-    // Map world <-> screen: y is world-up, screen y grows down.
+    // World <-> screen mapping (y is world-up, screen y grows down).
     auto to_screen = [&](double wx, double wy) {
-        float sx = canvas_origin.x + (float)((wx - st.gm_canvas_cx) * st.gm_canvas_scale);
-        float sy = canvas_origin.y + canvas_h * 0.5f - (float)((wy - st.gm_canvas_cy) * st.gm_canvas_scale);
-        return ImVec2(sx, sy);
+        return ImVec2(canvas_origin.x + (float)((wx - st.gm_canvas_cx) * st.gm_canvas_scale) + (float)cw * 0.5f,
+                      canvas_origin.y + (float)ch * 0.5f - (float)((wy - st.gm_canvas_cy) * st.gm_canvas_scale));
     };
-    auto to_world = [&](ImVec2 sp) {
-        double wx = st.gm_canvas_cx + (sp.x - canvas_origin.x) / st.gm_canvas_scale;
-        double wy = st.gm_canvas_cy + (canvas_origin.y + canvas_h * 0.5f - sp.y) / st.gm_canvas_scale;
-        return std::make_pair(wx, wy);
+    auto to_world = [&](const ImVec2& sp) {
+        return std::make_pair((double)st.gm_canvas_cx + (sp.x - canvas_origin.x - (float)cw * 0.5f) / st.gm_canvas_scale,
+                              (double)st.gm_canvas_cy - (sp.y - canvas_origin.y - (float)ch * 0.5f) / st.gm_canvas_scale);
     };
 
-    // Zoom with wheel; pan with middle mouse.
+    // Wheel zoom (anchored under the cursor) + MMB pan.
     if (canvas_hovered && io.MouseWheel != 0.0f) {
         const float factor = (io.MouseWheel > 0.0f) ? 1.15f : (1.0f / 1.15f);
         const ImVec2 mouse = ImGui::GetMousePos();
         auto before = to_world(mouse);
-        st.gm_canvas_scale = std::clamp(st.gm_canvas_scale * factor, 0.02f, 50.0f);
+        st.gm_canvas_scale = std::clamp(st.gm_canvas_scale * factor, 0.0005f, 500.0f);
         auto after = to_world(mouse);
-        st.gm_canvas_cx += before.first - after.first;
-        st.gm_canvas_cy += before.second - after.second;
+        st.gm_canvas_cx += (float)(before.first - after.first);
+        st.gm_canvas_cy += (float)(before.second - after.second);
     }
     if (canvas_hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-        auto d = io.MouseDelta;
-        st.gm_canvas_cx -= d.x / st.gm_canvas_scale;
-        st.gm_canvas_cy += d.y / st.gm_canvas_scale;
+        st.gm_canvas_cx -= io.MouseDelta.x / st.gm_canvas_scale;
+        st.gm_canvas_cy += io.MouseDelta.y / st.gm_canvas_scale;
     }
 
-    // Procedural 1-2-5 grid: minor lines stay crisp while major spacing and
-    // coordinate labels adapt continuously to the current zoom.
-    dl->AddRectFilled(canvas_origin, ImVec2(canvas_origin.x + canvas_w, canvas_origin.y + canvas_h),
-                      ImGui::ColorConvertFloat4ToU32(g_theme.background));
-    const double target_world = 90.0 / std::max(0.02f, st.gm_canvas_scale);
-    const double decade = std::pow(10.0, std::floor(std::log10(target_world)));
-    const double normalized = target_world / decade;
-    const double major_step = (normalized < 2.0 ? 2.0 : normalized < 5.0 ? 5.0 : 10.0) * decade;
-    const double minor_step = major_step / 5.0;
-    const double min_x = st.gm_canvas_cx;
-    const double max_x = st.gm_canvas_cx + canvas_w / st.gm_canvas_scale;
-    const double half_world_h = canvas_h * 0.5 / st.gm_canvas_scale;
-    const double min_y = st.gm_canvas_cy - half_world_h;
-    const double max_y = st.gm_canvas_cy + half_world_h;
-    const ImU32 minor_col = g_theme.dark ? IM_COL32(88, 96, 112, 46) : IM_COL32(70, 78, 92, 34);
-    const ImU32 major_col = g_theme.dark ? IM_COL32(116, 126, 145, 92) : IM_COL32(70, 78, 92, 70);
-    const ImU32 label_col = ImGui::ColorConvertFloat4ToU32(g_theme.text_muted);
-    char lbl[32];
-    for (double gx = std::floor(min_x / minor_step) * minor_step; gx <= max_x; gx += minor_step) {
-        float sx = to_screen(gx, 0).x;
-        const double major_index = std::round(gx / major_step);
-        const bool major = std::fabs(gx - major_index * major_step) < minor_step * 0.01;
-        dl->AddLine(ImVec2(sx, canvas_origin.y), ImVec2(sx, canvas_origin.y + canvas_h),
-                    major ? major_col : minor_col, major ? 1.0f : 1.0f);
-        if (major && std::fabs(gx) > minor_step * 0.01) {
-            snprintf(lbl, sizeof(lbl), major_step < 1.0 ? "%.2f" : "%.0f", gx);
-            dl->AddText(ImVec2(sx + 4.0f, canvas_origin.y + canvas_h - 20.0f), label_col, lbl);
-        }
+    // Live mesh preview behind the canvas (derived 2D camera: pitch 0, looking
+    // along -Z, distance tuned so the render scale matches gm_canvas_scale, so
+    // the outline drawn with to_screen aligns exactly with the mesh).
+    if (!st.gm_preview_fbo) {
+        st.gm_preview_fbo = av::create_fbo(cw, ch, &st.gm_preview_fbo_tex);
+        st.gm_preview_w = cw; st.gm_preview_h = ch;
+    } else if (cw != st.gm_preview_w || ch != st.gm_preview_h) {
+        av::resize_fbo(st.gm_preview_fbo, cw, ch, &st.gm_preview_fbo_tex);
+        st.gm_preview_w = cw; st.gm_preview_h = ch;
     }
-    for (double gy = std::floor(min_y / minor_step) * minor_step; gy <= max_y; gy += minor_step) {
-        float sy = to_screen(0, gy).y;
-        const double major_index = std::round(gy / major_step);
-        const bool major = std::fabs(gy - major_index * major_step) < minor_step * 0.01;
-        dl->AddLine(ImVec2(canvas_origin.x, sy), ImVec2(canvas_origin.x + canvas_w, sy),
-                    major ? major_col : minor_col, major ? 1.0f : 1.0f);
-        if (major && std::fabs(gy) > minor_step * 0.01) {
-            snprintf(lbl, sizeof(lbl), major_step < 1.0 ? "%.2f" : "%.0f", gy);
-            dl->AddText(ImVec2(canvas_origin.x + 5.0f, sy - ImGui::GetTextLineHeight()), label_col, lbl);
+    if (!st.gm_preview_meshes.empty()) {
+        av::Camera pc;
+        pc.target[0] = st.gm_canvas_cx;
+        pc.target[1] = st.gm_canvas_cy;
+        pc.target[2] = 0.0f;
+        pc.yaw = 0.0f;
+        pc.pitch = 0.0f;
+        const float tan_hf = std::tan(pc.fov * 3.14159265f / 360.0f);
+        pc.distance = std::clamp((ch * 0.5f) / std::max(1e-4f, st.gm_canvas_scale * tan_hf),
+                                 0.5f, 200000.0f);
+        pc.near_plane = std::max(0.01f, pc.distance / 10000.0f);
+        pc.far_plane  = std::max(2000.0f, pc.distance * 2.0f + 2000.0f);
+        // The canvas is a material DESIGN view, not a lit level: force bright,
+        // even lighting (neutral headlight + lifted hemisphere ambient) so the
+        // mesh always reads clearly no matter what the scene/user lighting is,
+        // then restore the previous globals afterwards.
+        const float s_ld[3] = {av::g_light_dir[0], av::g_light_dir[1], av::g_light_dir[2]};
+        const float s_lc[3] = {av::g_light_color[0], av::g_light_color[1], av::g_light_color[2]};
+        const float s_ac[3] = {av::g_ambient_color[0], av::g_ambient_color[1], av::g_ambient_color[2]};
+        const float s_ag[3] = {av::g_ambient_ground_color[0], av::g_ambient_ground_color[1], av::g_ambient_ground_color[2]};
+        const float s_fc[3] = {av::g_fill_color[0], av::g_fill_color[1], av::g_fill_color[2]};
+        const float s_ls = av::g_light_scale, s_as = av::g_ambient_scale;
+        const float s_rim = av::g_rim_strength, s_spec = av::g_spec_strength;
+        const float s_cc[3] = {av::g_clear_color[0], av::g_clear_color[1], av::g_clear_color[2]};
+        // Headlight: light mostly along the view direction (+Z) with a little
+        // elevation, so the face seen by the camera is fully lit, not shadowed
+        // by the scene's top-down sun.
+        av::g_light_dir[0] = 0.0f; av::g_light_dir[1] = 0.35f; av::g_light_dir[2] = 0.94f;
+        const float ld_len = std::sqrt(av::g_light_dir[0]*av::g_light_dir[0] +
+                                       av::g_light_dir[1]*av::g_light_dir[1] +
+                                       av::g_light_dir[2]*av::g_light_dir[2]);
+        av::g_light_dir[0] /= ld_len; av::g_light_dir[1] /= ld_len; av::g_light_dir[2] /= ld_len;
+        av::g_light_color[0] = 1.0f; av::g_light_color[1] = 0.98f; av::g_light_color[2] = 0.95f;
+        av::g_light_scale = 1.0f;
+        av::g_ambient_color[0] = 0.55f; av::g_ambient_color[1] = 0.56f; av::g_ambient_color[2] = 0.60f;
+        av::g_ambient_ground_color[0] = 0.38f; av::g_ambient_ground_color[1] = 0.39f; av::g_ambient_ground_color[2] = 0.44f;
+        av::g_ambient_scale = 1.0f;
+        av::g_fill_color[0] = 0.45f; av::g_fill_color[1] = 0.50f; av::g_fill_color[2] = 0.62f;
+        av::g_rim_strength = 0.20f;
+        av::g_spec_strength = 0.05f;
+        // Light background (soft neutral) so the mesh reads clearly against
+        // the canvas — restore the scene clear color afterwards.
+        av::g_clear_color[0] = 0.80f; av::g_clear_color[1] = 0.81f; av::g_clear_color[2] = 0.84f;
+        av::clear_point_lights();
+        av::set_depth_fog(false, nullptr, 0.0f, 0.0f);
+        av::begin_3d(st.gm_preview_fbo, cw, ch, pc);
+        float identity[16];
+        av::mat4_identity(identity);
+        for (size_t i = 0; i < st.gm_preview_meshes.size(); ++i) {
+            auto& gm = st.gm_preview_meshes[i];
+            gm.texture_id = (i < st.gm_preview_textures.size()) ? st.gm_preview_textures[i] : 0;
+            float col[4] = {1, 1, 1, 1};
+            av::render_mesh(gm, identity, col, false);
         }
+        av::end_3d();
+        // Restore the previous lighting globals.
+        av::g_light_dir[0] = s_ld[0]; av::g_light_dir[1] = s_ld[1]; av::g_light_dir[2] = s_ld[2];
+        av::g_light_color[0] = s_lc[0]; av::g_light_color[1] = s_lc[1]; av::g_light_color[2] = s_lc[2];
+        av::g_ambient_color[0] = s_ac[0]; av::g_ambient_color[1] = s_ac[1]; av::g_ambient_color[2] = s_ac[2];
+        av::g_ambient_ground_color[0] = s_ag[0]; av::g_ambient_ground_color[1] = s_ag[1]; av::g_ambient_ground_color[2] = s_ag[2];
+        av::g_fill_color[0] = s_fc[0]; av::g_fill_color[1] = s_fc[1]; av::g_fill_color[2] = s_fc[2];
+        av::g_light_scale = s_ls; av::g_ambient_scale = s_as;
+        av::g_rim_strength = s_rim; av::g_spec_strength = s_spec;
+        av::g_clear_color[0] = s_cc[0]; av::g_clear_color[1] = s_cc[1]; av::g_clear_color[2] = s_cc[2];
+        // Draw the mesh/texture preview as a DIMMED reference layer so it reads
+        // as "this is what the material will look like" rather than the thing
+        // being authored. The solid sketch polygon + bright vertices drawn on
+        // top are the actual editable geometry (see the legend below). Without
+        // the dim tint the textured mesh (which can extend past the outline)
+        // looks like the polygon is mis-positioned. (#5)
+        // ImGui::Image() in this build has no tint-color overload, so draw the
+        // FBO texture through the draw list where a per-vertex tint alpha is
+        // supported. UVs are flipped vertically (0,1)->(1,0) like the Image call.
+        const ImVec2 img_max(canvas_origin.x + (float)cw, canvas_origin.y + (float)ch);
+        dl->AddImage((ImTextureID)(intptr_t)st.gm_preview_fbo_tex,
+                     canvas_origin, img_max,
+                     ImVec2(0, 1), ImVec2(1, 0),
+                     IM_COL32(255, 255, 255, 148));   // ~58% opacity reference layer
+        // Keep the invisible button/layout advancing as the Image() call did.
+        ImGui::SetCursorScreenPos(canvas_origin);
+        ImGui::Dummy(ImVec2((float)cw, (float)ch));
+    } else {
+        dl->AddRectFilled(canvas_origin, ImVec2(canvas_origin.x + (float)cw, canvas_origin.y + (float)ch),
+                          ImGui::ColorConvertFloat4ToU32(g_theme.background));
     }
-    if (min_x <= 0.0 && max_x >= 0.0)
-        dl->AddLine(ImVec2(to_screen(0, 0).x, canvas_origin.y),
-                    ImVec2(to_screen(0, 0).x, canvas_origin.y + canvas_h), IM_COL32(74, 176, 96, 220), 1.5f);
-    if (min_y <= 0.0 && max_y >= 0.0)
-        dl->AddLine(ImVec2(canvas_origin.x, to_screen(0, 0).y),
-                    ImVec2(canvas_origin.x + canvas_w, to_screen(0, 0).y), IM_COL32(214, 76, 78, 220), 1.5f);
 
-    // Polygon fill + outline + top-segment hints.
+    // Optional scale grid (off by default — Grid checkbox).
+    if (st.gm_show_grid) {
+        const double target_world = 90.0 / std::max(0.0005, (double)st.gm_canvas_scale);
+        const double decade = std::pow(10.0, std::floor(std::log10(target_world)));
+        const double normalized = target_world / decade;
+        const double major_step = (normalized < 2.0 ? 2.0 : normalized < 5.0 ? 5.0 : 10.0) * decade;
+        const double minor_step = major_step / 5.0;
+        const double min_x = st.gm_canvas_cx - cw * 0.5 / st.gm_canvas_scale;
+        const double max_x = st.gm_canvas_cx + cw * 0.5 / st.gm_canvas_scale;
+        const double min_y = st.gm_canvas_cy - ch * 0.5 / st.gm_canvas_scale;
+        const double max_y = st.gm_canvas_cy + ch * 0.5 / st.gm_canvas_scale;
+        const ImU32 minor_col = g_theme.dark ? IM_COL32(88, 96, 112, 46) : IM_COL32(70, 78, 92, 34);
+        const ImU32 major_col = g_theme.dark ? IM_COL32(116, 126, 145, 92) : IM_COL32(70, 78, 92, 70);
+        char lbl[32];
+        for (double gx = std::floor(min_x / minor_step) * minor_step; gx <= max_x; gx += minor_step) {
+            const double major_index = std::round(gx / major_step);
+            const bool major = std::fabs(gx - major_index * major_step) < minor_step * 0.01;
+            const ImVec2 a = to_screen(gx, min_y);
+            const ImVec2 b = to_screen(gx, max_y);
+            dl->AddLine(a, b, major ? major_col : minor_col, 1.0f);
+            if (major && std::fabs(gx) > minor_step * 0.01) {
+                snprintf(lbl, sizeof(lbl), major_step < 1.0 ? "%.2f" : "%.0f", gx);
+                dl->AddText(ImVec2(a.x + 3.0f, a.y), ImGui::ColorConvertFloat4ToU32(g_theme.text_muted), lbl);
+            }
+        }
+        for (double gy = std::floor(min_y / minor_step) * minor_step; gy <= max_y; gy += minor_step) {
+            const double major_index = std::round(gy / major_step);
+            const bool major = std::fabs(gy - major_index * major_step) < minor_step * 0.01;
+            const ImVec2 a = to_screen(min_x, gy);
+            const ImVec2 b = to_screen(max_x, gy);
+            dl->AddLine(a, b, major ? major_col : minor_col, 1.0f);
+            if (major && std::fabs(gy) > minor_step * 0.01) {
+                snprintf(lbl, sizeof(lbl), major_step < 1.0 ? "%.2f" : "%.0f", gy);
+                dl->AddText(ImVec2(a.x + 3.0f, a.y), ImGui::ColorConvertFloat4ToU32(g_theme.text_muted), lbl);
+            }
+        }
+    }
+
+    // Polygon fill + outline + top-segment hints (flat-ish edges get the cap).
     if (st.gm_points.size() >= 3) {
         std::vector<ImVec2> pts;
-        for (auto& p : st.gm_points) pts.push_back(to_screen(p.x, p.y));
-        dl->AddConvexPolyFilled(pts.data(), (int)pts.size(), IM_COL32(70, 130, 90, 70));
-        dl->AddPolyline(pts.data(), (int)pts.size(), IM_COL32(120, 210, 150, 255), false, 2.0f);
-        dl->AddLine(pts.back(), pts.front(), IM_COL32(120, 210, 150, 255), 2.0f);
-        // Top-segment hints (flat-ish edges get the surface mesh).
+        pts.reserve(st.gm_points.size());
+        for (const auto& p : st.gm_points) pts.push_back(to_screen(p.x, p.y));
+        // The sketch polygon is the authored shape — draw it as a clear
+        // translucent fill + solid outline ON TOP of the dimmed material
+        // preview, so it's obvious this outline (not the texture behind it) is
+        // the geometry being edited. (#5)
+        dl->AddConvexPolyFilled(pts.data(), (int)pts.size(), IM_COL32(80, 150, 105, 105));
+        dl->AddPolyline(pts.data(), (int)pts.size(), IM_COL32(130, 225, 160, 255), false, 2.5f);
+        dl->AddLine(pts.back(), pts.front(), IM_COL32(130, 225, 160, 255), 2.5f);
         for (size_t i = 0; i < st.gm_points.size(); ++i) {
             const size_t a = i, b = (i + 1) % st.gm_points.size();
             double ang = std::atan2(st.gm_points[b].y - st.gm_points[a].y,
                                     st.gm_points[b].x - st.gm_points[a].x) * 180.0 / M_PI;
             if (ang < 0.0) ang += 360.0;
-            if (std::abs(ang - 180.0) < st.gm_top_angle) {
+            if (std::abs(ang - 180.0) < st.gm_top_angle)
                 dl->AddLine(to_screen(st.gm_points[a].x, st.gm_points[a].y),
                             to_screen(st.gm_points[b].x, st.gm_points[b].y),
                             IM_COL32(255, 200, 80, 220), 3.0f);
-            }
         }
     }
+
+    // Edge hover (middle-node creation): closest edge within 10 px.
+    int edge_hover = -1;
+    if (canvas_hovered && st.gm_points.size() >= 3) {
+        const ImVec2 mouse = ImGui::GetMousePos();
+        float best_d = 10.0f;
+        for (int i = 0; i < (int)st.gm_points.size(); ++i) {
+            const int j = (i + 1) % (int)st.gm_points.size();
+            const ImVec2 a = to_screen(st.gm_points[i].x, st.gm_points[i].y);
+            const ImVec2 b = to_screen(st.gm_points[j].x, st.gm_points[j].y);
+            const float abx = b.x - a.x, aby = b.y - a.y;
+            const float len2 = abx * abx + aby * aby;
+            float t = len2 > 1e-6f ? ((mouse.x - a.x) * abx + (mouse.y - a.y) * aby) / len2 : 0.0f;
+            t = std::clamp(t, 0.0f, 1.0f);
+            const float px = a.x + abx * t, py = a.y + aby * t;
+            const float d = std::hypotf(mouse.x - px, mouse.y - py);
+            if (d < best_d) { best_d = d; edge_hover = i; }
+        }
+        if (edge_hover >= 0) {
+            const int ej = (edge_hover + 1) % (int)st.gm_points.size();
+            const ImVec2 ea = to_screen(st.gm_points[edge_hover].x, st.gm_points[edge_hover].y);
+            const ImVec2 eb = to_screen(st.gm_points[ej].x, st.gm_points[ej].y);
+            const ImVec2 mid((ea.x + eb.x) * 0.5f, (ea.y + eb.y) * 0.5f);
+            dl->AddLine(ea, eb, IM_COL32(255, 215, 90, 210), 3.0f);
+            dl->AddQuadFilled(ImVec2(mid.x, mid.y - 6.0f), ImVec2(mid.x + 6.0f, mid.y),
+                              ImVec2(mid.x, mid.y + 6.0f), ImVec2(mid.x - 6.0f, mid.y),
+                              IM_COL32(255, 215, 90, 255));
+        }
+    }
+
     // Vertex handles with index labels.
     int hover = -1;
-    for (int i = 0; i < (int)st.gm_points.size(); ++i) {
-        ImVec2 sp = to_screen(st.gm_points[i].x, st.gm_points[i].y);
-        const bool inside = sp.x >= canvas_origin.x && sp.x <= canvas_origin.x + canvas_w &&
-                            sp.y >= canvas_origin.y && sp.y <= canvas_origin.y + canvas_h;
-        if (!inside) continue;
-        const bool near_mouse = canvas_hovered &&
-            std::fabs(ImGui::GetMousePos().x - sp.x) <= 9.0f &&
-            std::fabs(ImGui::GetMousePos().y - sp.y) <= 9.0f;
-        if (near_mouse) hover = i;
-        ImU32 col = IM_COL32(255, 130, 70, 255);
-        if (i == st.gm_drag_point) col = IM_COL32(255, 255, 120, 255);
-        else if (near_mouse) col = IM_COL32(255, 190, 120, 255);
-        const float r = (i == st.gm_drag_point || near_mouse) ? 6.5f : 5.0f;
-        dl->AddCircleFilled(sp, r, col);
-        dl->AddCircle(sp, r, IM_COL32(20, 20, 30, 255), 0, 1.5f);
-        snprintf(lbl, sizeof(lbl), "%d", i);
-        dl->AddText(ImVec2(sp.x + 7.0f, sp.y - 11.0f), IM_COL32(225, 235, 245, 190), lbl);
+    {
+        const ImVec2 mouse = ImGui::GetMousePos();
+        for (int i = 0; i < (int)st.gm_points.size(); ++i) {
+            const ImVec2 sp = to_screen(st.gm_points[i].x, st.gm_points[i].y);
+            const bool inside = sp.x >= canvas_origin.x && sp.x <= canvas_origin.x + cw &&
+                                sp.y >= canvas_origin.y && sp.y <= canvas_origin.y + ch;
+            if (!inside) continue;
+            const bool near_mouse = canvas_hovered &&
+                std::fabs(mouse.x - sp.x) <= 9.0f && std::fabs(mouse.y - sp.y) <= 9.0f;
+            if (near_mouse) hover = i;
+            ImU32 col = IM_COL32(255, 130, 70, 255);
+            if (i == st.gm_drag_point) col = IM_COL32(255, 255, 120, 255);
+            else if (near_mouse) col = IM_COL32(255, 190, 120, 255);
+            const float r = (i == st.gm_drag_point || near_mouse) ? 6.5f : 5.0f;
+            dl->AddCircleFilled(sp, r, col);
+            dl->AddCircle(sp, r, IM_COL32(20, 20, 30, 255), 0, 1.5f);
+            char lbl[16];
+            snprintf(lbl, sizeof(lbl), "%d", i);
+            dl->AddText(ImVec2(sp.x + 7.0f, sp.y - 11.0f), IM_COL32(225, 235, 245, 190), lbl);
+        }
+        // Coordinate readout for the hovered / dragged node — shows the exact
+        // world position so you can place features precisely.
+        const int shown = (st.gm_dragging && st.gm_drag_point >= 0) ? st.gm_drag_point : hover;
+        if (shown >= 0 && shown < (int)st.gm_points.size()) {
+            const ImVec2 sp = to_screen(st.gm_points[shown].x, st.gm_points[shown].y);
+            char coord[64];
+            snprintf(coord, sizeof(coord), "(%.2f, %.2f)",
+                     st.gm_points[shown].x, st.gm_points[shown].y);
+            const ImVec2 tsz = ImGui::CalcTextSize(coord);
+            const ImVec2 tp(sp.x + 10.0f, sp.y - 26.0f);
+            dl->AddRectFilled(ImVec2(tp.x - 4.0f, tp.y - 2.0f),
+                              ImVec2(tp.x + tsz.x + 4.0f, tp.y + tsz.y + 2.0f),
+                              IM_COL32(20, 24, 32, 225));
+            dl->AddText(tp, IM_COL32(255, 235, 150, 255), coord);
+        }
     }
 
     // ── Round-hat domes: footprint circle + radius handle + apex marker ──
     int hat_hover = -1, hat_handle_hit = -1;
-    for (int i = 0; i < (int)st.gm_hats.size(); ++i) {
-        const auto& h = st.gm_hats[i];
-        const ImVec2 c = to_screen(h.x, h.y);
-        const float rr = (float)(h.radius * st.gm_canvas_scale);
-        const bool inside = c.x >= canvas_origin.x && c.x <= canvas_origin.x + canvas_w &&
-                            c.y >= canvas_origin.y && c.y <= canvas_origin.y + canvas_h;
-        if (!inside) continue;
+    {
         const ImVec2 mouse = ImGui::GetMousePos();
-        const bool near_center = canvas_hovered &&
-            std::fabs(mouse.x - c.x) <= 12.0f && std::fabs(mouse.y - c.y) <= 12.0f;
-        const ImVec2 handle = ImVec2(c.x + rr, c.y);
-        const bool near_handle = canvas_hovered &&
-            std::fabs(mouse.x - handle.x) <= 8.0f && std::fabs(mouse.y - handle.y) <= 8.0f;
-        if (near_center) hat_hover = i;
-        if (near_handle) { hat_handle_hit = i; }
-        const bool active = (i == st.gm_drag_hat) || near_center || near_handle;
-        dl->AddCircle(c, rr, active ? IM_COL32(255, 170, 60, 255)
-                                    : IM_COL32(210, 150, 110, 190), 0, 2.0f);
-        dl->AddLine(ImVec2(c.x - 9, c.y), ImVec2(c.x + 9, c.y), IM_COL32(210, 150, 110, 190));
-        dl->AddLine(ImVec2(c.x, c.y - 9), ImVec2(c.x, c.y + 9), IM_COL32(210, 150, 110, 190));
-        dl->AddCircleFilled(c, 3.5f, IM_COL32(235, 175, 95, 255));
-        dl->AddCircleFilled(handle, 4.5f, IM_COL32(255, 120, 70, 255));      // radius handle
-        const ImVec2 apex = ImVec2(c.x, c.y - (float)(h.height * st.gm_canvas_scale));
-        dl->AddLine(c, apex, IM_COL32(210, 150, 110, 130));
-        dl->AddCircleFilled(apex, 3.0f, IM_COL32(150, 205, 120, 230));       // apex (height)
+        for (int i = 0; i < (int)st.gm_hats.size(); ++i) {
+            const auto& h = st.gm_hats[i];
+            const ImVec2 c = to_screen(h.x, h.y);
+            const float rr = (float)(h.radius * st.gm_canvas_scale);
+            const bool inside = c.x >= canvas_origin.x && c.x <= canvas_origin.x + cw &&
+                                c.y >= canvas_origin.y && c.y <= canvas_origin.y + ch;
+            if (!inside) continue;
+            const bool near_center = canvas_hovered &&
+                std::fabs(mouse.x - c.x) <= 12.0f && std::fabs(mouse.y - c.y) <= 12.0f;
+            const ImVec2 handle = ImVec2(c.x + rr, c.y);
+            const bool near_handle = canvas_hovered &&
+                std::fabs(mouse.x - handle.x) <= 8.0f && std::fabs(mouse.y - handle.y) <= 8.0f;
+            if (near_center) hat_hover = i;
+            if (near_handle) hat_handle_hit = i;
+            const bool active = (i == st.gm_drag_hat) || near_center || near_handle;
+            dl->AddCircle(c, rr, active ? IM_COL32(255, 170, 60, 255)
+                                        : IM_COL32(210, 150, 110, 190), 0, 2.0f);
+            dl->AddLine(ImVec2(c.x - 9, c.y), ImVec2(c.x + 9, c.y), IM_COL32(210, 150, 110, 190));
+            dl->AddLine(ImVec2(c.x, c.y - 9), ImVec2(c.x, c.y + 9), IM_COL32(210, 150, 110, 190));
+            dl->AddCircleFilled(c, 3.5f, IM_COL32(235, 175, 95, 255));
+            dl->AddCircleFilled(handle, 4.5f, IM_COL32(255, 120, 70, 255));
+            const ImVec2 apex = to_screen(h.x, h.y + h.height);
+            dl->AddLine(c, apex, IM_COL32(210, 150, 110, 130));
+            dl->AddCircleFilled(apex, 3.0f, IM_COL32(150, 205, 120, 230));
+        }
     }
 
-    // Mouse interactions (tool-aware).
+    // ── Mouse interactions (tool-aware) ──
+    // Snap helper: rounds a world position onto the snap grid when enabled.
+    auto snap_xy = [&](double& x, double& y) {
+        if (st.gm_snap) {
+            const double g = st.gm_snap_grid;
+            x = std::round(x / g) * g;
+            y = std::round(y / g) * g;
+        }
+    };
     if (canvas_hovered) {
         const ImVec2 mouse = ImGui::GetMousePos();
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -6448,48 +6908,99 @@ static void draw_ground_mesh_generator(ViewerState& st) {
                     st.gm_drag_hat = hat_hover;
                     st.gm_hat_dragging = true;
                 } else {
+                    gm_push_undo(st);
                     auto w = to_world(mouse);
-                    st.gm_hats.push_back({w.first, w.second,
-                                          st.gm_hat_radius, st.gm_hat_height});
+                    snap_xy(w.first, w.second);
+                    st.gm_hats.push_back({w.first, w.second, st.gm_hat_radius, st.gm_hat_height});
                     st.gm_drag_hat = (int)st.gm_hats.size() - 1;
                     st.gm_hat_dragging = true;
                     st.gm_sketch_dirty = true;
                 }
-            } else if (st.gm_tool == 0 && hat_hover >= 0) {
-                st.gm_drag_hat = hat_hover;              // Move tool: grab a hat
-                st.gm_hat_dragging = true;
             } else if (st.gm_tool == 3) {                // Direct freehand outline
+                if (!st.gm_freehand_active) gm_push_undo(st);   // one undo step per stroke
                 if (!io.KeyShift) st.gm_points.clear();
                 auto w = to_world(mouse);
                 st.gm_points.push_back({w.first, w.second});
                 st.gm_freehand_active = true;
                 st.gm_sketch_dirty = true;
-            } else if (st.gm_tool == 2) {                // Erase
+            } else if (st.gm_tool == 2) {                // Erase: vertex only
                 if (hover >= 0) {
+                    gm_push_undo(st);
                     st.gm_points.erase(st.gm_points.begin() + hover);
                     st.gm_drag_point = -1;
+                    st.gm_dragging = false;
                     st.gm_sketch_dirty = true;
                 }
+            } else if (st.gm_tool == 0 && hat_hover >= 0) {
+                st.gm_drag_hat = hat_hover;              // Move tool: grab a hat
+                st.gm_hat_dragging = true;
             } else if (hover >= 0 && st.gm_tool == 0) {  // Move: drag existing
                 st.gm_drag_point = hover;
                 st.gm_dragging = true;
-            } else {                                     // Add point
+                // Preserve the grab offset so the node doesn't jump to the
+                // cursor center on grab (matches the inline mesh editor).
                 auto w = to_world(mouse);
+                st.gm_drag_off_x = st.gm_points[hover].x - w.first;
+                st.gm_drag_off_y = st.gm_points[hover].y - w.second;
+            } else if (hover < 0 && edge_hover >= 0 && (st.gm_tool == 0 || st.gm_tool == 1)) {
+                // Middle-node creation: insert a point snapped onto the
+                // hovered edge (click spot projected onto the segment). The
+                // hover<0 guard stops the Add tool from stacking a duplicate
+                // node right on top of an existing vertex.
+                gm_push_undo(st);
+                const int a = edge_hover;
+                const int b = (a + 1) % (int)st.gm_points.size();
+                auto w = to_world(mouse);
+                const double ax = st.gm_points[a].x, ay = st.gm_points[a].y;
+                const double bx = st.gm_points[b].x, by = st.gm_points[b].y;
+                const double dx = bx - ax, dy = by - ay;
+                const double len2 = dx * dx + dy * dy;
+                double t = len2 > 1e-12 ? ((w.first - ax) * dx + (w.second - ay) * dy) / len2 : 0.0;
+                t = std::clamp(t, 0.0, 1.0);
+                const boulder::PolygonPoint np = {ax + dx * t, ay + dy * t};
+                st.gm_points.insert(st.gm_points.begin() + b, np);
+                if (st.gm_mirror_x) {
+                    int ma = -1;
+                    for (int i = 0; i < (int)st.gm_points.size(); ++i) {
+                        const int j = (i + 1) % (int)st.gm_points.size();
+                        if (std::fabs(st.gm_points[i].x + ax) < 1e-4 &&
+                            std::fabs(st.gm_points[i].y - ay) < 1e-4 &&
+                            std::fabs(st.gm_points[j].x + bx) < 1e-4 &&
+                            std::fabs(st.gm_points[j].y - by) < 1e-4) { ma = j; break; }
+                    }
+                    if (ma >= 0) st.gm_points.insert(st.gm_points.begin() + ma, {-np.x, np.y});
+                    else st.gm_points.push_back({-np.x, np.y});
+                }
+                st.gm_drag_point = b;
+                st.gm_dragging = (st.gm_tool == 0);
+                st.gm_drag_off_x = st.gm_drag_off_y = 0.0;
+                st.gm_sketch_dirty = true;
+            } else if (st.gm_tool == 0 || st.gm_tool == 1) {  // Add point (Move/Add only)
+                gm_push_undo(st);
+                auto w = to_world(mouse);
+                snap_xy(w.first, w.second);
                 st.gm_points.push_back({w.first, w.second});
                 if (st.gm_mirror_x) st.gm_points.push_back({-w.first, w.second});
-                st.gm_drag_point = (int)st.gm_points.size() - 1;
+                // Grab the node the user clicked (not its mirror, which is
+                // pushed second when Mirror X is on).
+                st.gm_drag_point = st.gm_mirror_x ? (int)st.gm_points.size() - 2
+                                                  : (int)st.gm_points.size() - 1;
                 st.gm_dragging = (st.gm_tool == 0);
+                st.gm_drag_off_x = st.gm_drag_off_y = 0.0;
                 st.gm_sketch_dirty = true;
             }
         }
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-            if (hat_hover >= 0) {                        // RMB on a hat → remove it
+            if (hat_hover >= 0) {                        // RMB on a hat: remove
+                gm_push_undo(st);
                 st.gm_hats.erase(st.gm_hats.begin() + hat_hover);
                 st.gm_drag_hat = -1;
                 st.gm_sketch_dirty = true;
-            } else if (hover >= 0) {
+            } else if (hover >= 0) {                     // RMB on a point: remove
+                gm_push_undo(st);
                 st.gm_points.erase(st.gm_points.begin() + hover);
                 st.gm_drag_point = -1;
+                st.gm_dragging = false;
                 st.gm_sketch_dirty = true;
             }
         }
@@ -6499,7 +7010,7 @@ static void draw_ground_mesh_generator(ViewerState& st) {
             auto w = to_world(ImGui::GetMousePos());
             if (st.gm_points.empty() || std::hypot(w.first - st.gm_points.back().x,
                                                    w.second - st.gm_points.back().y) >=
-                                        std::max(0.25f, 3.0f / st.gm_canvas_scale)) {
+                                        std::max(0.25, 3.0 / st.gm_canvas_scale)) {
                 st.gm_points.push_back({w.first, w.second});
                 st.gm_sketch_dirty = true;
             }
@@ -6512,6 +7023,9 @@ static void draw_ground_mesh_generator(ViewerState& st) {
         st.gm_drag_point < (int)st.gm_points.size()) {
         if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             auto w = to_world(ImGui::GetMousePos());
+            w.first += st.gm_drag_off_x;                 // keep the grab offset
+            w.second += st.gm_drag_off_y;
+            snap_xy(w.first, w.second);
             st.gm_points[st.gm_drag_point] = {w.first, w.second};
             st.gm_sketch_dirty = true;
         } else {
@@ -6522,7 +7036,10 @@ static void draw_ground_mesh_generator(ViewerState& st) {
     if (st.gm_dragging && st.gm_tool != 0) { st.gm_dragging = false; st.gm_drag_point = -1; }
     // Delete key removes the hovered point.
     if (canvas_hovered && hover >= 0 && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        gm_push_undo(st);
         st.gm_points.erase(st.gm_points.begin() + hover);
+        st.gm_drag_point = -1;
+        st.gm_dragging = false;
         st.gm_sketch_dirty = true;
     }
     // ── Hat drag / resize loops ──
@@ -6553,106 +7070,58 @@ static void draw_ground_mesh_generator(ViewerState& st) {
         st.gm_drag_hat = -1;
     }
     if (canvas_hovered && hat_hover >= 0 && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        gm_push_undo(st);
         st.gm_hats.erase(st.gm_hats.begin() + hat_hover);
         st.gm_sketch_dirty = true;
     }
-    // Frame the sketch (F key).
-    if (do_frame_key) gm_frame_sketch();
 
-    // Canvas hint bar + live stats.
+    // ── Arrow-key nudge ──
+    // While a node is grabbed (Move tool drag), arrows nudge it in world
+    // units (Shift = 5x); otherwise arrows pan the canvas view. This makes
+    // precise vertex placement possible without pixel-hunting.
+    {
+        float nx = 0.0f, ny = 0.0f;
+        if (ImGui::IsKeyDown(ImGuiKey_UpArrow))    ny += 1.0f;
+        if (ImGui::IsKeyDown(ImGuiKey_DownArrow))  ny -= 1.0f;
+        if (ImGui::IsKeyDown(ImGuiKey_LeftArrow))  nx -= 1.0f;
+        if (ImGui::IsKeyDown(ImGuiKey_RightArrow)) nx += 1.0f;
+        if (nx != 0.0f || ny != 0.0f) {
+            const float step = io.KeyShift ? 5.0f : 0.5f;
+            if (st.gm_dragging && st.gm_drag_point >= 0 &&
+                st.gm_drag_point < (int)st.gm_points.size()) {
+                st.gm_points[st.gm_drag_point].x += (double)(nx * step);
+                st.gm_points[st.gm_drag_point].y += (double)(ny * step);
+                st.gm_sketch_dirty = true;
+            } else {
+                // View pans in the pressed direction (same convention as the
+                // inline mesh editor): right arrow reveals more world to the
+                // right, up arrow reveals more world above.
+                st.gm_canvas_cx += nx * step;
+                st.gm_canvas_cy -= ny * step;
+            }
+        }
+    }
+
+    // Hint bar + live stats.
     const char* gm_hint =
-        (st.gm_tool == 0) ? "LMB move \xc2\xb7 click empty = add \xc2\xb7 RMB/Del = remove \xc2\xb7 Wheel zoom \xc2\xb7 MMB pan"
-        : (st.gm_tool == 1) ? "LMB add points \xc2\xb7 RMB/Del = remove \xc2\xb7 Wheel zoom \xc2\xb7 MMB pan"
-        : (st.gm_tool == 2) ? "LMB erase points \xc2\xb7 RMB/Del = remove \xc2\xb7 Wheel zoom \xc2\xb7 MMB pan"
-        : (st.gm_tool == 4) ? "LMB place a round-hat dome \xc2\xb7 drag center = move \xc2\xb7 drag orange handle = resize \xc2\xb7 RMB/Del = remove"
-        : "Drag to draw outline \xc2\xb7 Shift+drag appends \xc2\xb7 release converts to polygon nodes";
-    dl->AddRectFilled(ImVec2(canvas_origin.x, canvas_origin.y + canvas_h - 40.0f),
-                      ImVec2(canvas_origin.x + canvas_w, canvas_origin.y + canvas_h),
+        (st.gm_tool == 0) ? "LMB move | edge = insert node | empty = add | RMB/Del remove | arrows nudge | Ctrl+Z undo"
+        : (st.gm_tool == 1) ? "LMB add points (edge = insert node) | RMB/Del remove | arrows pan | Ctrl+Z undo"
+        : (st.gm_tool == 2) ? "LMB erase points | RMB/Del remove | Ctrl+Z undo"
+        : (st.gm_tool == 4) ? "LMB place a round-hat dome | drag center = move | orange handle = resize | RMB/Del remove"
+        : "Drag to draw | Shift+drag appends | release simplifies | Ctrl+Z undo";
+    dl->AddRectFilled(ImVec2(canvas_origin.x, canvas_origin.y + (float)ch - 40.0f),
+                      ImVec2(canvas_origin.x + (float)cw, canvas_origin.y + (float)ch),
                       IM_COL32(18, 21, 28, 215));
-    dl->AddText(ImVec2(canvas_origin.x + 8, canvas_origin.y + canvas_h - 34.0f),
+    dl->AddText(ImVec2(canvas_origin.x + 8, canvas_origin.y + (float)ch - 34.0f),
                 IM_COL32(160, 170, 190, 255), gm_hint);
     char gm_stats[160];
     snprintf(gm_stats, sizeof(gm_stats),
-             "%d points \xc2\xb7 Z %.1f \xc2\xb7 depth %.0f..%.0f \xc2\xb7 top %.0f\xc2\xb0",
+             "%d points | Z %.1f | depth %.0f..%.0f | top %.0f deg",
              (int)st.gm_points.size(), st.gm_z, st.gm_min_depth, st.gm_max_depth, st.gm_top_angle);
-    dl->AddText(ImVec2(canvas_origin.x + 8, canvas_origin.y + canvas_h - 18.0f),
+    dl->AddText(ImVec2(canvas_origin.x + 8, canvas_origin.y + (float)ch - 18.0f),
                 IM_COL32(140, 150, 170, 220), gm_stats);
     ImGui::EndChild(); // gm_canvas_host
 
-    // ── Live 3D preview of the extruded mesh ──
-    if (st.gm_show_3d) {
-        ImGui::SameLine();
-        ImGui::BeginChild("##gm_3d_host", ImVec2(preview_w, canvas_h), ImGuiChildFlags_Borders);
-        ImGui::TextDisabled(ICON_FA_CUBE " 3D Preview");
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", st.gm_preview_valid ? "live" : "(build...)");
-        ImGui::Separator();
-
-        int pw = (int)ImGui::GetContentRegionAvail().x;
-        int ph = (int)ImGui::GetContentRegionAvail().y;
-        if (pw < 4) pw = 4;
-        if (ph < 4) ph = 4;
-        if (!st.gm_preview_fbo) {
-            st.gm_preview_fbo = av::create_fbo(pw, ph, &st.gm_preview_fbo_tex);
-            st.gm_preview_w = pw; st.gm_preview_h = ph;
-        } else if (pw != st.gm_preview_w || ph != st.gm_preview_h) {
-            av::resize_fbo(st.gm_preview_fbo, pw, ph, &st.gm_preview_fbo_tex);
-            st.gm_preview_w = pw; st.gm_preview_h = ph;
-        }
-
-        if (st.gm_preview_valid && !st.gm_preview_meshes.empty()) {
-            // Orbit: LMB drag · zoom: wheel (anchored at the pivot point).
-            const bool prev_hovered = ImGui::IsItemHovered() || ImGui::IsWindowHovered();
-            if (prev_hovered && io.MouseWheel != 0.0f) {
-                const float factor = std::pow(0.94f, io.MouseWheel);
-                st.gm_preview_cam.distance = std::clamp(st.gm_preview_cam.distance * factor,
-                                                        0.5f, 2000.0f);
-            }
-            if (prev_hovered && ImGui::IsMouseDragging(0)) {
-                st.gm_preview_cam.yaw   += io.MouseDelta.x * 0.5f;
-                st.gm_preview_cam.pitch += io.MouseDelta.y * 0.5f;
-                st.gm_preview_cam.pitch = std::clamp(st.gm_preview_cam.pitch, -89.0f, 89.0f);
-            }
-            if (prev_hovered && ImGui::IsMouseDragging(1)) {
-                const float scale = st.gm_preview_cam.distance * 0.003f;
-                st.gm_preview_cam.target[0] -= std::cos(st.gm_preview_cam.yaw * 3.14159f / 180.0f) * io.MouseDelta.x * scale;
-                st.gm_preview_cam.target[2] += std::sin(st.gm_preview_cam.yaw * 3.14159f / 180.0f) * io.MouseDelta.x * scale;
-                st.gm_preview_cam.target[1] += io.MouseDelta.y * scale;
-            }
-
-            // The sketch preview is a close-up editor view: no scene fog/lights.
-            av::clear_point_lights();
-            av::set_depth_fog(false, nullptr, 0.0f, 0.0f);
-            av::begin_3d(st.gm_preview_fbo, pw, ph, st.gm_preview_cam);
-            av::render_grid_xy(60.0f, st.gm_preview_cam.target[2] - st.gm_preview_cam.distance * 0.5f);
-            float identity[16];
-            av::mat4_identity(identity);
-            for (size_t i = 0; i < st.gm_preview_meshes.size(); ++i) {
-                auto& gm = st.gm_preview_meshes[i];
-                gm.texture_id = (i < st.gm_preview_textures.size()) ? st.gm_preview_textures[i] : 0;
-                float col[4] = {1, 1, 1, 1};
-                av::render_mesh(gm, identity, col, false);
-            }
-            av::end_3d();
-
-            const ImVec2 ppos = ImGui::GetCursorScreenPos();
-            ImGui::Image((ImTextureID)(intptr_t)st.gm_preview_fbo_tex, ImVec2((float)pw, (float)ph),
-                         ImVec2(0, 1), ImVec2(1, 0));
-            // Preview hint bar.
-            ImDrawList* pdl = ImGui::GetWindowDrawList();
-            pdl->AddRectFilled(ImVec2(ppos.x, ppos.y + ph - 22.0f),
-                               ImVec2(ppos.x + pw, ppos.y + ph),
-                               IM_COL32(18, 21, 28, 215));
-            char hint[96];
-            snprintf(hint, sizeof(hint),
-                     "LMB orbit \xc2\xb7 Wheel zoom \xc2\xb7 RMB pan \xc2\xb7 Z %.0f", st.gm_z);
-            pdl->AddText(ImVec2(ppos.x + 6, ppos.y + ph - 18.0f),
-                         IM_COL32(150, 165, 190, 255), hint);
-        } else {
-            ImGui::TextDisabled("\nSketch a polygon (3+ points)\nto preview the extruded mesh.");
-        }
-        ImGui::EndChild(); // gm_3d_host
-    }
 
     // ── Extrusion / Depth properties ──
     ImGui::Separator();
@@ -6670,6 +7139,24 @@ static void draw_ground_mesh_generator(ViewerState& st) {
                           "Real Swordigo levels use Z in the 30-50 range; pick the layer that\n"
                           "matches the objects around it.");
     }
+    // Quick presets: common depth/thickness combos for fast level building.
+    auto gm_preset = [&](const char* label, float z, float th, const char* tip) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton(label)) {
+            st.gm_z = z;
+            const float center = (st.gm_min_depth + st.gm_max_depth) * 0.5f;
+            st.gm_min_depth = center - th * 0.5f;
+            st.gm_max_depth = center + th * 0.5f;
+            st.gm_sketch_dirty = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+    };
+    gm_preset("Platform", 30.0f, 40.0f,
+              "Preset: Z 30, thickness 40 (standard walkable platform)");
+    gm_preset("Wall", 40.0f, 90.0f,
+              "Preset: Z 40, thickness 90 (thick wall / cliff face)");
+    gm_preset("Cliff", 50.0f, 120.0f,
+              "Preset: Z 50, thickness 120 (deep background cliff)");
 
     // Thickness quick control — keeps Min/Max symmetric around a center.
     float thickness = std::fabs(st.gm_max_depth - st.gm_min_depth);
@@ -6768,7 +7255,13 @@ static void draw_ground_mesh_generator(ViewerState& st) {
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_TRASH " Clear", ImVec2(78, 26))) { st.gm_points.clear(); st.gm_hats.clear(); st.gm_sketch_dirty = true; }
+    if (ImGui::Button(ICON_FA_TRASH " Clear", ImVec2(78, 26))) {
+        gm_push_undo(st);
+        st.gm_points.clear(); st.gm_hats.clear(); st.gm_sketch_dirty = true;
+        st.gm_canvas_framed = false;     // reframe once the new sketch has points
+        st.gm_drag_point = -1; st.gm_dragging = false;
+        st.gm_drag_hat = -1; st.gm_hat_dragging = st.gm_hat_resizing = false;
+    }
     ImGui::SameLine();
     if (ImGui::Button(ICON_FA_LOCATION_DOT " Frame", ImVec2(76, 26))) gm_frame_sketch();
 
@@ -6782,7 +7275,9 @@ static void draw_ground_mesh_generator(ViewerState& st) {
                 std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
                 boulder::GroundMesh gm = boulder::parse_ground_mesh(content);
                 if (gm.polygon.size() >= 3) {
+                    gm_push_undo(st);
                     st.gm_points = gm.polygon;
+                    st.gm_hats = gm.hats;
                     st.gm_min_depth = gm.min_depth;
                     st.gm_max_depth = gm.max_depth;
                     st.gm_top_angle = gm.top_angle;
@@ -6791,6 +7286,7 @@ static void draw_ground_mesh_generator(ViewerState& st) {
                     snprintf(st.gm_top_tex, sizeof(st.gm_top_tex), "%s", gm.top_texture.c_str());
                     snprintf(st.gm_bottom_tex, sizeof(st.gm_bottom_tex), "%s", gm.bottom_texture.c_str());
                     st.gm_sketch_dirty = true;
+                    st.gm_canvas_framed = false;   // reframe on the loaded sketch
                     st.status_msg = "Loaded " + std::string(load_buf);
                 } else {
                     st.status_msg = "Invalid .swdm file.";
@@ -7534,10 +8030,10 @@ static void draw_scene_visualizer(ViewerState& st) {
     const int fh = rh < 1 ? 1 : rh;
 
     if (!st.fbo) {
-        st.fbo = av::create_fbo(fw, fh, &st.fbo_tex);
+        st.fbo = av::create_fbo_hdr(fw, fh, &st.fbo_tex);
         st.fbo_w = fw; st.fbo_h = fh;
     } else if (fw != st.fbo_w || fh != st.fbo_h) {
-        av::resize_fbo(st.fbo, fw, fh, &st.fbo_tex);
+        av::resize_fbo_hdr(st.fbo, fw, fh, &st.fbo_tex);
         st.fbo_w = fw; st.fbo_h = fh;
     }
 
@@ -7549,6 +8045,9 @@ static void draw_scene_visualizer(ViewerState& st) {
         sp::player_apply_camera(st.scene_player, st.camera);
 
     av::begin_3d(st.fbo, fw, fh, st.camera);
+    // HDR path: when PostFX owns tone mapping, the mesh shaders emit LINEAR
+    // light into the RGBA16F buffer (no double-ACES / gamma-on-gamma).
+    av::set_inline_tonemap(!(st.postfx_enabled && st.postfx.enabled && st.postfx.hd));
 
     // Viewport diagnostics (Settings → Rendering): flat texture view and the
     // world-normal color view. begin_3d resets these to OFF for every pass, so
@@ -7635,7 +8134,14 @@ static void draw_scene_visualizer(ViewerState& st) {
                 }
                 for (int axis = 0; axis < 3; ++axis) {
                     ddir[dir_count][axis] = direction[axis] / length;
-                    dcol[dir_count][axis] = light.color[axis] * light.intensity;
+                    // Game-space key intensity (≈2.6–3.4 in vanilla scenes and
+                    // the generators) is for the ENGINE's lighting equation.
+                    // Feeding it raw into the renderer overshot every tone
+                    // curve (the "everything is white" brightness bug). Remap
+                    // to linear-light units here; the renderer's HDR boost
+                    // brings it to ~2.3 effective.
+                    dcol[dir_count][axis] = light.color[axis] *
+                                            std::clamp(light.intensity * 0.32f, 0.0f, 1.6f);
                 }
                 ++dir_count;
             } else if (light.type == 3) {
@@ -7676,8 +8182,11 @@ static void draw_scene_visualizer(ViewerState& st) {
             if (point_count >= 16) break;
             const auto& light = *ranked.light;
             for (int axis = 0; axis < 3; ++axis) {
+                // 3.5 ceiling: torch/fire cores carry honest HDR energy for
+                // the bloom pass, but a stacked pile of lights can't bleach
+                // the whole scene.
                 lpos[point_count][axis] = light.pos[axis];
-                lcol[point_count][axis] = std::min(light.color[axis] * ranked.intensity, 1.5f);
+                lcol[point_count][axis] = std::min(light.color[axis] * ranked.intensity, 3.5f);
             }
             lrad[point_count] = std::max(1.0f, light.radius);
             ++point_count;
@@ -8212,6 +8721,17 @@ static void draw_scene_visualizer(ViewerState& st) {
     // The viewport is the Image item itself — capture hover right here so the
     // input block below works no matter what ImGui items get drawn afterwards.
     const bool viewport_hovered = ImGui::IsItemHovered();
+    // Sticky keyboard ownership: hovering (or clicking) the viewport grabs the
+    // keys; clicking anywhere else releases them. While held, arrow-nudging
+    // objects keeps working even with the cursor parked over a side panel —
+    // ImGui nav stays suspended so the GUI never eats the arrows.
+    if (viewport_hovered)
+        st.view_keyboard_focus = true;
+    else if (ImGui::IsMouseClicked(0))
+        st.view_keyboard_focus = false;
+    // Stamp this frame so the top-of-frame fallback clear (below) can tell
+    // the viewport is still live and must NOT stomp the sticky latch.
+    st.view_keyboard_focus_frame = ImGui::GetFrameCount();
 
     ImDrawList* overlay = ImGui::GetWindowDrawList();
 
@@ -8389,6 +8909,30 @@ static void draw_scene_visualizer(ViewerState& st) {
                                          IM_COL32(255, 255, 255, 200));
                 }
             }
+            // Selected sub-mesh tint (triple-tap drill-down): wash the whole
+            // mesh amber so it reads as "this mesh is selected" even before an
+            // element (vertex/face/edge) is picked.
+            if (st.mesh_edit_mesh >= 0 && st.mesh_edit_mesh < (int)eobj.ground_meshes.size() &&
+                st.mesh_edit_vertex < 0 && st.mesh_edit_triangle < 0 && st.mesh_edit_edge_a < 0) {
+                const auto& sm = eobj.ground_meshes[st.mesh_edit_mesh];
+                for (size_t t = 0; t + 2 < sm.indices.size(); t += 3) {
+                    ImVec2 pts[3];
+                    bool ok = true;
+                    for (int k = 0; k < 3; ++k) {
+                        const int vi = (int)sm.indices[t + k];
+                        if (vi < 0 || vi >= sm.num_vertices) { ok = false; break; }
+                        const float lp[3] = {sm.positions[vi*3], sm.positions[vi*3+1], sm.positions[vi*3+2]};
+                        const float wp[3] = { eobj_mat[0]*lp[0] + eobj_mat[4]*lp[1] + eobj_mat[8]*lp[2]  + eobj_mat[12],
+                                              eobj_mat[1]*lp[0] + eobj_mat[5]*lp[1] + eobj_mat[9]*lp[2]  + eobj_mat[13],
+                                              eobj_mat[2]*lp[0] + eobj_mat[6]*lp[1] + eobj_mat[10]*lp[2] + eobj_mat[14] };
+                        if (!swk::world_to_screen(st.camera, w, h, pos, wp, pts[k])) { ok = false; break; }
+                    }
+                    if (ok) {
+                        overlay->AddTriangleFilled(pts[0], pts[1], pts[2], IM_COL32(255, 180, 40, 46));
+                        overlay->AddTriangle(pts[0], pts[1], pts[2], IM_COL32(255, 200, 60, 120), 1.0f);
+                    }
+                }
+            }
             // Highlight the picked face / edge (face & edge tools).
             if (st.mesh_edit_tool == 1 && st.mesh_edit_triangle >= 0 &&
                 st.mesh_edit_mesh >= 0 && st.mesh_edit_mesh < (int)eobj.ground_meshes.size()) {
@@ -8460,6 +9004,24 @@ static void draw_scene_visualizer(ViewerState& st) {
         st.gm_edit_apply_object >= 0) {
         inline_edit_input(st, pos, w, h);
     }
+    // ── Failsafe: unstick pointer/drag flags ──
+    // The release handling inside the hover-gated block below never runs when
+    // the mouse is released over ANOTHER panel (inspector, terminal…), so
+    // scene_pointer_active stayed true forever — permanently disabling every
+    // keyboard camera control (WASD / arrows / +-). When we are NOT hovering
+    // the viewport and the button is up, nothing valid can be dragging: clear
+    // the sticky flags. (When we ARE hovering, the normal release block runs.)
+    if (!viewport_hovered && !ImGui::IsMouseDown(0)) {
+        if (st.scene_pointer_active || st.scene_transform_drag ||
+            st.mesh_edit_drag || st.gizmo_drag) {
+            st.scene_pointer_active = false;
+            st.scene_transform_drag = false;
+            st.mesh_edit_drag = false;
+            st.gizmo_drag = false;
+            st.gizmo_axis = -1;
+        }
+    }
+
     if (viewport_hovered && !using_guizmo && !st.gm_inline_edit) {
 
         // ── Keyboard shortcuts ──
@@ -8488,7 +9050,8 @@ static void draw_scene_visualizer(ViewerState& st) {
                 snapshot_scene(st);
             }
         }
-        if (ImGui::IsKeyPressed(ImGuiKey_S)) { st.scene_transform_mode = 3; st.scene_mesh_edit = false; } // Scale
+        // NOTE: S is no longer a Scale shortcut — WASD drives the camera.
+        // Scale mode: key 4 or the toolbar buttons.
         if (ImGui::IsKeyPressed(ImGuiKey_M)) {
             // M = inline 2D edit (2D-only, no legacy-3D fallback).
             if (st.selected_object >= 0 &&
@@ -8560,6 +9123,97 @@ static void draw_scene_visualizer(ViewerState& st) {
                 st.mesh_edit_mesh = st.mesh_edit_vertex = -1;
                 st.scene_dirty = true;
                 resync_scene_ground_meshes(st);
+            }
+        }
+
+        // ── WASD camera pan (W/S forward-back, A/D strafe, Q/E vertical) ──
+        // Active whenever the viewport is hovered and no drag or text field is
+        // in progress. Speed scales with the orbit distance so the camera
+        // feels consistent zoomed in or out.
+        if (!io.WantCaptureKeyboard && !st.scene_transform_drag &&
+            !st.gizmo_drag && !st.mesh_edit_drag && !st.scene_pointer_active) {
+            float right[3], up[3], fwd[3];
+            swk::camera_basis(st.camera, right, up, fwd);
+            const float speed = 0.09f * st.camera.distance * io.DeltaTime * st.cam_keyboard_speed;
+            float dx = 0.0f, dz = 0.0f, dy = 0.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_W)) { dx += fwd[0]; dz += fwd[2]; }
+            if (ImGui::IsKeyDown(ImGuiKey_S)) { dx -= fwd[0]; dz -= fwd[2]; }
+            if (ImGui::IsKeyDown(ImGuiKey_A)) { dx -= right[0]; dz -= right[2]; }
+            if (ImGui::IsKeyDown(ImGuiKey_D)) { dx += right[0]; dz += right[2]; }
+            if (ImGui::IsKeyDown(ImGuiKey_Q)) dy -= 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_E)) dy += 1.0f;
+            if (dx != 0.0f || dz != 0.0f || dy != 0.0f) {
+                st.camera.target[0] += dx * speed;
+                st.camera.target[2] += dz * speed;
+                st.camera.target[1] += dy * speed;
+            }
+        }
+
+        // ── Arrow keys ──
+        // In Move mode WITH a selection they nudge the selection (existing
+        // behaviour). Otherwise they PAN THE CAMERA (left/right on the view
+        // right vector, up/down vertical) — always-responsive navigation.
+        const bool arrow_nudge_selection =
+            st.scene_transform_mode == 1 && !st.scene_selection.empty();
+        if (!io.WantCaptureKeyboard && !st.scene_transform_drag) {
+            float mx = 0.0f, my = 0.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_UpArrow))    my += 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_DownArrow))  my -= 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_LeftArrow))  mx -= 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_RightArrow)) mx += 1.0f;
+            if (mx != 0.0f || my != 0.0f) {
+                if (arrow_nudge_selection) {
+                    const float step = snap_active ? st.scene_snap_step
+                        : std::max(5.0f, st.camera.distance * 0.01f);
+                    const float amount = step * 8.0f * io.DeltaTime * st.cam_keyboard_speed;
+                    for (int idx : st.scene_selection) {
+                        if (idx < 0 || idx >= (int)st.scene.objects.size()) continue;
+                        auto& o = st.scene.objects[idx];
+                        o.pos_x += mx * amount;
+                        o.pos_y += my * amount;
+                    }
+                    av::scene_refresh(st.scene);
+                    st.scene_dirty = true;
+                } else {
+                    float right[3], up[3], fwd[3];
+                    swk::camera_basis(st.camera, right, up, fwd);
+                    const float speed = 0.09f * st.camera.distance * io.DeltaTime * st.cam_keyboard_speed;
+                    st.camera.target[0] += mx * right[0] * speed;
+                    st.camera.target[2] += mx * right[2] * speed;
+                    st.camera.target[1] += my * speed;
+                }
+            }
+        }
+
+        // ── +/- keys ──
+        // In Scale mode WITH a selection they scale the selection (existing
+        // behaviour). Otherwise they ZOOM THE CAMERA (exponential distance,
+        // same feel as the mouse wheel). '=' (top row) and keypad +/-.
+        const bool plusminus_scale_selection =
+            st.scene_transform_mode == 3 && !st.scene_selection.empty();
+        if (!io.WantCaptureKeyboard && !st.scene_transform_drag) {
+            float dir = 0.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_Equal))       dir += 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_Minus))       dir -= 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_KeypadAdd))   dir += 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_KeypadSubtract)) dir -= 1.0f;
+            if (dir != 0.0f) {
+                if (plusminus_scale_selection) {
+                    const float dscl = expf(dir * 1.8f * io.DeltaTime);
+                    for (int idx : st.scene_selection) {
+                        if (idx < 0 || idx >= (int)st.scene.objects.size()) continue;
+                        auto& o = st.scene.objects[idx];
+                        o.scale_x = std::clamp(o.scale_x * dscl, 0.001f, 100.0f);
+                        o.scale_y = o.scale_z = o.scale_x;
+                    }
+                    av::scene_refresh(st.scene);
+                    st.scene_dirty = true;
+                } else {
+                    // '+' pulls in, '-' pushes out (wheel convention).
+                    const float factor = expf(-dir * 1.2f * io.DeltaTime);
+                    st.camera.distance = std::clamp(st.camera.distance * factor,
+                                                    0.1f, 2000.0f);
+                }
             }
         }
 
@@ -8774,6 +9428,39 @@ static void draw_scene_visualizer(ViewerState& st) {
                                                        st.scene_show_hidden, st.camera, w, h,
                                                        pos, io.MousePos);
                 if (hit != st.selected_object) select_scene_object(st, hit);
+
+                // Triple-tap a mesh → select the sub-mesh under the cursor.
+                // Three rapid taps (<= 0.4 s) within a small radius count as a
+                // deliberate drill-down; a drag or a click elsewhere resets.
+                const double now = ImGui::GetTime();
+                const bool rapid = (now - st.scene_tap_time) <= 0.4;
+                const bool same_spot = std::hypotf(io.MousePos.x - st.scene_tap_pos.x,
+                                                   io.MousePos.y - st.scene_tap_pos.y) <= 14.0f;
+                st.scene_tap_count = (rapid && same_spot) ? st.scene_tap_count + 1 : 1;
+                st.scene_tap_time = now;
+                st.scene_tap_pos = io.MousePos;
+                if (st.scene_tap_count >= 3) {
+                    st.scene_tap_count = 0;
+                    int mobj = -1, mmesh = -1;
+                    if (swk::pick_scene_ground_mesh(st.scene.objects, st.scene_show_hidden,
+                                                    st.camera, w, h, pos, io.MousePos,
+                                                    mobj, mmesh)) {
+                        select_scene_object(st, mobj);
+                        st.scene_mesh_edit = true;      // arm vertex-level editing
+                        st.mesh_edit_object = mobj;
+                        st.mesh_edit_mesh = mmesh;
+                        st.mesh_edit_vertex = -1;
+                        st.mesh_edit_triangle = -1;
+                        st.mesh_edit_edge_a = st.mesh_edit_edge_b = -1;
+                        st.mesh_edit_tool = 0;
+                        st.mesh_edit_drag = false;
+                        char msg[192];
+                        snprintf(msg, sizeof(msg),
+                                 "Selected mesh %d of '%s' \xe2\x80\x94 edit in 2D with M",
+                                 mmesh, st.scene.objects[mobj].name.c_str());
+                        st.status_msg = msg;
+                    }
+                }
             }
             st.scene_pointer_active = false;
             st.scene_transform_drag = false;
@@ -9024,7 +9711,11 @@ static void draw_text_preview(ViewerState& st) {
     // Content probing records the actual schema when the file is opened. This
     // keeps Save correct for extensionless/renamed decoded assets as well.
     const bool is_protobuf = !st.text_protobuf_type.empty() && st.text_is_decoded_markup;
-    bool is_gmesh = (ext == ".gmesh");
+    // .gmesh AND .swdm are both boulder GroundMesh sketch formats — they get the
+    // GroundMesh helpers (compile to SCL, plus "Open in Ground Mesh Studio" for a
+    // real visual viewer/editor instead of staring at raw text).
+    bool is_swdm  = (ext == ".swdm");
+    bool is_gmesh = (ext == ".gmesh") || is_swdm;
 
     // Initialize edit buffer on file change
     static std::string last_loaded_path;
@@ -9121,6 +9812,41 @@ static void draw_text_preview(ViewerState& st) {
                 st.status_msg = "GroundMesh compilation yielded empty markup.";
             }
         }
+
+        // Open the sketch in the visual Ground Mesh Studio instead of editing
+        // raw text. Parses the current buffer (works for both .swdm and .gmesh),
+        // loads the polygon/hats/params into the sketch canvas, then jumps to
+        // the create/sketch workspace where it can be edited visually.
+        ImGui::SameLine();
+        if (ImGui::Button(ICON_FA_MOUNTAIN_SUN " Open in Ground Mesh Studio")) {
+            boulder::GroundMesh gm = boulder::parse_ground_mesh(st.text_edit_buffer);
+            if (gm.polygon.size() >= 3) {
+                gm_push_undo(st);
+                st.gm_points       = gm.polygon;
+                st.gm_hats         = gm.hats;
+                st.gm_min_depth    = gm.min_depth;
+                st.gm_max_depth    = gm.max_depth;
+                st.gm_top_angle    = gm.top_angle;
+                st.gm_generate_top = gm.generate_top;
+                st.gm_z            = gm.z;
+                snprintf(st.gm_top_tex, sizeof(st.gm_top_tex), "%s", gm.top_texture.c_str());
+                snprintf(st.gm_bottom_tex, sizeof(st.gm_bottom_tex), "%s", gm.bottom_texture.c_str());
+                // Carry the file name over as the object/output name (strip ext).
+                {
+                    std::string stem = fs::path(st.sel_path).stem().string();
+                    if (!stem.empty())
+                        snprintf(st.gm_obj_name, sizeof(st.gm_obj_name), "%s", stem.c_str());
+                }
+                st.gm_sketch_dirty = true;
+                open_ground_mesh_studio(st);   // workspace mode 0 + switch to canvas tab
+                st.status_msg = "Opened " + st.sel_name + " in Ground Mesh Studio.";
+            } else {
+                st.status_msg = "Not a valid GroundMesh sketch (need >= 3 polygon points).";
+            }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Edit this %s visually on the sketch canvas",
+                              is_swdm ? ".swdm" : ".gmesh");
     }
 
     // Style Selection combo box and Import button
@@ -10148,8 +10874,8 @@ static void draw_properties_panel(ViewerState& st) {
                     opts.flip_v           = st.convert_flip_v;
                     opts.convert_textures = st.convert_tex_pgm;
                     opts.output_pvr       = true;
-                    std::string out = fs::path(st.sel_path).parent_path() /
-                                      (fs::path(st.sel_path).stem().string() + ".POD");
+                    std::string out = (fs::path(st.sel_path).parent_path() /
+                                      (fs::path(st.sel_path).stem().string() + ".POD")).string();
                     std::vector<std::string> written;
                     std::string conv_err;
                     if (av::fbx_to_pod(st.sel_path, out, opts, &written, &conv_err)) {
@@ -10643,6 +11369,64 @@ static void draw_properties_panel(ViewerState& st) {
                                             is_edited ? "  *" : "")) {
                             ImGui::TextDisabled("Bounds X: %.1f..%.1f  Y: %.1f..%.1f  Z: %.1f..%.1f",
                                 gm.min_x, gm.max_x, gm.min_y, gm.max_y, gm.min_z, gm.max_z);
+
+                            // Texture picker: thumbnail + combo of every known
+                            // texture + free-text fallback. Applying rewrites
+                            // the MeshData material so a save keeps the new look.
+                            {
+                                GLuint thumb = 0;
+                                if (st.selected_object >= 0 &&
+                                    st.selected_object < (int)st.scene_ground_textures.size() &&
+                                    mi < (int)st.scene_ground_textures[st.selected_object].size())
+                                    thumb = st.scene_ground_textures[st.selected_object][mi];
+                                if (thumb)
+                                    ImGui::Image((ImTextureID)(intptr_t)thumb, ImVec2(26, 26));
+                                else
+                                    ImGui::Dummy(ImVec2(26, 26));
+                                ImGui::SameLine();
+                                const std::string cur = (mi < (int)obj.ground_mesh_textures.size())
+                                                            ? obj.ground_mesh_textures[mi] : std::string();
+                                if (!st.gm_tex_scanned || st.gm_tex_scan_key != st.scene.filepath) {
+                                    gm_texture_scan(st);
+                                    st.gm_tex_scan_key = st.scene.filepath;
+                                }
+                                auto apply_tex = [&](const std::string& name) {
+                                    if (name.empty() || st.selected_object < 0) return;
+                                    snapshot_scene(st);
+                                    if (av::scene_set_ground_mesh_texture(
+                                            st.scene.objects[st.selected_object], (size_t)mi, name)) {
+                                        reupload_object_ground_meshes(st, st.selected_object);
+                                        av::scene_refresh(st.scene);
+                                        st.scene_dirty = true;
+                                        st.status_msg = "Mesh " + std::to_string(mi) +
+                                                        " texture \xe2\x86\x92 " + name;
+                                    }
+                                };
+                                ImGui::SetNextItemWidth(170.0f);
+                                const char* preview = cur.empty() ? "(none)" : cur.c_str();
+                                if (ImGui::BeginCombo(("##tex" + std::to_string(mi)).c_str(), preview)) {
+                                    bool cur_in_list = cur.empty();
+                                    for (const auto& name : st.gm_tex_names) {
+                                        const bool selected = (name == cur);
+                                        if (selected) cur_in_list = true;
+                                        if (ImGui::Selectable(name.c_str(), selected)) apply_tex(name);
+                                        if (selected) ImGui::SetItemDefaultFocus();
+                                    }
+                                    if (!cur_in_list && !cur.empty())
+                                        ImGui::Selectable(cur.c_str(), true);
+                                    ImGui::EndCombo();
+                                }
+                                ImGui::SameLine();
+                                ImGui::SetNextItemWidth(110.0f);
+                                ImGui::InputText(("##texcustom" + std::to_string(mi)).c_str(),
+                                                 st.gm_tex_custom, sizeof(st.gm_tex_custom));
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton(("Apply##" + std::to_string(mi)).c_str())) {
+                                    apply_tex(st.gm_tex_custom);
+                                    st.gm_tex_custom[0] = '\0';
+                                }
+                            }
+
                             if (ImGui::SmallButton("Edit in 2D")) {
                                 // The 2D outline drives the whole object's
                                 // geometry, so this opens the inline editor.
@@ -12026,21 +12810,92 @@ static void open_procedural_generator(ViewerState& st) {
 }
 
 static void proc_gen_generate(ViewerState& st) {
-    sgen::TerrainOptions opt;
-    opt.biome = (sgen::Biome)std::clamp(st.proc_gen_biome, 0,
-                                         (int)sgen::Biome::Count - 1);
-    opt.seed = st.proc_gen_seed;
-    opt.width = std::max(600.0f, st.proc_gen_width);
-    opt.height = std::max(200.0f, st.proc_gen_height);
-    opt.platform_count = std::clamp(st.proc_gen_platforms, 2, 24);
-    opt.add_water = st.proc_gen_water;
-    opt.spill_torches = st.proc_gen_torches;
-    opt.mountains = st.proc_gen_mountains;
-    opt.islands = st.proc_gen_islands;
-    opt.deco_density = st.proc_gen_deco;
-    opt.scene_name = st.proc_gen_name;
+    const sgen::Biome biome = (sgen::Biome)std::clamp(st.proc_gen_biome, 0,
+                                                       (int)sgen::Biome::Count - 1);
 
-    sgen::Result r = sgen::generate_biome_scene(opt);
+    sgen::Result r;
+    std::string generator;
+    if (st.proc_gen_use_3d) {
+        // ── v2-3d generator: full-3D Minecraft-style voxel world ────────────
+        // One continuous heightfield over (X, Z), block-quantized and sliced
+        // into depth rows: walkable gameplay row at Z=0 + parallax terrain
+        // rows receding behind it. v1 camera semantics (no camera shapes).
+        sgen::v2_3d::TerrainOptions3D opt;
+        opt.biome = biome;
+        opt.seed = st.proc_gen_seed;
+        opt.width = std::max(600.0f, st.proc_gen_width);
+        opt.height = std::max(200.0f, st.proc_gen_height);
+        opt.platform_count = std::clamp(st.proc_gen_platforms, 2, 24);
+        opt.add_water = st.proc_gen_water;
+        opt.spill_torches = st.proc_gen_torches;
+        opt.mountains = st.proc_gen_mountains;
+        opt.deco_density = st.proc_gen_deco;
+        opt.scene_name = st.proc_gen_name;
+        opt.depth_rows        = std::clamp(st.proc_gen_3d_rows, 0, 24);
+        opt.front_rows        = std::clamp(st.proc_gen_3d_front_rows, 0, 12);
+        opt.row_band          = std::clamp(st.proc_gen_3d_band, 30.0f, 140.0f);
+        opt.block_size        = std::clamp(st.proc_gen_3d_block, 16.0f, 120.0f);
+        opt.add_caves         = st.proc_gen_3d_caves;
+        opt.sky_islands       = st.proc_gen_3d_islands;
+        opt.scatter_far_trees = st.proc_gen_3d_far_trees;
+        opt.randomize_deco_rotation = st.proc_gen_rand_deco_rot;
+        opt.randomize_deco_scale    = st.proc_gen_rand_deco_scale;
+        opt.add_portal              = st.proc_gen_portal;
+        opt.portal_destination      = st.proc_gen_portal_dest;
+        r = sgen::v2_3d::generate_biome_scene_v2_3d(opt);
+        generator = "v2-3d";
+    } else if (st.proc_gen_use_v2) {
+        // ── v2 generator: superset of v1 (Z-layers, bg/fg terrain, z-path) ──
+        sgen::v2::TerrainOptionsV2 opt;
+        opt.biome = biome;
+        opt.seed = st.proc_gen_seed;
+        opt.width = std::max(600.0f, st.proc_gen_width);
+        opt.height = std::max(200.0f, st.proc_gen_height);
+        opt.platform_count = std::clamp(st.proc_gen_platforms, 2, 24);
+        opt.add_water = st.proc_gen_water;
+        opt.spill_torches = st.proc_gen_torches;
+        opt.mountains = st.proc_gen_mountains;
+        opt.islands = st.proc_gen_islands;
+        opt.deco_density = st.proc_gen_deco;
+        opt.scene_name = st.proc_gen_name;
+        opt.enable_bg_terrain  = st.proc_gen_v2_bg_terrain;
+        opt.enable_fg_terrain  = st.proc_gen_v2_fg_terrain;
+        opt.enable_z_path      = st.proc_gen_v2_z_path;
+        opt.z_path_amplitude   = st.proc_gen_v2_z_amp;
+        opt.bg_layers          = std::clamp(st.proc_gen_v2_bg_layers, 1, 4);
+        opt.scatter_background_decos = st.proc_gen_v2_bg_decos;
+        opt.scatter_foreground_decos = st.proc_gen_v2_fg_decos;
+        opt.add_terracing      = st.proc_gen_v2_terracing;
+        opt.terrace_strength   = st.proc_gen_v2_terrace;
+        opt.add_overhangs      = st.proc_gen_v2_overhangs;
+        opt.emit_camera_shapes = st.proc_gen_v2_camera;
+        opt.randomize_deco_rotation = st.proc_gen_rand_deco_rot;
+        opt.randomize_deco_scale    = st.proc_gen_rand_deco_scale;
+        opt.add_portal              = st.proc_gen_portal;
+        opt.portal_destination      = st.proc_gen_portal_dest;
+        r = sgen::v2::generate_biome_scene_v2(opt);
+        generator = "v2";
+    } else {
+        // ── v1 generator ──
+        sgen::TerrainOptions opt;
+        opt.biome = biome;
+        opt.seed = st.proc_gen_seed;
+        opt.width = std::max(600.0f, st.proc_gen_width);
+        opt.height = std::max(200.0f, st.proc_gen_height);
+        opt.platform_count = std::clamp(st.proc_gen_platforms, 2, 24);
+        opt.add_water = st.proc_gen_water;
+        opt.spill_torches = st.proc_gen_torches;
+        opt.mountains = st.proc_gen_mountains;
+        opt.islands = st.proc_gen_islands;
+        opt.deco_density = st.proc_gen_deco;
+        opt.scene_name = st.proc_gen_name;
+        opt.randomize_deco_rotation = st.proc_gen_rand_deco_rot;
+        opt.randomize_deco_scale    = st.proc_gen_rand_deco_scale;
+        opt.add_portal              = st.proc_gen_portal;
+        opt.portal_destination      = st.proc_gen_portal_dest;
+        r = sgen::generate_biome_scene(opt);
+        generator = "v1";
+    }
     if (!r.ok()) {
         st.proc_gen_status = "Generation failed: " + r.error;
         return;
@@ -12076,8 +12931,8 @@ static void proc_gen_generate(ViewerState& st) {
     st.proc_gen_open = false;
     st.proc_gen_request = false;
     st.proc_gen_status = "Generated: " + path;
-    log_file_event("Procedural", "Generated " + path + " | biome=" +
-                   sgen::biome_name(opt.biome) + " seed=" +
+    log_file_event("Procedural", "Generated " + path + " | gen=" + generator +
+                   " biome=" + sgen::biome_name(biome) + " seed=" +
                    std::to_string(st.proc_gen_seed) + " objects=" +
                    std::to_string(r.objects));
 }
@@ -12098,6 +12953,36 @@ static void draw_procedural_generator(ViewerState& st) {
     ImGui::TextDisabled("Textures, water colors, tree/rock sets, torch style and light "
                         "colors are harvested from the actual shipped scenes.");
     ImGui::Spacing();
+
+    // ── Generator version selector ──
+    {
+        const bool v1 = !st.proc_gen_use_v2 && !st.proc_gen_use_3d;
+        const bool v2 = st.proc_gen_use_v2 && !st.proc_gen_use_3d;
+        const bool v3d = st.proc_gen_use_3d;
+        ImGui::Text("Generator:");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("v1 (classic)", v1)) {
+            st.proc_gen_use_v2 = false; st.proc_gen_use_3d = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("v2 (layered Z-terrain)", v2)) {
+            st.proc_gen_use_v2 = true; st.proc_gen_use_3d = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("v2-3d (Minecraft world)", v3d)) {
+            st.proc_gen_use_3d = true;
+        }
+        if (v3d)
+            ImGui::TextDisabled("Full 3D voxel-style world: one heightfield over X and Z, "
+                                "blocky columns, depth rows into the screen, ravines, "
+                                "sky islands and sea-level oceans. v1 camera.");
+        else if (v2)
+            ImGui::TextDisabled("Adds background/foreground Z-layers, winding terrain "
+                                "path, terracing and overhangs.");
+        else
+            ImGui::TextDisabled("Single-layer heightfield with mountains and island hats.");
+        ImGui::Spacing();
+    }
 
     // ── Biome preset picker ──
     const char* preview = sgen::biome_name((sgen::Biome)st.proc_gen_biome);
@@ -12127,14 +13012,98 @@ static void draw_procedural_generator(ViewerState& st) {
         ImGui::SliderFloat("Height range", &st.proc_gen_height, 200.0f, 3000.0f, "%.0f");
         ImGui::SliderInt("Platform strips", &st.proc_gen_platforms, 2, 24);
         ImGui::SliderFloat("Decoration density", &st.proc_gen_deco, 0.0f, 2.0f, "%.1f");
+        if (st.proc_gen_use_3d) {
+            ImGui::Separator();
+            ImGui::TextDisabled("Rows tile the Z axis and share boundary depth planes — "
+                                "one continuous slab on BOTH sides of the hero plane "
+                                "(z=0 is the walkable slice).");
+            ImGui::SliderInt("Depth rows behind", &st.proc_gen_3d_rows, 0, 24);
+            ImGui::SliderInt("Depth rows in front", &st.proc_gen_3d_front_rows, 0, 12);
+            ImGui::SliderFloat("Row band (half Z)", &st.proc_gen_3d_band,
+                               40.0f, 140.0f, "%.0f");
+            ImGui::SliderFloat("Block size", &st.proc_gen_3d_block, 24.0f, 96.0f, "%.0f");
+        } else if (st.proc_gen_use_v2) {
+            ImGui::Separator();
+            ImGui::Checkbox("Background terrain (2 silhouette layers at Z -130/-165)",
+                            &st.proc_gen_v2_bg_terrain);
+            if (st.proc_gen_v2_bg_terrain) {
+                ImGui::Indent();
+                ImGui::SliderInt("BG layers", &st.proc_gen_v2_bg_layers, 1, 4);
+                ImGui::Unindent();
+            }
+            ImGui::Checkbox("Winding terrain path (Z variation)", &st.proc_gen_v2_z_path);
+            if (st.proc_gen_v2_z_path) {
+                ImGui::Indent();
+                ImGui::SliderFloat("Path amplitude (±Z)", &st.proc_gen_v2_z_amp,
+                                   0.0f, 40.0f, "%.0f");
+                ImGui::Unindent();
+            }
+            ImGui::Separator();
+            ImGui::Checkbox("Camera follows hero (vertical follow shape)",
+                            &st.proc_gen_v2_camera);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(?)");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Emits a camera_follow_y_shape over the walkable band "
+                                  "and derives scene Bounds from the terrain top "
+                                  "profile — the in-game camera pans with the hero "
+                                  "and starts centered on the level.");
+        }
     }
 
     // ── Features ──
     if (ImGui::CollapsingHeader("Features", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("Water sheet", &st.proc_gen_water);
         ImGui::Checkbox("Torches + glow lights on walkable edges", &st.proc_gen_torches);
+        if (st.proc_gen_use_3d) {
+            ImGui::Checkbox("Caves / winding ravines", &st.proc_gen_3d_caves);
+            ImGui::Checkbox("Floating sky islands", &st.proc_gen_3d_islands);
+            ImGui::Checkbox("Far forest on depth rows (parallax)", &st.proc_gen_3d_far_trees);
+            ImGui::Separator();
+        } else if (st.proc_gen_use_v2) {
+            ImGui::Checkbox("Foreground cliff framing (Z +80)", &st.proc_gen_v2_fg_terrain);
+            ImGui::Checkbox("Background parallax decos (deep-Z trees/rocks)",
+                            &st.proc_gen_v2_bg_decos);
+            ImGui::Checkbox("Foreground parallax decos (near-Z rocks/shrubs)",
+                            &st.proc_gen_v2_fg_decos);
+            ImGui::Checkbox("Terracing (stepped bands)", &st.proc_gen_v2_terracing);
+            if (st.proc_gen_v2_terracing) {
+                ImGui::Indent();
+                ImGui::SliderFloat("Terrace strength", &st.proc_gen_v2_terrace,
+                                   0.0f, 1.0f, "%.2f");
+                ImGui::Unindent();
+            }
+            ImGui::Checkbox("Overhangs (cliff-edge ledges)", &st.proc_gen_v2_overhangs);
+            ImGui::Separator();
+        }
         ImGui::Checkbox("Mountain ridges (ridged multifractal)", &st.proc_gen_mountains);
-        ImGui::Checkbox("Island hats on even platforms", &st.proc_gen_islands);
+        if (!st.proc_gen_use_3d)
+            ImGui::Checkbox("Island hats on even platforms", &st.proc_gen_islands);
+        ImGui::Separator();
+        ImGui::Checkbox("Randomize decoration rotation", &st.proc_gen_rand_deco_rot);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Trees/bushes may be rotated a quarter-turn for variety.\nUncheck for upright, vanilla-style placement.");
+        ImGui::Checkbox("Randomize decoration size", &st.proc_gen_rand_deco_scale);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Decorations spawn at random scales.\nUncheck for uniform (1.0) size.");
+    }
+
+    // ── Portal ──
+    if (ImGui::CollapsingHeader("Portal", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Spawn a portal somewhere in the scene", &st.proc_gen_portal);
+        if (st.proc_gen_portal) {
+            ImGui::Indent();
+            ImGui::InputText("Destination scene", st.proc_gen_portal_dest,
+                             sizeof(st.proc_gen_portal_dest));
+            ImGui::TextDisabled("The portal is placed at a random walkable spot "
+                                "away from spawn; the area around it is filled "
+                                "with biome brick/stone ruins, signs and torches.");
+            ImGui::Unindent();
+        }
     }
 
     // ── Output ──
@@ -12674,6 +13643,9 @@ static void draw_settings_dialog(ViewerState& st) {
             ImGui::SliderFloat("Orbit Sensitivity", &st.cam_orbit_speed, 0.1f, 2.0f, "%.1f");
             ImGui::SliderFloat("Zoom Sensitivity", &st.cam_zoom_speed, 0.05f, 1.0f, "%.2f");
             ImGui::SliderFloat("Pan Sensitivity", &st.cam_pan_speed, 0.001f, 0.02f, "%.3f");
+            ImGui::SliderFloat("Keyboard Move Speed", &st.cam_keyboard_speed, 0.25f, 4.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Multiplier for WASD camera pan, arrow-key camera pan and arrow-key object nudging.");
             ImGui::Checkbox("Invert Orbit X (Yaw)", &st.cam_invert_x);
             ImGui::Checkbox("Invert Orbit Y (Pitch)", &st.cam_invert_y);
             
@@ -12743,21 +13715,24 @@ static void draw_settings_dialog(ViewerState& st) {
                 pf.vignette = true; pf.grain = false;
                 if (fx_profile == 0) {          // Vanilla Swordigo (default)
                     pf.exposure = 1.0f;
-                    pf.bloom_strength = 0.22f; pf.bloom_threshold = 0.95f;
-                    pf.saturation = 1.05f; pf.contrast = 1.04f;
-                    pf.brightness = 0.03f; pf.warmth = 0.05f;
+                    pf.bloom_strength = 0.38f; pf.bloom_threshold = 0.95f;
+                    pf.ssao = true; pf.ssao_strength = 0.45f; pf.ssao_radius = 90.0f;
+                    pf.saturation = 1.08f; pf.contrast = 1.12f;
+                    pf.brightness = 0.0f; pf.warmth = 0.05f;
                     pf.sharpen_amount = 0.30f; pf.vignette_strength = 0.22f;
                 } else if (fx_profile == 1) {   // Cinematic
                     pf.exposure = 1.15f;
-                    pf.bloom_strength = 0.45f; pf.bloom_threshold = 0.80f;
-                    pf.saturation = 1.18f; pf.contrast = 1.12f;
+                    pf.bloom_strength = 0.55f; pf.bloom_threshold = 0.90f;
+                    pf.ssao = true; pf.ssao_strength = 0.65f; pf.ssao_radius = 130.0f;
+                    pf.saturation = 1.18f; pf.contrast = 1.15f;
                     pf.brightness = 0.0f; pf.warmth = 0.10f;
                     pf.sharpen_amount = 0.45f; pf.vignette_strength = 0.45f;
                 } else {                        // Clean / Neutral
                     pf.exposure = 1.0f;
-                    pf.bloom_strength = 0.12f; pf.bloom_threshold = 1.00f;
-                    pf.saturation = 1.0f; pf.contrast = 1.0f;
-                    pf.brightness = 0.02f; pf.warmth = 0.0f;
+                    pf.bloom_strength = 0.18f; pf.bloom_threshold = 1.10f;
+                    pf.ssao = false;
+                    pf.saturation = 1.0f; pf.contrast = 1.05f;
+                    pf.brightness = 0.0f; pf.warmth = 0.0f;
                     pf.sharpen_amount = 0.20f; pf.vignette_strength = 0.10f;
                 }
             }
@@ -12771,7 +13746,17 @@ static void draw_settings_dialog(ViewerState& st) {
             ImGui::Checkbox("Enable Bloom", &st.postfx.bloom);
             if (st.postfx.bloom) {
                 ImGui::SliderFloat("Bloom Strength", &st.postfx.bloom_strength, 0.0f, 2.0f, "%.2f");
-                ImGui::SliderFloat("Bloom Threshold", &st.postfx.bloom_threshold, 0.1f, 1.5f, "%.2f");
+                ImGui::SliderFloat("Bloom Threshold", &st.postfx.bloom_threshold, 0.1f, 2.5f, "%.2f");
+                ImGui::TextDisabled("Two-band HDR bloom (tight cores + wide halo) over linear light.");
+            }
+
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.85f, 0.75f, 0.45f, 1.0f), "Ambient Occlusion (SSAO)");
+            ImGui::Checkbox("Enable SSAO", &st.postfx.ssao);
+            if (st.postfx.ssao) {
+                ImGui::SliderFloat("AO Strength", &st.postfx.ssao_strength, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("AO Radius", &st.postfx.ssao_radius, 20.0f, 300.0f, "%.0f");
+                ImGui::TextDisabled("Half-res depth-based contact shadows; needs the depth buffer.");
             }
 
             ImGui::Separator();
@@ -12844,8 +13829,12 @@ static bool handle_shortcuts(ViewerState& st) {
         return true;
     }
 
-    if (ImGui::IsKeyPressed(ImGuiKey_W)) st.show_wireframe = !st.show_wireframe;
-    if (ImGui::IsKeyPressed(ImGuiKey_T)) st.show_textured = !st.show_textured;
+    // W/T display toggles yield to the viewport camera keys while the 3D view
+    // is hovered (W is camera-forward there, not wireframe).
+    if (!st.view_keyboard_focus) {
+        if (ImGui::IsKeyPressed(ImGuiKey_W)) st.show_wireframe = !st.show_wireframe;
+        if (ImGui::IsKeyPressed(ImGuiKey_T)) st.show_textured = !st.show_textured;
+    }
     
     // Toggle bottom panel via Ctrl+` (or just GraveAccent alone when not focused in input fields)
     if ((io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) || ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) {
@@ -13527,6 +14516,25 @@ int main(int argc, char* argv[]) {
         // Poll the Blender round-trip daemon for completed exports.
         blender_poll_result(g_state);
 
+        // ── Keyboard-nav handoff ──
+        // NavEnableKeyboard makes ImGui consume WASD / arrows / Enter to move
+        // focus between GUI buttons — while the 3D viewport owns the keyboard
+        // those keys must drive the camera / selection instead. Ownership is
+        // STICKY (set by hovering/clicking the viewport, cleared by clicking
+        // another panel) and always yields to text inputs. Applied here,
+        // before NewFrame processes the queued key events.
+        {
+            const bool scene_view_active =
+                (g_state.preview_type == PREVIEW_SCENE) && (g_state.scene_preview_tab == 1);
+            if (!scene_view_active)
+                g_state.view_keyboard_focus = false;
+            ImGuiIO& nio = ImGui::GetIO();
+            if (g_state.view_keyboard_focus && !nio.WantTextInput)
+                nio.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+            else
+                nio.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        }
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
@@ -13551,6 +14559,18 @@ int main(int argc, char* argv[]) {
         }
 
         if (handle_shortcuts(g_state)) running = false;
+        // Consume the viewport-hover latch AFTER the consumers above (nav
+        // handoff ran before NewFrame, shortcuts just now). The scene viewport
+        // draw later this frame re-latches it (sticky: hovering grabs it,
+        // clicking another panel releases it). We only fall back to false when
+        // the viewport did NOT draw last frame — tab switch or panel layout
+        // hiding it — so a stale latch can't lock the keyboard away from the
+        // GUI. While the viewport is live we leave the latch alone: that is
+        // what keeps arrow-nudging an object working with the cursor parked
+        // over a side panel (ImGui nav stays suspended, arrows never hit the
+        // GUI buttons).
+        if (g_state.view_keyboard_focus_frame != ImGui::GetFrameCount() - 1)
+            g_state.view_keyboard_focus = false;
 
         // Draw top Blender-style main menu bar
         bool open_about = false;

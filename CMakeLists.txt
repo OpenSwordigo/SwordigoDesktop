@@ -1,11 +1,23 @@
 cmake_minimum_required(VERSION 3.16)
 project(SwordigoDesktop VERSION 4.5.0 LANGUAGES C CXX ASM)
 
-# Build directly into the source tree's bin/ distribution folder — no separate
-# `cmake --install` step needed. Executables land in bin/, shared libs in bin/libs/.
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin/libs")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin/libs")
+# Build directly into the source tree's distribution folder — no separate
+# `cmake --install` step needed. Executables land in <dist>/, shared libs in
+# <dist>/libs/.
+#
+# The dist folder is `bin` for native (Linux) builds and `binw` for Windows
+# builds (incl. MinGW cross-compiles) so Windows .exe/.dll artifacts never land
+# in — or clobber — the Linux `bin/` tree. Override with -DSWORDIGO_DIST_DIR=...
+if (NOT DEFINED SWORDIGO_DIST_DIR)
+    if (WIN32)
+        set(SWORDIGO_DIST_DIR "binw")
+    else()
+        set(SWORDIGO_DIST_DIR "bin")
+    endif()
+endif()
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/${SWORDIGO_DIST_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/${SWORDIGO_DIST_DIR}/libs")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/${SWORDIGO_DIST_DIR}/libs")
 
 include(CTest)
 

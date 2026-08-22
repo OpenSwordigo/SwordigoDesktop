@@ -120,6 +120,11 @@ void set_mesh_flip_uv(GPUMesh& mesh, bool flip);
 /// @param out_tex         Receives the GL texture ID for the color attachment
 /// @return FBO id (0 on failure)
 unsigned int create_fbo(int width, int height, unsigned int* out_tex);
+/// HDR variant: RGBA16F color (linear light, values > 1) + DEPTH24 texture.
+/// Falls back to RGBA8 when float render targets are unavailable.
+unsigned int create_fbo_hdr(int width, int height, unsigned int* out_tex);
+/// Resize an HDR (RGBA16F) FBO created by create_fbo_hdr.
+void resize_fbo_hdr(unsigned int fbo, int w, int h, unsigned int* tex);
 
 /// Resize an existing FBO's attachments in-place.
 void resize_fbo(unsigned int fbo, int w, int h, unsigned int* tex);
@@ -231,6 +236,10 @@ void set_depth_fog(bool enabled, const float color[3], float near_dist, float fa
 ///                      obvious (walls facing away show purple-blue instead of
 ///                      their surface tint). Ignored while flat_shade is on.
 void set_view_flags(bool flat_shade, bool debug_normals);
+/// Modern HDR path: when false, mesh shaders output LINEAR light and the
+/// PostFX HD pass owns tone mapping. When true (default) the shaders keep
+/// their inline ACES so thumbnails/previews without PostFX are unchanged.
+void set_inline_tonemap(bool enabled);
 
 /// Render debug line segments, two xyz points per segment.
 void render_lines(const float* positions, int vertex_count, const float color[4],
@@ -336,17 +345,27 @@ struct PostFXParams {
     // Master switch — postfx_apply returns the source texture untouched when off.
     bool enabled = true;
 
-    // HD render: exposure + ACES tone mapping + gamma. This is what makes the
-    // preview stop looking like a raw framebuffer.
+    // HD render: exposure + ACES tone mapping + gamma. The scene view renders
+    // LINEAR HDR (mesh shaders skip their inline tonemap) and this pass owns
+    // tone mapping — no double-ACES, no gamma-on-gamma (the old washed-out,
+    // over-bright look). Thumbnails/previews without PostFX keep the inline
+    // tonemap so nothing else changes.
     bool  hd          = true;
     float exposure    = 1.0f;
 
-    // Bloom: bright-pass extract, downsample, separable 9-tap gaussian blur.
-    // Default profile is Swordigo-faithful: restrained bloom so torch cores
-    // glow without washing the level into haze.
+    // Bloom: HDR bright-pass + a two-band (half + quarter res) separable
+    // gaussian pyramid — tight cores AND a soft wide halo. Defaults tuned for
+    // the linear pipeline (values > 1.0 HDR bloom naturally).
     bool  bloom           = true;
-    float bloom_strength  = 0.22f;
+    float bloom_strength  = 0.38f;
     float bloom_threshold = 0.95f;
+
+    // SSAO: half-res depth-based ambient occlusion (view-space spiral
+    // samples + range check, blurred). Grounds contact shadows and crevice
+    // darkening the direct lights can't provide.
+    bool  ssao          = true;
+    float ssao_strength = 0.45f;   // 0..1 mix of the occlusion term
+    float ssao_radius   = 90.0f;   // view-space radius in world units
 
     // Depth of field: CoC blur driven by the FBO depth texture. `dof_focus` is
     // the in-focus distance from the camera (world units).
@@ -355,12 +374,12 @@ struct PostFXParams {
     float dof_scale  = 2.5f;
 
     // Cinematic color grade (applied after tone mapping).
-    // Default profile: vanilla-like — readable shadows, restrained saturation,
-    // a hint of warmth. PostFX finishes the lighting, never compensates for it.
+    // Default profile: punchy but readable — real shadow contrast (the scene
+    // lives in linear light now, so the grade shapes instead of rescuing).
     bool  color_grade = true;
-    float saturation  = 1.05f;
-    float contrast    = 1.04f;
-    float brightness  = 0.03f;
+    float saturation  = 1.08f;
+    float contrast    = 1.12f;
+    float brightness  = 0.0f;
     float warmth      = 0.05f;  // -1..1, warm(+)/cool(-) tint
 
     // Unsharp-mask sharpen / crispness.

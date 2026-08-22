@@ -95,7 +95,13 @@
 #define ICON_FA_BOX_OPEN         "\xef\x92\x9e"  // U+F49E
 #define ICON_FA_ARROWS_ROTATE    "\xef\x82\x9f"  // U+F021
 #define ICON_FA_NEWSPAPER        "\xef\x87\xaa"  // U+F1EA
-#define ICON_FA_CLOCK_ROTATE_LEFT "\xef\x87\xda" // U+F1F6
+#define ICON_FA_CLOCK_ROTATE_LEFT "\xef\x87\x9a" // U+F1DA (fa-history / clock-rotate-left)
+// Canonical undo/redo glyphs — present in every Font Awesome Free "Solid"
+// build (FA5/6/7). Prefer these for undo/redo buttons; the older
+// clock-rotate-left/arrows-rotate codepoints are refresh/history icons and
+// were rendering as a missing-glyph box in the shipped FA7 Solid font.
+#define ICON_FA_ARROW_ROTATE_LEFT  "\xef\x83\xa2" // U+F0E2 (fa-arrow-rotate-left / fa-undo)
+#define ICON_FA_ARROW_ROTATE_RIGHT "\xef\x80\x9e" // U+F01E (fa-arrow-rotate-right / fa-redo)
 #define ICON_FA_LIST             "\xef\x80\xba"  // U+F03A
 #define ICON_FA_ELLIPSIS         "\xef\x85\x81"  // U+F141
 #define ICON_FA_TOOLBOX          "\xef\x92\x91"  // U+F491

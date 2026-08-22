@@ -485,6 +485,12 @@ static int sre_vfs_rewrite_path(const char* original, char* rewritten, int max_l
 int sre_FileExistsAtPath(SreString* path_str) {
     const char* path = path_str->data;
     if (!path || !path[0]) return 0;
+    static int s_vfs_log_count = 0;
+    if (s_vfs_log_count < 5 && g_sre_vfs_active && g_sre_vfs_hierarchy_enabled) {
+        fprintf(stderr, "[SRE VFS] FileExists: path='%s' mod='%s' active=%d hier=%d\n",
+                path, g_sre_vfs_mod_name, g_sre_vfs_active, g_sre_vfs_hierarchy_enabled);
+        s_vfs_log_count++;
+    }
 
     char rewritten[512];
 
@@ -526,6 +532,11 @@ int sre_FileExistsAtPath(SreString* path_str) {
             const char* sp = g_sre_vfs_search_list;
             char candidate[512];
             int found = 0;
+            static int s_search_log = 0;
+            if (s_search_log < 3) {
+                fprintf(stderr, "[SRE VFS] Search list for '%s': %s\n", path, g_sre_vfs_search_list);
+                s_search_log++;
+            }
             while (*sp && !found) {
                 int ci = 0;
                 while (*sp && *sp != '|' && ci < 511)
@@ -574,6 +585,11 @@ void* sre_NewByteBufferFromAndroidAsset(SreString* path_str, uint32_t* out_len) 
         if (out_len) *out_len = 0;
         return NULL;
     }
+    static int s_vfs_load_log = 0;
+    if (s_vfs_load_log < 5 && g_sre_vfs_active && g_sre_vfs_hierarchy_enabled) {
+        fprintf(stderr, "[SRE VFS] NewByteBuffer: path='%s' mod='%s'\n", path, g_sre_vfs_mod_name);
+        s_vfs_load_log++;
+    }
 
     const char* load_path = path;
     char rewritten[512];
@@ -583,6 +599,11 @@ void* sre_NewByteBufferFromAndroidAsset(SreString* path_str, uint32_t* out_len) 
         if (g_sre_vfs_hierarchy_enabled && g_sre_vfs_search_list[0]) {
             const char* p = g_sre_vfs_search_list;
             char candidate[512];
+            static int s_nbb_log = 0;
+            if (s_nbb_log < 3) {
+                fprintf(stderr, "[SRE VFS] NewBB search list: %s\n", g_sre_vfs_search_list);
+                s_nbb_log++;
+            }
             while (*p) {
                 int ci = 0;
                 while (*p && *p != '|' && ci < 511)

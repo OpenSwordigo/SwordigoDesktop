@@ -508,6 +508,10 @@ static void do_export_file(BatchState& bs,
         }
     }
 
+    {
+        std::error_code dir_ec;
+        fs::create_directories(fs::path(dst_path).parent_path(), dir_ec);
+    }
     if (!stbi_write_png(dst_path.c_str(), w, h, 4, rgba.data(), w * 4)) {
         res.error_msg = "stbi_write_png failed";
         res.duration_ms = wall_ms() - t0;

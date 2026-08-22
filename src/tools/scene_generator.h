@@ -277,8 +277,49 @@ struct TerrainOptions {
     float deco_density = 1.0f;           // 0..1 multiplier for trees/rocks
     bool  mountains = false;             // use ridged multifractal profile
     bool  islands = false;               // disconnected island blobs (hats)
+    // Decoration randomization (v1 + v2; GUI toggles).
+    bool  randomize_deco_rotation = true;  // trees/bushes may get a quarter-turn
+    bool  randomize_deco_scale    = true;  // decorations vary in size
+    // Single decorative portal hub: a random portal + per-biome brick/stone
+    // ruin cluster around it (v1 + v2).
+    bool  add_portal = false;
+    std::string portal_destination = "next_level";
     std::string scene_name = "procedural";
 };
+
+// ── Decorative portal hub ──────────────────────────────────────────────────
+// One portal placed on a random walkable spot, with the area around it
+// heavily decorated using per-biome brick/stone meshes (vanilla-style ruins),
+// bushes/rocks, signs and torches. Byte-exact portal wire format verified
+// against forest_part1/grass_part1 (Model id 1 + CollisionShape id 101 +
+// Portal id 104 with payload f500).
+struct PortalHubOptions {
+    float x = 0.0f, y = 0.0f;          // anchor on the walkable surface
+    int   facing = 1;                  // -1 = portal opens left, +1 = right
+    std::string destination = "next_level";  // PortalComponent DestinationSceneName
+    std::string portal_name = "portal";      // object identifier base
+};
+
+// Build the full scene-transition portal hub as a list of scene-wrapped
+// object byte strings (caller writes each into its scene via
+// extract_object_bytes):
+//   1. functional portal (Model + CollisionShape + PortalComponent)
+//   2. visual 'portal' template FX (TemplateName 'portal', game_common.scl)
+//   3. spawn_from_<dest> return spawn beside the portal (vanilla naming)
+//   4. sign_left/sign_right pointing back at the portal
+//   5. per-biome brick/stone ruin cluster + bushes/rocks + torches
+// Randomness is drawn from @p rng (deterministic, caller-owned).
+std::vector<std::string> build_portal_hub(const PortalHubOptions& o,
+                                          Biome biome, uint64_t& rng);
+
+// Build the special WORLD-TRAVEL portal — the game's one-per-scene portal
+// model (TemplateName 'portal', game_common.scl: portal.POD + flanking
+// portal_torch_left/right at ±75/+40/-70 + Portal.Activate touch script that
+// teleports across the world). Around it goes the same per-biome brick/stone
+// ruin cluster + sign + shrubs + flanking torches. Returns scene-wrapped
+// object byte strings.
+std::vector<std::string> build_game_portal_hub(const PortalHubOptions& o,
+                                               Biome biome, uint64_t& rng);
 
 // Build a full procedural level as a complete .scene (root object bytes +
 // bounds). Combines: heightfield terrain → platforms, decorations, torches,

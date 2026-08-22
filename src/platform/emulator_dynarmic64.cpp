@@ -44,7 +44,7 @@ extern uint64_t g_sre_runtime_text_end;   // libsre executable segment end
 //   1. Be 4-byte aligned (ARM64 ISA requirement — LSBits must be 00)
 //   2. Lie within the ELF .text segment [g_sre_text_base, g_sre_text_end)
 //      OR in the TrampolineMgr cave arena [0x3000000, 0x3100000)
-//      OR in libsre.so guest range        [0x2000000, 0x2300000)
+//      OR in libsre.so/extras guest range  [0x2000000, 0x2600000)
 //   3. OR be the magic sentinel / bridge region (always valid).
 //
 // Returns false for the corrupted LR pattern from crash-report-03:
@@ -58,6 +58,8 @@ static inline bool is_known_executable_pc(uint64_t pc) {
         pc >= g_sre_text_base && pc < g_sre_text_end) return true;
     if (g_sre_runtime_text_base && g_sre_runtime_text_end &&
         pc >= g_sre_runtime_text_base && pc < g_sre_runtime_text_end) return true;
+    /* libsre-extras.so (loaded at ~0x2400000, spans < 0x2600000) */
+    if (pc >= 0x2400000ULL && pc < 0x2600000ULL) return true;
     if (pc >= 0x3000000ULL && pc < 0x3100000ULL) return true;
     return false;
 }
@@ -73,8 +75,8 @@ static inline bool is_valid_exec_pc(uint64_t pc) {
         pc >= g_sre_text_base && pc < g_sre_text_end) return true;
     // TrampolineMgr cave arena
     if (pc >= 0x3000000ULL && pc < 0x3100000ULL) return true;
-    // libsre.so guest range
-    if (pc >= 0x2000000ULL && pc < 0x2300000ULL) return true;
+    // libsre.so + libsre-extras.so guest range
+    if (pc >= 0x2000000ULL && pc < 0x2600000ULL) return true;
     // Fallback: old broad range check (for symbols outside .text e.g. PLT stubs)
     if (pc >= 0x1000000ULL && pc < 0x3000000ULL) return true;
     return false;
@@ -552,8 +554,8 @@ public:
             bool bad_align = (vaddr & 3u) != 0;
             bool bad_range = g_sre_text_base && g_sre_text_end &&
                              (vaddr < g_sre_text_base || vaddr >= g_sre_text_end) &&
-                             // Don't flag TrampolineMgr caves or libsre.so
-                             !(vaddr >= 0x2000000ULL && vaddr < 0x2300000ULL) &&
+                             // Don't flag TrampolineMgr caves or libsre.so/libsre-extras.so
+                             !(vaddr >= 0x2000000ULL && vaddr < 0x2600000ULL) &&
                              !(vaddr >= 0x3000000ULL && vaddr < 0x3100000ULL);
             if (bad_align || bad_range) {
                 static int render_guard_log = 0;
@@ -718,8 +720,8 @@ public:
                 emu->get_jit()->HaltExecution(Dynarmic::HaltReason::UserDefined1);
                 return;
             }
-            // BRK in SRE (C++ exception recovery)
-            if (pc >= 0x2000000 && pc < 0x2100000) {
+            // BRK in SRE / libsre-extras (C++ exception recovery)
+            if (pc >= 0x2000000 && pc < 0x2600000) {
                 emu->bridge_halt_requested = true;
                 emu->bridge_halt_address = pc;
                 emu->get_jit()->HaltExecution(Dynarmic::HaltReason::UserDefined2);
@@ -779,7 +781,63 @@ public:
             // from inside jit->Run(), before the corrupt PC can halt with LR=0x0.
             if (g_sre_dynstr_base && pc >= g_sre_dynstr_base && pc < g_sre_dynstr_end) {
                 static int dynstr_recover_log = 0;
-                if (dynstr_recover_log++ < 10) {
+
+                // ── Persistent-bad-vcall tracker ────────────────────────────
+                // Root cause of the infinite draws=0 hang: a dangling GUIView
+                // child with vptr=0 stays in the parent's subview linked list.
+                // GUIView::DrawRect iterates the list, hits the dead node, BLR
+                // lands in .dynstr, we recover to LR (the draw-loop top), the
+                // loop advances to the SAME node again → repeats forever.
+                //
+                // Fix: track the bad object address. On the FIRST hit, log and
+                // recover to LR as before. On the SECOND hit for the same X0,
+                // the object is definitively a persistent dangling node — write
+                // 1 into its GUIView::isHidden byte (offset +0xE4) so the draw
+                // loop's GV_HIDDEN check skips it on ALL future frames.
+                //
+                // GUIView layout (confirmed from sre_gui_native.c):
+                //   +0x00  vptr
+                //   +0xE4  isHidden (uint8_t)
+                static uint64_t s_last_bad_vcall_obj  = 0;
+                static int      s_bad_vcall_obj_count = 0;
+
+                uint64_t obj  = emu->get_reg(0);
+                uint64_t vptr_live = 0;
+                extern uint8_t* g_guest_memory;
+                if (obj && obj < 0xE0000000ULL)
+                    std::memcpy(&vptr_live, g_guest_memory + (obj & 0xffffffffULL), 8);
+
+                // Track repeated hits on the same dangling object.
+                if (obj && obj == s_last_bad_vcall_obj) {
+                    s_bad_vcall_obj_count++;
+                } else {
+                    s_last_bad_vcall_obj  = obj;
+                    s_bad_vcall_obj_count = 1;
+                }
+
+                // On the second+ hit for the same zero-vptr object: poison-hide it.
+                bool quarantined = false;
+                if (s_bad_vcall_obj_count >= 2 && vptr_live == 0 &&
+                    obj && obj < 0xE0000000ULL) {
+                    // Write isHidden = 1 at obj+0xE4 to permanently skip this
+                    // node in all future GUIView::DrawRect iterations.
+                    uint32_t hidden_addr = (uint32_t)(obj & 0xffffffffULL) + 0xE4u;
+                    if ((uint64_t)hidden_addr + 1 < 0xE0000000ULL) {
+                        g_guest_memory[hidden_addr] = 1;
+                        quarantined = true;
+                        std::cerr << "[RenderGuard] Quarantined dangling GUIView node 0x"
+                                  << std::hex << obj
+                                  << " (vptr=0, hit #" << std::dec << s_bad_vcall_obj_count
+                                  << ") — set isHidden=1 to break draw-loop cycle"
+                                  << std::endl;
+                        // Reset tracker — the node is neutralised.
+                        s_last_bad_vcall_obj  = 0;
+                        s_bad_vcall_obj_count = 0;
+                    }
+                }
+
+                if (dynstr_recover_log < 10) {
+                    dynstr_recover_log++;
                     std::cerr << "[RenderGuard] .dynstr breakpoint at 0x" << std::hex << pc
                               << " LR=0x" << emu->get_jit()->GetRegister(30) << std::dec
                               << " — recovering (bad virtual dispatch into STRTAB)"
@@ -788,16 +846,13 @@ public:
                     // drawApplication does: x0=obj; x8=[x0] (vptr); x8=[x8+0x70]; blr x8.
                     // Re-read the live values so we can see whether the object's
                     // vptr, or the vtable slot, was overwritten at runtime.
-                    uint64_t obj  = emu->get_reg(0);
-                    uint64_t vptr = 0, slot = 0, x1 = emu->get_reg(1);
-                    extern uint8_t* g_guest_memory;
-                    if (obj && obj < 0xE0000000ULL)
-                        std::memcpy(&vptr, g_guest_memory + (obj & 0xffffffffULL), 8);
-                    if (vptr && (vptr + 0x70) < 0xE0000000ULL)
-                        std::memcpy(&slot, g_guest_memory + ((vptr + 0x70) & 0xffffffffULL), 8);
+                    uint64_t x1 = emu->get_reg(1);
+                    uint64_t slot = 0;
+                    if (vptr_live && (vptr_live + 0x70) < 0xE0000000ULL)
+                        std::memcpy(&slot, g_guest_memory + ((vptr_live + 0x70) & 0xffffffffULL), 8);
                     std::cerr << "[DIAG/vcall] X0(obj)=0x" << std::hex << obj
                               << " X1=0x" << x1
-                              << " vptr=[obj]=0x" << vptr
+                              << " vptr=[obj]=0x" << vptr_live
                               << " [vptr+0x70]=0x" << slot
                               << "  (live vtable[Render] should be 0x1211014)"
                               << std::dec << std::endl;

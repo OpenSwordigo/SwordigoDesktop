@@ -10,7 +10,7 @@
  *   CppString_from_char_p  (0x566bb8 in v1.4.12)
  *   CppString_append_impl  (0x567254 in v1.4.12)
  *   CppString_assign       (0x56918c in v1.4.12)
- *   CppString_release      (0x565220 in v1.4.12)
+ *   CppString_rep_release  (0x565220 in v1.4.12)
  */
 
 #include "sre.h"
@@ -19,6 +19,7 @@
 extern void* malloc(size_t size);
 extern void  free(void* ptr);
 extern void* memcpy(void* dest, const void* src, size_t n);
+extern void* memmove(void* dest, const void* src, size_t n);
 extern void* memset(void* s, int c, size_t n);
 extern size_t strlen(const char* s);
 extern void* realloc(void* ptr, size_t size);
@@ -75,6 +76,16 @@ static void sre_rep_release(char* data) {
         /* We were the last reference, free the block */
         free(rep);
     }
+}
+
+/* Replacement for the internal GNU COW _Rep release routine at 0x565220.
+ * Unlike a std::string destructor, its X0 argument is the 24-byte rep header. */
+void sre_CppString_rep_release(SreStringRep* rep) {
+    if (!rep || rep->refcount == -1) return;
+
+    int old = rep->refcount;
+    rep->refcount = old - 1;
+    if (old <= 0) free(rep);
 }
 
 /* Grab (increment) a reference — non-atomic */
@@ -339,11 +350,23 @@ SreString* sre_CppString_assign(SreString* self, const char* src, uint64_t len) 
         return self;
     }
 
-    /* Try to reuse existing buffer */
+    char* old_data = self->data;
+    uint64_t src_offset = 0;
+    int src_aliases_self = 0;
+    if (!sre_is_empty_sentinel(old_data)) {
+        uint64_t old_len = SRE_REP(old_data)->length;
+        if (src >= old_data && src <= old_data + old_len) {
+            src_offset = (uint64_t)(src - old_data);
+            src_aliases_self = 1;
+        }
+    }
+
+    /* Try to reuse existing buffer. Rebase an aliased source if COW/realloc moved it. */
     char* data = sre_string_mutate(self, len);
     SreStringRep* rep = SRE_REP(data);
+    if (src_aliases_self) src = data + src_offset;
 
-    memcpy(data, src, len);
+    memmove(data, src, len);
     data[len] = '\0';
     rep->length = len;
     return self;
@@ -365,23 +388,27 @@ SreString* sre_CppString_append(SreString* self, const char* src, uint64_t len) 
         old_len = SRE_REP(data)->length;
     }
 
+    uint64_t src_offset = 0;
+    int src_aliases_self = src >= data && src <= data + old_len;
+    if (src_aliases_self) src_offset = (uint64_t)(src - data);
+
     uint64_t new_len = old_len + len;
 
     /* Ensure we have exclusive ownership and enough space */
     data = sre_string_mutate(self, new_len);
     SreStringRep* rep = SRE_REP(data);
+    if (src_aliases_self) src = data + src_offset;
 
     /* Append */
-    memcpy(data + old_len, src, len);
+    memmove(data + old_len, src, len);
     data[new_len] = '\0';
     rep->length = new_len;
     return self;
 }
 
 /*
- * sre_CppString_release — Replace std::string destructor / release
+ * sre_CppString_release — SRE helper for releasing a std::string object
  *
- * Original at offset 0x565220 (v1.4.12)
  * ARM64 ABI: X0 = this (SreString*)
  *
  * Decrements refcount. If last reference, frees memory.

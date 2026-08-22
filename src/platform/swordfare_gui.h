@@ -44,6 +44,8 @@ typedef struct VkDescriptorPool_T* VkDescriptorPool;
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <deque>
+#include <condition_variable>
 
 // ---------------------------------------------------------------------------
 // Debug stats snapshot (passed to draw_debug each frame)
@@ -199,6 +201,9 @@ public:
     void toggle_lua_console();
     void update_console_backend();
 
+    // Public entry point used by the SWORDFARE_TCP_PORT debug env var
+    void auto_start_tcp_server(int port) { start_tcp_server(port); }
+
     // Returns true if coordinates fall inside any active overlay, button, or console
     bool is_input_blocked(float mx, float my);
 
@@ -317,7 +322,33 @@ private:
     std::atomic<bool>          m_tcp_running{false};
     int                        m_tcp_server_fd = -1;
     std::atomic<int>           m_tcp_client_fd{-1};
-    std::string                m_tcp_pending_cmd;
-    std::mutex                 m_tcp_mutex;
+
+    // Command pipeline (reader thread -> main thread -> guest -> back).
+    //
+    // The reader thread enqueues each complete Lua chunk into m_tcp_cmd_queue.
+    // The main thread (update_console_backend) drains ONE chunk at a time,
+    // dispatches it to the guest, and — when the guest's result comes back —
+    // writes the result to the socket and signals m_tcp_done_cv so the reader
+    // (which may be waiting to keep output ordered) can continue. This replaces
+    // the old single-slot m_tcp_pending_cmd design that raced on paste and
+    // dropped lines. Each queued item carries the client fd it belongs to so a
+    // late result is never written to a newer client.
+    //
+    // Connection GENERATION: a client fd can be recycled by the OS, so keying
+    // ownership on the fd alone leaks a dead connection's queued/in-flight
+    // results onto the next client. Every accepted connection bumps
+    // m_tcp_client_gen; each queued command captures the generation it was
+    // submitted under, and a result is only written to the socket when its
+    // generation still matches the live connection. On connect/disconnect we
+    // purge the queue and clear the in-flight slot so the dispatcher can never
+    // wedge on a command whose owner has gone away.
+    struct TcpCmd { std::string code; int client_fd; uint64_t gen; };
+    std::deque<TcpCmd>         m_tcp_cmd_queue;      // FIFO of pending chunks
+    std::mutex                 m_tcp_mutex;          // guards queue + in-flight
+    std::condition_variable    m_tcp_done_cv;        // signalled on result done
     bool                       m_tcp_cmd_in_flight = false;
+    int                        m_tcp_in_flight_fd  = -1; // fd that owns result
+    uint64_t                   m_tcp_in_flight_gen = 0;  // gen that owns result
+    uint64_t                   m_tcp_client_gen    = 0;  // current connection gen
+    uint64_t                   m_tcp_completed_seq = 0;  // monotonic completion
 };

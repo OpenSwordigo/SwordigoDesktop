@@ -14,6 +14,16 @@
 extern std::string g_assets_dir;
 extern std::string g_instance_assets_dir;
 
+// On Windows/PE (e.g. MinGW cross builds) a shared library cannot leave these
+// globals undefined expecting the host executable to supply them at load time
+// the way an ELF .so can. The executables (main.cpp / asset_viewer.cpp /
+// ruby_cli.cpp) still define strong versions; these weak fallbacks only make
+// the DLL self-contained at link time and are overridden by those when present.
+#if defined(_WIN32) && defined(__GNUC__)
+__attribute__((weak)) std::string g_assets_dir = "assets";
+__attribute__((weak)) std::string g_instance_assets_dir = "assets";
+#endif
+
 namespace fs = std::filesystem;
 
 // ============================================================

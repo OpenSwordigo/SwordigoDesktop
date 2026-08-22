@@ -16,6 +16,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
+
+/* Forward declaration — g_swordigo_base is defined further down in this TU. */
+extern uint64_t g_swordigo_base;
 
 /* Forward declaration: defined later in this file, called from sre_init() */
 void sre_install_exception_safeguard(void);
@@ -48,7 +52,7 @@ SreHookEntry sre_hook_table[] = {
     { 0x566bb8, "sre_CppString_from_char_p" },  /* std::string(const char*) */
     { 0x56918c, "sre_CppString_assign"      },  /* std::string::assign()    */
     { 0x567254, "sre_CppString_append"      },  /* std::string::append()    */
-    { 0x565220, "sre_CppString_release"     },  /* std::string destructor   */
+    { 0x565220, "sre_CppString_rep_release" },  /* GNU COW _Rep release     */
 
     /* AudioSystem::EndAudioInterruptionIfNecessary — iOS audio session resumption.
      * IDA: _ZN5Caver11AudioSystem31EndAudioInterruptionIfNecessaryEv @ 0x47ED50
@@ -100,28 +104,26 @@ SreHookEntry sre_hook_table[] = {
      * The g_sre_hero_obj=0 zero in the hook body is safe and kept. */
     { 0x4358dc, "sre_SceneLoadingView_InitWithGameState" },
     { 0,        "sre_GameSceneController_InitWithScene"  },
-    /* SceneLoadingView::Update AND AnimateIn — NOT hooked (reverted to the last
-     * stable TVPG build). Enabling these two hooks is the regression that caused
-     * the black screen (draws=0): both suffer from the relay-trampoline
-     * continuation bug — the relay's literal-pool continuation slot is filled
-     * with 0xd4400000d4400000 (BRK#0 bridge bytes) instead of the correct
-     * continuation VA. Calling g_orig_Xxx() therefore branches through a
-     * poisoned pointer (observed: virtual dispatch into .dynstr @0x1077168 with
-     * a null/garbage vtable), corrupting guest state and triggering the
-     * per-frame bogus ~256MB malloc -> St9bad_alloc -> abort/unwind so the
-     * render/scene path never runs. This CANNOT be fixed from SRE C code (it is
-     * a host relay-builder ordering bug: the relay saves the patch-site bytes
-     * AFTER the BRK is installed, capturing bridge bytes). The forced gateway
-     * teleports via GotoLevel only; the scene transition completes through
-     * BackgroundLoad -> GVC+0xE9=1 -> GameViewController::Update as normal, so
-     * these two hooks are not required for functionality.
+    /* SceneLoadingView::Update and AnimateIn — RE-ENABLED.
+     * Previous disablement was based on a wrong TPIDR_EL0 analysis.
      *
-     * nm arm64 v1.4.12 (for reference only — do NOT re-enable until the host
-     * relay builder is fixed to snapshot original bytes BEFORE writing the BRK):
+     * VERIFIED: both first instructions are pure immediate SUB SP,SP,#N:
+     *   0x43650c: 0xd10243ff  SUB SP, SP, #0x90  (position-independent ✓)
+     *   0x436a54: 0xd10143ff  SUB SP, SP, #0x50  (position-independent ✓)
+     * No ADRP, no LDR-literal, no PC-relative operand → copy_and_relocate
+     * succeeds in one pass. Previous "BRK#0 in literal-pool" crash was caused
+     * by g_orig_* pointers NOT being populated (missing relay entries in
+     * main.cpp's nav_relays[]). With those entries present, call-throughs work.
+     *
+     * These hooks MUST be enabled: SceneLoadingView::Update drives the loading-
+     * bar animation AND fires the scene-transition-complete callback. Without it,
+     * every in-game scene change freezes: gsv=0, relay counter frozen, 2 draws/frame.
+     *
+     * nm arm64 v1.4.12:
      *   SceneLoadingView::Update    0x43650c
      *   SceneLoadingView::AnimateIn 0x436a54 */
-    { 0, "sre_SceneLoadingView_Update"    },
-    { 0, "sre_SceneLoadingView_AnimateIn" },
+    { 0x43650c, "sre_SceneLoadingView_Update"    },
+    { 0x436a54, "sre_SceneLoadingView_AnimateIn" },
     { 0x4642a8, "sre_Scene_FinishLoad"                   },
     { 0x470ec4, "sre_SceneObject_FinishLoad"             },
     { 0x475498, "sre_SceneObjectGroup_FinishLoad"        },
@@ -226,7 +228,7 @@ SreHookEntry sre_hook_table[] = {
 
     /* Lua error safety — wraps ALL lua_call with pcall
      * Installed as LATE trampoline in main.cpp (after sre_init_lua) */
-     { 0, "sre_lua_call_safe" }, 
+     /* Installed directly after sre_init_lua has initialized pcall. */
 
     /* C++ exception handling — hook __cxa_throw to prevent broken unwind.
      * When a C++ exception is thrown (e.g. Lua error), the unwind machinery
@@ -244,7 +246,7 @@ SreHookEntry sre_hook_table[] = {
      * infinite recovery loop → eventual PC jump into RTTI data string.
      * Our replacement zeros the unwind frame and returns 0 so sub_5818C4
      * can proceed to a single controlled abort (caught by abort-recovery). */
-    { 0, "sre_ExceptionFrameInit" },
+     /* No verified host symbol/offset mapping for this internal helper. */
 
     /* C++ exception unwinder dispatcher — sub_5818C4 at 0x5818C4.
      * Even after sre_ExceptionFrameInit suppresses the abort inside
@@ -257,7 +259,7 @@ SreHookEntry sre_hook_table[] = {
      *
      * NOTE: This hook has 2744 callers — it is the global C++ exception
      * dispatcher. Disabling it causes the abort loop to return immediately. */
-    { 0, "sre_UnwindRaiseException" },
+     /* No verified host symbol/offset mapping for this internal helper. */
 
 
     /* MusicPlayer — FULL native replacement.
@@ -324,7 +326,11 @@ SreHookEntry sre_hook_table[] = {
      *   GUINavigationController::FinishTransitionToVC     0x49a42c
      */
     { 0, "sre_GUINavigationController_Update"           },  /* resolved via sym_hooks (engine sym in .dynsym): _ZN5Caver23GUINavigationController6UpdateEf */
-    { 0, "sre_GUINavigationController_VCLoaded"         },  /* disabled — matches TVPG stable */
+    /* Disabled — matches TVPG stable. Keep it out of the table rather than
+     * relying on a failed/mismangled host symbol lookup to skip installation. */
+#if 0
+    { 0, "sre_GUINavigationController_VCLoaded"         },
+#endif
     { 0, "sre_GUINavigationController_FinishTransition" },  /* resolved via sym_hooks (engine sym in .dynsym) */
 
 
@@ -396,7 +402,11 @@ SreHookEntry sre_hook_table[] = {
      * DISABLED: relay stubs crash because original function uses PC-relative
      * instructions (ADRP) that break when relocated to 0x3000000.
      * Mini.* injection is done via sre_lua_call_safe piggyback instead. */
-    { 0x4c0f18, "sre_RegisterProgramLibrary", 0 },
+     /* Disabled: no sre_RegisterProgramLibrary replacement is exported by the
+      * current libsre build. Mini injection is performed by sre_lua_call_safe. */
+#if 0
+     { 0x4c0f18, "sre_RegisterProgramLibrary", 0 },
+#endif
 
     /* Virtual Filesystem — mod asset layering.
      * Re-enabled: sre_FileExistsAtPath now uses real fopen() checks instead
@@ -416,11 +426,11 @@ SreHookEntry sre_hook_table[] = {
     /* Unified Lua Interpreter Hooks */
     
     { 0, "lua_pcall" },
-    { 0, "lua_resume" },
+    /* lua_resume is installed directly with g_lua_resume relay ownership. */
     { 0, "lua_settop" },
     { 0, "lua_gettop" },
     { 0, "lua_tolstring" },
-    { 0, "lua_call" },
+    /* lua_call is installed directly after lua_pcall is available. */
     { 0, "lua_pushstring" },
     { 0, "lua_pushcclosure" },
     { 0, "lua_setfield" },
@@ -456,26 +466,22 @@ SreHookEntry sre_hook_table[] = {
     { 0, "lua_concat" },
     { 0, "lua_pushlstring" },
     { 0, "lua_setmetatable" },
-    { 0, "luaL_newstate" },
+    /* sre_luaL_newstate wraps the vendored luaL_newstate to record every
+     * newly created lua_State so the console can re-lock after the game
+     * destroys/recreates its state (see sre_lua.c state registry). */
+    { 0, "sre_luaL_newstate" },
     { 0, "luaL_loadstring" },
     { 0, "luaL_loadbuffer" },
     { 0, "luaL_loadfile" },
-    { 0, "_Z12luaopen_baseP9lua_State" },
-    { 0, "luaopen_package" },  /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 (this build only exports luaopen_base + luaopen_string; ProgramState ctor @0x4C0D84 opens the rest inline) */
-    { 0, "luaopen_table" },    /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 */
-    { 0, "luaopen_io" },       /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 */
-    { 0, "luaopen_os" },       /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 */
-    { 0, "_Z14luaopen_stringP9lua_State" },
-    { 0, "luaopen_math" },     /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 */
-    { 0, "luaopen_debug" },    /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 */
-    { 0, "luaL_openlibs" },    /* UNRESOLVED: inlined; not a standalone symbol in v1.4.12 ARM64 (no _Z13luaL_openlibsP9lua_State anywhere in symtab or IDA index) */
+    /* luaopen_* hooks are intentionally disabled. The game exports only base
+     * and string as C++ symbols, while libsre exports unmangled vendored names;
+     * the remaining libraries are inlined in this target binary. */
     { 0, "lua_newthread" },
-    { 0, "lua_xmove" },
     { 0, "lua_tothread" },
     { 0, "lua_pushthread" },
     { 0, "lua_status" },
     { 0, "lua_gc" },
-    { 0, "lua_close" },
+    { 0, "sre_lua_close" },
     { 0, "lua_dump" },
     { 0, "lua_atpanic" },
     { 0, "lua_getmetatable" },
@@ -771,6 +777,8 @@ int sre_is_valid_vtable_ptr(uint64_t vtable) {
     if (vtable >= 0x1583480ULL && vtable < 0x15a1148ULL) return 1;
     /* libsre.so data sections (loaded at ~0x2000000) */
     if (vtable >= 0x2000000ULL && vtable < 0x2300000ULL) return 1;
+    /* libsre-extras.so data sections (loaded at ~0x2400000) */
+    if (vtable >= 0x2400000ULL && vtable < 0x2600000ULL) return 1;
 
     return 0;
 }
@@ -798,6 +806,8 @@ int sre_is_valid_code_ptr(uint64_t addr) {
     if (addr >= 0x1203e90ULL && addr < 0x1583478ULL) return 1;
     /* libsre.so .text (loaded at ~0x2000000) */
     if (addr >= 0x2000000ULL && addr < 0x2300000ULL) return 1;
+    /* libsre-extras.so .text (loaded at ~0x2400000) */
+    if (addr >= 0x2400000ULL && addr < 0x2600000ULL) return 1;
     /* relay caves (0x3000000 .. 0x3100000) — trampolines dispatch through here */
     if (addr >= 0x3000000ULL && addr < 0x3100000ULL) return 1;
 

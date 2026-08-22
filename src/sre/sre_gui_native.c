@@ -1284,6 +1284,7 @@ static uint64_t g_sre_text_delegate = 0;
  * Calling convention: X0 = ITextInputDelegate*, X1 = const std::string*
  */
 void sre_StartTextInputWithDelegate(void* delegate, void* text) {
+    if (!g_swordigo_base) return;
     /* Store delegate in OUR global */
     g_sre_text_delegate = (uint64_t)delegate;
 
@@ -1313,6 +1314,7 @@ void sre_StartTextInputWithDelegate(void* delegate, void* text) {
  */
 void sre_StopTextInputWithDelegate(void* delegate) {
     (void)delegate;
+    if (!g_swordigo_base) return;
 
     g_sre_text_delegate = 0;
     g_sre_text_input_active = 0;
@@ -1382,7 +1384,7 @@ void sre_textInputTextDidChange(void* env, void* cls, void* jstring_text) {
 
     /* Resolve virtual method TextInputTextDidChange from ITextInputDelegate vtable (offset 0) */
     uint64_t vtable = *(uint64_t*)delegate;
-    uint64_t func_ptr = *(uint64_t*)vtable;
+    uint64_t func_ptr = sre_is_valid_vtable_ptr(vtable) ? *(uint64_t*)vtable : 0;
 
     /* CONSERVATIVE SAFETY GUARD (FIX7): the ITextInputDelegate vtable can be the
      * corrupt/unrelocated one (its patch is intentionally disabled), so dispatching
@@ -1432,8 +1434,8 @@ void sre_textInputDidFinish(void* env, void* cls) {
 
     /* Call virtual TextInputDidFinish(delegate) dynamically from vtable */
     uint64_t vtable = *(uint64_t*)delegate;
-    uint64_t func_ptr = *(uint64_t*)(vtable + 8);
-    if (func_ptr) {
+    uint64_t func_ptr = sre_is_valid_vtable_ptr(vtable) ? *(uint64_t*)(vtable + 8) : 0;
+    if (sre_is_valid_code_ptr(func_ptr)) {
         typedef void (*pfn_VirtualTextInputDidFinish)(void* delegate);
         pfn_VirtualTextInputDidFinish func = (pfn_VirtualTextInputDidFinish)func_ptr;
         func((void*)delegate);
@@ -1443,7 +1445,8 @@ void sre_textInputDidFinish(void* env, void* cls) {
     g_sre_text_delegate = 0;
     g_sre_text_input_active = 0;
     g_sre_text_input_init_val[0] = '\0';
-    *(uint64_t*)(g_swordigo_base + TEXTINPUT_DELEGATE_OFFSET) = 0;
+    if (g_swordigo_base)
+        *(uint64_t*)(g_swordigo_base + TEXTINPUT_DELEGATE_OFFSET) = 0;
 }
 
 /* =====================================================================

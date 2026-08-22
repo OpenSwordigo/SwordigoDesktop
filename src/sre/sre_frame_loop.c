@@ -147,6 +147,85 @@ typedef void (*pfn_AudioSystem_Update)(void* self, float dt);
 /* GUIView vtable update — slot at +0x48 from root GUIView */
 typedef void (*pfn_GUIView_Update)(void* self, float dt);
 
+/* ──────────────────────────────────────────────────────────────────────────
+ * GAME-VIEW REPAIR DRIVE — scene-object destruction fix
+ *
+ * BUG (SRE-only): with the NavController menu→game transition stalled inside
+ * __vmi_class_type_info::__do_upcast (0x54c6d4), the shell's per-frame root
+ * view dispatch (shell+0x88 vtable slot 9) keeps ticking the OLD menu view
+ * and GameSceneView::Update is NEVER called. The world simulation survives
+ * because the JOB1 fallback drives Scene::Update directly — but the GAME'S
+ * VIEW SUBTREE silently dies:
+ *
+ *   GameSceneView::Update → GUIView::Update (0x49e55c)
+ *     ├─ animation loop: GUIAnimation::Update + completion callbacks
+ *     │   (vtable+0x78 = AnimationDidFinish, GUIWindow::DismissModalView)
+ *     ├─ subview loop: dispatches every child's vtable[+0x48] Update
+ *     │   (NotificationView::Update counts its +0x18C auto-dismiss timer,
+ *     │    adds the fade-out animation, GUITextBubble/ chat views tick)
+ *     └─ orphan drain: unlinks+releases views removed from their superview
+ *
+ * Nothing above ever runs → notifications, chat bubbles and item popups
+ * stay on screen forever, and removed subviews are never released.
+ * (Verified live: g_sre_gui_scene_active stays 0 for the whole session
+ * while world_drive keeps climbing.)
+ *
+ * FIX: mirror the JOB1 pattern for the view tree. When the normal chain did
+ * not dispatch the GameSceneView this frame (per-frame flag stays 0) but a
+ * game scene is live, locate the GameSceneView in the shell root view's
+ * subview tree by vtable identity and dispatch its vtable[9] Update — the
+ * 4-byte trampoline at 0x134ed2c routes it into sre_GameSceneView_Update,
+ * which ends by calling the ORIGINAL GUIView::Update via the host-resolved
+ * g_sre_GUIView_Update relay (main.cpp dynamic_fns table, 43/43 resolved).
+ *
+ * GameSceneView vtable: 'vtable for Caver::GameSceneView' = RVA 0x6cb570,
+ * address point (what objects store) = RVA 0x6cb580.
+ * Subview list: sentinel head at view+0x20; node {next@+0x00, view px@+0x10}.
+ * ────────────────────────────────────────────────────────────────────────── */
+#define OFF_GameSceneView_vtable_addr_point 0x6cb580ULL
+
+extern volatile int g_sre_gui_scene_active;        /* set by sre_GameSceneView_Update */
+extern volatile uint64_t g_sre_captured_gvc;       /* set by sre_GUINavigationController_FinishTransition */
+volatile uint64_t g_sre_gui_drive_count = 0;       /* frames we dispatched the GSV ourselves */
+
+static int sre_guest_ptr_plausible(uint64_t p) {
+    return p >= 0x10000ULL && p < 0x0000800000000000ULL && (p & 7) == 0;
+}
+
+/* Depth-first walk of the subview tree below 'root'; returns the first view
+ * whose stored vtable pointer equals want_vt. Node/visit caps keep a corrupt
+ * list from looping or wandering the heap. */
+static void* sre_find_view_by_vtable(uint64_t root, uint64_t want_vt) {
+    uint64_t stack[24];
+    int sp = 0;
+    uint32_t visited = 0;
+    if (!sre_guest_ptr_plausible(root)) return NULL;
+    stack[sp++] = root;
+    while (sp > 0 && visited < 2048) {
+        uint64_t view = stack[--sp];
+        visited++;
+        if (!sre_guest_ptr_plausible(view)) continue;
+        uint64_t vt = *(uint64_t*)(uintptr_t)view;
+        if (vt == want_vt) return (void*)(uintptr_t)view;
+        if (!sre_is_valid_vtable_ptr(vt)) continue;   /* garbage node — skip subtree */
+        uint64_t head = view + 0x20;                  /* subview list sentinel */
+        uint64_t node = *(uint64_t*)(uintptr_t)head;
+        uint32_t hops = 0;
+        while (sre_guest_ptr_plausible(node) && node != head && hops < 256) {
+            uint64_t child = *(uint64_t*)(uintptr_t)(node + 0x10);
+            if (sre_guest_ptr_plausible(child)) {
+                uint64_t cvt = *(uint64_t*)(uintptr_t)child;
+                if (cvt == want_vt) return (void*)(uintptr_t)child;
+                if (sp < 24 && sre_is_valid_vtable_ptr(cvt))
+                    stack[sp++] = child;
+            }
+            node = *(uint64_t*)(uintptr_t)node;       /* node->next */
+            hops++;
+        }
+    }
+    return NULL;
+}
+
 /* GUIApplication::DispatchEvents — Android touch event queue; PC no-op */
 typedef void (*pfn_DispatchEvents)(void* self);
 
@@ -378,11 +457,95 @@ void sre_frame_update(void* env, void* obj, float dt) {
     if (shell) {
         g_sre_frame_shell_ticks++;
 
+        /* Clear the per-frame "GameSceneView received its Update" flag before
+         * the shell dispatch. sre_GameSceneView_Update sets it to 1 whenever
+         * the normal chain reaches the game view; the repair drive below uses
+         * the still-zero flag to detect frames where it did not. */
+        g_sre_gui_scene_active = 0;
+
         /* Call our PC-safe CaverShell::Update.
      * This will cascade into GameSceneView::Update (hooked via trampoline)
      * and ProgramState::Update (hooked via trampoline), both of which are
      * safe to call here. */
         sre_CaverShell_Update(shell, dt);
+    }
+
+    /* ─── GAME-VIEW REPAIR DRIVE (scene-object destruction fix) ─────────────
+     * When the NavController transition is stuck (see JOB 1 below), the shell
+     * keeps dispatching the stale menu root view and the GameSceneView never
+     * gets its Update — killing the whole game GUI subtree: notification
+     * auto-dismiss timers, chat/text-bubble fade-outs, item popups, GUI
+     * animation completion callbacks and the deferred subview removal drain
+     * all live inside GUIView::Update, which only runs from GameSceneView::
+     * Update's tail call. The world side is covered by the JOB1 fallback;
+     * this drive covers the view side, dispatching the GameSceneView's
+     * vtable[9] ourselves when nothing else did this frame. It is a strict
+     * no-op while the normal chain works (flag already 1), during scene
+     * loads, or when no game view is attached to the shell's view tree. */
+    if (!g_sre_gui_scene_active && !g_sre_scene_loading && g_swordigo_base &&
+        g_sre_finishloaded_scene > 0x10000ULL) {
+        void** shell_slot2 = (void**)(g_swordigo_base + OFF_CaverShell_globalptr);
+        void* shell2 = *shell_slot2;
+        if (shell2 && sre_guest_ptr_plausible((uint64_t)(uintptr_t)shell2)) {
+        uint64_t root = *(uint64_t*)((char*)shell2 + 0x88);
+        if (sre_guest_ptr_plausible(root) &&
+            sre_is_valid_vtable_ptr(*(uint64_t*)(uintptr_t)root)) {
+            uint64_t want_vt = g_swordigo_base + OFF_GameSceneView_vtable_addr_point;
+
+            void* gsv = sre_find_view_by_vtable(root, want_vt);
+            /* Fallback: the GameViewController captured by the FinishTransition
+             * hook. GVC+0xD8 = shared_ptr<GameSceneView> px (BackgroundLoad),
+             * so the game view is reachable even though the stuck transition
+             * never attaches it to the tree the shell walks. Validate the
+             * chain: GVC vtable + GSV vtable + GSC(Scene*) must match the
+             * live scene published by Scene::FinishLoad. */
+            if (!gsv && g_sre_captured_gvc) {
+                uint64_t gvc = g_sre_captured_gvc;
+                if (sre_guest_ptr_plausible(gvc) &&
+                    *(uint64_t*)(uintptr_t)gvc == g_swordigo_base + 0x6cb880ULL) {
+                    uint64_t v = *(uint64_t*)(uintptr_t)(gvc + 0xD8);
+                    if (sre_guest_ptr_plausible(v) &&
+                        *(uint64_t*)(uintptr_t)v == want_vt) {
+                        uint64_t gsc = *(uint64_t*)(uintptr_t)(v + 0xF0);
+                        if (sre_guest_ptr_plausible(gsc) &&
+                            *(uint64_t*)(uintptr_t)(gsc + 0x20) ==
+                                g_sre_finishloaded_scene) {
+                            gsv = (void*)(uintptr_t)v;
+                        }
+                    }
+                }
+            }
+                if (gsv) {
+                    uint64_t gvt = *(uint64_t*)(uintptr_t)gsv;
+                    pfn_GUIView_Update gsv_update =
+                        (pfn_GUIView_Update)((uint64_t*)(uintptr_t)gvt)[9];
+                    if (gsv_update &&
+                        sre_is_valid_code_ptr((uint64_t)(uintptr_t)gsv_update)) {
+                        static int s_gui_drive_logged = -1;
+                        if (s_gui_drive_logged < 0)
+                            s_gui_drive_logged = getenv("SRE_WORLD_DEBUG") != NULL ? 0 : 2;
+                        if (s_gui_drive_logged == 0) {
+                            fprintf(stderr,
+                                    "[SRE/FrameLoop] GUI repair drive: dispatching "
+                                    "GameSceneView::Update directly (view=%p) — nav chain "
+                                    "never reaches the game view\n", gsv);
+                            s_gui_drive_logged = 1;
+                        }
+                        g_sre_gui_drive_count++;
+                        gsv_update(gsv, dt);   /* → trampoline → sre_GameSceneView_Update */
+                    }
+                } else {
+                    static int s_gui_notfound_warn = 0;
+                    if (s_gui_notfound_warn++ == 240) {
+                        fprintf(stderr,
+                                "[SRE/FrameLoop] GUI repair drive: no GameSceneView in "
+                                "shell root view tree (root=0x%llx) — game view unreachable; "
+                                "notifications/chat will not self-dismiss\n",
+                                (unsigned long long)root);
+                    }
+                }
+            }
+        }
     }
 
     /* Scene Shifter — consume pending teleport requests from the host GUI.

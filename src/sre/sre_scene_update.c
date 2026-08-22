@@ -54,17 +54,21 @@ extern SreJmpBufRec g_sre_recovery_stack[];
 extern int sre_setjmp(void* env);
 
 /* =========================================================================
- * sre_GUIView_Update — safe no-op
+ * sre_GUIView_Update — LEGACY no-op stub (NOT installed as a hook)
  * =========================================================================
- * GUIView::Update iterates child animations using boost::shared_ptr refcounts
- * with STXR/LDXR spin loops. It also dereferences animation list pointers
- * that may point into the files_dir string area (0x20010), causing a jump
- * into string data and a ReservedValue exception.
- * Safe to skip: gameplay, rendering, and input are all unaffected.
+ * Historical note: this used to be trampolined over GUIView::Update in the
+ * old Unicorn-era runtime, on the theory that its boost::shared_ptr refcount
+ * ops were LDAXR/STLXR spin loops. In the v1.4.12 ARM64 binary those
+ * refcount ops are PLAIN non-atomic ldr/str (verified by disassembly), so
+ * the original GUIView::Update is safe under the single-threaded Dynarmic
+ * JIT. The hook entry is commented out in sre_init.c on purpose: stubbing
+ * this function kills the notification/chat-dismissal animation system and
+ * the deferred subview-removal drain (see the relay call at the end of
+ * sre_GameSceneView_Update). Kept only as an unused stub for history.
  */
 void sre_GUIView_Update(void* self, float deltaTime) {
     (void)self; (void)deltaTime;
-    /* Intentional no-op: animation system bypassed */
+    /* Intentional no-op: never installed, never called. */
 }
 
 /* =========================================================================
@@ -168,6 +172,9 @@ void* sre_RenderingContext_C1(void* self, int api_mode) {
 /* Scene state flags */
 volatile int g_sre_gui_scene_active = 0;
 volatile uint64_t g_sre_gui_scene_view_ptr = 0;
+/* Total calls into the ORIGINAL Caver::GUIView::Update through the bound
+ * relay (telemetry for the GUI-subtree repair drive verification). */
+volatile uint64_t g_sre_guiview_relay_calls = 0;
 void* g_sre_gamesceneview_ptr = NULL;
 
 /* ── Per-frame world-update drive guard ──────────────────────────────────────
@@ -246,7 +253,7 @@ static int sp_vtable_is_valid(uint64_t vtable) {
      * keys, collectibles) and nothing else. Mirrors sre_is_valid_vtable_ptr. */
     if (vtable >= 0x1583480ULL && vtable < 0x15a1148ULL) return 1; /* .rodata (0x583480..0x5a1145) */
     if (vtable >= 0x16b6a80ULL && vtable < 0x16dc000ULL) return 1; /* .data.rel.ro (0x6b6a80..0x6dbfc0, Caver::* vtables 0x6b8ec0..0x6dbfb8) */
-    if (vtable >= 0x2000000ULL && vtable < 0x2300000ULL) return 1; /* libsre.so guest vtables */
+    if (vtable >= 0x2000000ULL && vtable < 0x2600000ULL) return 1; /* libsre.so + libsre-extras.so guest vtables */
     /* SRE relay-cave vtables (TrampolineMgr arena 0x3000000–0x3100000) */
     if (vtable >= 0x3000000ULL && vtable < 0x3100000ULL) return 1;
     return 0;
@@ -729,9 +736,19 @@ do_effects:
             if (g_sre_GUIEffect_Update) g_sre_GUIEffect_Update((void*)dmg_flash, deltaTime);
         }
     }
-    if (g_sre_GUIView_Update) g_sre_GUIView_Update(self, deltaTime);
-    /* GUIView::Update (animation system) is now hooked as sre_GUIView_Update
-     * (safe no-op) — no direct call needed here. */
+    if (g_sre_GUIView_Update) {
+        g_sre_guiview_relay_calls++;
+        g_sre_GUIView_Update(self, deltaTime);
+    }
+    /* GUIView::Update relay — bound by main.cpp's dynamic_fns resolver to the
+     * ORIGINAL Caver::GUIView::Update (RVA 0x49e55c). This call is what keeps
+     * the game's view subtree alive: it dispatches every subview's Update
+     * (notification auto-dismiss timers, chat/text-bubble fades), ticks
+     * GUIAnimations and fires their completion callbacks, and drains subviews
+     * removed from their superview. NOTE: sre_GUIView_Update below is a legacy
+     * no-op stub that is NOT installed as a hook anymore — the original runs
+     * everywhere; do not re-enable the trampoline on GUIView::Update, it would
+     * sever exactly this dispatch chain again. */
 }
 
 /* =========================================================================
@@ -799,7 +816,8 @@ volatile uint64_t g_sre_finishloaded_scene = 0;
 
 void sre_Scene_FinishLoad(void* self) {
     if (!self) return;
-    fprintf(stderr, "[SRE/Scene] Scene::FinishLoad starting (scene=%p)...\n", self);
+    extern char g_sre_current_scene_name[128];
+    fprintf(stderr, "[SRE/Scene] Scene::FinishLoad starting (scene=%p, name='%s')...\n", self, g_sre_current_scene_name);
     /* Publish the freshly-loaded scene for the JOB 1 world-drive bypass. */
     g_sre_finishloaded_scene = (uint64_t)self;
 
@@ -839,7 +857,14 @@ finish_load_done:
     /* Scene load is complete. ProgramState owns its mutex; this wrapper never
      * locks it, so unlocking here would violate mutex ownership and is undefined. */
     g_sre_scene_loading = 0;
-    fprintf(stderr, "[SRE/Scene] Scene::FinishLoad finished. Loading flag cleared.\n");
+    fprintf(stderr, "[SRE/Scene] Scene::FinishLoad finished (name='%s'). Loading flag cleared.\n", g_sre_current_scene_name);
+    /* Keep g_sre_game_level_name in sync so Lua game.current_level_name works */
+    {
+        extern char g_sre_game_level_name[128];
+        extern int snprintf(char *str, size_t size, const char *format, ...);
+        if (g_sre_current_scene_name[0])
+            snprintf(g_sre_game_level_name, sizeof(g_sre_game_level_name), "%s", g_sre_current_scene_name);
+    }
 }
 
 typedef void (*pfn_orig_SceneObject_FinishLoad)(void* self);
@@ -924,7 +949,7 @@ void sre_SceneObject_FinishLoad(void* self) {
 
                 /* Vtable must be in .data.rel.ro / .rodata, libsre, or trampoline caves */
                 bool vtable_ok = (vtable >= ro_lo && vtable < ro_hi) ||
-                                 (vtable >= 0x2000000ULL && vtable < 0x2300000ULL) ||
+                                 (vtable >= 0x2000000ULL && vtable < 0x2600000ULL) ||
                                  (vtable >= 0x3000000ULL && vtable < 0x3100000ULL);
                 if (!vtable_ok) {
                     fprintf(stderr, "[SRE/SceneObject] FinishLoad guard: "
@@ -945,7 +970,7 @@ void sre_SceneObject_FinishLoad(void* self) {
                 }
 
                 bool fn9_ok = (fn9 >= text_lo && fn9 < text_hi) ||
-                              (fn9 >= 0x2000000ULL && fn9 < 0x2300000ULL) ||
+                              (fn9 >= 0x2000000ULL && fn9 < 0x2600000ULL) ||
                               (fn9 >= 0x3000000ULL && fn9 < 0x3100000ULL);
                 if (!fn9_ok) {
                     fprintf(stderr, "[SRE/SceneObject] FinishLoad guard: "
@@ -968,7 +993,7 @@ void sre_SceneObject_FinishLoad(void* self) {
                     uint64_t parent_vt = *(uint64_t*)parent;
                     if (!parent_vt || (parent_vt & 7) != 0 ||
                         !((parent_vt >= ro_lo && parent_vt < ro_hi) ||
-                          (parent_vt >= 0x2000000ULL && parent_vt < 0x2300000ULL) ||
+                          (parent_vt >= 0x2000000ULL && parent_vt < 0x2600000ULL) ||
                           (parent_vt >= 0x3000000ULL && parent_vt < 0x3100000ULL))) {
                         fprintf(stderr, "[SRE/SceneObject] FinishLoad guard: "
                                 "comp[%zu]=%p parent=0x%llx has bad vtable=0x%llx — zeroing\n",
@@ -1356,7 +1381,7 @@ void sre_Proto_SceneObject_Destroy(void* this_) {
             bool vtable_ok = vtable && (vtable & 7) == 0 &&
                 ((vtable >= rodata_lo && vtable < rodata_hi) ||
                  (vtable >= drr_lo && vtable < drr_hi) ||
-                 (vtable >= 0x2000000ULL && vtable < 0x2300000ULL) ||
+                 (vtable >= 0x2000000ULL && vtable < 0x2600000ULL) ||
                  (vtable >= 0x3000000ULL && vtable < 0x3100000ULL));
             if (!vtable_ok) {
                 bad = true;
@@ -1367,7 +1392,7 @@ void sre_Proto_SceneObject_Destroy(void* this_) {
             bool destructor_ok = destructor && (destructor & 3) == 0 &&
                 ((destructor >= plt_lo && destructor < plt_hi) ||
                  (destructor >= text_lo && destructor < text_hi) ||
-                 (destructor >= 0x2000000ULL && destructor < 0x2300000ULL) ||
+                 (destructor >= 0x2000000ULL && destructor < 0x2600000ULL) ||
                  (destructor >= 0x3000000ULL && destructor < 0x3100000ULL));
             if (!destructor_ok) {
                 bad = true;

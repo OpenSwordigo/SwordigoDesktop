@@ -186,6 +186,13 @@ void (*g_Camera_SetPerspectiveProjection)(void* camera, float fov, float aspect,
 void (*g_orig_CameraController_Update)(void* self, float dt) = 0;
 void (*g_orig_SceneGrid_UpdateVisibleAreasWithCamera)(void* self, void* camera) = 0;
 
+/* Live CameraController instance pointer, captured every frame from the
+ * CameraController::Update hook below. Lets the console / FFI reach the active
+ * camera safely (no blind pointer walking from the console, which risks
+ * crashing the emulator). 0 until the first Update fires. Read via
+ * ffi through the exported symbol, or from host code directly. */
+volatile void* g_sre_camera_ctrl = 0;
+
 /* SwingableWeaponComponent glow function pointers
  * Addresses from GhidraDecomp (ARM64, libswordigo_v1.4.12.so, base 0x0):
  *   SetGlowIntensity  0x00228c49
@@ -242,6 +249,12 @@ void sre_caver_init(uint64_t swordigo_base) {
 /* Our guest-side CameraController::Update hook function */
 void sre_CameraController_Update(void* self, float dt) {
     if (!self) return;
+
+    /* Publish the live CameraController pointer for the console / FFI.
+     * Captured here every frame so tools can reach the active camera without
+     * blindly walking heap pointers from Lua (which can crash the emulator). */
+    g_sre_camera_ctrl = self;
+
     if (g_orig_CameraController_Update) {
         g_orig_CameraController_Update(self, dt);
     }

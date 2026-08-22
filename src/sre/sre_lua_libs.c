@@ -31,6 +31,7 @@ pfn_lua_xmove          g_lua_xmove          = 0;
 pfn_lua_newthread      g_lua_newthread      = 0;
 pfn_lua_pushthread     g_lua_pushthread     = 0;
 pfn_lua_sethook        g_lua_sethook        = 0;
+pfn_lua_newuserdata    g_lua_newuserdata    = 0;
 pfn_lua_pushvalue      g_lua_pushvalue      = 0;
 pfn_lua_remove         g_lua_remove         = 0;
 pfn_lua_insert         g_lua_insert         = 0;
@@ -94,6 +95,7 @@ typedef struct {
     sre_u64 lua_newthread;
     sre_u64 lua_pushthread;
     sre_u64 lua_sethook;
+    sre_u64 lua_newuserdata;
 } SreLuaExtAddrs;
 
 void sre_init_lua_ext(SreLuaExtAddrs* a) {
@@ -129,6 +131,7 @@ void sre_init_lua_ext(SreLuaExtAddrs* a) {
     g_lua_newthread      = (pfn_lua_newthread)a->lua_newthread;
     g_lua_pushthread     = (pfn_lua_pushthread)a->lua_pushthread;
     g_lua_sethook        = (pfn_lua_sethook)a->lua_sethook;
+    g_lua_newuserdata    = (pfn_lua_newuserdata)a->lua_newuserdata;
     if (!g_lua_sethook && g_swordigo_base) {
         g_lua_sethook = (pfn_lua_sethook)(g_swordigo_base + 0x4ea334);
     }
@@ -1863,6 +1866,16 @@ static const SreLuaReg fslib[] = {
  * Registration — called from sre_mini_ensure_injected
  * ========================================================================= */
 
+/* The vanilla engine only opens base+string; the mods (Throndigo) need
+ * math + table. We compile the real Lua 5.1 lmathlib/ltablib into libsre
+ * (identical source to the engine's — verified byte-identical lua.h/
+ * lstate.h/lapi.c vs bitcvh_fking_src/lua). Their internal calls operate on
+ * the same struct layout, so calling luaopen_math/luaopen_table on the
+ * live game state is safe and gives the FULL standard libs. */
+LUALIB_API int (luaopen_math) (lua_State *L);
+LUALIB_API int (luaopen_table) (lua_State *L);
+LUALIB_API int (luaopen_debug) (lua_State *L);
+
 void sre_open_std_libs(lua_State* L) {
     if (!g_luaL_register || !g_lua_pushnumber || !g_lua_setfield) return;
 
@@ -1882,7 +1895,45 @@ void sre_open_std_libs(lua_State* L) {
     g_luaL_register(L, "fs", (const void*)fslib);
     lua_pop(L, 1);
 
-    /* 5. Override loadfile/dofile with VFS-aware versions */
+    /* 5. Full Lua 5.1 math library (engine doesn't ship it; mods need it).
+     * Only if absent — don't clobber an engine-provided table. */
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "math");
+    if (g_lua_type(L, -1) == 0 /* LUA_TNIL */) {
+        g_lua_settop(L, -2);
+        luaopen_math(L);
+        lua_pop(L, 1);
+    } else {
+        g_lua_settop(L, -2);
+    }
+
+    /* 6. Full Lua 5.1 table library (engine doesn't ship it). */
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "table");
+    if (g_lua_type(L, -1) == 0 /* LUA_TNIL */) {
+        g_lua_settop(L, -2);
+        luaopen_table(L);
+        lua_pop(L, 1);
+    } else {
+        g_lua_settop(L, -2);
+    }
+
+    /* 6b. Full Lua 5.1 debug library — the engine opens only base+string
+     * (verified in RegisterProgramLibrary: luaopen_string + luaopen_base,
+     * no luaopen_debug). SRE's sre_hook_obj needs debug.getmetatable to
+     * read metatables that are protected via __metatable (the engine's
+     * SceneObjectLib userdata metatable is protected), so without debug the
+     * destroy/setAlwaysActive interception never applies and mods that call
+     * obj:destroy() (Throndigo hiro.scl np:destroy() etc.) crash with
+     * "attempt to call method 'destroy' (a nil value)". */
+    g_lua_getfield(L, LUA_GLOBALSINDEX, "debug");
+    if (g_lua_type(L, -1) == 0 /* LUA_TNIL */) {
+        g_lua_settop(L, -2);
+        luaopen_debug(L);
+        lua_pop(L, 1);
+    } else {
+        g_lua_settop(L, -2);
+    }
+
+    /* 7. Override loadfile/dofile with VFS-aware versions */
     g_lua_pushcclosure(L, sre_loadfile, 0);
     g_lua_setfield(L, LUA_GLOBALSINDEX, "loadfile");
 

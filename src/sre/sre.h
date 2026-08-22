@@ -104,6 +104,7 @@ SreString* sre_CppString_from_char_p(SreString* self, const char* src);
 SreString* sre_CppString_assign(SreString* self, const char* src, uint64_t len);
 SreString* sre_CppString_append(SreString* self, const char* src, uint64_t len);
 void sre_CppString_release(SreString* self);
+void sre_CppString_rep_release(SreStringRep* rep);
 
 /* C++ exception frame initializer — prevents EHABI abort (sre_effects.c) */
 void sre_ExceptionFrameInit(uint64_t* a1, uint64_t a2, uint64_t a3);
@@ -181,5 +182,24 @@ extern uint64_t g_orig_ComponentOutletBase_Connect;
 /* Proto::SceneObject destructor guard used during scene teardown. */
 void sre_Proto_SceneObject_Destroy(void* this_);
 extern uint64_t g_orig_Proto_SceneObject_Destroy;
+
+/* =========================================================================
+ * Button lifecycle hooks — auto-hide/show buttons during game state changes.
+ * Implemented in sre_mini_api.c.
+ * ========================================================================= */
+void sre_button_set_all_hidden(int hidden);
+void sre_button_remove_all(void);
+void sre_button_lifecycle_set_enabled(int enabled);
+void sre_button_lifecycle_on_cinematic_mode(int enabled);
+void sre_button_lifecycle_on_menu_load(void);
+void sre_button_lifecycle_on_menu_disappear(void);
+void sre_button_lifecycle_on_pause(void);
+void sre_button_lifecycle_on_unpause(void);
+void sre_button_lifecycle_on_portal_in(void);
+void sre_button_lifecycle_on_portal_out(void);
+void sre_button_lifecycle_on_skill_picker_load(void);
+void sre_button_lifecycle_on_skill_picker_destroy(void);
+void sre_button_lifecycle_on_game_over(void);
+void sre_button_lifecycle_on_scene_destruct(void);
 
 #endif /* SRE_H */

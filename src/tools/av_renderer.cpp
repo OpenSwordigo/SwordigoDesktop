@@ -105,6 +105,9 @@ uniform bool  uFogEnabled;
 uniform vec3  uFogColor;        // atmospheric depth-darkening tint
 uniform float uFogNear;         // distance where fog starts
 uniform float uFogFar;          // distance where fog is full
+uniform bool  uInlineTonemap;   // false = HDR path: output LINEAR light, the
+                                // PostFX HD pass owns tone mapping (no
+                                // double-ACES / gamma-on-gamma wash)
 
 #define MAX_POINT_LIGHTS 16
 uniform int    uLightCount;
@@ -142,23 +145,29 @@ void main() {
         return;
     }
 
-    // ── Ambient: hemisphere sky/ground fill with a hard floor so nothing
-    //    ever crushes to black (the "black wood" / "black hero" symptom).
+    // ── Ambient: hemisphere sky/ground fill with a low floor so nothing
+    //    ever crushes to black (the "black wood" / "black hero" symptom),
+    //    but shadows still get real depth in the linear pipeline.
     float hemi = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
-    vec3  amb  = max(mix(uAmbientGround, uAmbient, hemi), vec3(0.07));
+    vec3  amb  = max(mix(uAmbientGround, uAmbient, hemi), vec3(0.025));
+    // Textures are authored in sRGB — decode to LINEAR before any lighting
+    // math (gamma-correct rendering). This alone recovers most of the lost
+    // contrast of the old washed-out look.
+    vec3 albedo = pow(base.rgb, vec3(2.2));
 
     // Epsilon guards normalize() against a vertex sitting exactly at the
     // camera (NaN would poison the rim term → black pixels).
     vec3 V = normalize(uCamPos - vWorldPos + vec3(1e-4));
 
     // Soft half-Lambert preserves Swordigo's readable silhouettes while every
-    // directional component follows one coherent lighting equation.
+    // directional component follows one coherent lighting equation. The tight
+    // wrap + gamma curve keeps a punchy terminator (real shadow contrast).
     vec3 keyDir = (uDirLightCount == 0) ? normalize(uLightDir)
                                         : normalize(uDirLightDir[0]);
     vec3 keyCol = (uDirLightCount == 0) ? uLightColor : uDirLightCol[0];
     float ndl   = dot(N, keyDir);
-    float wrap  = clamp((ndl + 0.22) / 1.22, 0.0, 1.0);
-    vec3  key   = keyCol * (wrap * wrap * 0.9);
+    float wrap  = clamp((ndl + 0.12) / 1.12, 0.0, 1.0);
+    vec3  key   = keyCol * (pow(wrap, 1.35) * 0.95);
 
     // ── Fill light: cool light from the opposite side of the key. This is
     //    the classic three-point setup — it gives walls/players shape on the
@@ -176,13 +185,13 @@ void main() {
     vec3  H    = normalize(keyDir + V);
     float spec = pow(max(dot(N, H), 0.0), 24.0) * uSpecStrength;
 
-    vec3 lit = base.rgb * (amb + key + fill + rimL) + keyCol * spec;
+    vec3 lit = albedo * (amb + key + fill + rimL) + keyCol * spec;
     for (int i = 1; i < max(uDirLightCount, 0); ++i) {
         vec3 L = normalize(uDirLightDir[i]);
         float d = clamp((dot(N, L) + 0.14) / 1.14, 0.0, 1.0);
         vec3 H2 = normalize(L + V);
         float s = pow(max(dot(N, H2), 0.0), 24.0) * uSpecStrength;
-        lit += base.rgb * uDirLightCol[i] * d * d + uDirLightCol[i] * s;
+        lit += albedo * uDirLightCol[i] * d * d + uDirLightCol[i] * s;
     }
 
     // Point lights (warm torch / fire / SimpleGlow): compact LOCALIZED sources.
@@ -208,7 +217,7 @@ void main() {
         float diff = clamp((dot(N, L) + 0.08) / 1.08, 0.0, 1.0);
         vec3 Hp = normalize(L + V);
         float pointSpec = pow(max(dot(N, Hp), 0.0), 32.0) * uSpecStrength;
-        lit += (base.rgb * diff + pointSpec) * uLightCol[i] * atten;
+        lit += (albedo * diff + pointSpec) * uLightCol[i] * atten;
     }
 
     // Atmospheric depth fog: distant geometry darkens toward the cave tint,
@@ -222,10 +231,15 @@ void main() {
         lit = mix(lit, fogged, f * f);
     }
 
-    // Tonemap + clamp so the Lambertian path can never wash out to white
-    // (matches the PBR path). Keeps Swordigo's softer, non-bleached look.
-    lit = clamp(lit, 0.0, 1e4);
-    lit = (lit * (2.51 * lit + 0.03)) / (lit * (2.43 * lit + 0.59) + 0.14);
+    // Tone map ownership: the HDR path (PostFX HD on) keeps this value LINEAR
+    // — exposure + ACES + gamma happen once, in the composite pass. Only the
+    // legacy/no-PostFX path tonemaps here (thumbnails, previews).
+    if (uInlineTonemap) {
+        lit = clamp(lit, 0.0, 1e4);
+        lit = (lit * (2.51 * lit + 0.03)) / (lit * (2.43 * lit + 0.59) + 0.14);
+    } else {
+        lit = clamp(lit, 0.0, 64.0);   // sane HDR ceiling for RGBA8 fallback
+    }
 
     FragColor = vec4(lit, base.a * uAlpha);
 }
@@ -787,6 +801,11 @@ static GLint s_loc_fill_col  = -1;
 static GLint s_loc_rim_str   = -1;
 static GLint s_loc_spec_str  = -1;
 static GLint s_loc_flip_v    = -1;
+static GLint s_loc_inline_tm = -1;
+
+// HDR path switch (see set_inline_tonemap): when false, render_mesh uploads
+// linear-space boosted lights and the mesh shader outputs linear light.
+static bool s_inline_tonemap = true;
 
 // ── PBR program state (vendored algorithms, see src/render/zauonlok) ──
 struct PBRProg {
@@ -1368,6 +1387,7 @@ bool renderer_init() {
     s_loc_rim_str   = glGetUniformLocation(s_model_prog, "uRimStrength");
     s_loc_spec_str  = glGetUniformLocation(s_model_prog, "uSpecStrength");
     s_loc_flip_v    = glGetUniformLocation(s_model_prog, "uFlipV");
+    s_loc_inline_tm = glGetUniformLocation(s_model_prog, "uInlineTonemap");
 
     // --- PBR program (vendored algorithms from zauonlok/renderer, MIT) ---
     // Non-fatal: if the PBR program fails to build, the legacy model path
@@ -1818,6 +1838,80 @@ unsigned int create_fbo(int width, int height, unsigned int* out_tex) {
     return fbo;
 }
 
+unsigned int create_fbo_hdr(int width, int height, unsigned int* out_tex) {
+    // Same layout as create_fbo but with an RGBA16F color attachment so the
+    // scene can live in LINEAR light (values > 1 feed the bloom pass real
+    // HDR energy). Falls back to RGBA8 when half-float rendering is
+    // unavailable — the pipeline stays correct, just clamps at 1.0.
+    GLuint fbo, tex, depth_tex;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0,
+                 GL_RGBA, GL_HALF_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, tex, 0);
+
+    glGenTextures(1, &depth_tex);
+    glBindTexture(GL_TEXTURE_2D, depth_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, width, height, 0,
+                 GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                           GL_TEXTURE_2D, depth_tex, 0);
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        // Half-float render target unsupported — fall back to RGBA8.
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            fprintf(stderr, "[av_renderer] HDR FBO incomplete: 0x%x\n", status);
+            glDeleteFramebuffers(1, &fbo);
+            glDeleteTextures(1, &tex);
+            glDeleteTextures(1, &depth_tex);
+            if (out_tex) *out_tex = 0;
+            return 0;
+        }
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    s_fbo_records.push_back({fbo, depth_tex});
+    if (out_tex) *out_tex = tex;
+    return fbo;
+}
+
+static void resize_fbo_internal(unsigned int fbo, int w, int h,
+                                unsigned int* tex, GLint internal_format,
+                                GLenum format, GLenum type) {
+    if (!fbo || !tex || w <= 0 || h <= 0) return;
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glBindTexture(GL_TEXTURE_2D, *tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, internal_format, w, h, 0, format, type, nullptr);
+    GLuint depth_tex = find_depth_for_fbo(fbo);
+    if (depth_tex) {
+        glBindTexture(GL_TEXTURE_2D, depth_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, w, h, 0,
+                     GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void resize_fbo_hdr(unsigned int fbo, int w, int h, unsigned int* tex) {
+    resize_fbo_internal(fbo, w, h, tex, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT);
+}
+
 void resize_fbo(unsigned int fbo, int w, int h, unsigned int* tex) {
     if (!fbo || !tex || w <= 0 || h <= 0) return;
 
@@ -1912,12 +2006,19 @@ void set_view_flags(bool flat_shade, bool debug_normals) {
     s_debug_normals = debug_normals;
 }
 
+void set_inline_tonemap(bool enabled) {
+    s_inline_tonemap = enabled;
+}
+
 void begin_3d(unsigned int fbo, int w, int h, const Camera& cam) {
     // Every pass starts with the diagnostics OFF — the scene visualizer opts
     // into flat/normal view after its begin_3d, so POD previews, thumbnails
-    // and the GM preview can never inherit stale flags.
+    // and the GM preview can never inherit stale flags. Same for the HDR
+    // inline-tonemap switch: passes opt OUT after begin_3d (scene view with
+    // PostFX HD); everything else tonemaps inline into LDR by default.
     s_flat_shade = false;
     s_debug_normals = false;
+    s_inline_tonemap = true;
 
     // Save current state for restore in end_3d
     glGetIntegerv(GL_VIEWPORT, s_saved_viewport);
@@ -1992,15 +2093,20 @@ void render_mesh(const GPUMesh& mesh, const float* model_matrix,
     glUniformMatrix3fv(s_loc_normalmat, 1, GL_FALSE, nmat);
 
     glUniform3fv(s_loc_light_dir, 1, g_light_dir);
-    float lcol[3] = { g_light_color[0] * g_light_scale,
-                      g_light_color[1] * g_light_scale,
-                      g_light_color[2] * g_light_scale };
-    float amb[3] = { g_ambient_color[0] * g_ambient_scale,
-                     g_ambient_color[1] * g_ambient_scale,
-                     g_ambient_color[2] * g_ambient_scale };
-    float ambg[3] = { g_ambient_ground_color[0] * g_ambient_scale,
-                      g_ambient_ground_color[1] * g_ambient_scale,
-                      g_ambient_ground_color[2] * g_ambient_scale };
+    // Linear-space boosts for the HDR path: with sRGB→linear albedo (darker
+    // mids) and tone mapping owned by PostFX, lights need to carry honest
+    // linear energy. The legacy LDR path keeps the old tuned values.
+    const float key_boost = s_inline_tonemap ? 1.0f : 2.35f;
+    const float amb_boost = s_inline_tonemap ? 1.0f : 1.35f;
+    float lcol[3] = { g_light_color[0] * g_light_scale * key_boost,
+                      g_light_color[1] * g_light_scale * key_boost,
+                      g_light_color[2] * g_light_scale * key_boost };
+    float amb[3] = { g_ambient_color[0] * g_ambient_scale * amb_boost,
+                     g_ambient_color[1] * g_ambient_scale * amb_boost,
+                     g_ambient_color[2] * g_ambient_scale * amb_boost };
+    float ambg[3] = { g_ambient_ground_color[0] * g_ambient_scale * amb_boost,
+                      g_ambient_ground_color[1] * g_ambient_scale * amb_boost,
+                      g_ambient_ground_color[2] * g_ambient_scale * amb_boost };
     glUniform3fv(s_loc_light_col, 1, lcol);
     glUniform3fv(s_loc_fill_col,  1, g_fill_color);
     glUniform1f(s_loc_rim_str,   g_rim_strength);
@@ -2011,20 +2117,29 @@ void render_mesh(const GPUMesh& mesh, const float* model_matrix,
     glUniform1f(s_loc_alpha,      col[3]);
     glUniform1i(s_loc_flat_shade, s_flat_shade ? 1 : 0);
     glUniform1i(s_loc_dbg_normals, s_debug_normals ? 1 : 0);
+    glUniform1i(s_loc_inline_tm, s_inline_tonemap ? 1 : 0);
 
     // Directional light array (scene override). When empty the single
     // editor preview directional (g_light_dir/color) above is used.
     glUniform1i(s_loc_dir_cnt, s_dir_light_count);
     if (s_dir_light_count > 0) {
         glUniform3fv(s_loc_dir_dir, s_dir_light_count, &s_dir_light_dir[0][0]);
-        glUniform3fv(s_loc_dir_col, s_dir_light_count, &s_dir_light_col[0][0]);
+        float dcols[4][3];
+        for (int i = 0; i < s_dir_light_count && i < 4; ++i)
+            for (int a = 0; a < 3; ++a)
+                dcols[i][a] = s_dir_light_col[(size_t)i][a] * key_boost;
+        glUniform3fv(s_loc_dir_col, s_dir_light_count, &dcols[0][0]);
     }
 
     // Point lights + camera position for local warm illumination.
     glUniform1i(s_loc_light_cnt, s_point_light_count);
     if (s_point_light_count > 0) {
         glUniform3fv(s_loc_light_pos,  s_point_light_count, &s_point_light_pos[0][0]);
-        glUniform3fv(s_loc_light_cols, s_point_light_count, &s_point_light_col[0][0]);
+        float pcols[16][3];
+        for (int i = 0; i < s_point_light_count && i < 16; ++i)
+            for (int a = 0; a < 3; ++a)
+                pcols[i][a] = s_point_light_col[(size_t)i][a] * key_boost;
+        glUniform3fv(s_loc_light_cols, s_point_light_count, &pcols[0][0]);
         glUniform1fv(s_loc_light_rad,  s_point_light_count, s_point_light_radius);
     }
     glUniform3fv(s_loc_cam_pos, 1, s_cam_eye);
@@ -2742,6 +2857,55 @@ void main() {
 }
 )GLSL";
 
+// Half-res depth-based SSAO: golden-angle spiral taps compare view-space
+// distances around the fragment; closer neighbors occlude. Range-checked so
+// silhouettes don't self-shadow. Blurred afterwards (FX_BLUR) and mixed into
+// the ambient in the composite — contact shadows the direct lights can't give.
+static const char* FX_SSAO_FS = R"GLSL(
+#version 330 core
+in vec2 vUV;
+out vec4 FragColor;
+uniform sampler2D uDepth;
+uniform vec2  uTexel;          // 1 / half-res size
+uniform float uNear;
+uniform float uFar;
+uniform float uTanHalfFov;     // tan(fov/2) of the scene camera
+uniform float uAspect;         // width / height
+uniform float uRadius;         // view-space radius in world units
+
+float linearDepth(vec2 uv) {
+    float d = texture(uDepth, uv).r;
+    float z = d * 2.0 - 1.0;
+    return (2.0 * uNear * uFar) / (uFar + uNear - z * (uFar - uNear));
+}
+
+void main() {
+    float d0 = linearDepth(vUV);
+    // World radius → screen UV footprint at this depth:
+    //   ndc = (worldOffset / depth) / tanHalf ; uv = ndc / 2
+    vec2 radiusUV = vec2((uRadius / d0) / (uTanHalfFov * uAspect),
+                         (uRadius / d0) /  uTanHalfFov) * 0.5;
+    radiusUV = clamp(radiusUV, vec2(0.002), vec2(0.06));
+
+    float occ = 0.0;
+    const int TAPS = 12;
+    for (int i = 0; i < TAPS; ++i) {
+        float ang = (float(i) + 0.5) * 2.39996323;          // golden angle
+        float rr  = sqrt((float(i) + 0.5) / float(TAPS));   // spiral radius
+        vec2 off = vec2(cos(ang), sin(ang)) * rr * radiusUV * 2.0;
+        float ds = linearDepth(clamp(vUV + off, vec2(0.001), vec2(0.999)));
+        float diff = d0 - ds;                               // >0: neighbor nearer
+        if (diff > 0.02 * d0) {
+            float rangeCheck = smoothstep(0.0, 1.0, uRadius / max(abs(diff), 1e-3));
+            occ += clamp(diff / (0.35 * uRadius), 0.0, 1.0) * rangeCheck;
+        }
+    }
+    float ao = 1.0 - (occ / float(TAPS)) * 1.6;
+    ao = clamp(pow(max(ao, 0.0), 1.3), 0.0, 1.0);
+    FragColor = vec4(ao, ao, ao, 1.0);
+}
+)GLSL";
+
 static const char* FX_COMP_FS = R"GLSL(
 #version 330 core
 in vec2 vUV;
@@ -2749,12 +2913,16 @@ out vec4 FragColor;
 
 uniform sampler2D uColor;
 uniform sampler2D uBloom;
+uniform sampler2D uBloom2;      // quarter-res wide band
 uniform sampler2D uDepth;
+uniform sampler2D uSsao;
 uniform vec2  uTexel;         // 1 / full size
 uniform float uExposure;
 uniform int   uHdOn;
 uniform int   uBloomOn;
 uniform float uBloomStrength;
+uniform int   uSsaoOn;
+uniform float uSsaoStrength;
 uniform int   uDofOn;
 uniform float uDofFocus;
 uniform float uDofScale;
@@ -2791,6 +2959,11 @@ vec3 aces(vec3 x) {
 void main() {
     vec3 col = texture(uColor, vUV).rgb;
 
+    // ── SSAO: darken ambient-occluded crevices / contacts in LINEAR light,
+    //    before tone mapping (so the darkening behaves like lighting). ──
+    if (uSsaoOn == 1)
+        col *= mix(1.0, texture(uSsao, vUV).r, uSsaoStrength);
+
     // ── Depth of field: CoC-driven disc blur ──
     if (uDofOn == 1) {
         float depth = linearDepth(texture(uDepth, vUV).r);
@@ -2813,9 +2986,11 @@ void main() {
         }
     }
 
-    // ── Bloom (additive) ──
+    // ── Bloom (additive, two bands): the half-res band keeps tight cores,
+    //    the quarter-res band spreads a soft wide halo. ──
     if (uBloomOn == 1)
-        col += texture(uBloom, vUV).rgb * uBloomStrength;
+        col += (texture(uBloom,  vUV).rgb * 0.62 +
+                texture(uBloom2, vUV).rgb * 0.48) * uBloomStrength;
 
     // ── HD render: exposure + ACES tone map + gamma ──
     if (uHdOn == 1) {
@@ -2866,11 +3041,16 @@ void main() {
 static GLuint s_fx_bright  = 0;
 static GLuint s_fx_blur    = 0;
 static GLuint s_fx_comp    = 0;
+static GLuint s_fx_ssao    = 0;
 static GLuint s_fx_vao     = 0;
 static GLuint s_fx_vbo     = 0;
 static GLuint s_fx_ebo     = 0;
-static GLuint s_fx_bloom_a_fbo = 0, s_fx_bloom_a_tex = 0;
+static GLuint s_fx_bloom_a_fbo = 0, s_fx_bloom_a_tex = 0;   // half-res band
 static GLuint s_fx_bloom_b_fbo = 0, s_fx_bloom_b_tex = 0;
+static GLuint s_fx_bloom_c_fbo = 0, s_fx_bloom_c_tex = 0;   // quarter-res band
+static GLuint s_fx_bloom_d_fbo = 0, s_fx_bloom_d_tex = 0;
+static GLuint s_fx_ssao_a_fbo = 0, s_fx_ssao_a_tex = 0;     // half-res AO
+static GLuint s_fx_ssao_b_fbo = 0, s_fx_ssao_b_tex = 0;
 static GLuint s_fx_out_fbo = 0, s_fx_out_tex = 0;
 static int    s_fx_w = 0, s_fx_h = 0;
 
@@ -2902,6 +3082,11 @@ static bool fx_make_fbo(int w, int h, GLuint* fbo, GLuint* tex) {
     return true;
 }
 
+static void fx_delete_fbo(GLuint* fbo, GLuint* tex) {
+    if (*fbo) { glDeleteFramebuffers(1, fbo); *fbo = 0; }
+    if (*tex) { glDeleteTextures(1, tex);     *tex = 0; }
+}
+
 static bool fx_ensure(int w, int h) {
     if (w < 1 || h < 1) return false;
 
@@ -2909,7 +3094,8 @@ static bool fx_ensure(int w, int h) {
         s_fx_bright = fx_make_prog(FX_BRIGHT_FS);
         s_fx_blur   = fx_make_prog(FX_BLUR_FS);
         s_fx_comp   = fx_make_prog(FX_COMP_FS);
-        if (!s_fx_comp || !s_fx_bright || !s_fx_blur) {
+        s_fx_ssao   = fx_make_prog(FX_SSAO_FS);
+        if (!s_fx_comp || !s_fx_bright || !s_fx_blur || !s_fx_ssao) {
             fprintf(stderr, "[av_renderer] PostFX shader build failed\n");
             return false;
         }
@@ -2937,18 +3123,24 @@ static bool fx_ensure(int w, int h) {
 
     // (Re)size the internal FBOs if needed
     if (s_fx_out_fbo && (s_fx_w != w || s_fx_h != h)) {
-        glDeleteFramebuffers(1, &s_fx_out_fbo); glDeleteTextures(1, &s_fx_out_tex);
-        s_fx_out_fbo = s_fx_out_tex = 0;
-        glDeleteFramebuffers(1, &s_fx_bloom_a_fbo); glDeleteTextures(1, &s_fx_bloom_a_tex);
-        s_fx_bloom_a_fbo = s_fx_bloom_a_tex = 0;
-        glDeleteFramebuffers(1, &s_fx_bloom_b_fbo); glDeleteTextures(1, &s_fx_bloom_b_tex);
-        s_fx_bloom_b_fbo = s_fx_bloom_b_tex = 0;
+        fx_delete_fbo(&s_fx_out_fbo, &s_fx_out_tex);
+        fx_delete_fbo(&s_fx_bloom_a_fbo, &s_fx_bloom_a_tex);
+        fx_delete_fbo(&s_fx_bloom_b_fbo, &s_fx_bloom_b_tex);
+        fx_delete_fbo(&s_fx_bloom_c_fbo, &s_fx_bloom_c_tex);
+        fx_delete_fbo(&s_fx_bloom_d_fbo, &s_fx_bloom_d_tex);
+        fx_delete_fbo(&s_fx_ssao_a_fbo, &s_fx_ssao_a_tex);
+        fx_delete_fbo(&s_fx_ssao_b_fbo, &s_fx_ssao_b_tex);
     }
     if (!s_fx_out_fbo) {
-        const int bw = std::max(1, w / 2), bh = std::max(1, h / 2);
+        const int bw = std::max(1, w / 2),  bh = std::max(1, h / 2);
+        const int qw = std::max(1, w / 4),  qh = std::max(1, h / 4);
         if (!fx_make_fbo(w, h, &s_fx_out_fbo, &s_fx_out_tex)) return false;
         if (!fx_make_fbo(bw, bh, &s_fx_bloom_a_fbo, &s_fx_bloom_a_tex)) return false;
         if (!fx_make_fbo(bw, bh, &s_fx_bloom_b_fbo, &s_fx_bloom_b_tex)) return false;
+        if (!fx_make_fbo(qw, qh, &s_fx_bloom_c_fbo, &s_fx_bloom_c_tex)) return false;
+        if (!fx_make_fbo(qw, qh, &s_fx_bloom_d_fbo, &s_fx_bloom_d_tex)) return false;
+        if (!fx_make_fbo(bw, bh, &s_fx_ssao_a_fbo, &s_fx_ssao_a_tex)) return false;
+        if (!fx_make_fbo(bw, bh, &s_fx_ssao_b_fbo, &s_fx_ssao_b_tex)) return false;
         s_fx_w = w; s_fx_h = h;
     }
     return true;
@@ -2964,15 +3156,17 @@ void postfx_shutdown() {
     if (s_fx_comp)   { glDeleteProgram(s_fx_comp);   s_fx_comp = 0; }
     if (s_fx_bright) { glDeleteProgram(s_fx_bright); s_fx_bright = 0; }
     if (s_fx_blur)   { glDeleteProgram(s_fx_blur);   s_fx_blur = 0; }
+    if (s_fx_ssao)   { glDeleteProgram(s_fx_ssao);   s_fx_ssao = 0; }
     if (s_fx_vao)    { glDeleteVertexArrays(1, &s_fx_vao); s_fx_vao = 0; }
     if (s_fx_vbo)    { glDeleteBuffers(1, &s_fx_vbo); s_fx_vbo = 0; }
     if (s_fx_ebo)    { glDeleteBuffers(1, &s_fx_ebo); s_fx_ebo = 0; }
-    if (s_fx_out_fbo)     { glDeleteFramebuffers(1, &s_fx_out_fbo);     s_fx_out_fbo = 0; }
-    if (s_fx_out_tex)     { glDeleteTextures(1, &s_fx_out_tex);         s_fx_out_tex = 0; }
-    if (s_fx_bloom_a_fbo) { glDeleteFramebuffers(1, &s_fx_bloom_a_fbo); s_fx_bloom_a_fbo = 0; }
-    if (s_fx_bloom_a_tex) { glDeleteTextures(1, &s_fx_bloom_a_tex);     s_fx_bloom_a_tex = 0; }
-    if (s_fx_bloom_b_fbo) { glDeleteFramebuffers(1, &s_fx_bloom_b_fbo); s_fx_bloom_b_fbo = 0; }
-    if (s_fx_bloom_b_tex) { glDeleteTextures(1, &s_fx_bloom_b_tex);     s_fx_bloom_b_tex = 0; }
+    fx_delete_fbo(&s_fx_out_fbo, &s_fx_out_tex);
+    fx_delete_fbo(&s_fx_bloom_a_fbo, &s_fx_bloom_a_tex);
+    fx_delete_fbo(&s_fx_bloom_b_fbo, &s_fx_bloom_b_tex);
+    fx_delete_fbo(&s_fx_bloom_c_fbo, &s_fx_bloom_c_tex);
+    fx_delete_fbo(&s_fx_bloom_d_fbo, &s_fx_bloom_d_tex);
+    fx_delete_fbo(&s_fx_ssao_a_fbo, &s_fx_ssao_a_tex);
+    fx_delete_fbo(&s_fx_ssao_b_fbo, &s_fx_ssao_b_tex);
     s_fx_w = s_fx_h = 0;
 }
 
@@ -2980,7 +3174,7 @@ unsigned int postfx_apply(unsigned int src_tex, unsigned int depth_tex,
                           int w, int h, const PostFXParams& p,
                           float near_plane, float far_plane, float time_sec) {
     if (!p.enabled) return src_tex;
-    const bool any = p.hd || p.bloom || p.dof || p.color_grade ||
+    const bool any = p.hd || p.bloom || p.ssao || p.dof || p.color_grade ||
                      p.sharpen || p.vignette || p.grain;
     if (!any) return src_tex;
     if (!fx_ensure(w, h)) return src_tex;
@@ -2990,12 +3184,50 @@ unsigned int postfx_apply(unsigned int src_tex, unsigned int depth_tex,
     glGetIntegerv(GL_VIEWPORT, saved_viewport);
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &saved_fbo);
 
-    const int bw = std::max(1, w / 2), bh = std::max(1, h / 2);
+    const int bw = std::max(1, w / 2),  bh = std::max(1, h / 2);
+    const int qw = std::max(1, w / 4),  qh = std::max(1, h / 4);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
 
-    // ── Bloom chain (bright pass + separable blur, half-res ping-pong) ──
+    // ── SSAO: half-res AO from the depth buffer, then a separable blur ──
+    // (s_grid_proj_f = 1/tan(fov/2) captured by this frame's begin_3d.)
+    const bool ssao_ok = p.ssao && depth_tex;
+    if (ssao_ok) {
+        glBindFramebuffer(GL_FRAMEBUFFER, s_fx_ssao_a_fbo);
+        glViewport(0, 0, bw, bh);
+        glUseProgram(s_fx_ssao);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, depth_tex);
+        glUniform1i(glGetUniformLocation(s_fx_ssao, "uDepth"), 0);
+        glUniform2f(glGetUniformLocation(s_fx_ssao, "uTexel"), 1.0f / bw, 1.0f / bh);
+        glUniform1f(glGetUniformLocation(s_fx_ssao, "uNear"), near_plane);
+        glUniform1f(glGetUniformLocation(s_fx_ssao, "uFar"), far_plane);
+        glUniform1f(glGetUniformLocation(s_fx_ssao, "uTanHalfFov"),
+                    s_grid_proj_f > 0.0f ? 1.0f / s_grid_proj_f : 1.0f);
+        glUniform1f(glGetUniformLocation(s_fx_ssao, "uAspect"),
+                    h > 0 ? (float)w / (float)h : 1.0f);
+        glUniform1f(glGetUniformLocation(s_fx_ssao, "uRadius"), p.ssao_radius);
+        fx_quad();
+
+        // Blur H: ssaoA -> ssaoB
+        glBindFramebuffer(GL_FRAMEBUFFER, s_fx_ssao_b_fbo);
+        glViewport(0, 0, bw, bh);
+        glUseProgram(s_fx_blur);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s_fx_ssao_a_tex);
+        glUniform1i(glGetUniformLocation(s_fx_blur, "uTex"), 0);
+        glUniform2f(glGetUniformLocation(s_fx_blur, "uDir"), 1.0f / bw, 0.0f);
+        fx_quad();
+        // Blur V: ssaoB -> ssaoA
+        glBindFramebuffer(GL_FRAMEBUFFER, s_fx_ssao_a_fbo);
+        glViewport(0, 0, bw, bh);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s_fx_ssao_b_tex);
+        glUniform2f(glGetUniformLocation(s_fx_blur, "uDir"), 0.0f, 1.0f / bh);
+        fx_quad();
+    }
+
+    // ── Bloom chain: two bands ──
+    //   half-res   — bright pass + H/V blur   (tight cores)
+    //   quarter-res— downsample + H/V blur    (soft wide halo)
     if (p.bloom) {
         // Bright pass: full-res -> half-res bloomA
         glBindFramebuffer(GL_FRAMEBUFFER, s_fx_bloom_a_fbo);
@@ -3024,6 +3256,32 @@ unsigned int postfx_apply(unsigned int src_tex, unsigned int depth_tex,
         glUniform1i(glGetUniformLocation(s_fx_blur, "uTex"), 0);
         glUniform2f(glGetUniformLocation(s_fx_blur, "uDir"), 0.0f, 1.0f / bh);
         fx_quad();
+
+        // Wide band: bright pass over the blurred half-res -> quarter bloomC,
+        // then H/V blur at quarter res. Deepens the halo without smearing the
+        // core band above.
+        glBindFramebuffer(GL_FRAMEBUFFER, s_fx_bloom_c_fbo);
+        glViewport(0, 0, qw, qh);
+        glUseProgram(s_fx_bright);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s_fx_bloom_a_tex);
+        glUniform1i(glGetUniformLocation(s_fx_bright, "uTex"), 0);
+        glUniform2f(glGetUniformLocation(s_fx_bright, "uTexel"), 1.0f / bw, 1.0f / bh);
+        glUniform1f(glGetUniformLocation(s_fx_bright, "uThreshold"), 0.0f);
+        fx_quad();
+
+        glBindFramebuffer(GL_FRAMEBUFFER, s_fx_bloom_d_fbo);
+        glViewport(0, 0, qw, qh);
+        glUseProgram(s_fx_blur);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s_fx_bloom_c_tex);
+        glUniform1i(glGetUniformLocation(s_fx_blur, "uTex"), 0);
+        glUniform2f(glGetUniformLocation(s_fx_blur, "uDir"), 1.0f / qw, 0.0f);
+        fx_quad();
+
+        glBindFramebuffer(GL_FRAMEBUFFER, s_fx_bloom_c_fbo);
+        glViewport(0, 0, qw, qh);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s_fx_bloom_d_tex);
+        glUniform2f(glGetUniformLocation(s_fx_blur, "uDir"), 0.0f, 1.0f / qh);
+        fx_quad();
     }
 
     // ── Composite ──
@@ -3033,14 +3291,22 @@ unsigned int postfx_apply(unsigned int src_tex, unsigned int depth_tex,
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, src_tex);
     glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, p.bloom ? s_fx_bloom_a_tex : 0);
     glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, depth_tex);
+    glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D,
+        ssao_ok ? s_fx_ssao_a_tex : s_fx_bloom_a_tex);
+    glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D,
+        p.bloom ? s_fx_bloom_c_tex : s_fx_bloom_a_tex);
     glUniform1i(glGetUniformLocation(s_fx_comp, "uColor"), 0);
     glUniform1i(glGetUniformLocation(s_fx_comp, "uBloom"), 1);
     glUniform1i(glGetUniformLocation(s_fx_comp, "uDepth"), 2);
+    glUniform1i(glGetUniformLocation(s_fx_comp, "uSsao"), 3);
+    glUniform1i(glGetUniformLocation(s_fx_comp, "uBloom2"), 4);
     glUniform2f(glGetUniformLocation(s_fx_comp, "uTexel"), 1.0f / w, 1.0f / h);
     glUniform1f(glGetUniformLocation(s_fx_comp, "uExposure"), p.exposure);
     glUniform1i(glGetUniformLocation(s_fx_comp, "uHdOn"), p.hd ? 1 : 0);
     glUniform1i(glGetUniformLocation(s_fx_comp, "uBloomOn"), p.bloom ? 1 : 0);
     glUniform1f(glGetUniformLocation(s_fx_comp, "uBloomStrength"), p.bloom_strength);
+    glUniform1i(glGetUniformLocation(s_fx_comp, "uSsaoOn"), ssao_ok ? 1 : 0);
+    glUniform1f(glGetUniformLocation(s_fx_comp, "uSsaoStrength"), p.ssao_strength);
     glUniform1i(glGetUniformLocation(s_fx_comp, "uDofOn"), (p.dof && depth_tex) ? 1 : 0);
     glUniform1f(glGetUniformLocation(s_fx_comp, "uDofFocus"), p.dof_focus);
     glUniform1f(glGetUniformLocation(s_fx_comp, "uDofScale"), p.dof_scale);

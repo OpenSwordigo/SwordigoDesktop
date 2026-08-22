@@ -785,28 +785,28 @@ bool SwordfareGUI::process_event(const SDL_Event& event) {
 void SwordfareGUI::update_console_backend() {
     if (!m_console_ready || !m_guest_memory) return;
 
-    // ---- Poll and dispatch TCP client commands ----
-    if (m_tcp_running) {
-        // 1. Dispatch pending TCP command to the guest
-        m_tcp_mutex.lock();
-        bool has_cmd = !m_tcp_pending_cmd.empty();
-        m_tcp_mutex.unlock();
-
-        if (has_cmd) {
-            // Check if SRE is ready to accept a new command
-            int32_t pending = *(int32_t*)(m_guest_memory + m_console_pending_addr);
-            int32_t status = *(int32_t*)(m_guest_memory + m_console_status_addr);
-            if (pending == 0 && status == 0) {
-                m_tcp_mutex.lock();
-                std::string cmd = m_tcp_pending_cmd;
-                m_tcp_pending_cmd.clear();
-                m_tcp_mutex.unlock();
-
-                m_tcp_cmd_in_flight = true;
-                console_submit(cmd);
-            }
-        }
-    }
+    // ---- Guest console IPC: DELIVER first, DISPATCH second, never both ----
+    //
+    // The guest console is a SINGLE-SLOT, cross-thread mailbox:
+    //   host: writes buf, sets status=0 then pending=1   (submit)
+    //   guest: sees pending==1, runs it, writes result, sets status(1|2),
+    //          clears pending=0                            (complete)
+    //   host: sees status!=0, reads result, sets status=0 (consume)
+    //
+    // The original rewrite dispatched a NEW command at the TOP of this tick and
+    // read the result at the BOTTOM of the SAME tick. Because console_submit()
+    // unconditionally writes status=0, a dispatch could race ahead and WIPE a
+    // completion the host had not consumed yet — so most results were silently
+    // dropped and the survivors appeared one command late (the desync + the
+    // ">>"-flood we observed on the wire).
+    //
+    // Host-only fix (no guest/Raijin change): make DELIVERY and DISPATCH
+    // mutually exclusive per tick, with delivery ALWAYS winning. We only ever
+    // submit the next chunk on a tick where the slot is fully idle
+    // (pending==0 && status==0) AND we did not just consume a result. That
+    // closes the check-then-act window: a pending completion is always read
+    // and cleared on its own tick before the slot can be reused.
+    bool delivered_this_tick = false;
 
     // ---- Unified SRE command result polling (Local GUI + TCP Console) ----
     int32_t status = *(int32_t*)(m_guest_memory + m_console_status_addr);
@@ -830,10 +830,30 @@ void SwordfareGUI::update_console_backend() {
         }
 
         // If the command was sent by TCP, send the result back to the client
-        if (m_tcp_running && m_tcp_cmd_in_flight) {
-            m_tcp_cmd_in_flight = false;
-            int client_fd = m_tcp_client_fd.load();
-            if (client_fd >= 0) {
+        // that OWNS it (m_tcp_in_flight_fd), not whatever client happens to be
+        // connected now — a slow result must never leak to a newer client.
+        // Then clear the in-flight flag and wake the reader thread (which may
+        // be blocked in enqueue_wait keeping output strictly ordered).
+        bool was_in_flight;
+        int  owner_fd;
+        uint64_t owner_gen;
+        uint64_t cur_gen;
+        {
+            std::lock_guard<std::mutex> lk(m_tcp_mutex);
+            was_in_flight = m_tcp_cmd_in_flight;
+            owner_fd      = m_tcp_in_flight_fd;
+            owner_gen     = m_tcp_in_flight_gen;
+            cur_gen       = m_tcp_client_gen;
+        }
+
+        if (m_tcp_running && was_in_flight) {
+            // Only deliver if the owning client is still the connected one:
+            // BOTH the fd matches AND the connection generation matches, so a
+            // result computed for a client that has since disconnected (and had
+            // its fd possibly recycled by a new client) is never written to the
+            // wrong client.
+            if (owner_fd >= 0 && owner_fd == m_tcp_client_fd.load() &&
+                owner_gen == cur_gen) {
                 std::string output;
                 if (status == 2) {
                     // Output error in red
@@ -842,11 +862,43 @@ void SwordfareGUI::update_console_backend() {
                     // Normal execution output
                     output = res_str.empty() ? "\033[1;36mraijin-sdk\033[0m> " : (res_str + "\n\033[1;36mraijin-sdk\033[0m> ");
                 }
-                write(client_fd, output.c_str(), output.size());
+                write(owner_fd, output.c_str(), output.size());
             }
+
+            {
+                std::lock_guard<std::mutex> lk(m_tcp_mutex);
+                m_tcp_cmd_in_flight = false;
+                m_tcp_in_flight_fd  = -1;
+                m_tcp_completed_seq++;
+            }
+            m_tcp_done_cv.notify_all();
         }
 
         *(int32_t*)(m_guest_memory + m_console_status_addr) = 0;
+        delivered_this_tick = true;
+    }
+
+    // ---- Dispatch the next queued TCP chunk (ONLY if we did not just consume
+    //      a result this tick). Popping and submitting are done under the same
+    //      lock, and we re-check the guest slot is fully idle right before
+    //      console_submit() so we can never clobber an unread completion. This
+    //      strict deliver-then-dispatch ordering is the host-only fix for the
+    //      dropped-result / one-behind desync seen on the wire. ----
+    if (m_tcp_running && !delivered_this_tick) {
+        std::unique_lock<std::mutex> lk(m_tcp_mutex);
+        if (!m_tcp_cmd_in_flight && !m_tcp_cmd_queue.empty()) {
+            int32_t pending = *(int32_t*)(m_guest_memory + m_console_pending_addr);
+            int32_t st      = *(int32_t*)(m_guest_memory + m_console_status_addr);
+            if (pending == 0 && st == 0) {
+                TcpCmd item = m_tcp_cmd_queue.front();
+                m_tcp_cmd_queue.pop_front();
+                m_tcp_cmd_in_flight = true;
+                m_tcp_in_flight_fd  = item.client_fd;
+                m_tcp_in_flight_gen = item.gen;
+                lk.unlock();
+                console_submit(item.code);
+            }
+        }
     }
 }
 
@@ -4008,6 +4060,15 @@ void SwordfareGUI::start_tcp_server(int port) {
 
 void SwordfareGUI::stop_tcp_server() {
     m_tcp_running = false;
+    // Wake the reader thread if it is parked in the back-pressure CV wait so it
+    // observes m_tcp_running == false and unwinds instead of hanging the join.
+    m_tcp_done_cv.notify_all();
+    {
+        std::lock_guard<std::mutex> lk(m_tcp_mutex);
+        m_tcp_cmd_queue.clear();
+        m_tcp_cmd_in_flight = false;
+        m_tcp_in_flight_fd  = -1;
+    }
     if (m_tcp_server_fd >= 0) {
         ::shutdown(m_tcp_server_fd, SHUT_RDWR);
         close(m_tcp_server_fd);
@@ -4031,7 +4092,8 @@ static bool is_lua_chunk_complete(const std::string& code) {
     int parens = 0;
     int brackets = 0; // [ ]
     int blocks = 0;
-    
+    bool pending_elseif = false; // true between an `elseif` and its `then`
+
     size_t i = 0;
     size_t n = code.length();
     while (i < n) {
@@ -4120,26 +4182,102 @@ static bool is_lua_chunk_complete(const std::string& code) {
         else if (ch == '[') brackets++;
         else if (ch == ']') brackets--;
         
-        // 5. Track Lua block keywords
-        if (isalpha(ch) || ch == '_') {
+        // 5. Track Lua block keywords.
+        //
+        //   Openers:  function / do / then / repeat  -> blocks++
+        //   Closers:  end / until                    -> blocks--
+        //   elseif / else are NEITHER — they live inside an already-open
+        //   if-block and must not change the depth (the old code did
+        //   `elseif -> blocks--`, which made every if/elseif/end report as
+        //   unbalanced and falsely "complete", the core multiline bug).
+        //
+        //   Note: a bare `then`/`do` that is part of `elseif ... then` still
+        //   correctly pairs with the block's single `end`, because the `if`
+        //   only opened one level via its first `then`. To keep depth right we
+        //   only count the FIRST `then` of an if-chain: track whether we are
+        //   between `elseif`/`else` and its `then` and skip that `then`.
+        if (isalpha((unsigned char)ch) || ch == '_') {
             std::string word;
-            while (i < n && (isalnum(code[i]) || code[i] == '_')) {
+            while (i < n && (isalnum((unsigned char)code[i]) || code[i] == '_')) {
                 word += code[i];
                 i++;
             }
-            if (word == "do" || word == "then" || word == "repeat" || word == "function") {
+            if (word == "function" || word == "do" || word == "repeat") {
                 blocks++;
+            } else if (word == "then") {
+                // `then` closes an `if`/`elseif` condition. Only the if's
+                // first `then` opens a block; an `elseif ... then` reuses the
+                // same block level.
+                if (pending_elseif) {
+                    pending_elseif = false;   // elseif's then: no depth change
+                } else {
+                    blocks++;                 // if/while ... then: opens block
+                }
             } else if (word == "end" || word == "until") {
                 blocks--;
             } else if (word == "elseif") {
-                blocks--;
+                pending_elseif = true;        // its following `then` is neutral
             }
+            // `else` and everything else: no depth change.
             continue;
         }
         
         i++;
     }
     return (braces <= 0 && parens <= 0 && brackets <= 0 && blocks <= 0);
+}
+
+// Wrap a bare expression so the console prints its value, LuaJIT/lua5.1
+// interactive style. If `code` is a single expression (e.g. `1+2`, `ffi.base()`,
+// `player.hp`) rather than a statement, evaluating it as a chunk yields nothing;
+// prefixing `return ` makes the result visible. We only do this when:
+//   * the chunk is a single line (no embedded newline), AND
+//   * it does not already start with a statement keyword or `return`, AND
+//   * it does not contain a top-level `=` assignment (`==`/`~=`/`<=`/`>=` are ok).
+// On failure to compile as an expression, the caller falls back to the raw
+// chunk, so this is always safe.
+static std::string maybe_wrap_expression(const std::string& code) {
+    // Trim.
+    size_t a = code.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return code;
+    size_t b = code.find_last_not_of(" \t\r\n");
+    std::string s = code.substr(a, b - a + 1);
+
+    if (s.find('\n') != std::string::npos) return code;   // multi-line: leave as-is
+
+    static const char* kw[] = {
+        "return", "local", "if", "for", "while", "repeat", "do", "function",
+        "break", "goto", "end", "else", "elseif", "then", nullptr
+    };
+    for (int i = 0; kw[i]; i++) {
+        size_t klen = strlen(kw[i]);
+        if (s.size() >= klen && s.compare(0, klen, kw[i]) == 0 &&
+            (s.size() == klen || !(isalnum((unsigned char)s[klen]) || s[klen] == '_')))
+            return code;   // already a statement
+    }
+
+    // Detect a top-level assignment `=` (not ==, ~=, <=, >=). Respect strings.
+    bool in_str = false; char q = 0; int depth = 0;
+    for (size_t i = 0; i < s.size(); i++) {
+        char c = s[i];
+        if (in_str) {
+            if (c == '\\') { i++; continue; }
+            if (c == q) in_str = false;
+            continue;
+        }
+        if (c == '\'' || c == '"') { in_str = true; q = c; continue; }
+        if (c == '(' || c == '{' || c == '[') depth++;
+        else if (c == ')' || c == '}' || c == ']') depth--;
+        else if (c == '=' && depth == 0) {
+            char prev = (i > 0) ? s[i-1] : 0;
+            char next = (i+1 < s.size()) ? s[i+1] : 0;
+            if (prev != '=' && prev != '~' && prev != '<' && prev != '>' &&
+                next != '=')
+                return code;   // assignment statement, don't wrap
+        }
+    }
+
+    return "return " + s;
 }
 
 void SwordfareGUI::tcp_server_loop() {
@@ -4160,6 +4298,21 @@ void SwordfareGUI::tcp_server_loop() {
             write(old_client, msg, strlen(msg));
             close(old_client);
         }
+
+        // New connection generation. Purge any backlog from a previous client
+        // and clear the in-flight slot so a dead client's queued/in-flight
+        // results are never delivered to THIS client and the dispatcher cannot
+        // stay wedged waiting on an owner that has gone away.
+        uint64_t my_gen;
+        {
+            std::lock_guard<std::mutex> lk(m_tcp_mutex);
+            my_gen = ++m_tcp_client_gen;
+            m_tcp_cmd_queue.clear();
+            m_tcp_cmd_in_flight = false;
+            m_tcp_in_flight_fd  = -1;
+            m_tcp_in_flight_gen = 0;
+        }
+        m_tcp_done_cv.notify_all();
 
         // Welcome greeting
         const char* greeting = 
@@ -4185,7 +4338,9 @@ void SwordfareGUI::tcp_server_loop() {
                 break;
             }
             read_buf[bytes_read] = '\0';
-            line_accumulator += read_buf;
+            // Append by explicit length so embedded NULs in a paste don't
+            // truncate the accumulator (operator+= on a char* stops at NUL).
+            line_accumulator.append(read_buf, (size_t)bytes_read);
 
             // Process any complete lines
             size_t newline_pos;
@@ -4251,36 +4406,78 @@ void SwordfareGUI::tcp_server_loop() {
 
                 if (execute) {
                     if (!multiline_cmd.empty()) {
-                        // Block until the previous command has been processed
-                        while (m_tcp_running && m_tcp_client_fd.load() == client_fd) {
-                            m_tcp_mutex.lock();
-                            bool empty = m_tcp_pending_cmd.empty();
-                            m_tcp_mutex.unlock();
-                            if (empty) break;
-                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        // Auto-wrap a bare expression (e.g. `1+2`, `ffi.base()`)
+                        // so the console prints its value like an interactive
+                        // REPL. Multi-line/statement chunks pass through.
+                        std::string chunk = maybe_wrap_expression(multiline_cmd);
+
+                        // Enqueue the chunk (FIFO). The main thread drains one
+                        // at a time and returns each result + prompt in order.
+                        // We do NOT busy-wait on a single slot anymore — that
+                        // was the multiline-paste bug (races/dropped lines).
+                        //
+                        // Back-pressure: if the client floods us (huge paste),
+                        // wait — bounded — until the queue drains below a cap so
+                        // we never grow unboundedly, but without ever dropping a
+                        // line. The wait is interruptible on disconnect/shutdown.
+                        {
+                            std::unique_lock<std::mutex> lk(m_tcp_mutex);
+                            const size_t kMaxQueued = 256;
+                            m_tcp_done_cv.wait_for(
+                                lk, std::chrono::milliseconds(250),
+                                [&]{
+                                    return !m_tcp_running ||
+                                           m_tcp_client_fd.load() != client_fd ||
+                                           m_tcp_cmd_queue.size() < kMaxQueued;
+                                });
+                            if (!m_tcp_running || m_tcp_client_fd.load() != client_fd) {
+                                break;
+                            }
+                            m_tcp_cmd_queue.push_back({chunk, client_fd, my_gen});
                         }
 
-                        if (!m_tcp_running || m_tcp_client_fd.load() != client_fd) break;
-
-                        m_tcp_mutex.lock();
-                        m_tcp_pending_cmd = multiline_cmd;
-                        m_tcp_mutex.unlock();
-
                         multiline_cmd.clear();
+                        // The prompt for THIS command is emitted by the main
+                        // thread once the guest returns its result, so output
+                        // and prompt stay correctly ordered even under paste.
                     } else {
-                        // Just print a new prompt if empty line is submitted in clean state
+                        // Empty line in a clean state: just re-emit the prompt.
                         const char* prompt = "\033[1;36mraijin-sdk\033[0m> ";
                         write(client_fd, prompt, strlen(prompt));
                     }
                 } else {
-                    // Send block continuation prompt
-                    const char* cont_prompt = "\033[1;33m          \033[0m>> ";
-                    write(client_fd, cont_prompt, strlen(cont_prompt));
+                    // Incomplete block: keep accumulating lines. Only emit a
+                    // continuation prompt when we have genuinely CONSUMED all
+                    // buffered input and are now waiting on the human to type
+                    // the next line. When a whole multi-line block was pasted
+                    // in a single write (line_accumulator still holds more
+                    // complete lines), emitting a ">>" per interior line just
+                    // floods the client with "  >>   >>   >>" and desyncs the
+                    // display — so we suppress it until the buffer drains.
+                    if (line_accumulator.find('\n') == std::string::npos) {
+                        const char* cont_prompt = "\033[1;33m          \033[0m>> ";
+                        write(client_fd, cont_prompt, strlen(cont_prompt));
+                    }
                 }
             }
         }
 
-        // Cleanup this client connection if we broke out of the read loop
+        // Cleanup this client connection if we broke out of the read loop.
+        // Also purge any pending/in-flight work belonging to THIS connection so
+        // the main-thread dispatcher never stays wedged (m_tcp_cmd_in_flight
+        // stuck true) waiting on a client that has gone away, and a late guest
+        // result for this connection is dropped rather than leaked to the next
+        // client. Bumping the generation invalidates any in-flight result.
+        {
+            std::lock_guard<std::mutex> lk(m_tcp_mutex);
+            ++m_tcp_client_gen;
+            m_tcp_cmd_queue.clear();
+            m_tcp_cmd_in_flight = false;
+            m_tcp_in_flight_fd  = -1;
+            m_tcp_in_flight_gen = 0;
+        }
+        m_tcp_done_cv.notify_all();
+
         if (m_tcp_client_fd.load() == client_fd) {
             close(client_fd);
             m_tcp_client_fd.store(-1);

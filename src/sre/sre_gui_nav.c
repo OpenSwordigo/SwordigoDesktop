@@ -166,11 +166,31 @@ void sre_GUINavigationController_VCLoaded(void* self, void* vc) {
  *
  * Same reasoning as VCLoaded: arguments are live objects from the transition
  * system, not stale pointers. The original implementation is called directly.
+ *
+ * CAPTURE: with the menu→game transition stalling inside __do_upcast, this
+ * is the only reliable early handle on the freshly-loaded GameViewController
+ * (arg2 = const shared_ptr<GUIViewController>& — px at offset 0). The frame
+ * loop's GUI repair drive reads GVC+0xD8 (shared_ptr<GameSceneView> px, from
+ * GameViewController::BackgroundLoad) off the captured VC to dispatch the
+ * game view the stuck chain never reaches. Only GameViewControllers are
+ * captured (vtable identity) and the value is refreshed on every call, so
+ * successive level transitions replace it.
+ * 'vtable for Caver::GameViewController' = RVA 0x6cb870 → address point 0x6cb880.
  */
+volatile uint64_t g_sre_captured_gvc = 0;
+
 void sre_GUINavigationController_FinishTransition(void* self,
                                                    void* vc_shared_ptr,
                                                    void* userdata,
                                                    void* event) {
+    if (vc_shared_ptr) {
+        extern uint64_t g_swordigo_base;
+        uint64_t vc = *(uint64_t*)vc_shared_ptr;
+        if (vc >= 0x10000ULL && vc < 0x0000800000000000ULL &&
+            *(uint64_t*)(uintptr_t)vc == g_swordigo_base + 0x6cb880ULL) {
+            g_sre_captured_gvc = vc;
+        }
+    }
     if (g_orig_GUINavigationController_Finish) {
         typedef void (*pfn)(void*, void*, void*, void*);
         ((pfn)(uintptr_t)g_orig_GUINavigationController_Finish)(self, vc_shared_ptr, userdata, event);
