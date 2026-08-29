@@ -1503,6 +1503,7 @@ void load_and_boot() {
                     mod_toast("Stepped 1 frame", 0.8f);
                 }
             }
+
             g_swordfare_gui.update_console_backend();
             // --- Death recovery: execv restart after ~3s ---
             // The death state machine is tied to Android's ad system and can't be
@@ -3701,6 +3702,11 @@ void load_and_boot_arm64() {
                         const char* sre_orig_sym;
                     };
                     const GUINavRelay nav_relays[] = {
+                        /* GameSceneView::Update relay — lightweight passthrough hook.
+                         * The relay cave lets sre_GameSceneView_Update call the original
+                         * via g_orig_GameSceneView_Update_fn. nm offset verified. */
+                        { 0x34ed2c, "_ZN5Caver13GameSceneView6UpdateEf",
+                          "g_orig_GameSceneView_Update_fn" },
                         { 0x49923c, "_ZN5Caver23GUINavigationController6UpdateEf",
                           "g_orig_GUINavigationController_Update" },
                         { 0x499288, "_ZN5Caver23GUINavigationController24ViewControllerViewLoadedEPNS_17GUIViewControllerE",
@@ -4018,6 +4024,7 @@ void load_and_boot_arm64() {
                     };
                     const DynamicFns dynamic_fns[] = {
                         { "g_Camera_SetPerspectiveProjection", "_ZN5Caver6Camera24SetPerspectiveProjectionEffff" },
+                        { "g_Camera_EvaluateViewMatrix", "_ZN5Caver6Camera18EvaluateViewMatrixEv" },
                         { "g_SceneObject_ComponentWithInterface", "_ZNK5Caver11SceneObject22ComponentWithInterfaceEl" },
                         { "g_SceneObject_InitWithTemplate", "_ZN5Caver11SceneObject16InitWithTemplateERKN5boost13intrusive_ptrINS_14ObjectTemplateEEE" },
                         { "g_ProgramState_FromLuaState", "_ZN5Caver12ProgramState12FromLuaStateEP9lua_State" },
@@ -5192,6 +5199,11 @@ void load_and_boot_arm64() {
     uint64_t snapshotLoaded = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_snapshotLoaded");
     uint64_t sre_scene_shifter_tick_addr = g_use_sre
         ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_scene_shifter_tick") : 0;
+    uint64_t sre_gameover_respawn_tick_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_gameover_respawn_tick") : 0;
+    uint64_t sre_gameover_respawn_controller_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(
+              &g_sre_mod, "g_sre_gameover_respawn_controller") : 0;
     uint64_t sre_update_ticks_addr = g_use_sre
         ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_update_application_ticks") : 0;
     uint64_t sre_frame_ticks_addr = g_use_sre
@@ -5511,7 +5523,7 @@ void load_and_boot_arm64() {
                     // causes a SIGSEGV inside JniBridge64::call_handler.
                     {
                         static uint64_t s_lua_vm_faulted_addr = 0;
-                        if (!s_lua_vm_faulted_addr && g_loader_64 && g_sre_mod.base) {
+                        if (!s_lua_vm_faulted_addr && g_loader_64 && g_sre_mod.base_addr) {
                             s_lua_vm_faulted_addr = g_loader_64->get_symbol_vaddr(
                                 &g_sre_mod, "g_sre_lua_vm_faulted");
                         }
@@ -5767,14 +5779,14 @@ void load_and_boot_arm64() {
                             int still_loading = *(volatile int*)(g_guest_memory + s_scene_loading_addr);
                             if (still_loading) {
                                 s_scene_stuck_frames++;
-                                if (s_scene_stuck_frames >= 8) {
+                                if (s_scene_stuck_frames >= 60) {
                                     std::cout << "[Watchdog] Scene load flag stuck for "
                                               << s_scene_stuck_frames
-                                              << " consecutive frames — force-clearing." << std::endl;
+                                              << " consecutive frames — force-clearing (safety net)." << std::endl;
                                     *(volatile int*)(g_guest_memory + s_scene_loading_addr) = 0;
-                                    // Suppress HUD spam for 2 frames
+                                    // Suppress stale pointer reads for 30 frames
                                     if (s_suppress_hud_addr)
-                                        *(volatile int*)(g_guest_memory + s_suppress_hud_addr) = 2;
+                                        *(volatile int*)(g_guest_memory + s_suppress_hud_addr) = 30;
                                     s_scene_stuck_frames = 0;
                                 }
                                 // Below threshold: do NOT clear — let the load finish.
@@ -5797,15 +5809,25 @@ void load_and_boot_arm64() {
                                   << completed_frames << std::endl;
                     }
 
+                    /* ShowAdMaybe runs inside GameOverVC::Update. Starting a
+                     * scene load from that nested callback re-enters Lua/GC and
+                     * can spin at 0x14edd04. Drain the request only after the
+                     * complete updateApplication invocation has returned. */
+                    if (sre_gameover_respawn_tick_addr &&
+                        sre_gameover_respawn_controller_addr &&
+                        *(volatile uint64_t*)(g_guest_memory +
+                            sre_gameover_respawn_controller_addr) != 0) {
+                        g_emulator_64->call(sre_gameover_respawn_tick_addr, {});
+                        g_death_detected_countdown = 0;
+                    }
+
                     // ── Auto Level Loader (debug) ────────────────────────────────
                     // SWORDIGO_AUTO_LEVEL=<scene> [SWORDIGO_AUTO_SPAWN=<spawn>]
                     // After boot stabilizes (~frame 200), requests a scene shift via
                     // the guest scene-shifter vars so we can test in-game behavior
                     // (e.g. timed object destruction) headlessly.
-                    // WARNING: GotoLevel from the MENU state currently hangs the
-                    // guest (spin at 0x54c6d4 after FinishLoad) — only set this
-                    // when a GameViewController is already active (in-game), or
-                    // expect the load to freeze.
+                    // The guest scene shifter validates that the current controller
+                    // is a GameViewController, so menu-state requests fail safely.
                     {
                         static int      s_auto_state = 0;  /* 0=unresolved,1=armed,2=fired */
                         static uint64_t s_ss_pending_va = 0, s_ss_target_va = 0, s_ss_spawn_va = 0;

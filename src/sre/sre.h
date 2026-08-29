@@ -171,6 +171,12 @@ extern pfn_orig_GSC_Update g_orig_GameSceneController_Update;
 typedef void (*pfn_orig_Scene_Update)(void* self, float dt);
 extern pfn_orig_Scene_Update g_orig_Scene_Update_fn;
 
+/* GameSceneView::Update relay — set by TrampolineMgr in main.cpp.
+ * Points to the relay cave that executes the original GameSceneView::Update
+ * first instruction and jumps back to the rest of the original function. */
+typedef void (*pfn_orig_GSV_Update)(void* self, float dt);
+extern pfn_orig_GSV_Update g_orig_GameSceneView_Update_fn;
+
 /* GameData::Clear crash guard (sre_scene_update.c) */
 void sre_GameData_Clear(void* this_);
 extern uint64_t g_orig_GameData_Clear;

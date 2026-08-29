@@ -45,11 +45,6 @@
 #include "tools/av_renderer.h"
 #include "tools/av_audio.h"
 #include "tools/scene_loader.h"
-#include "tools/scene_creator.h"
-#include "tools/scene_generator.h"
-#include "tools/scene_generator_v2.h"
-#include "tools/scene_generator_v2_3d.h"
-#include "tools/scene_generator_v3.h"
 #include "tools/scene_schemas.h"
 #include "tools/intellij.h"
 #include "tools/boulder.h"
@@ -61,8 +56,6 @@
 #include "tools/scene_game.h"
 #include "tools/ruby_mcp.h"
 #include "tools/scene_categories.h"
-#include "tools/map_loader.h"
-#include "tools/map_editor.h"
 #include "Guizmo/src/ImGuizmo.h"
 #include <zlib.h>
 
@@ -140,35 +133,6 @@ static const float MIN_EDITOR_W      = 320.0f;
 static const float MIN_EDITOR_H      = 180.0f;
 static const char* GLSL_VERSION      = "#version 330";
 
-// The OS title bar is deliberately disabled for Ruby.  This hit-test gives
-// the borderless window native-quality resize edges plus a safe drag region in
-// the unused part of the custom app bar; menus and window-control buttons keep
-// their normal ImGui mouse input.
-static SDL_HitTestResult SDLCALL ruby_window_hit_test(SDL_Window* window,
-                                                       const SDL_Point* area,
-                                                       void*) {
-    int width = 0, height = 0;
-    SDL_GetWindowSize(window, &width, &height);
-    const bool maximized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
-    constexpr int edge = 7;
-    if (!maximized) {
-        const bool left = area->x < edge, right = area->x >= width - edge;
-        const bool top = area->y < edge, bottom = area->y >= height - edge;
-        if (top && left) return SDL_HITTEST_RESIZE_TOPLEFT;
-        if (top && right) return SDL_HITTEST_RESIZE_TOPRIGHT;
-        if (bottom && left) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
-        if (bottom && right) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
-        if (left) return SDL_HITTEST_RESIZE_LEFT;
-        if (right) return SDL_HITTEST_RESIZE_RIGHT;
-        if (top) return SDL_HITTEST_RESIZE_TOP;
-        if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
-    }
-    // Keep x < 650 for Ruby's menus and the right-most 116 px for controls.
-    if (!maximized && area->y < 40 && area->x >= 650 && area->x < width - 116)
-        return SDL_HITTEST_DRAGGABLE;
-    return SDL_HITTEST_NORMAL;
-}
-
 struct RubyTheme {
     ImVec4 background, panel, panel_alt, surface, surface_hover, surface_active;
     ImVec4 border, text, text_muted, accent, warning, error, success, selection;
@@ -192,74 +156,12 @@ static ImVec4 th_text_on(const ImVec4& bg) {
     return th_luma(bg) > 0.5f ? ImVec4(0.10f, 0.12f, 0.16f, 1.0f) : ImVec4(0.88f, 0.90f, 0.94f, 1.0f);
 }
 
-// ── Shared Inspector layout helpers ─────────────────────────────────────────
-// The Inspector panels are narrow, so any labeled widget (ColorEdit/SliderFloat/
-// DragFloat/…) whose label sits to the RIGHT of the control will have its label
-// clipped by the panel's right edge. These helpers give every tab ONE
-// consistent way to lay out "control + label" and to show truncated text with a
-// hover tooltip, so the clipping bug can't recur tab-by-tab.
-
-// Draw `text` fitted into `avail_w` px; if it doesn't fit, hard-truncate with a
-// trailing "…" and show the full string as a hover tooltip. Pass avail_w <= 0 to
-// use the remaining content region width.
-static void av_text_elided(const char* text, float avail_w = -1.0f) {
-    if (!text) text = "";
-    if (avail_w <= 0.0f) avail_w = ImGui::GetContentRegionAvail().x;
-    const float full_w = ImGui::CalcTextSize(text).x;
-    if (full_w <= avail_w) { ImGui::TextUnformatted(text); return; }
-    const float dots_w = ImGui::CalcTextSize("...").x;
-    const float budget = avail_w - dots_w;
-    std::string s(text);
-    // Trim from the end until the visible part + "..." fits.
-    while (!s.empty() && ImGui::CalcTextSize(s.c_str()).x > budget) s.pop_back();
-    s += "...";
-    ImGui::TextUnformatted(s.c_str());
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
-}
-
-// Compute a control width that leaves room for its trailing ImGui label so the
-// label is never clipped by a narrow Inspector panel. Reserves the label text
-// width + the internal spacing ImGui adds between control and label. Clamped to
-// a sensible minimum so the control stays usable even with very long labels.
-static float av_labeled_item_width(const char* label, float min_control_w = 90.0f) {
-    const float avail = ImGui::GetContentRegionAvail().x;
-    float label_w = 0.0f;
-    if (label && label[0] != '\0' && !(label[0] == '#' && label[1] == '#'))
-        label_w = ImGui::CalcTextSize(label).x + ImGui::GetStyle().ItemInnerSpacing.x;
-    float w = avail - label_w;
-    if (w < min_control_w) w = min_control_w;
-    return w;
-}
-
-// Wrappers that size the control so the label always fits, and add a
-// tooltip-on-truncation for the label itself when even the reserved space is
-// tight. These are drop-in replacements for the raw ImGui calls in Inspector
-// tabs.
-static bool av_color_edit3(const char* label, float col[3], ImGuiColorEditFlags flags = 0) {
-    ImGui::SetNextItemWidth(av_labeled_item_width(label));
-    return ImGui::ColorEdit3(label, col, flags);
-}
-static bool av_color_edit4(const char* label, float col[4], ImGuiColorEditFlags flags = 0) {
-    ImGui::SetNextItemWidth(av_labeled_item_width(label));
-    return ImGui::ColorEdit4(label, col, flags);
-}
-static bool av_slider_float(const char* label, float* v, float vmin, float vmax,
-                            const char* fmt = "%.3f") {
-    ImGui::SetNextItemWidth(av_labeled_item_width(label));
-    return ImGui::SliderFloat(label, v, vmin, vmax, fmt);
-}
-static bool av_drag_float(const char* label, float* v, float speed = 1.0f,
-                          float vmin = 0.0f, float vmax = 0.0f, const char* fmt = "%.3f") {
-    ImGui::SetNextItemWidth(av_labeled_item_width(label));
-    return ImGui::DragFloat(label, v, speed, vmin, vmax, fmt);
-}
-
 // ============================================================================
 // File entry & type classification
 // ============================================================================
 
-enum FileType { FTYPE_OTHER = 0, FTYPE_TEXTURE = 1, FTYPE_MODEL = 2, FTYPE_SCENE = 3, FTYPE_AUDIO = 4, FTYPE_TEXT = 5, FTYPE_MAP = 6 };
-enum PreviewType { PREVIEW_NONE = 0, PREVIEW_TEXTURE, PREVIEW_MODEL, PREVIEW_SCENE, PREVIEW_AUDIO, PREVIEW_TEXT = 5, PREVIEW_MAP = 6 };
+enum FileType { FTYPE_OTHER = 0, FTYPE_TEXTURE = 1, FTYPE_MODEL = 2, FTYPE_SCENE = 3, FTYPE_AUDIO = 4, FTYPE_TEXT = 5 };
+enum PreviewType { PREVIEW_NONE = 0, PREVIEW_TEXTURE, PREVIEW_MODEL, PREVIEW_SCENE, PREVIEW_AUDIO, PREVIEW_TEXT = 5 };
 
 struct FileEntry {
     std::string name;
@@ -270,174 +172,39 @@ struct FileEntry {
     std::string vendor_scn;   // non-empty: dir holds a renderer-master demo .scn (folder pack)
 };
 
-struct ContentProbe {
-    int type = FTYPE_OTHER;
-    std::string protobuf_type;       // schema to use when saving decoded markup
-    bool decoded_markup = false;
-};
-
-static bool looks_like_text(const std::string& bytes) {
-    if (bytes.empty()) return true;
-    size_t printable = 0;
-    for (unsigned char c : bytes) {
-        if (c == 0) return false;
-        if (c == '\n' || c == '\r' || c == '\t' || (c >= 0x20 && c < 0x7f) || c >= 0x80) ++printable;
-    }
-    return printable * 100 >= bytes.size() * 92;
-}
-
-static ContentProbe probe_file_content(const std::string& path) {
-    ContentProbe result;
-    std::ifstream input(path, std::ios::binary);
-    if (!input) return result;
-    std::string head(64 * 1024, '\0');
-    input.read(head.data(), static_cast<std::streamsize>(head.size()));
-    head.resize(static_cast<size_t>(input.gcount()));
-    const auto starts = [&](const char* magic) {
-        const size_t n = std::strlen(magic);
-        return head.size() >= n && std::memcmp(head.data(), magic, n) == 0;
-    };
-    if (starts("\x89PNG\r\n\x1a\n") || starts("\xff\xd8\xff") || starts("PVR\x03") || starts("\x50\x56\x52\x03") || starts("OggS") ||
-        (starts("RIFF") && head.size() >= 12 && std::memcmp(head.data() + 8, "WAVE", 4) == 0) || starts("ID3")) {
-        result.type = starts("OggS") || starts("ID3") || starts("RIFF") ? FTYPE_AUDIO : FTYPE_TEXTURE;
-        return result;
-    }
-    if (starts("glTF") || starts("Kaydara FBX Binary") || starts("; FBX")) { result.type = FTYPE_MODEL; return result; }
-
-    const std::string decoded_prefix = "## FileRift decoded Swordigo file type: ";
-    if (head.rfind(decoded_prefix, 0) == 0) {
-        const size_t begin = decoded_prefix.size();
-        const size_t end = head.find_first_of("\r\n ", begin);
-        result.protobuf_type = head.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
-        result.decoded_markup = true;
-        result.type = result.protobuf_type == "scene" ? FTYPE_SCENE :
-                      result.protobuf_type == "scmap" ? FTYPE_MAP : FTYPE_TEXT;
-        return result;
-    }
-    // Headerless FileRift markup is common when source has been copied out of
-    // the SDK.  These root records are unambiguous enough to open as source.
-    if (looks_like_text(head)) {
-        if (head.find("SceneObject {") != std::string::npos || head.find("Object {") != std::string::npos ||
-            head.find("SceneObject{") != std::string::npos || head.find("Object{") != std::string::npos) {
-            result.type = FTYPE_SCENE;
-            result.protobuf_type = "scene";
-            result.decoded_markup = true;
-            return result;
-        }
-        if (head.find("ObjectLibrary {") != std::string::npos) {
-            result.type = FTYPE_TEXT;
-            result.protobuf_type = "scl";
-            result.decoded_markup = true;
-            return result;
-        }
-        if (head.find("type:") == 0) { result.type = FTYPE_MODEL; return result; }
-        result.type = FTYPE_TEXT;
-        return result;
-    }
-
-    // Binary FileRift scenes have no magic number. Their first-level object
-    // records reliably carry these schema strings, so recognise them before
-    // using an extension as a compatibility fallback.
-    if (head.find("Background") != std::string::npos || head.find("SpawnPoint") != std::string::npos ||
-        head.find("GroundMesh") != std::string::npos) {
-        result.type = FTYPE_SCENE;
-        result.protobuf_type = "scene";
-        return result;
-    }
-
-    const std::string name = fs::path(path).filename().string();
+static int classify_file(const std::string& name) {
     auto dot = name.rfind('.');
-    if (dot == std::string::npos) return result;
+    if (dot == std::string::npos) return FTYPE_OTHER;
     std::string ext = name.substr(dot);
     for (auto& c : ext) c = (char)tolower((unsigned char)c);
 
-    if (ext == ".pvr" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tex" || ext == ".tga") { result.type = FTYPE_TEXTURE; return result; }
+    if (ext == ".pvr" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tex" || ext == ".tga") return FTYPE_TEXTURE;
     if (name.size() > 8) {
         std::string low = name;
         for (auto& c : low) c = (char)tolower((unsigned char)c);
-        if (low.find(".tex.png") != std::string::npos) { result.type = FTYPE_TEXTURE; return result; }
+        if (low.find(".tex.png") != std::string::npos) return FTYPE_TEXTURE;
     }
-    if (ext == ".pod" || ext == ".fbx" || ext == ".glb" || ext == ".gltf" || ext == ".obj") { result.type = FTYPE_MODEL; return result; }
-    if (ext == ".scene") { result.type = FTYPE_SCENE; result.protobuf_type = "scene"; return result; }
-    if (ext == ".scmap") { result.type = FTYPE_MAP; result.protobuf_type = "scmap"; return result; }
-    if (ext == ".wav" || ext == ".ogg" || ext == ".mp3") { result.type = FTYPE_AUDIO; return result; }
+    if (ext == ".pod") return FTYPE_MODEL;
+    if (ext == ".fbx") return FTYPE_MODEL;
+    if (ext == ".glb" || ext == ".gltf") return FTYPE_MODEL;   // glTF 2.0 (binary/JSON)
+    if (ext == ".obj") return FTYPE_MODEL;   // Wavefront (renderer-master ext.joint/weight)
+    if (ext == ".scene") return FTYPE_SCENE;
+    if (ext == ".wav" || ext == ".ogg" || ext == ".mp3") return FTYPE_AUDIO;
     if (ext == ".txt" || ext == ".lua" || ext == ".xml" || ext == ".plist" ||
         ext == ".json" || ext == ".shader" || ext == ".vs" || ext == ".fs" ||
         ext == ".cfg" || ext == ".ini" || ext == ".md" || ext == ".log" || ext == ".sh" ||
         ext == ".cpp" || ext == ".h" || ext == ".c" ||
         ext == ".scl" || ext == ".gdata" || ext == ".gstate" || ext == ".gplayer" ||
-        ext == ".gopt" || ext == ".sounds" || ext == ".atlas" || ext == ".fnt" ||
+        ext == ".gopt" || ext == ".sounds" || ext == ".scmap" || ext == ".atlas" || ext == ".fnt" ||
         ext == ".gmesh") {
-        result.type = FTYPE_TEXT;
-        if (ext == ".scl") result.protobuf_type = "scl";
-        else if (ext == ".gdata" || ext == ".gstate" || ext == ".gplayer" || ext == ".gopt" ||
-                 ext == ".sounds" || ext == ".atlas" || ext == ".fnt") result.protobuf_type = ext.substr(1);
-        return result;
+        return FTYPE_TEXT;
     }
-    return result;
+    return FTYPE_OTHER;
 }
 
 // ============================================================================
 // Viewer state
 // ============================================================================
-
-struct SceneCreatorPortalEntry {
-    char destination[128] = {};
-    char spawn_name[128]  = {};
-    bool tap_to_enter = true;
-    float x = 0.0f, y = 0.0f;
-    float rect_w = 83.0f, rect_h = 110.0f;
-    int   facing = 1;
-};
-
-struct SceneCreatorDialogState {
-    bool open         = false;
-    bool request_open = false;
-
-    // ── Identity & output ──────────────────────────────────────────────────
-    char output_path[1024] = {};
-    char level_name[128]   = "new_level";
-    char scene_namespace[128] = "my_mod";
-
-    // ── Template ───────────────────────────────────────────────────────────
-    int scene_template = 1;  // scenecreate::SceneTemplate index (0=Minimal … 7=Menu)
-
-    // ── Visuals ────────────────────────────────────────────────────────────
-    char base_mesh[256]  = {};
-    char background[256] = {};
-
-    // ── Ground mesh ────────────────────────────────────────────────────────
-    char ground_top[128]  = "fire_grass";
-    char ground_side[128] = "graveyard_ground";
-    float platform_size[3] = {320.0f, 48.0f, 90.0f};
-
-    // ── Spawn ──────────────────────────────────────────────────────────────
-    float spawn[3] = {0.0f, 56.0f, 0.0f};
-    int   facing   = 1;
-
-    // ── DirectionalLight overrides ─────────────────────────────────────────
-    bool  light_advanced = false;  // show the override sliders
-    float key_intensity    = 3.0f;
-    float ambient_intensity = 0.3f;
-    float shadow_intensity  = 0.4f;
-    float key_color[3]    = {1.0f, 1.0f, 1.0f};
-
-    // ── Scene Bounds override ─────────────────────────────────────────────
-    bool  bounds_override = false;
-    float bounds[4]       = {-3500.0f, -1000.0f, 5500.0f, 2500.0f}; // X,Y,W,H
-
-    // ── Portals ───────────────────────────────────────────────────────────
-    int portal_count = 0;
-    static constexpr int kMaxPortals = 4;
-    SceneCreatorPortalEntry portals[kMaxPortals];
-
-    // ── Map link ──────────────────────────────────────────────────────────
-    char map_path[1024]  = {};
-    bool link_to_map     = false;
-
-    // ── Status ────────────────────────────────────────────────────────────
-    std::string error;
-};
 
 struct ViewerState {
     // File browser
@@ -524,12 +291,7 @@ struct ViewerState {
     // (e.g. "graveyardback" -> graveyardback_2x.tex.png). The background is a
     // camera-following textured quad, not a POD model.
     std::map<std::string, GLuint> scene_background_textures;
-                bool       scene_show_hidden = true;
-    // Editor marker toggles for non-visual objects (spawn points, portals,
-    // cameras). Colliders / triggers / AI keep using the neutral marker always.
-    bool       scene_marker_spawn  = true;
-    bool       scene_marker_portal = true;
-    bool       scene_marker_camera = false; // cameras are niche — hidden by default
+    bool       scene_show_hidden = true;
     bool       obj_group_by_cat = false;    // Objects panel: flat list vs 11-category tree
     // Scene visualizer animation: per-object animation clocks so every model
     // plays its POD animation (no more bind-pose T-shape). scene_anim_playing
@@ -547,37 +309,14 @@ struct ViewerState {
     bool            postfx_enabled = true;
     av::PostFXParams postfx;
     bool  scene_lights_enabled = true;  // render scene Light/SimpleGlow components (vanilla-faithful default)
-    // STICKY viewport keyboard ownership: set while the 3D viewport is
-    // hovered (or clicked) and KEPT when the mouse leaves — so arrow-nudging
-    // an object keeps working with the cursor resting over a side panel.
-    // Cleared by clicking any other panel, leaving the scene tab, or typing.
-    // While set, ImGui widget keyboard navigation is suspended so WASD /
-    // arrows / +- drive the viewport instead of moving focus between buttons.
-    bool  view_keyboard_focus = false;
-    // Frame stamp of the last time the scene viewport re-latched
-    // view_keyboard_focus. Lets the per-frame fallback clear distinguish
-    // "cursor parked over a side panel" (viewport still drawing, latch must
-    // survive) from "viewport stopped drawing" (tab switch / layout hides it,
-    // latch must be released so the GUI gets its keys back).
-    int   view_keyboard_focus_frame = -1;
     bool  scene_glow_enabled = true;    // emissive glow sprites (bloom feed)
     bool  scene_light_debug = false;    // editor rings: influence radius + emitter cross
     bool  scene_depth_fog_enabled = true; // vanilla atmospheric depth darkening
     bool  scene_water_enabled = true;   // render WaterMesh fluid sheets (water/lava)
-    bool  scene_portal_enabled = true;  // render PortalEffectComponent swirl + PortalComponent outline
-    bool  scene_fire_enabled = true;    // render animated procedural flames on fire-linked lights
-    // Animated-fire billboards collected during point-light ranking: world pos,
-    // warm color, per-flame current flicker, and world size. Rendered as a
-    // dedicated pass (render_fire_sprite) after the glow pass so torches/lava
-    // show a real animated flame instead of a static glow ball.
-    struct FireBillboard { float pos[3]; float col[3]; float flicker; float size; };
-    std::vector<FireBillboard> fire_billboards;
     bool  scene_shadows_enabled = true; // render ShadowComponent contact blobs
     bool  scene_overlay_enabled = true; // apply overlay-light darkness veil
     bool  scene_lighting_enabled = true; // dynamic Lambert lighting (off = flat texture)
     bool  scene_normals_debug = false;   // color = world normal (orientation check)
-    bool  scene_dimension_rift = false;  // reveal DimensionObject components (rift powerup)
-
     // Textures for parsed WaterMesh sheets (parallel to st.scene.waters).
     std::vector<GLuint> scene_water_textures;
     float render_scale = 3.0f;          // high-DPI FBO render scale (default 3x)
@@ -616,12 +355,6 @@ struct ViewerState {
     bool  mesh_edit_drag = false;       // currently dragging the selected vertex
     float mesh_edit_plane_y = 0.0f;     // world Y of the vertex-drag plane
 
-    // Triple-tap mesh selection: 3 rapid taps at the same spot drill into the
-    // sub-mesh under the cursor (object picking stays the default).
-    int    scene_tap_count = 0;         // consecutive rapid taps at ~same spot
-    double scene_tap_time = 0.0;        // time of the last tap
-    ImVec2 scene_tap_pos = {};          // screen position of the last tap
-
     // --- Transform gizmo / workspace tooling ---
     bool  scene_show_gizmo = true;      // show the axis gizmo on the selected object
     int   gizmo_axis = -1;              // axis under cursor / being dragged (0=X 1=Y 2=Z)
@@ -630,12 +363,6 @@ struct ViewerState {
     bool  scene_snap = false;           // grid snapping toggle (or hold Ctrl)
     float scene_snap_step = 1.0f;       // snap grid size
     bool  scene_show_axis = true;       // corner axis-indicator overlay
-    // Gizmo parity options (web TransformControls space / showX/Y/Z / universal).
-    bool  gizmo_local = false;          // false = WORLD space, true = LOCAL space
-    bool  gizmo_universal = false;      // ImGuizmo UNIVERSAL (move+rotate+uniform)
-    bool  gizmo_show_x = true;          // per-axis masking (web showX/showY/showZ)
-    bool  gizmo_show_y = true;
-    bool  gizmo_show_z = true;
     int   scene_rendered_objects = 0;   // latest viewport status counts
     int   scene_proxy_objects = 0;
 
@@ -657,8 +384,6 @@ struct ViewerState {
     float gm_max_depth = 45.0f;
     float gm_top_angle  = 20.0f;
     bool  gm_generate_top = true;
-    bool  gm_dimension_object = false;  // tag generated mesh as a DimensionObject
-
     char  gm_top_tex[96]    = "fire_grass";
     char  gm_bottom_tex[96] = "graveyard_ground";
     int   gm_drag_point = -1;           // point being dragged (-1 = none)
@@ -668,8 +393,8 @@ struct ViewerState {
     float gm_simplify = 2.5f;
     int   gm_target_points = 0;
     bool  gm_mirror_x = false;          // mirror newly placed points across X
-    bool  gm_snap = false;              // snap new/moved points to a grid
-    float gm_snap_grid = 0.5f;          // snap grid step (world units)
+    float gm_canvas_scale = 1.0f;       // world units per screen px (2D canvas)
+    float gm_canvas_cx = 0.0f, gm_canvas_cy = 0.0f; // canvas world origin
     char  gm_obj_name[96] = "ground_mesh";
     std::vector<boulder::Hat> gm_hats;  // round-hat domes on the sketch
     int   gm_drag_hat = -1;             // hat being moved/resized (-1 = none)
@@ -687,19 +412,8 @@ struct ViewerState {
     double gm_drag_off_y = 0.0;
     av::Camera gm_inline_saved_cam;     // camera snapshot restored on exit
     bool  gm_inline_saved_valid = false;
-    av::SceneData gm_inline_saved_scene; // pre-edit scene snapshot (one-key revert)
-    bool  gm_inline_saved_scene_valid = false;
 
-    // Ground-mesh texture picker: canonical texture stems scanned from the
-    // assets dirs once per scene, plus a free-text fallback for custom names.
-    bool  gm_tex_scanned = false;
-    std::string gm_tex_scan_key;          // scene dir the scan was built for
-    std::vector<std::string> gm_tex_names; // deduped, sorted texture stems
-    char  gm_tex_custom[96] = {};         // custom texture name input
-
-    // --- Ground Mesh Generator: merged 3D sketch canvas (live mesh preview
-    //     rendered behind the editable polygon outline, like the mesh editor) ---
-    bool  gm_show_grid = false;         // optional scale grid on the sketch (off)
+    // --- Ground Mesh Generator: live 3D preview of the extruded mesh ---
     bool  gm_show_3d = true;            // split view: 2D sketch | 3D preview
     GLuint gm_preview_fbo = 0;
     GLuint gm_preview_fbo_tex = 0;
@@ -707,19 +421,7 @@ struct ViewerState {
     std::vector<av::GPUMesh> gm_preview_meshes;
     std::vector<GLuint>      gm_preview_textures;
     av::Camera gm_preview_cam;          // orbit camera for the 3D preview
-    // Simple 2D canvas view (world coord at the canvas CENTER + world-per-px
-    // scale). The live extruded mesh renders behind as a background image.
-    float gm_canvas_scale = 1.0f;       // world units per screen px
-    float gm_canvas_cx = 0.0f, gm_canvas_cy = 0.0f; // world coord at canvas center
-    bool  gm_canvas_framed = false;     // view framed on the current sketch
     bool  gm_preview_valid = false;     // last build succeeded
-
-    // Internal sketch undo/redo: snapshots of (gm_points, gm_hats) pushed
-    // before every discrete edit, capped so the stack can't grow unbounded.
-    std::vector<std::vector<boulder::PolygonPoint>> gm_undo_points;
-    std::vector<std::vector<boulder::Hat>>           gm_undo_hats;
-    std::vector<std::vector<boulder::PolygonPoint>> gm_redo_points;
-    std::vector<std::vector<boulder::Hat>>           gm_redo_hats;
 
     // --- POD preview chrome ---
     bool  model_auto_rotate = false;    // slow turntable orbit (R toggles)
@@ -767,7 +469,6 @@ struct ViewerState {
     float       cam_orbit_speed = 1.0f;
     float       cam_zoom_speed = 1.0f;
     float       cam_pan_speed = 1.0f;
-    float       cam_keyboard_speed = 1.0f; // WASD / arrow camera + nudge multiplier
     bool        cam_invert_x = false;
     bool        cam_invert_y = false;
     bool        tex_pixel_art_mode = true;
@@ -792,7 +493,6 @@ struct ViewerState {
     std::string tex_edit_src;         // original file path (save-back target)
     std::string tex_edit_ext;         // original extension (lowercased)
     int    tex_edit_tool = 0;         // 0 brush, 1 eraser, 2 fill, 3 pick, 4 crop
-    int    tex_view_channel = 0;      // 0 RGBA composite, 1 RGB, 2 Alpha (canvas view)
     float  tex_edit_color[4] = {0.16f, 0.55f, 1.0f, 1.0f};
     float  tex_edit_size = 6.0f;
     int    tex_edit_last_x = -1, tex_edit_last_y = -1;
@@ -813,15 +513,11 @@ struct ViewerState {
     bool        tex_reset_required = false;
     std::string text_preview_content;
     std::string text_edit_buffer;
-    std::string text_protobuf_type;    // detected schema; independent of file name
-    bool        text_is_decoded_markup = false;
     bool        text_is_binary = false;
     bool        text_select_mode = false;
     bool        text_edit_modified = false;
     ImFont*     mono_font = nullptr;
-
-
-
+    
     // Bottom panel (Terminal / Logger)
     bool                     show_bottom_panel = false;  // hidden by default, Ctrl+` to open
     bool                     show_asset_browser = true;
@@ -839,52 +535,7 @@ pid_t                    pty_child_pid   = -1;
     char                     terminal_input[512] = {};
     bool                     terminal_scroll_to_bottom = false;
 
-    // --- Procedural Scene Generator dialog (v2 biome presets) ---
-    bool       proc_gen_open = false;
-    bool       proc_gen_request = false;
-    bool       proc_gen_use_v2 = true;     // true = v2 generator, false = v1
-    int        proc_gen_biome = 0;         // sgen::Biome
-    uint32_t   proc_gen_seed = 1337;
-    float      proc_gen_width = 4200.0f;
-    float      proc_gen_height = 900.0f;
-    int        proc_gen_platforms = 6;
-    bool       proc_gen_water = true;
-    bool       proc_gen_torches = true;
-    bool       proc_gen_mountains = false;
-    bool       proc_gen_islands = false;
-    float      proc_gen_deco = 1.0f;
-    char       proc_gen_name[96] = "procedural_scene";
-    std::string proc_gen_status;
-    // v2-only options (TerrainOptionsV2)
-    bool       proc_gen_v2_bg_terrain = true;   // background silhouette layers
-    bool       proc_gen_v2_fg_terrain = false;  // foreground cliff framing strip
-    bool       proc_gen_v2_z_path = false;      // winding Z-varying terrain path
-    float      proc_gen_v2_z_amp = 30.0f;       // ±Z amplitude of the path
-    int        proc_gen_v2_bg_layers = 2;       // background strip count
-    bool       proc_gen_v2_bg_decos = true;     // deep-Z background scatter
-    bool       proc_gen_v2_fg_decos = true;     // shallow-Z foreground scatter
-    bool       proc_gen_v2_terracing = false;   // stepped/quantized bands
-    float      proc_gen_v2_terrace = 0.5f;      // 0..1 terrace strength
-    bool       proc_gen_v2_overhangs = false;   // cliff-edge ledge juts
-    bool       proc_gen_v2_camera = false;      // camera_follow_y_shape emission (off by default — bounds stay top-profile)
-    // v2-3d options (TerrainOptions3D) — Minecraft-style full-3D world
-    bool       proc_gen_use_3d = false;         // true = v2-3d generator
-    bool       proc_gen_use_v3 = false;         // true = v3 "Ultimate" data-driven generator
-    int        proc_gen_3d_rows = 15;           // depth rows behind (z<0)
-    int        proc_gen_3d_front_rows = 5;      // depth rows in front (z>0)
-    float      proc_gen_3d_band = 90.0f;        // row half-band; Z tiles at 2×band
-    float      proc_gen_3d_block = 44.0f;       // block size (X columns + Y grid)
-    bool       proc_gen_3d_caves = true;        // winding carved ravines
-    bool       proc_gen_3d_islands = true;      // floating sky islands
-    bool       proc_gen_3d_far_trees = true;    // parallax forest on depth rows
-    // Decoration randomization + portal (v1 + v2)
-    bool       proc_gen_rand_deco_rot = true;   // trees/bushes may quarter-turn
-    bool       proc_gen_rand_deco_scale = true; // decorations vary in size
-    bool       proc_gen_portal = false;         // single portal + decorated hub
-    char       proc_gen_portal_dest[128] = "next_level";
-
     // --- Scene Editor state ---
-    SceneCreatorDialogState scene_creator;
     bool        scene_dirty = false;       // true when unsaved changes exist
     bool        scene_save_requested = false;
     std::string scene_save_msg;            // status message after last save
@@ -937,9 +588,6 @@ pid_t                    pty_child_pid   = -1;
     bool        convert_tex_pgm  = true;     // re-encode textures to .tex.png
     bool        convert_flip_v   = true;      // flip V (FBX top → game bottom)
     std::string convert_status;                // last conversion result line
-
-    // World-map (.scmap) editor state
-    mapedit::MapEditorState map_editor;
 };
 
 
@@ -1037,16 +685,8 @@ static void switch_scene_tab(ViewerState& st, int mode) {
     st.scene_preview_tab = mode;
 }
 
-// Internal GMG sketch undo/redo (defined later with the GMG helpers).
-static void gm_push_undo(ViewerState& st);
-static void gm_undo_sketch(ViewerState& st);
-static void gm_redo_sketch(ViewerState& st);
-static void gm_clear_undo(ViewerState& st);
-
 static void open_ground_mesh_studio(ViewerState& st) {
     st.gm_workspace_mode = 0;
-    st.gm_canvas_framed = false;   // reframe the canvas on the current sketch
-    gm_clear_undo(st);             // fresh sketch session — no stale undo steps
     switch_scene_tab(st, 3);
 }
 
@@ -1159,7 +799,6 @@ static void paste_scene_selection(ViewerState& st) {
         ? std::vector<av::SceneObject>{st.scene_object_clipboard}
         : st.scene_object_clipboard_multi;
     st.scene_selection.clear();
-    const size_t paste_start = st.scene.objects.size();
     for (const auto& copied : source) {
         av::SceneObject pasted = copied;
         pasted.name = av::scene_fresh_identifier(st.scene);
@@ -1172,20 +811,6 @@ static void paste_scene_selection(ViewerState& st) {
     st.selected_object = st.scene_selection.empty() ? -1 : st.scene_selection.back();
     sync_scene_object_editor(st);
     resync_scene_ground_meshes(st);
-    // Fix #4 (cross-scene paste): load model + background caches for every
-    // newly pasted object — they may be from a different scene whose resources
-    // were cleared when select_file() ran. Same-scene paste is a no-op because
-    // the original object's names are already cached.
-    if (!st.scene.filepath.empty()) {
-        const fs::path scene_dir = fs::path(st.scene.filepath).parent_path();
-        for (size_t i = paste_start; i < st.scene.objects.size(); ++i) {
-            const auto& pobj = st.scene.objects[i];
-            if (!pobj.mesh_name.empty())
-                load_scene_model_to_cache(st, pobj.mesh_name, scene_dir.string());
-            if (!pobj.background_name.empty())
-                load_scene_background_texture(st, pobj.background_name, scene_dir.string());
-        }
-    }
     st.scene_dirty = true;
     st.status_msg = "Pasted " + std::to_string(source.size()) + " object(s)";
 }
@@ -1220,8 +845,6 @@ static void move_scene_object(ViewerState& st, int direction) {
     snapshot_scene(st);
     av::scene_move_object(st.scene, st.selected_object, destination);
     select_scene_object(st, destination);
-    // Fix #6: after a reorder the parallel ground-cache arrays are misaligned.
-    resync_scene_ground_meshes(st);
     st.scene_dirty = true;
 }
 
@@ -1327,8 +950,6 @@ static const char* filetype_label(int ft, const char* path) {
         case FTYPE_MODEL:   return "Model";
         case FTYPE_SCENE:   return "Scene";
         case FTYPE_AUDIO:   return "Audio";
-        case FTYPE_MAP:     return "World Map";
-        case FTYPE_TEXT:    return "Text";
         default:            return "File";
     }
 }
@@ -1423,7 +1044,7 @@ static void refresh_directory(ViewerState& st) {
         fe.full_path = entry.path().string();
         fe.is_dir = entry.is_directory(ec);
         fe.size = fe.is_dir ? 0 : (size_t)entry.file_size(ec);
-        fe.type = fe.is_dir ? FTYPE_OTHER : probe_file_content(fe.full_path).type;
+        fe.type = fe.is_dir ? FTYPE_OTHER : classify_file(fe.name);
         if (fe.is_dir) fe.vendor_scn = find_vendor_scn_in_dir(fe.full_path);
         st.files.push_back(fe);
     }
@@ -1454,11 +1075,7 @@ static void apply_filters(ViewerState& st) {
     for (auto& c : search_lower) c = (char)tolower((unsigned char)c);
 
     for (auto& f : st.files) {
-        if (st.type_filter != 0 && !f.is_dir) {
-            if (f.type != st.type_filter &&
-                !(st.type_filter == FTYPE_TEXT && f.type == FTYPE_MAP))
-                continue;   // maps stay visible under the Code/Text chip
-        }
+        if (st.type_filter != 0 && !f.is_dir && f.type != st.type_filter) continue;
         if (!search_lower.empty()) {
             std::string name_lower = f.name;
             for (auto& c : name_lower) c = (char)tolower((unsigned char)c);
@@ -1583,8 +1200,6 @@ static void free_preview_resources(ViewerState& st) {
     st.gm_hats.clear();
     st.gm_hat_dragging = st.gm_hat_resizing = false;
     st.gm_drag_hat = -1;
-    gm_clear_undo(st);
-    st.gm_canvas_framed = false;   // reframe the GMG canvas on a fresh scene
     st.mesh_edit_drag = false;
     st.gizmo_axis = -1;
     st.gizmo_drag = false;
@@ -2119,7 +1734,6 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
     st.sel_name = fe.name;
     st.sel_path = fe.full_path;
     st.sel_size = fe.size;
-    const ContentProbe content = probe_file_content(fe.full_path);
 
     switch (fe.type) {
     case FTYPE_TEXTURE: {
@@ -2362,36 +1976,7 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
         st.scene_loading = true;          // loading screen (see main frame)
         st.scene_loading_frames = 3.0f;
         st.scene_loading_msg = fe.name;
-        // Source exported/edited outside Ruby is valid input too. Compile it
-        // to a sibling temporary protobuf for the scene loader, then keep the
-        // original path as the save target so Ctrl+S turns it into a playable
-        // binary scene in place.
-        if (content.decoded_markup && content.protobuf_type == "scene") {
-            std::ifstream source(fe.full_path, std::ios::binary);
-            st.text_preview_content.assign(std::istreambuf_iterator<char>(source), {});
-            st.text_edit_buffer = st.text_preview_content;
-            st.text_is_decoded_markup = true;
-            st.text_protobuf_type = "scene";
-            try {
-                const std::string binary = filerift::recode_markup(st.text_edit_buffer, "scene");
-                const fs::path temporary = fe.full_path + ".ruby-open.tmp";
-                { std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-                  if (!out) throw std::runtime_error("cannot create temporary scene file");
-                  out.write(binary.data(), static_cast<std::streamsize>(binary.size())); }
-                st.scene = av::scene_load(temporary.string());
-                std::error_code cleanup_error;
-                fs::remove(temporary, cleanup_error);
-                st.scene.filepath = fe.full_path;
-                st.scene.filename = fe.name;
-            } catch (const std::exception& error) {
-                st.scene = av::SceneData{};
-                st.status_msg = "Could not compile decoded scene: " + std::string(error.what());
-            }
-        } else {
-            st.scene = av::scene_load(fe.full_path);
-            st.text_is_decoded_markup = false;
-            st.text_protobuf_type = "scene";
-        }
+        st.scene = av::scene_load(fe.full_path);
         // Reset scene editor state
         st.selected_object     = -1;
         st.scene_selection.clear();
@@ -2442,7 +2027,7 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
             st.scene_text_dirty = false;
 
             // Read scene binary bytes and decode to text markup
-            if (!content.decoded_markup) {
+            {
                 std::ifstream f_in(fe.full_path, std::ios::binary);
                 if (f_in) {
                     std::string bytes((std::istreambuf_iterator<char>(f_in)), std::istreambuf_iterator<char>());
@@ -2486,22 +2071,6 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
         }
     } break;
 
-    case FTYPE_MAP: {
-        std::string err;
-        if (mapedit::map_editor_open(st.map_editor, fe.full_path, &err)) {
-            st.preview_type = PREVIEW_MAP;
-            st.status_msg = "Loaded world map: " + fe.name + " (" +
-                            std::to_string(st.map_editor.map.zones.size()) + " zones, " +
-                            std::to_string(st.map_editor.map.node_index.size()) + " nodes)";
-            log_file_event("MapRead", "Loaded world map: " + fe.name);
-            mapedit::map_editor_fit_view(st.map_editor);
-        } else {
-            st.status_msg = "Failed to load map: " + err;
-            log_file_event("MapRead", "ERROR: " + err);
-            st.preview_type = PREVIEW_TEXT;
-            st.text_preview_content = "Failed to parse world map:\n" + err;
-        }
-    } break;
 
     case FTYPE_AUDIO: {
         st.preview_type = PREVIEW_AUDIO;
@@ -2525,20 +2094,19 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
         st.preview_type = PREVIEW_TEXT;
         st.text_preview_content.clear();
         st.text_is_binary = false;
-        st.text_protobuf_type = content.protobuf_type;
-        st.text_is_decoded_markup = content.decoded_markup;
 
         auto dot = fe.full_path.rfind('.');
         std::string ext = (dot != std::string::npos) ? fe.full_path.substr(dot) : "";
         for (auto& c : ext) c = (char)tolower((unsigned char)c);
-        bool is_protobuf = !st.text_protobuf_type.empty() && !content.decoded_markup;
+        bool is_protobuf = (ext == ".scl" || ext == ".gdata" || ext == ".gstate" || 
+                            ext == ".gplayer" || ext == ".gopt" || ext == ".sounds" || 
+                            ext == ".scmap" || ext == ".atlas" || ext == ".fnt");
         if (is_protobuf) {
             std::ifstream f(fe.full_path, std::ios::binary);
             if (f) {
                 std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
                 f.close();
-                st.text_preview_content = filerift::decode_protobuf(bytes, st.text_protobuf_type);
-                st.text_is_decoded_markup = true;
+                st.text_preview_content = filerift::decode_protobuf(bytes, ext.substr(1));
                 st.status_msg = "Decoded " + fe.name + " via FileRift";
                 log_file_event("FileDecode", "Decoded binary Protobuf to markup: " + fe.name + " (" + format_size(fe.size) + ")");
             } else {
@@ -2701,22 +2269,16 @@ static void draw_breadcrumbs(ViewerState& st) {
         ImGui::SameLine();
     }
 
-    bool drew_any = false;
     for (size_t i = first_visible; i < parts.size(); i++) {
         std::string name = parts[i].filename().string();
-        // A path component whose filename() is empty (a trailing separator, or
-        // the "/" produced by root_path()) must NOT be rendered as a bare "/"
-        // breadcrumb chip — that is the meaningless segment seen as
-        // "… > resources > / > fire_part2.scene". Skip these entirely; the true
-        // filesystem root is already represented by the "Vanilla" shortcut and
-        // the hidden-prefix collapse. (bug #5)
-        if (name.empty()) continue;
-        if (drew_any) {
+        if (name.empty()) {
+            name = "/";
+        }
+        if (i > first_visible) {
             ImGui::SameLine();
             ImGui::TextDisabled(ICON_FA_CHEVRON_RIGHT);
             ImGui::SameLine();
         }
-        drew_any = true;
 
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0)); // transparent flat button
         if (ImGui::SmallButton(name.c_str())) {
@@ -2837,50 +2399,16 @@ static void draw_file_browser(ViewerState& st) {
             st.selected_idx = i;
             select_file(st, f);
         }
-        // Filename ellipsis + tooltip: Selectable hard-clips long names to the
-        // row width with no "…" and no way to read the rest. When the icon+name
-        // is wider than the row, show the full filename on hover so long,
-        // similarly-prefixed asset names (achicon_*, font_megalopolis_*, …)
-        // stay identifiable. (bug #4)
-        if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && ImGui::IsItemHovered()) {
-            const float row_w = ImGui::GetItemRectSize().x;
-            char shown[512];
-            snprintf(shown, sizeof(shown), "%s%s", icon, f.name.c_str());
-            if (ImGui::CalcTextSize(shown).x > row_w - ImGui::GetStyle().FramePadding.x * 2.0f)
-                ImGui::SetTooltip("%s", f.name.c_str());
-        }
-        // Right-click any row → global browser context menu (file/folder actions).
-        // There must be exactly ONE BeginPopupContextItem per row; the old
-        // vendor_scn-only popup is merged into this menu below.
-        if (ImGui::BeginPopupContextItem()) {
-            if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN " Open")) {
-                st.selected_idx = i;
-                select_file(st, f);
-            }
-            if (ImGui::MenuItem("Open in File Explorer")) {
-                // Folders open themselves; files open their containing folder.
-                std::string target = f.is_dir ? f.full_path
-                                              : fs::path(f.full_path).parent_path().string();
-                os_external::open_in_file_manager(target);
-            }
-            if (!f.is_dir && ImGui::MenuItem("Reveal Containing Folder")) {
-                os_external::open_in_file_manager(fs::path(f.full_path).parent_path().string());
-            }
-            // Merged vendor scene-pack action (folders that hold a demo .scn).
-            if (f.is_dir && !f.vendor_scn.empty()) {
+        if (f.is_dir && !f.vendor_scn.empty()) {
+            // Right-click: preview the whole folder as a vendor scene pack.
+            if (ImGui::BeginPopupContextItem()) {
                 if (ImGui::MenuItem(ICON_FA_LAYER_GROUP " Preview folder as scene pack")) {
                     std::string pack_name = fs::path(f.vendor_scn).filename().string();
                     open_vendor_scn(st, f.vendor_scn, pack_name);
                 }
+                if (ImGui::MenuItem("Open folder")) select_file(st, f);
+                ImGui::EndPopup();
             }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Copy Path")) ImGui::SetClipboardText(f.full_path.c_str());
-            if (ImGui::MenuItem("Copy Name")) ImGui::SetClipboardText(f.name.c_str());
-            ImGui::Separator();
-            if (ImGui::MenuItem(ICON_FA_ARROWS_ROTATE " Refresh")) { refresh_directory(st); apply_filters(st); }
-            ImGui::EndPopup();
-        }
-        if (f.is_dir && !f.vendor_scn.empty()) {
             // Small purple pack badge at the row's right edge.
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.50f, 0.88f, 1.0f));
@@ -2944,17 +2472,14 @@ static void draw_model_viewport(ViewerState& st) {
     }
 
     if (!st.fbo) {
-        st.fbo = av::create_fbo_hdr(fw, fh, &st.fbo_tex);
+        st.fbo = av::create_fbo(fw, fh, &st.fbo_tex);
         st.fbo_w = fw; st.fbo_h = fh;
     } else if (fw != st.fbo_w || fh != st.fbo_h) {
-        av::resize_fbo_hdr(st.fbo, fw, fh, &st.fbo_tex);
+        av::resize_fbo(st.fbo, fw, fh, &st.fbo_tex);
         st.fbo_w = fw; st.fbo_h = fh;
     }
 
     av::begin_3d(st.fbo, fw, fh, st.camera);
-    // HDR path: when PostFX owns tone mapping, the mesh shaders emit LINEAR
-    // light into the RGBA16F buffer (no double-ACES / gamma-on-gamma).
-    av::set_inline_tonemap(!(st.postfx_enabled && st.postfx.enabled && st.postfx.hd));
     if (st.show_grid) {
         av::render_grid(st.grid_size, st.model.min_y * st.model_scale);
     }
@@ -3427,15 +2952,6 @@ static void draw_texture_preview(ViewerState& st) {
     {
         const bool can_edit = st.tex_edit_valid;
         const bool small_grid = can_edit && st.tex_edit_w <= 100 && st.tex_edit_h <= 100;
-        // REMASTER: the edit tools used to be a bare row of SameLine() buttons
-        // that overflowed the right edge on narrow windows (the "buggy top
-        // panel"). Host them in a fixed-height toolbar strip that clips its own
-        // content and scrolls horizontally, so it never overlaps the canvas.
-        const float toolbar_h = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f;
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, th_alpha(g_theme.panel_alt, 0.65f));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, ImGui::GetStyle().WindowPadding.y));
-        ImGui::BeginChild("##tex_toolbar", ImVec2(0, toolbar_h), ImGuiChildFlags_None,
-                          ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, th_alpha(g_theme.surface_hover, 0.55f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, g_theme.surface_hover);
@@ -3471,126 +2987,29 @@ static void draw_texture_preview(ViewerState& st) {
         }
         if (!can_edit) ImGui::EndDisabled();
         if (st.tex_edit_enabled && can_edit) {
-            // ── REMASTERED TOOLBAR ────────────────────────────────────────
-            // Grouped sections: Tool palette | Tool options | Color | View |
-            // File actions | status. Sections are separated by a vertical
-            // rule + spacing rhythm instead of bare "|" glyphs, every control
-            // uses a consistent icon+label, the active tool carries a strong
-            // accent background, and tooltips are one short line drawn ABOVE
-            // the toolbar so they never cover the canvas below.
-            auto tb_sep = [&]() {
-                ImGui::SameLine(0.0f, 8.0f);
-                // Manual vertical rule (ImGui::SeparatorEx is internal-only).
-                const ImVec2 p = ImGui::GetCursorScreenPos();
-                const float h = ImGui::GetFrameHeight();
-                ImGui::GetWindowDrawList()->AddLine(
-                    ImVec2(p.x, p.y + 2.0f), ImVec2(p.x, p.y + h - 2.0f),
-                    ImGui::GetColorU32(ImGuiCol_Separator), 1.0f);
-                ImGui::Dummy(ImVec2(1.0f, h));
-                ImGui::SameLine(0.0f, 8.0f);
-            };
-            // Short, canvas-safe tooltip: anchored to the bottom edge of the
-            // just-drawn item so the little box grows UP"-ish and stays clear
-            // of the canvas (the toolbar sits above the canvas, so anchoring
-            // the tooltip's bottom-left to the item's top-left keeps it in the
-            // toolbar band, never over the image).
-            auto tb_tip = [&](const char* tip) {
-                if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) return;
-                const ImVec2 mn = ImGui::GetItemRectMin();
-                ImGui::SetNextWindowPos(ImVec2(mn.x, mn.y), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
-                ImGui::BeginTooltip();
-                ImGui::TextUnformatted(tip);
-                ImGui::EndTooltip();
-            };
-
-            // ── Section: Tool palette (Brush/Eraser/Fill/Pick/Crop) ───────
-            tb_sep();
+            ImGui::SameLine();
+            ImGui::Text("|");
+            ImGui::SameLine();
             const char* tool_names[] = {
                 ICON_FA_PEN " Brush", ICON_FA_TRASH " Eraser",
-                ICON_FA_WAND_SPARKLES " Fill", ICON_FA_EYE " Pick",
-                ICON_FA_OBJECT_GROUP " Crop"};
+                ICON_FA_WAND_SPARKLES " Fill", ICON_FA_EYE " Pick", " Crop"};
             const char* tool_tips[] = {
-                "Paint", "Erase", "Flood fill", "Sample color", "Crop region"};
+                "Brush: drag on the image to paint",
+                "Eraser: drag on the image to erase",
+                "Fill: click a region to flood-fill it",
+                "Pick: click to sample a color",
+                "Crop: drag a rectangle, then Apply Crop"};
             for (int t = 0; t < 5; ++t) {
                 if (t) ImGui::SameLine();
-                const bool active = st.tex_edit_tool == t;
-                if (active) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, g_theme.accent);
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, g_theme.accent);
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, g_theme.accent);
-                    ImGui::PushStyleColor(ImGuiCol_Text, th_text_on(g_theme.accent));
-                }
-                if (ImGui::Button(tool_names[t])) st.tex_edit_tool = t;
-                if (active) ImGui::PopStyleColor(4);
-                tb_tip(tool_tips[t]);
+                if (ImGui::Selectable(tool_names[t], st.tex_edit_tool == t))
+                    st.tex_edit_tool = t;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tool_tips[t]);
             }
 
-            // ── Section: Tool options (contextual to the active tool) ─────
-            tb_sep();
-            if (st.tex_edit_tool == 0 || st.tex_edit_tool == 1) {
-                if (small_grid) {
-                    st.tex_edit_size = 1.0f;   // pixel-map editing is 1px only
-                    ImGui::TextDisabled(ICON_FA_PEN " 1 px");
-                } else {
-                    ImGui::SetNextItemWidth(140.0f);
-                    ImGui::SliderFloat("Brush", &st.tex_edit_size, 1.0f, 128.0f, "%.0f px");
-                    tb_tip("Brush size");
-                }
-            } else if (st.tex_edit_tool == 2) {
-                ImGui::TextDisabled(ICON_FA_WAND_SPARKLES " Click a region to fill");
-            } else if (st.tex_edit_tool == 3) {
-                ImGui::TextDisabled(ICON_FA_EYE " Click the image to sample");
-            } else if (st.tex_edit_tool == 4) {
-                if (st.tex_edit_crop_ready) {
-                    if (ImGui::Button(ICON_FA_CHECK " Apply Crop")) tex_edit_apply_crop(st);
-                    ImGui::SameLine();
-                    if (ImGui::Button(ICON_FA_XMARK " Cancel")) st.tex_edit_crop_ready = false;
-                } else {
-                    ImGui::TextDisabled(ICON_FA_OBJECT_GROUP " Drag a rectangle on the image");
-                }
-            }
-
-            // ── Section: Color (labeled swatch + picker + RGBA readout) ───
-            if (st.tex_edit_tool == 0 || st.tex_edit_tool == 1 || st.tex_edit_tool == 2) {
-                tb_sep();
-                ImGui::TextUnformatted("Paint color");
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(150.0f);
-                ImGui::ColorEdit4("##paintcolor", st.tex_edit_color,
-                                  ImGuiColorEditFlags_AlphaPreviewHalf |
-                                  ImGuiColorEditFlags_NoInputs);
-                tb_tip("Click for full color picker");
-                ImGui::SameLine();
-                ImGui::TextDisabled("R%d G%d B%d A%d",
-                                    (int)(st.tex_edit_color[0] * 255.0f + 0.5f),
-                                    (int)(st.tex_edit_color[1] * 255.0f + 0.5f),
-                                    (int)(st.tex_edit_color[2] * 255.0f + 0.5f),
-                                    (int)(st.tex_edit_color[3] * 255.0f + 0.5f));
-            }
-
-            // ── Section: View channel (RGBA composite / RGB / Alpha) ──────
-            tb_sep();
-            ImGui::TextUnformatted("View");
-            const char* view_labels[] = {"RGBA", "RGB", "A"};
-            const char* view_tips[]   = {"RGBA composite", "Color only", "Alpha channel only"};
-            for (int v = 0; v < 3; ++v) {
-                ImGui::SameLine();
-                const bool active = st.tex_view_channel == v;
-                if (active) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, g_theme.accent);
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, g_theme.accent);
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, g_theme.accent);
-                    ImGui::PushStyleColor(ImGuiCol_Text, th_text_on(g_theme.accent));
-                }
-                if (ImGui::Button(view_labels[v])) st.tex_view_channel = v;
-                if (active) ImGui::PopStyleColor(4);
-                tb_tip(view_tips[v]);
-            }
-
-            // ── Section: File actions (Bake / Save / Undo / Reload) ───────
-            tb_sep();
+            ImGui::SameLine();
+            ImGui::Text("|");
+            ImGui::SameLine();
             if (ImGui::Button(ICON_FA_ARROWS_ROTATE " Bake")) ImGui::OpenPopup("##tex_bake");
-            tb_tip("Rotate / flip the whole image");
             if (ImGui::BeginPopup("##tex_bake")) {
                 if (ImGui::MenuItem("Rotate 90° CW"))  { tex_edit_snapshot(st); tex_edit_bake_rotate(st, 1); }
                 if (ImGui::MenuItem("Rotate 180°"))    { tex_edit_snapshot(st); tex_edit_bake_rotate(st, 2); }
@@ -3602,8 +3021,7 @@ static void draw_texture_preview(ViewerState& st) {
             }
 
             ImGui::SameLine();
-            if (ImGui::Button(ICON_FA_FLOPPY_DISK " Save")) ImGui::OpenPopup("##tex_save");
-            tb_tip("Save PNG / .tex / overwrite source");
+            if (ImGui::Button(ICON_FA_IMAGE " Save")) ImGui::OpenPopup("##tex_save");
             if (ImGui::BeginPopup("##tex_save")) {
                 ImGui::SetNextItemWidth(300.0f);
                 ImGui::InputText("Path", st.tex_edit_save_path,
@@ -3633,41 +3051,50 @@ static void draw_texture_preview(ViewerState& st) {
             }
 
             ImGui::SameLine();
-            const bool can_undo = !st.tex_edit_undo.empty();
-            if (!can_undo) ImGui::BeginDisabled();
-            if (ImGui::Button(ICON_FA_CLOCK_ROTATE_LEFT " Undo")) tex_edit_undo(st);
-            if (!can_undo) ImGui::EndDisabled();
-            tb_tip(can_undo ? "Undo last edit" : "Nothing to undo");
-            ImGui::SameLine();
-            if (ImGui::Button(ICON_FA_ARROW_ROTATE_LEFT " Reload")) {
+            if (!st.tex_edit_undo.empty()) {
+                if (ImGui::Button(ICON_FA_CLOCK_ROTATE_LEFT " Undo")) tex_edit_undo(st);
+                ImGui::SameLine();
+            }
+            if (ImGui::Button("Reload")) {
                 tex_editor_load(st, st.tex_edit_src);
                 tex_editor_upload(st);
                 st.tex_reset_required = true;
             }
-            tb_tip("Discard edits, reload from source");
+
+            // Contextual row: brush options / crop actions / pick hint.
+            if (st.tex_edit_tool == 0 || st.tex_edit_tool == 1) {
+                if (small_grid) {
+                    st.tex_edit_size = 1.0f;   // pixel-map editing is 1px only
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("1 px");
+                } else {
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(140.0f);
+                    ImGui::SliderFloat("Size", &st.tex_edit_size, 1.0f, 128.0f, "%.0f");
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::ColorEdit4("Color", st.tex_edit_color, ImGuiColorEditFlags_AlphaPreviewHalf);
+            } else if (st.tex_edit_tool == 4 && st.tex_edit_crop_ready) {
+                ImGui::SameLine();
+                if (ImGui::Button("Apply Crop")) tex_edit_apply_crop(st);
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel Crop")) st.tex_edit_crop_ready = false;
+            } else if (st.tex_edit_tool == 3) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("Click the image to sample a color");
+            }
         } else {
             ImGui::SameLine();
             if (ImGui::Button(ICON_FA_TOOLBOX " Convert…")) st.batch_converter.open_window = true;
         }
 
-        // ── Status: file dirty-state label, pinned to the far right ───────
-        {
-            const char* status = st.tex_edit_dirty && can_edit ? ICON_FA_CIRCLE_EXCLAMATION " Modified"
-                               : can_edit                        ? ICON_FA_CIRCLE_CHECK " Original"
-                                                                 : nullptr;
-            if (status) {
-                const float sw = ImGui::CalcTextSize(status).x;
-                float rx = ImGui::GetContentRegionMax().x - sw - 4.0f;
-                if (rx > ImGui::GetCursorPosX()) ImGui::SameLine(rx);
-                else ImGui::SameLine();
-                if (st.tex_edit_dirty && can_edit) ImGui::TextColored(g_theme.warning, "%s", status);
-                else                               ImGui::TextDisabled("%s", status);
-            }
-        }
-        ImGui::PopStyleColor(3);       // Button / ButtonHovered / ButtonActive
-        ImGui::EndChild();             // ##tex_toolbar
-        ImGui::PopStyleVar();          // WindowPadding
-        ImGui::PopStyleColor();        // ChildBg
+        ImGui::SameLine();
+        if (st.tex_edit_dirty && can_edit)
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.20f, 1.0f), "(modified)");
+        else if (can_edit)
+            ImGui::TextDisabled("(original)");
+        ImGui::PopStyleColor(3);
     }
     
     ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -3722,42 +3149,19 @@ static void draw_texture_preview(ViewerState& st) {
         glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, 4.0f);
     }
 
-    // View-channel mode (toolbar "View" toggle): RGBA composite shows the
-    // checker through transparent pixels; RGB view forces the image opaque over
-    // a black backdrop so alpha is ignored; Alpha view previews only the alpha
-    // channel as a black-to-white matte (opaque pixels white, cut-outs black).
-    const bool tex_editing_view = st.tex_edit_enabled && st.tex_edit_valid;
-    const int  view_ch = tex_editing_view ? st.tex_view_channel : 0;
-
-    // Draw Checkerboard Background (only meaningful in RGBA composite view).
-    if (st.checker_tex && view_ch == 0) {
+    // Draw Checkerboard Background
+    if (st.checker_tex) {
         float uv_scale_x = img_size.x / 32.0f;
         float uv_scale_y = img_size.y / 32.0f;
         dl->AddImageQuad((ImTextureID)(intptr_t)st.checker_tex,
                          p1, p2, p3, p4,
                          ImVec2(0, 0), ImVec2(uv_scale_x, 0), ImVec2(uv_scale_x, uv_scale_y), ImVec2(0, uv_scale_y));
-    } else if (view_ch != 0) {
-        // Solid black backdrop for RGB / Alpha views.
-        dl->AddQuadFilled(p1, p2, p3, p4, IM_COL32(0, 0, 0, 255));
     }
 
     // Compute transformed UVs and draw Image
     ImVec2 uv[4];
     compute_transformed_uvs(st.texture_rotation, st.texture_flip_h, st.texture_flip_v, uv);
-    ImU32 tint_col;
-    if (view_ch == 2) {
-        // Alpha matte: additive white over black. AddImageQuad multiplies the
-        // sampled texel by the tint; with a white tint the RGB shows, so we
-        // instead draw the source with alpha-as-coverage by using white tint
-        // and letting the (premultiplied-looking) blend approximate the matte.
-        tint_col = IM_COL32(255, 255, 255, 255);
-    } else if (view_ch == 1) {
-        // RGB view: keep color, force opaque so alpha is ignored.
-        tint_col = ImGui::ColorConvertFloat4ToU32(
-            ImVec4(st.texture_tint[0], st.texture_tint[1], st.texture_tint[2], 1.0f));
-    } else {
-        tint_col = ImGui::ColorConvertFloat4ToU32(ImVec4(st.texture_tint[0], st.texture_tint[1], st.texture_tint[2], st.texture_tint[3]));
-    }
+    ImU32 tint_col = ImGui::ColorConvertFloat4ToU32(ImVec4(st.texture_tint[0], st.texture_tint[1], st.texture_tint[2], st.texture_tint[3]));
     dl->AddImageQuad((ImTextureID)(intptr_t)st.preview_tex, p1, p2, p3, p4, uv[0], uv[1], uv[2], uv[3], tint_col);
 
     // Zoom/Pan interaction area
@@ -3898,37 +3302,6 @@ static void draw_texture_preview(ViewerState& st) {
                 dl->AddLine(ImVec2(p1.x, gy), ImVec2(p1.x + img_size.x, gy), grid_col);
             }
         }
-    }
-
-    // ── On-canvas zoom HUD (bottom-left): live % readout + Fit / 100% / 1:1 ──
-    // The zoom used to only be a static number buried in the Inspector; put a
-    // visible, clickable control right on the canvas with quick presets.
-    {
-        const float pad = 8.0f;
-        ImGui::SetCursorScreenPos(ImVec2(cursor.x + pad, cursor.y + avail.y - ImGui::GetFrameHeight() - pad));
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, th_alpha(g_theme.panel, 0.82f));
-        ImGui::BeginChild("##tex_zoom_hud", ImVec2(0, 0),
-                          ImGuiChildFlags_AutoResizeX | ImGuiChildFlags_AutoResizeY,
-                          ImGuiWindowFlags_NoScrollbar);
-        ImGui::AlignTextToFramePadding();
-        ImGui::Text(ICON_FA_MAGNIFYING_GLASS " %.0f%%", st.tex_zoom * 100.0f);
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Fit")) st.tex_reset_required = true;   // reset path = fit-to-window
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fit image to window");
-        ImGui::SameLine();
-        if (ImGui::SmallButton("100%")) {
-            st.tex_zoom = 1.0f; st.tex_pan_x = st.tex_pan_y = 0.0f;
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Actual size (100%)");
-        ImGui::SameLine();
-        if (ImGui::SmallButton("1:1")) {
-            // Pixel-perfect: nearest whole-integer zoom >= 1 for crisp pixels.
-            st.tex_zoom = std::max(1.0f, std::round(st.tex_zoom));
-            st.tex_pan_x = st.tex_pan_y = 0.0f;
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pixel-perfect (integer zoom)");
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
     }
 
     ImGui::EndChild();
@@ -4398,10 +3771,13 @@ static void draw_object_inspector(ViewerState& st) {
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame the selection in the Visual viewport");
     ImGui::SameLine();
     if (ImGui::Button(ICON_FA_COPY " Duplicate")) {
-        // Fix #3: use the same path as Ctrl+D (copy→paste) so ground-mesh
-        // caches are resynchronized after the insert.
-        duplicate_scene_selection(st);
-        st.status_msg = "Duplicated object.";
+        snapshot_scene(st);
+        size_t new_idx = 0;
+        if (av::scene_duplicate_object(st.scene, (size_t)obj_idx, &new_idx)) {
+            select_scene_object(st, (int)new_idx);
+            st.scene_dirty = true;
+            st.status_msg = "Duplicated object.";
+        }
     }
     if (from_library) {
         if (ImGui::Button(ICON_FA_LINK " Materialize Template")) {
@@ -4423,8 +3799,6 @@ static void draw_object_inspector(ViewerState& st) {
         st.scene_selection.clear();
         st.selected_object = (removed < (int)st.scene.objects.size()) ? removed : (int)st.scene.objects.size() - 1;
         sync_scene_object_editor(st);
-        // Fix #3b: deletion shifts all higher-index ground-cache entries.
-        resync_scene_ground_meshes(st);
         st.scene_dirty = true;
         st.status_msg = "Deleted object #" + std::to_string(removed) + ".";
     }
@@ -4516,14 +3890,6 @@ static void draw_scene_inspector(ViewerState& st) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.48f, 0.48f, 0.52f, 1.0f));
                 ImGui::TextUnformatted(o.template_name.c_str());
                 ImGui::PopStyleColor();
-            }
-            if (o.is_dimension_object) {
-                ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.55f, 1.0f, 0.9f));
-                ImGui::TextUnformatted("  [DIM]");
-                ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("DimensionObject — only visible in-game while the Dimension Rift powerup is active");
             }
             ImGui::PopID();
         };
@@ -4940,11 +4306,12 @@ static void upload_scene_ground_meshes(ViewerState& st, const std::string& scene
         av::GPUMesh gm = av::upload_mesh(pos, nrm, uv, mesh.num_vertices,
                                           idx_ptr, (int)mesh.indices.size());
         st.scene_ground_gpu_meshes[idx].push_back(gm);
-        const std::string texture_name = gi < obj.ground_mesh_textures.size()
-            ? obj.ground_mesh_textures[gi] : std::string();
-        GLuint tex_id = load_ground_mesh_texture(scene_dir, texture_name);
+        GLuint tex_id = load_ground_mesh_texture(scene_dir,
+                                                 obj.ground_mesh_textures[gi]);
         st.scene_ground_textures[idx].push_back(tex_id);
-        st.scene_ground_tex_names[idx].push_back(texture_name);
+        st.scene_ground_tex_names[idx].push_back(
+            gi < obj.ground_mesh_textures.size() ? obj.ground_mesh_textures[gi]
+                                                 : std::string());
         }
     }
 }
@@ -5396,17 +4763,6 @@ static void decompose_view_to_camera(const float view[16], const float old_targe
     }
 }
 
-/// Camera modifier — frame the current selection (or the whole scene when
-/// nothing is selected) in view. Parity with the web editor's camera framing:
-/// recenters the orbit target on the content bounds and pulls the distance so
-/// the bounding sphere fits the vertical FOV. Works for perspective and ortho
-/// (ortho half-height derives from distance in camera_get_projection).
-// NOTE: frame_camera_on_selection() was removed. It duplicated
-// frame_scene_selection() (the canonical, AABB-accurate framing already bound
-// to the F key and the View ▸ menu). Its only unique behaviour — resetting the
-// orthographic zoom after framing — is now folded into the single canonical
-// Frame button, so there is no dead code and no duplicate-ID toolbar button.
-
 /// Mesh-edit "Insert": subdivide the picked face (face tool) or split the
 /// picked edge (edge tool).  Shared by the toolbar button and the I key.
 static void mesh_edit_insert_vertex(ViewerState& st) {
@@ -5445,7 +4801,6 @@ static bool gm_regenerate_object_geometry(ViewerState& st, int idx, std::string*
 static void gm_apply_to_object(ViewerState& st);          // GMG tab: apply to object
 static bool gm_begin_inline_edit(ViewerState& st);        // inline 2D edit in viewport
 static void gm_end_inline_edit(ViewerState& st);
-static void gm_revert_inline_edit(ViewerState& st);       // discard the session
 static void draw_inline_polygon_overlay(ViewerState& st, ImDrawList* overlay,
                                         const ImVec2& pos, int w, int h);
 static void inline_edit_input(ViewerState& st, const ImVec2& pos, int w, int h);
@@ -5463,45 +4818,6 @@ static std::string gm_build_swdm_text(const ViewerState& st) {
     gm.top_texture = st.gm_top_tex;
     gm.bottom_texture = st.gm_bottom_tex;
     return boulder::serialize_swdm(gm);
-}
-
-// Append a DimensionObject component to an object — the exact byte layout the
-// vanilla game writes (ClassName + Identifier, empty payload). Tagged objects
-// only appear in-game while the Dimension Rift powerup is active.
-static void gm_append_dimension_component(av::SceneObject& obj) {
-    int instance_id = 1;
-    for (const auto& c : obj.components)
-        instance_id = std::max(instance_id, c.type_id + 1);
-    proto::Writer w;
-    w.write_string_field(1, "DimensionObject");
-    w.write_varint_field(2, static_cast<uint64_t>(instance_id));
-    av::SceneComponent comp;
-    comp.type_name = "DimensionObject";
-    comp.type_id = instance_id;
-    comp.raw_data = w.to_string();
-    obj.components.push_back(std::move(comp));
-}
-
-// Terrain height at world X: scan every ground mesh in the open scene and
-// return the topmost world Y within `tolerance` units of x. Returns -1e9
-// when no terrain is near the sample (callers fall back to the camera Y).
-static float scene_terrain_top_y(const ViewerState& st, float x, float tolerance) {
-    float best = -1e9f;
-    for (const auto& obj : st.scene.objects) {
-        if (obj.ground_meshes.empty()) continue;
-        const float s = std::abs(obj.scale_x * obj.template_scaling);
-        for (const auto& gm : obj.ground_meshes) {
-            const float* p = gm.positions.data();
-            for (size_t i = 0; i + 2 < gm.positions.size(); i += 3) {
-                const float wx = obj.pos_x + p[i] * s;
-                if (std::fabs(wx - x) <= tolerance) {
-                    const float wy = obj.pos_y + p[i + 1] * s;
-                    if (wy > best) best = wy;
-                }
-            }
-        }
-    }
-    return best;
 }
 
 // Inject a freshly generated GroundMesh object into the open scene.
@@ -5547,12 +4863,8 @@ static int gm_add_to_scene(ViewerState& st) {
     snapshot_scene(st);
     av::SceneObject obj = std::move(parsed.objects[0]);
     obj.name = st.gm_obj_name[0] ? st.gm_obj_name : av::scene_fresh_identifier(st.scene);
-    if (st.gm_dimension_object)
-        gm_append_dimension_component(obj);   // rift-gated mesh
     // Spawn under the camera focus (X/Y) so the new ground mesh appears where
     // the user is looking; keep the depth layer chosen in the generator.
-    // No frame_scene_selection() here: the mesh lands at the camera's look
-    // point, so forcing the camera to it would jerk the view for nothing.
     obj.pos_x = st.camera.target[0];
     obj.pos_y = st.camera.target[1];
     st.scene.objects.push_back(std::move(obj));
@@ -5567,22 +4879,17 @@ static int gm_add_to_scene(ViewerState& st) {
     select_scene_object(st, idx);
     st.scene_dirty = true;
     st.status_msg = "Added ground mesh '" + std::string(st.gm_obj_name) + "' to scene.";
-    // Jump to the Visual editor; the mesh already sits at the camera's look
-    // point so it is visible without re-framing the camera.
+    // Jump to the Visual editor and frame the new mesh so it can be grabbed.
     switch_scene_tab(st, 1);
+    frame_scene_selection(st);
     return idx;
 }
 
 // Import an existing GroundMesh object's polygon into the sketch editor.
-// The object's own texture + depth metadata is carried over too, so re-applying
-// the sketch keeps the vanilla look (a vanilla mesh edited in 2D must not fall
-// back to the generator's hardcoded default textures / depth).
 static void gm_import_from_scene(ViewerState& st) {
     if (st.selected_object < 0 || st.selected_object >= (int)st.scene.objects.size()) return;
     const auto& obj = st.scene.objects[st.selected_object];
-    gm_push_undo(st);              // the previous sketch stays one Ctrl+Z away
     st.gm_points.clear();
-    bool have_depth = false;
     for (const auto& comp : obj.components) {
         const int payload = comp.payload_field;
         if (payload != 110) continue;   // GroundPolygonComponent
@@ -5594,13 +4901,7 @@ static void gm_import_from_scene(ViewerState& st) {
                 proto::Reader gpc(f.bytes_val);
                 proto::Field g;
                 while (gpc.read_field(g)) {
-                    if (g.field_number == 4 && g.wire_type == proto::WIRE_I32) {
-                        st.gm_min_depth = g.float_val; have_depth = true; continue;
-                    } else if (g.field_number == 5 && g.wire_type == proto::WIRE_I32) {
-                        st.gm_max_depth = g.float_val; have_depth = true; continue;
-                    } else if (g.field_number != 2 || g.wire_type != proto::WIRE_LEN) {
-                        continue;
-                    }
+                    if (g.field_number != 2 || g.wire_type != proto::WIRE_LEN) continue; // Polygon
                     proto::Reader poly(g.bytes_val);
                     proto::Field p;
                     while (poly.read_field(p)) {
@@ -5619,50 +4920,11 @@ static void gm_import_from_scene(ViewerState& st) {
         } catch (...) {}
         if (!st.gm_points.empty()) break;
     }
-    // Carry the object's own textures over (vanilla layout: the first
-    // SurfaceMesh (field 8) is the TOP, later field-8 meshes + the FrontMesh
-    // (field 9) are the side walls). Re-applying then regenerates the mesh
-    // with the SAME materials instead of the generator defaults.
-    {
-        const size_t n = std::min({obj.ground_meshes.size(),
-                                   obj.ground_mesh_textures.size(),
-                                   obj.ground_mesh_fields.size()});
-        std::string top_tex, bottom_tex;
-        for (size_t i = 0; i < n; ++i) {
-            const std::string& tex = obj.ground_mesh_textures[i];
-            if (tex.empty()) continue;
-            const int src_field = obj.ground_mesh_fields[i];
-            if (src_field == 9) {                       // FrontMesh → side walls
-                if (bottom_tex.empty()) bottom_tex = tex;
-            } else if (src_field == 8) {                // SurfaceMesh: first = top
-                if (top_tex.empty()) top_tex = tex;
-                else if (bottom_tex.empty()) bottom_tex = tex;
-            } else if (src_field == 6 && bottom_tex.empty()) { // base
-                bottom_tex = tex;
-            }
-        }
-        if (top_tex.empty()) top_tex = bottom_tex;
-        if (bottom_tex.empty()) bottom_tex = top_tex;
-        if (!top_tex.empty())
-            snprintf(st.gm_top_tex, sizeof(st.gm_top_tex), "%s", top_tex.c_str());
-        if (!bottom_tex.empty())
-            snprintf(st.gm_bottom_tex, sizeof(st.gm_bottom_tex), "%s", bottom_tex.c_str());
-    }
     if (!st.gm_points.empty()) {
         st.gm_sketch_dirty = true;
-        st.gm_canvas_framed = false;     // reframe the GMG canvas on the import
         st.status_msg = "Imported " + std::to_string(st.gm_points.size()) + " points from selected object.";
         // Keep the object's depth as the default Z.
         st.gm_z = obj.pos_z;
-        if (!have_depth) {
-            // No MinDepth/MaxDepth on the polygon — derive the slab from the
-            // parsed mesh extents so the regenerated mesh keeps its thickness.
-            float dmin = 1e30f, dmax = -1e30f;
-            for (const auto& pm : obj.ground_meshes) {
-                dmin = std::min(dmin, pm.min_z); dmax = std::max(dmax, pm.max_z);
-            }
-            if (dmin < 1e29f && dmax > -1e29f) { st.gm_min_depth = dmin; st.gm_max_depth = dmax; }
-        }
     } else {
         st.status_msg = "Selected object has no GroundPolygon to import.";
     }
@@ -5712,11 +4974,8 @@ static bool gm_regenerate_object_geometry(ViewerState& st, int idx, std::string*
         return fail("Generated mesh failed to parse.");
 
     av::SceneObject& target = st.scene.objects[idx];
-    const bool was_dim = target.is_dimension_object;
     av::SceneObject fresh = std::move(parsed.objects[0]);
     target.components = std::move(fresh.components);
-    if (was_dim || st.gm_dimension_object)
-        gm_append_dimension_component(target);   // keep/promote the rift gate
     target.pos_z = st.gm_z;               // depth layer chosen in the editor
     av::scene_refresh(st.scene);
     // The re-parsed geometry (SurfaceMesh / FrontMesh / hats) wins over what
@@ -5769,10 +5028,6 @@ static bool gm_begin_inline_edit(ViewerState& st) {
         return false;
     }
     snapshot_scene(st);           // one undo step for the whole edit session
-    // Keep a dedicated pre-edit snapshot so a single key/click can DISCARD
-    // the session (revert) regardless of what the undo stack holds.
-    st.gm_inline_saved_scene = st.scene;
-    st.gm_inline_saved_scene_valid = true;
     st.gm_edit_apply_object = sel;
     st.gm_inline_edit = true;
     st.gm_inline_dirty = false;
@@ -5822,7 +5077,7 @@ static bool gm_begin_inline_edit(ViewerState& st) {
 
     st.status_msg = "2D editing '" + st.scene.objects[sel].name +
                     "' — drag vertices \xc2\xb7 right-click an edge to add a node \xc2\xb7 "
-                    "MMB pan / wheel zoom \xc2\xb7 Esc to finish \xc2\xb7 R to revert.";
+                    "MMB pan / wheel zoom \xc2\xb7 Esc to finish.";
     return true;
 }
 
@@ -5848,32 +5103,6 @@ static void gm_end_inline_edit(ViewerState& st) {
         st.gm_inline_saved_valid = false;
     }
     st.status_msg = "Mesh edit finished.";
-}
-
-// Discard the whole inline-edit session and restore the pre-edit scene
-// snapshot — one-key undo for the 2D editor. Ends the session WITHOUT
-// applying the sketch (unlike gm_end_inline_edit, which commits).
-static void gm_revert_inline_edit(ViewerState& st) {
-    if (!st.gm_inline_edit) return;
-    if (st.gm_inline_saved_scene_valid) {
-        st.scene = st.gm_inline_saved_scene;
-        st.gm_inline_saved_scene_valid = false;
-        av::scene_refresh(st.scene);
-        const fs::path scene_dir = fs::path(st.scene.filepath).parent_path();
-        upload_scene_ground_meshes(st, scene_dir.string());
-    }
-    st.gm_inline_edit = false;
-    st.gm_inline_dirty = false;
-    st.gm_edit_apply_object = -1;
-    st.gm_drag_point = -1;
-    st.gm_dragging = false;
-    st.gm_drag_from_insert = false;
-    st.gm_drag_off_x = st.gm_drag_off_y = 0.0;
-    if (st.gm_inline_saved_valid) {          // restore the pre-edit camera view
-        st.camera = st.gm_inline_saved_cam;
-        st.gm_inline_saved_valid = false;
-    }
-    st.status_msg = "Reverted mesh edit \xe2\x80\x94 session changes discarded.";
 }
 
 // Intersect a world ray with the plane spanned by an object matrix's X/Y axes
@@ -6038,17 +5267,12 @@ static void draw_inline_polygon_overlay(ViewerState& st, ImDrawList* overlay,
     // Mode tag + hint bar.
     overlay->AddText(ImVec2(pos.x + (float)w - 120.0f, pos.y + 14.0f),
                      IM_COL32(110, 210, 255, 255), "2D EDIT");
-    // Revert button: discard the whole session and restore the pre-edit mesh.
-    ImGui::SetCursorScreenPos(ImVec2(pos.x + (float)w - 96.0f, pos.y + 34.0f));
-    if (ImGui::SmallButton("Revert (R)")) gm_revert_inline_edit(st);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Discard this edit session and restore the mesh as it was before (Ctrl+Z / R)");
     overlay->AddRectFilled(ImVec2(pos.x, pos.y + (float)h - 24.0f),
                            ImVec2(pos.x + (float)w, pos.y + (float)h),
                            IM_COL32(18, 21, 28, 215));
     overlay->AddText(ImVec2(pos.x + 8.0f, pos.y + (float)h - 20.0f),
                      IM_COL32(160, 175, 195, 255),
-                     "LMB drag vertex \xc2\xb7 RMB edge = new node \xc2\xb7 RMB/Del vertex = remove \xc2\xb7 Esc done \xc2\xb7 R revert");
+                     "LMB drag vertex \xc2\xb7 RMB edge = new node \xc2\xb7 RMB/Del vertex = remove \xc2\xb7 Esc done");
 }
 
 // Input for the inline 2D editor — owns the whole viewport input block while
@@ -6148,13 +5372,6 @@ static void inline_edit_input(ViewerState& st, const ImVec2& pos, int w, int h) 
         st.gm_dragging = false;
         st.gm_inline_dirty = true;
     }
-    // Ctrl+Z or R discards the whole session: restore the pre-edit snapshot
-    // (the one-key "undo everything" for the 2D editor).
-    if ((io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) ||
-        ImGui::IsKeyPressed(ImGuiKey_R)) {
-        gm_revert_inline_edit(st);
-        return;
-    }
     if (ImGui::IsKeyPressed(ImGuiKey_Escape) || ImGui::IsKeyPressed(ImGuiKey_M)) {
         gm_end_inline_edit(st);
         return;
@@ -6225,47 +5442,6 @@ static double gm_polygon_area(const std::vector<boulder::PolygonPoint>& pts) {
 
 static void gm_ensure_ccw(std::vector<boulder::PolygonPoint>& pts) {
     if (gm_polygon_area(pts) < 0.0) std::reverse(pts.begin(), pts.end());
-}
-
-// ── Internal sketch undo/redo ─────────────────────────────────────────────
-// Snapshot the current (points, hats) onto the undo stack before a discrete
-// edit; the redo stack is cleared on every new edit (standard branching).
-static void gm_push_undo(ViewerState& st) {
-    st.gm_undo_points.push_back(st.gm_points);
-    st.gm_undo_hats.push_back(st.gm_hats);
-    if (st.gm_undo_points.size() > 60) {
-        st.gm_undo_points.erase(st.gm_undo_points.begin());
-        st.gm_undo_hats.erase(st.gm_undo_hats.begin());
-    }
-    st.gm_redo_points.clear();
-    st.gm_redo_hats.clear();
-}
-
-static void gm_undo_sketch(ViewerState& st) {
-    if (st.gm_undo_points.empty()) return;
-    st.gm_redo_points.push_back(st.gm_points);
-    st.gm_redo_hats.push_back(st.gm_hats);
-    st.gm_points = st.gm_undo_points.back();
-    st.gm_hats   = st.gm_undo_hats.back();
-    st.gm_undo_points.pop_back();
-    st.gm_undo_hats.pop_back();
-    st.gm_sketch_dirty = true;
-}
-
-static void gm_redo_sketch(ViewerState& st) {
-    if (st.gm_redo_points.empty()) return;
-    st.gm_undo_points.push_back(st.gm_points);
-    st.gm_undo_hats.push_back(st.gm_hats);
-    st.gm_points = st.gm_redo_points.back();
-    st.gm_hats   = st.gm_redo_hats.back();
-    st.gm_redo_points.pop_back();
-    st.gm_redo_hats.pop_back();
-    st.gm_sketch_dirty = true;
-}
-
-static void gm_clear_undo(ViewerState& st) {
-    st.gm_undo_points.clear(); st.gm_undo_hats.clear();
-    st.gm_redo_points.clear(); st.gm_redo_hats.clear();
 }
 
 static void gm_simplify_freehand(ViewerState& st) {
@@ -6442,81 +5618,14 @@ static void obj_browser_scan(ViewerState& st) {
     st.obj_browser_scanned = true;
 }
 
-// Scan the scene + assets dirs for texture files and cache their canonical
-// stems (suffixes stripped) for the ground-mesh texture picker. Runs once per
-// scene (keyed on the scene dir); the list is a flat, sorted, deduped set.
-static void gm_texture_scan(ViewerState& st) {
-    st.gm_tex_names.clear();
-    std::vector<fs::path> roots;
-    if (!st.scene.filepath.empty())
-        roots.push_back(fs::path(st.scene.filepath).parent_path());
-    roots.push_back(fs::path(g_assets_dir) / "resources");
-    roots.push_back(fs::path(expand_home("~/.local/share/swordigo-desktop/assets/resources")));
-    roots.push_back(fs::path(expand_home("~/.local/share/swordigo-desktop/assets")));
-
-    static const char* suffixes[] = {
-        "_2x.tex.png", ".tex.png", "_2x.pvr", ".pvr",
-        "_2x.tex", ".tex", "_2x.png", ".png"
-    };
-    std::set<std::string> seen;
-    std::error_code ec;
-    for (const auto& root : roots) {
-        if (!fs::is_directory(root, ec)) continue;
-        for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
-             it != end && !ec; it.increment(ec)) {
-            if (it.depth() > 3) { it.disable_recursion_pending(); continue; }
-            if (!it->is_regular_file(ec)) continue;
-            const std::string fname = it->path().filename().string();
-            std::string lower = fname;
-            for (auto& c : lower) c = (char)tolower((unsigned char)c);
-            const bool is_pvr = lower.size() > 4 &&
-                                lower.compare(lower.size() - 4, 4, ".pvr") == 0;
-            const bool is_png = lower.size() > 4 &&
-                                lower.compare(lower.size() - 4, 4, ".png") == 0;
-            if (!is_pvr && !is_png) continue;
-            std::string stem = fname;
-            for (const char* suf : suffixes) {
-                const std::string s(suf);
-                if (stem.size() > s.size() &&
-                    stem.compare(stem.size() - s.size(), s.size(), s) == 0) {
-                    stem.erase(stem.size() - s.size());
-                    break;
-                }
-            }
-            if (stem.empty()) continue;
-            if (seen.insert(stem).second) st.gm_tex_names.push_back(stem);
-        }
-    }
-    std::sort(st.gm_tex_names.begin(), st.gm_tex_names.end());
-    st.gm_tex_scanned = true;
-}
-
 // Build a SceneObject that references a POD model (ClassName 'Model').
 static av::SceneObject build_pod_object(const std::string& pod_path, const std::string& identifier) {
     const std::string stem = fs::path(pod_path).stem().string();
     av::SceneObject obj;
     obj.template_name = "SceneObject";
     obj.name = identifier;
-    proto::Writer payload;   // ModelComponent{ Name: 1, ..., DiffuseColor: 8 }
+    proto::Writer payload;   // ModelComponent{ Name: 1 }
     payload.write_string_field(1, stem);
-    payload.write_float_field(2, 0.0f);             // YRotation
-    payload.write_float_field(3, 0.0f);             // EmissionFactor
-    payload.write_float_field(4, 0.0f);             // XRotation
-    proto::Writer shc;                              // ShatterColor (black)
-    shc.write_float_field(1, 0); shc.write_float_field(2, 0);
-    shc.write_float_field(3, 0); shc.write_float_field(4, 1);
-    payload.write_nested_field(5, shc);
-    proto::Writer org;                              // Origin (0,0,0)
-    org.write_float_field(1, 0); org.write_float_field(2, 0);
-    org.write_float_field(3, 0);
-    payload.write_nested_field(6, org);
-    payload.write_varint_field(7, 0);               // Transparent
-    // DiffuseColor MUST be white: a missing color message defaults to alpha 0
-    // in the real game, rendering the model fully invisible.
-    proto::Writer dfc;                              // DiffuseColor (white)
-    dfc.write_float_field(1, 1); dfc.write_float_field(2, 1);
-    dfc.write_float_field(3, 1); dfc.write_float_field(4, 1);
-    payload.write_nested_field(8, dfc);
     proto::Writer wrapper;   // Component{ ClassName, Identifier:101, ModelComponent }
     wrapper.write_string_field(1, "Model");
     wrapper.write_varint_field(2, 101);
@@ -6541,9 +5650,7 @@ static void obj_browser_add(ViewerState& st, const std::string& path, bool is_po
         std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         boulder::GroundMesh gm = boulder::parse_ground_mesh(content);
         if (gm.polygon.size() < 3) { st.status_msg = "Invalid .swdm file."; return; }
-        gm_push_undo(st);
         st.gm_points = gm.polygon;
-        st.gm_hats = gm.hats;
         st.gm_min_depth = gm.min_depth;
         st.gm_max_depth = gm.max_depth;
         st.gm_top_angle = gm.top_angle;
@@ -6553,208 +5660,41 @@ static void obj_browser_add(ViewerState& st, const std::string& path, bool is_po
         snprintf(st.gm_bottom_tex, sizeof(st.gm_bottom_tex), "%s", gm.bottom_texture.c_str());
         snprintf(st.gm_obj_name, sizeof(st.gm_obj_name), "%s",
                  fs::path(path).stem().string().c_str());
-        st.gm_canvas_framed = false;   // reframe on the loaded sketch
         gm_add_to_scene(st);
         open_ground_mesh_studio(st);
         return;
     }
     snapshot_scene(st);
-    // Fix #1: preserve mesh_name BEFORE the move so the cache load and
-    // status messages are not reading from a moved-from string.
     av::SceneObject obj = build_pod_object(path, av::scene_fresh_identifier(st.scene));
-    const std::string mesh_name = obj.mesh_name; // stable copy
-    // Spawn where the camera is looking (its target IS the look-at point) and
-    // snap the model onto the terrain so it stands on the ground instead of
-    // floating in the air. No camera re-frame: the object appears centered in
-    // the current view by construction.
+    // Spawn where the user is looking (camera focus), so the fresh object
+    // appears right in front of the view instead of at the world origin.
     obj.pos_x = st.camera.target[0];
+    obj.pos_y = st.camera.target[1];
     obj.pos_z = st.camera.target[2];
-    const float terrain_y = scene_terrain_top_y(st, obj.pos_x, 150.0f);
-    obj.pos_y = (terrain_y > -1e8f) ? terrain_y : st.camera.target[1];
     st.scene.objects.push_back(std::move(obj));
     av::scene_refresh(st.scene);
     const fs::path scene_dir = fs::path(st.scene.filepath).parent_path();
-    const int idx = static_cast<int>(st.scene.objects.size()) - 1;
-    select_scene_object(st, idx);
-    st.scene_dirty = true;
-    if (load_scene_model_to_cache(st, mesh_name, scene_dir.string())) {
-        // The POD origin may sit feet_offset ABOVE the visual feet (center
-        // origin); lift the object so its feet stand on the terrain instead
-        // of sinking into it. Feet-origin PODs report ~0 and stay put.
-        if (terrain_y > -1e8f) {
-            auto hit = st.scene_model_cache.find(mesh_name);
-            if (hit != st.scene_model_cache.end()) {
-                const float fo = av::pod_feet_offset(hit->second);
-                const float s = std::abs(st.scene.objects[idx].scale_x *
-                                         st.scene.objects[idx].template_scaling);
-                if (fo > 0.0f) st.scene.objects[idx].pos_y += fo * s;
-            }
-        }
-        st.status_msg = "Added model '" + mesh_name + "' to scene.";
+    if (load_scene_model_to_cache(st, obj.mesh_name, scene_dir.string())) {
+        const int idx = static_cast<int>(st.scene.objects.size()) - 1;
+        select_scene_object(st, idx);
+        st.scene_dirty = true;
+        st.status_msg = "Added model '" + obj.mesh_name + "' to scene.";
     } else {
-        st.status_msg = "Added '" + mesh_name + "' (model file not found locally).";
+        // Model couldn't be resolved — keep the object but report it.
+        const int idx = static_cast<int>(st.scene.objects.size()) - 1;
+        select_scene_object(st, idx);
+        st.scene_dirty = true;
+        st.status_msg = "Added '" + obj.mesh_name + "' (model file not found locally).";
     }
-    // Jump to the Visual editor; the object is already centered in the view.
+    // Jump to the Visual editor and frame the new object so it can be grabbed.
     switch_scene_tab(st, 1);
+    frame_scene_selection(st);
 }
 
 // ── Ground Mesh Generator: live 3D preview ──
 // Rebuild the extruded mesh from the current sketch and upload it for the
 // side-by-side 3D viewport. Falls back gracefully when the sketch is too
 // small to generate (keeps the last valid preview).
-// ── Ground Mesh Generator window (SMM2-style 2D sketch) ──
-// ── Hand-built preview geometry (superseded by gm_rebuild_preview, which
-// generates the REAL backend mesh) — kept disabled for reference. ─────────
-__attribute__((unused)) static void gm_build_preview_mesh_disabled(ViewerState& st) {
-    for (auto& m : st.gm_preview_meshes) av::free_mesh(m);
-    st.gm_preview_meshes.clear();
-    if (st.gm_points.size() < 3) { st.gm_preview_valid = false; return; }
-
-    std::vector<boulder::PolygonPoint> poly = st.gm_points;
-    gm_ensure_ccw(poly);
-    const int n = (int)poly.size();
-    const float z_min = st.gm_z + std::min(st.gm_min_depth, st.gm_max_depth);
-    const float z_max = st.gm_z + std::max(st.gm_min_depth, st.gm_max_depth);
-    const float uv_s = 0.02f;
-
-    // Winding-aware top-edge test (same convention as the 2D canvas).
-    double area2 = 0.0;
-    for (int i = 0; i < n; ++i) {
-        const int j = (i + 1) % n;
-        area2 += poly[i].x * poly[j].y - poly[j].x * poly[i].y;
-    }
-    const bool ccw = area2 >= 0.0;
-    auto is_top = [&](int i, int j) {
-        if (st.gm_top_angle <= 0.0f) return false;
-        double ang = std::atan2(poly[j].y - poly[i].y,
-                                poly[j].x - poly[i].x) * 180.0 / M_PI;
-        if (ang < 0.0) ang += 360.0;
-        const double want = ccw ? 180.0 : 0.0;
-        const double d = std::fabs(ang - want);
-        return std::min(d, 360.0 - d) < (double)st.gm_top_angle;
-    };
-
-    struct Buf {
-        std::vector<float> pos, nrm, uv;
-        std::vector<uint32_t> idx;
-        void tri(const float a[3], const float b[3], const float c[3],
-                 const float nr[3], const float ta[2], const float tb[2], const float tc[2]) {
-            const uint32_t base = (uint32_t)(pos.size() / 3);
-            const float* ps[3] = {a, b, c};
-            const float* ts[3] = {ta, tb, tc};
-            for (int i = 0; i < 3; ++i) {
-                pos.insert(pos.end(), ps[i], ps[i] + 3);
-                nrm.insert(nrm.end(), nr, nr + 3);
-                uv.insert(uv.end(), ts[i], ts[i] + 2);
-            }
-            idx.insert(idx.end(), {base, base + 1, base + 2});
-        }
-        void quad(const float p[4][3], const float nr[3], const float t[4][2]) {
-            const uint32_t base = (uint32_t)(pos.size() / 3);
-            for (int i = 0; i < 4; ++i) {
-                pos.insert(pos.end(), p[i], p[i] + 3);
-                nrm.insert(nrm.end(), nr, nr + 3);
-                uv.insert(uv.end(), t[i], t[i] + 2);
-            }
-            idx.insert(idx.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
-        }
-    };
-    Buf body, cap;
-
-    // Front/back faces (fan from the centroid) + side walls.
-    double ccx = 0, ccy = 0;
-    for (const auto& p : poly) { ccx += p.x; ccy += p.y; }
-    ccx /= n; ccy /= n;
-    const float fc[3] = {(float)ccx, (float)ccy, z_max};
-    const float bc[3] = {(float)ccx, (float)ccy, z_min};
-    const float nz_f[3] = {0, 0, 1};
-    const float nz_b[3] = {0, 0, -1};
-    for (int i = 0; i < n; ++i) {
-        const int j = (i + 1) % n;
-        const float a_f[3] = {(float)poly[i].x, (float)poly[i].y, z_max};
-        const float b_f[3] = {(float)poly[j].x, (float)poly[j].y, z_max};
-        const float a_b[3] = {(float)poly[i].x, (float)poly[i].y, z_min};
-        const float b_b[3] = {(float)poly[j].x, (float)poly[j].y, z_min};
-        const float ta_f[2] = {(float)poly[i].x * uv_s, (float)poly[i].y * uv_s};
-        const float tb_f[2] = {(float)poly[j].x * uv_s, (float)poly[j].y * uv_s};
-        const float tc_f[2] = {(float)ccx * uv_s, (float)ccy * uv_s};
-        body.tri(a_f, b_f, fc, nz_f, ta_f, tb_f, tc_f);
-        body.tri(b_b, a_b, bc, nz_b, tb_f, ta_f, tc_f);
-
-        double dx = poly[j].x - poly[i].x, dy = poly[j].y - poly[i].y;
-        const double len = std::hypot(dx, dy);
-        float nr[3] = {0, 0, 0};
-        if (len > 1e-9) { nr[0] = (float)(dy / len); nr[1] = (float)(-dx / len); }
-        const float wl[4][3] = {{a_f[0], a_f[1], a_f[2]}, {a_b[0], a_b[1], a_b[2]},
-                                {b_b[0], b_b[1], b_b[2]}, {b_f[0], b_f[1], b_f[2]}};
-        const float wt[4][2] = {{0.0f, z_max * uv_s}, {0.0f, z_min * uv_s},
-                                {(float)(len * uv_s), z_min * uv_s},
-                                {(float)(len * uv_s), z_max * uv_s}};
-
-        if (is_top(i, j)) {
-            // Walkable top strip, lifted slightly so it renders proud of the
-            // wall (mirrors the real surface-mesh overhang).
-            const float off = 1.5f;
-            const float cl[4][3] = {{a_f[0] + nr[0] * off, a_f[1] + nr[1] * off, a_f[2]},
-                                    {a_b[0] + nr[0] * off, a_b[1] + nr[1] * off, a_b[2]},
-                                    {b_b[0] + nr[0] * off, b_b[1] + nr[1] * off, b_b[2]},
-                                    {b_f[0] + nr[0] * off, b_f[1] + nr[1] * off, b_f[2]}};
-            const float un[3] = {0.0f, 1.0f, 0.0f};
-            cap.quad(cl, un, wt);
-        } else {
-            body.quad(wl, nr, wt);
-        }
-    }
-
-    // Hat domes: half-ellipse cross-sections extruded across the depth.
-    for (const auto& h : st.gm_hats) {
-        const int K = 12;
-        const float hx = (float)h.x, hy = (float)h.y;
-        const float hr = (float)h.radius, hh = (float)h.height;
-        float prev[3] = {hx + hr, hy, z_max};
-        float prev_b[3] = {hx + hr, hy, z_min};
-        for (int k = 1; k <= K; ++k) {
-            const float t = (float)M_PI * (float)k / (float)K;
-            const float px = hx + hr * std::cos(t);
-            const float py = hy + hh * std::sin(t);
-            const float cur[3] = {px, py, z_max};
-            const float cur_b[3] = {px, py, z_min};
-            const float tm = (float)M_PI * ((float)k - 0.5f) / (float)K;
-            float nr[3] = {std::cos(tm), std::sin(tm), 0.0f};
-            const float nlen = std::hypot(nr[0], nr[1]);
-            if (nlen > 1e-9f) { nr[0] /= nlen; nr[1] /= nlen; }
-            const float u0 = (float)(k - 1) / (float)K * (float)M_PI * hr * uv_s;
-            const float u1 = (float)k / (float)K * (float)M_PI * hr * uv_s;
-            const float wl[4][3] = {{prev[0], prev[1], prev[2]}, {prev_b[0], prev_b[1], prev_b[2]},
-                                    {cur_b[0], cur_b[1], cur_b[2]}, {cur[0], cur[1], cur[2]}};
-            const float wt[4][2] = {{u0, z_max * uv_s}, {u0, z_min * uv_s},
-                                    {u1, z_min * uv_s}, {u1, z_max * uv_s}};
-            cap.quad(wl, nr, wt);
-            const float c_f[3] = {hx, hy, z_max};
-            const float c_b[3] = {hx, hy, z_min};
-            const float tu[2] = {hx * uv_s, hy * uv_s};
-            cap.tri(c_f, prev, cur, nz_f, tu, wt[0], wt[3]);
-            cap.tri(c_b, cur_b, prev_b, nz_b, tu, wt[2], wt[1]);
-            std::memcpy(prev, cur, sizeof(prev));
-            std::memcpy(prev_b, cur_b, sizeof(prev_b));
-        }
-    }
-
-    auto upload = [](Buf& b) {
-        if (b.idx.empty()) return av::GPUMesh{};
-        return av::upload_mesh(b.pos.data(), b.nrm.data(), b.uv.data(),
-                               (int)(b.pos.size() / 3), b.idx.data(), (int)b.idx.size());
-    };
-    st.gm_preview_meshes.push_back(upload(body));
-    st.gm_preview_meshes.push_back(upload(cap));
-    st.gm_preview_valid = true;
-}
-
-// ── Ground Mesh Generator: live 3D preview ──────────────────────────────
-// (ported from asset_viewer_backup.cpp) Rebuild the extruded mesh from the
-// current sketch using the REAL backend (boulder::generate_ground_mesh_object)
-// and upload it for the side-by-side 3D viewport. Falls back gracefully when
-// the sketch is too small to generate (keeps the last valid preview).
 static void gm_rebuild_preview(ViewerState& st) {
     st.gm_preview_valid = false;
     if (st.gm_points.size() < 3 || st.scene.filepath.empty()) return;
@@ -6854,692 +5794,14 @@ static void gm_rebuild_preview(ViewerState& st) {
     st.gm_preview_cam.pitch = 24.0f;
     st.gm_preview_valid = true;
 }
-// Simple 2D side-view sketcher for boulder ground meshes:
-//   · Move / Add / Erase / Hat tools on the outline
-//   · clean preview: front-face fill + walkable top edges + hat domes
-//   · Save / Load .swdm · Add to Scene · Import selected · Apply to Object
-// Reuses the shared backend glue (gm_build_swdm_text, gm_add_to_scene,
-// gm_import_from_scene, gm_apply_to_object, gm_push_undo*). The previous
-// frontend is preserved untouched below as draw_ground_mesh_generator_disabled.
+
+// ── Ground Mesh Generator window (SMM2-style 2D sketch) ──
 static void draw_ground_mesh_generator(ViewerState& st) {
-    ImGuiIO& io = ImGui::GetIO();
-    if (st.gm_tool == 3) st.gm_tool = 0;         // old freehand id → Move
-
-    // Hotkeys (panel-focused, never while typing): V move · A add · D erase ·
-    // H hat · F frame · Backspace pop · Ctrl+Z/Y undo/redo.
-    const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-    bool want_frame = false;
-    if (focused && !io.WantTextInput) {
-        if (ImGui::IsKeyPressed(ImGuiKey_V)) st.gm_tool = 0;
-        if (ImGui::IsKeyPressed(ImGuiKey_A)) st.gm_tool = 1;
-        if (ImGui::IsKeyPressed(ImGuiKey_D)) st.gm_tool = 2;
-        if (ImGui::IsKeyPressed(ImGuiKey_H)) st.gm_tool = 4;
-        if (ImGui::IsKeyPressed(ImGuiKey_F)) want_frame = true;
-        if (ImGui::IsKeyPressed(ImGuiKey_Backspace) && !st.gm_points.empty() &&
-            !st.gm_dragging) {
-            gm_push_undo(st);
-            st.gm_points.pop_back();
-        }
-        if (io.KeyCtrl) {
-            if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z)) gm_undo_sketch(st);
-            if ((io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z)) ||
-                ImGui::IsKeyPressed(ImGuiKey_Y)) gm_redo_sketch(st);
-        }
-    }
-
-    // ── Toolbar ──
-    auto tool_btn = [&](int id, const char* label, const char* tip) {
-        const bool active = (st.gm_tool == id);
-        if (active) ImGui::PushStyleColor(ImGuiCol_Button, th_mix(g_theme.surface_active, g_theme.accent, 0.35f));
-        if (ImGui::Button(label, ImVec2(78.0f, 24))) st.gm_tool = id;
-        if (active) ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
-    };
-    tool_btn(0, ICON_FA_HAND_POINTER " Move", "Move (V) — drag nodes, grab hats, click an edge to insert a node");
-    ImGui::SameLine();
-    tool_btn(1, ICON_FA_PLUS " Add", "Add (A) — click to place a node (splits the nearest edge once the outline is closed)");
-    ImGui::SameLine();
-    tool_btn(2, ICON_FA_TRASH " Erase", "Erase (D) — click a node or a hat to remove it");
-    ImGui::SameLine();
-    tool_btn(4, ICON_FA_MOUNTAIN_SUN " Hat", "Hat (H) — place a round dome; drag the center to move, the handle resizes");
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_ARROW_ROTATE_LEFT "##gmg_undo", ImVec2(30, 24))) gm_undo_sketch(st);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Undo (Ctrl+Z)");
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_ARROW_ROTATE_RIGHT "##gmg_redo", ImVec2(30, 24))) gm_redo_sketch(st);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Redo (Ctrl+Y)");
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_LOCATION_DOT "##gmg_frame", ImVec2(30, 24))) want_frame = true;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame the sketch (F)");
-    ImGui::SameLine();
-    ImGui::Checkbox("3D", &st.gm_show_3d);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show the live 3D mesh preview beside the sketch");
-    ImGui::SameLine();
-    ImGui::TextDisabled("%d pts \xc2\xb7 %zu hats \xc2\xb7 Z %.0f \xc2\xb7 depth %.0f..%.0f \xc2\xb7 top %.0f\xc2\xb0",
-                        (int)st.gm_points.size(), st.gm_hats.size(), st.gm_z,
-                        st.gm_min_depth, st.gm_max_depth, st.gm_top_angle);
-
-    // ── Canvas (left: 2D sketch · right: live 3D preview) ──
-    const float bar_h = 118.0f;
-    float canvas_h = ImGui::GetContentRegionAvail().y - bar_h;
-    if (canvas_h < 160.0f) canvas_h = 160.0f;
-    float preview_w = 0.0f;
-    float canvas_w = ImGui::GetContentRegionAvail().x;
-    if (st.gm_show_3d) {
-        preview_w = std::clamp(canvas_w * 0.45f, 240.0f, 780.0f);
-        canvas_w -= preview_w + 6.0f;
-    }
-    if (canvas_w < 260.0f) canvas_w = 260.0f;
-    ImGui::BeginChild("##gmg2_canvas", ImVec2(canvas_w, canvas_h), ImGuiChildFlags_Borders);
-    const ImVec2 org = ImGui::GetCursorScreenPos();
-    const float cw = std::max(4.0f, canvas_w - 8.0f);
-    const float chh = std::max(4.0f, canvas_h - 8.0f);
-    ImGui::InvisibleButton("##gmg2_area", ImVec2(cw, chh));
-    const bool hovered = ImGui::IsItemHovered();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    // Frame the sketch (F / toolbar / first points after a clear or load).
-    auto frame = [&]() {
-        if (st.gm_points.empty()) return;
-        double minx = st.gm_points[0].x, maxx = st.gm_points[0].x;
-        double miny = st.gm_points[0].y, maxy = st.gm_points[0].y;
-        for (const auto& p : st.gm_points) {
-            minx = std::min(minx, p.x); maxx = std::max(maxx, p.x);
-            miny = std::min(miny, p.y); maxy = std::max(maxy, p.y);
-        }
-        for (const auto& h : st.gm_hats) {
-            minx = std::min(minx, h.x - h.radius); maxx = std::max(maxx, h.x + h.radius);
-            miny = std::min(miny, h.y);            maxy = std::max(maxy, h.y + h.height);
-        }
-        st.gm_canvas_cx = (float)((minx + maxx) * 0.5);
-        st.gm_canvas_cy = (float)((miny + maxy) * 0.5);
-        const float ex = std::max((float)(maxx - minx), 40.0f);
-        const float ey = std::max((float)(maxy - miny), 40.0f);
-        st.gm_canvas_scale = std::clamp(0.8f * std::min(cw / ex, chh / ey), 0.0005f, 500.0f);
-        st.gm_canvas_framed = true;
-    };
-    if ((want_frame || !st.gm_canvas_framed) && !st.gm_points.empty()) frame();
-
-    // World ↔ screen (y is world-up, screen y grows down).
-    auto to_screen = [&](double wx, double wy) {
-        return ImVec2(org.x + (float)((wx - st.gm_canvas_cx) * st.gm_canvas_scale) + cw * 0.5f,
-                      org.y + chh * 0.5f - (float)((wy - st.gm_canvas_cy) * st.gm_canvas_scale));
-    };
-    auto to_world = [&](const ImVec2& sp) {
-        return std::make_pair((double)st.gm_canvas_cx + (sp.x - org.x - cw * 0.5f) / st.gm_canvas_scale,
-                              (double)st.gm_canvas_cy - (sp.y - org.y - chh * 0.5f) / st.gm_canvas_scale);
-    };
-
-    // Wheel zoom (anchored under the cursor) + MMB pan.
-    if (hovered && io.MouseWheel != 0.0f) {
-        const float factor = (io.MouseWheel > 0.0f) ? 1.15f : (1.0f / 1.15f);
-        const auto before = to_world(ImGui::GetMousePos());
-        st.gm_canvas_scale = std::clamp(st.gm_canvas_scale * factor, 0.0005f, 500.0f);
-        const auto after = to_world(ImGui::GetMousePos());
-        st.gm_canvas_cx += (float)(before.first - after.first);
-        st.gm_canvas_cy += (float)(before.second - after.second);
-    }
-    if (hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-        st.gm_canvas_cx -= io.MouseDelta.x / st.gm_canvas_scale;
-        st.gm_canvas_cy += io.MouseDelta.y / st.gm_canvas_scale;
-    }
-    // Arrow keys pan the view (Shift = faster).
-    if (focused && !io.WantTextInput) {
-        float px = 0.0f, py = 0.0f;
-        if (ImGui::IsKeyDown(ImGuiKey_LeftArrow))  px -= 1.0f;
-        if (ImGui::IsKeyDown(ImGuiKey_RightArrow)) px += 1.0f;
-        if (ImGui::IsKeyDown(ImGuiKey_UpArrow))    py += 1.0f;
-        if (ImGui::IsKeyDown(ImGuiKey_DownArrow))  py -= 1.0f;
-        if (px != 0.0f || py != 0.0f) {
-            const float step = (io.KeyShift ? 40.0f : 10.0f) / st.gm_canvas_scale;
-            st.gm_canvas_cx += px * step;
-            st.gm_canvas_cy += py * step;
-        }
-    }
-    // Optional grid (nice 1/2/5 decades, world axes brighter).
-    if (st.gm_show_grid) {
-        const double target = 80.0 / std::max(0.0005, (double)st.gm_canvas_scale);
-        const double decade = std::pow(10.0, std::floor(std::log10(target)));
-        const double r = target / decade;
-        const double gstep = decade * (r >= 5.0 ? 5.0 : r >= 2.0 ? 2.0 : 1.0);
-        const double min_x = st.gm_canvas_cx - cw * 0.5 / st.gm_canvas_scale;
-        const double max_x = st.gm_canvas_cx + cw * 0.5 / st.gm_canvas_scale;
-        const double min_y = st.gm_canvas_cy - chh * 0.5 / st.gm_canvas_scale;
-        const double max_y = st.gm_canvas_cy + chh * 0.5 / st.gm_canvas_scale;
-        for (double gx = std::floor(min_x / gstep) * gstep; gx <= max_x; gx += gstep) {
-            const bool axis = std::fabs(gx) < gstep * 0.01;
-            dl->AddLine(to_screen(gx, min_y), to_screen(gx, max_y),
-                        axis ? IM_COL32(110, 120, 140, 110) : IM_COL32(90, 98, 114, 42), 1.0f);
-        }
-        for (double gy = std::floor(min_y / gstep) * gstep; gy <= max_y; gy += gstep) {
-            const bool axis = std::fabs(gy) < gstep * 0.01;
-            dl->AddLine(to_screen(min_x, gy), to_screen(max_x, gy),
-                        axis ? IM_COL32(110, 120, 140, 110) : IM_COL32(90, 98, 114, 42), 1.0f);
-        }
-    }
-
-    // Winding-aware top-edge test (backend normalizes CCW; top edges run
-    // ≈180° on CCW polygons, ≈0° on CW ones).
-    double area2 = 0.0;
-    {
-        const int n = (int)st.gm_points.size();
-        for (int i = 0; i < n; ++i) {
-            const int j = (i + 1) % n;
-            area2 += st.gm_points[i].x * st.gm_points[j].y -
-                     st.gm_points[j].x * st.gm_points[i].y;
-        }
-    }
-    const bool ccw = area2 >= 0.0;
-    auto is_top = [&](int i, int j) {
-        if (st.gm_top_angle <= 0.0f || (int)st.gm_points.size() < 2) return false;
-        double ang = std::atan2(st.gm_points[j].y - st.gm_points[i].y,
-                                st.gm_points[j].x - st.gm_points[i].x) * 180.0 / M_PI;
-        if (ang < 0.0) ang += 360.0;
-        const double want = ccw ? 180.0 : 0.0;
-        const double d = std::fabs(ang - want);
-        return std::min(d, 360.0 - d) < (double)st.gm_top_angle;
-    };
-
-    // Hit tests: nearest vertex (≤10px), nearest edge (≤8px), hat center /
-    // radius handle (≤12px / ≤8px).
-    int hover = -1, edge_hover = -1, hat_hover = -1, hat_handle = -1;
-    float edge_t = 0.0f;
-    if (hovered) {
-        const ImVec2 m = ImGui::GetMousePos();
-        for (int i = 0; i < (int)st.gm_points.size(); ++i) {
-            const ImVec2 sp = to_screen(st.gm_points[i].x, st.gm_points[i].y);
-            if (std::hypot(m.x - sp.x, m.y - sp.y) <= 10.0f) { hover = i; break; }
-        }
-        if (hover < 0 && st.gm_points.size() >= 2) {
-            float best_d = 8.0f;
-            for (int i = 0; i < (int)st.gm_points.size(); ++i) {
-                const int j = (i + 1) % (int)st.gm_points.size();
-                const ImVec2 a = to_screen(st.gm_points[i].x, st.gm_points[i].y);
-                const ImVec2 b = to_screen(st.gm_points[j].x, st.gm_points[j].y);
-                const float abx = b.x - a.x, aby = b.y - a.y;
-                const float len2 = abx * abx + aby * aby;
-                float t = len2 > 1e-6f ? ((m.x - a.x) * abx + (m.y - a.y) * aby) / len2 : 0.0f;
-                t = std::clamp(t, 0.0f, 1.0f);
-                const float d = std::hypotf(m.x - (a.x + abx * t), m.y - (a.y + aby * t));
-                if (d < best_d) { best_d = d; edge_hover = i; edge_t = t; }
-            }
-        }
-        for (int i = 0; i < (int)st.gm_hats.size(); ++i) {
-            const auto& h = st.gm_hats[i];
-            const ImVec2 c = to_screen(h.x, h.y);
-            if (std::hypot(m.x - c.x, m.y - c.y) <= 12.0f) hat_hover = i;
-            const ImVec2 hd(c.x + (float)(h.radius * st.gm_canvas_scale), c.y);
-            if (std::hypot(m.x - hd.x, m.y - hd.y) <= 8.0f) hat_handle = i;
-        }
-    }
-    // 1. Front face: translucent fill + solid outline (this IS the mesh).
-    if (st.gm_points.size() >= 3) {
-        std::vector<ImVec2> pts;
-        pts.reserve(st.gm_points.size());
-        for (const auto& p : st.gm_points) pts.push_back(to_screen(p.x, p.y));
-        dl->AddConvexPolyFilled(pts.data(), (int)pts.size(), IM_COL32(80, 150, 105, 90));
-        dl->AddPolyline(pts.data(), (int)pts.size(), IM_COL32(130, 225, 160, 255), 0, 2.5f);
-        dl->AddLine(pts.back(), pts.front(), IM_COL32(130, 225, 160, 255), 2.5f);
-        // 2. Walkable top edges, highlighted.
-        for (int i = 0; i < (int)st.gm_points.size(); ++i) {
-            const int j = (i + 1) % (int)st.gm_points.size();
-            if (is_top(i, j))
-                dl->AddLine(pts[i], pts[j], IM_COL32(255, 205, 90, 220), 4.0f);
-        }
-    } else if (st.gm_points.size() == 2) {
-        dl->AddLine(to_screen(st.gm_points[0].x, st.gm_points[0].y),
-                    to_screen(st.gm_points[1].x, st.gm_points[1].y),
-                    IM_COL32(130, 225, 160, 255), 2.5f);
-    }
-
-    // 3. Insert marker on the hovered edge (Add / Move tools).
-    if (edge_hover >= 0 && (st.gm_tool == 0 || st.gm_tool == 1) && hover < 0) {
-        const int j = (edge_hover + 1) % (int)st.gm_points.size();
-        const ImVec2 a = to_screen(st.gm_points[edge_hover].x, st.gm_points[edge_hover].y);
-        const ImVec2 b = to_screen(st.gm_points[j].x, st.gm_points[j].y);
-        const ImVec2 p(a.x + (b.x - a.x) * edge_t, a.y + (b.y - a.y) * edge_t);
-        dl->AddCircleFilled(p, 5.0f, IM_COL32(255, 215, 90, 230));
-        dl->AddCircle(p, 5.0f, IM_COL32(30, 30, 40, 255), 0, 1.5f);
-    }
-
-    // 4. Hat domes: footprint circle + radius handle + apex marker.
-    for (int i = 0; i < (int)st.gm_hats.size(); ++i) {
-        const auto& h = st.gm_hats[i];
-        const ImVec2 c = to_screen(h.x, h.y);
-        const float rr = (float)(h.radius * st.gm_canvas_scale);
-        const bool active = (i == st.gm_drag_hat) || i == hat_hover || i == hat_handle;
-        dl->AddCircle(c, rr, active ? IM_COL32(255, 170, 60, 255) : IM_COL32(210, 150, 110, 190), 0, 2.0f);
-        dl->AddCircleFilled(c, 3.5f, IM_COL32(235, 175, 95, 255));
-        dl->AddCircleFilled(ImVec2(c.x + rr, c.y), 4.5f, IM_COL32(255, 120, 70, 255));
-        const ImVec2 apex = to_screen(h.x, h.y + h.height);
-        dl->AddLine(c, apex, IM_COL32(210, 150, 110, 130));
-        dl->AddCircleFilled(apex, 3.0f, IM_COL32(150, 205, 120, 230));
-    }
-
-    // 5. Nodes: filled circles + index labels + coordinate readout.
-    for (int i = 0; i < (int)st.gm_points.size(); ++i) {
-        const ImVec2 sp = to_screen(st.gm_points[i].x, st.gm_points[i].y);
-        const bool near_m = hovered && std::hypot(ImGui::GetMousePos().x - sp.x,
-                                                  ImGui::GetMousePos().y - sp.y) <= 10.0f;
-        ImU32 col = IM_COL32(255, 130, 70, 255);
-        if (i == st.gm_drag_point) col = IM_COL32(255, 255, 120, 255);
-        else if (near_m) col = IM_COL32(255, 190, 120, 255);
-        const float r = (i == st.gm_drag_point || near_m) ? 6.5f : 5.0f;
-        dl->AddCircleFilled(sp, r, col);
-        dl->AddCircle(sp, r, IM_COL32(20, 20, 30, 255), 0, 1.5f);
-        char lbl[16];
-        snprintf(lbl, sizeof(lbl), "%d", i);
-        dl->AddText(ImVec2(sp.x + 7.0f, sp.y - 11.0f), IM_COL32(225, 235, 245, 190), lbl);
-    }
-    {
-        const int shown = (st.gm_dragging && st.gm_drag_point >= 0) ? st.gm_drag_point : hover;
-        if (shown >= 0 && shown < (int)st.gm_points.size()) {
-            const ImVec2 sp = to_screen(st.gm_points[shown].x, st.gm_points[shown].y);
-            char coord[64];
-            snprintf(coord, sizeof(coord), "(%.2f, %.2f)",
-                     st.gm_points[shown].x, st.gm_points[shown].y);
-            const ImVec2 tsz = ImGui::CalcTextSize(coord);
-            const ImVec2 tp(sp.x + 10.0f, sp.y - 26.0f);
-            dl->AddRectFilled(ImVec2(tp.x - 4.0f, tp.y - 2.0f),
-                              ImVec2(tp.x + tsz.x + 4.0f, tp.y + tsz.y + 2.0f),
-                              IM_COL32(20, 24, 32, 225));
-            dl->AddText(tp, IM_COL32(255, 235, 150, 255), coord);
-        }
-    }
-
-    // 6. Hint bar.
-    const char* hint =
-        (st.gm_tool == 0) ? "Move: drag nodes/hats · click edge = insert · MMB pan · wheel zoom"
-        : (st.gm_tool == 1) ? "Add: click empty = node on nearest edge · click edge = insert there"
-        : (st.gm_tool == 2) ? "Erase: click a node or a hat"
-        : "Hat: click = place · drag center = move · handle = resize";
-    dl->AddRectFilled(ImVec2(org.x, org.y + chh - 22.0f), ImVec2(org.x + cw, org.y + chh),
-                      IM_COL32(18, 21, 28, 200));
-    dl->AddText(ImVec2(org.x + 8.0f, org.y + chh - 18.0f), IM_COL32(160, 170, 190, 255), hint);
-    // ── Interactions ──
-    auto snap = [&](double& x, double& y) {
-        if (st.gm_snap) {
-            x = std::round(x / st.gm_snap_grid) * st.gm_snap_grid;
-            y = std::round(y / st.gm_snap_grid) * st.gm_snap_grid;
-        }
-    };
-    // Insertion index for a new node: split the nearest edge once the
-    // outline is closed; append while it is still open.
-    auto insert_at = [&](double wx, double wy) -> int {
-        const int n = (int)st.gm_points.size();
-        if (n < 3) return n;
-        double best = 1e30;
-        int at = n;
-        for (int i = 0; i < n; ++i) {
-            const int j = (i + 1) % n;
-            const double ax = st.gm_points[i].x, ay = st.gm_points[i].y;
-            const double bx = st.gm_points[j].x, by = st.gm_points[j].y;
-            const double dx = bx - ax, dy = by - ay;
-            const double len2 = dx * dx + dy * dy;
-            double t = len2 > 1e-12 ? ((wx - ax) * dx + (wy - ay) * dy) / len2 : 0.0;
-            t = std::clamp(t, 0.0, 1.0);
-            const double ex = ax + dx * t - wx, ey = ay + dy * t - wy;
-            const double d2 = ex * ex + ey * ey;
-            if (d2 < best) { best = d2; at = i + 1; }
-        }
-        return at;
-    };
-    // Mirror-X partner: insert on the mirrored edge (reversed traversal) so
-    // symmetric outlines stay symmetric; append as fallback.
-    auto mirror_insert = [&](int at, double x, double y) {
-        const int n = (int)st.gm_points.size();
-        const int a = (at - 1 + n) % n, b = at % n;
-        const double ax = st.gm_points[a].x, ay = st.gm_points[a].y;
-        const double bx = st.gm_points[b].x, by = st.gm_points[b].y;
-        for (int i = 0; i < n; ++i) {
-            const int j = (i + 1) % n;
-            if (std::fabs(st.gm_points[i].x + bx) < 1e-4 &&
-                std::fabs(st.gm_points[i].y - by) < 1e-4 &&
-                std::fabs(st.gm_points[j].x + ax) < 1e-4 &&
-                std::fabs(st.gm_points[j].y - ay) < 1e-4) {
-                st.gm_points.insert(st.gm_points.begin() + j, {-x, y});
-                return;
-            }
-        }
-        st.gm_points.push_back({-x, y});
-    };
-
-    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        const ImVec2 m = ImGui::GetMousePos();
-        if (st.gm_tool == 4) {                                   // Hat tool
-            if (hat_handle >= 0)      { st.gm_drag_hat = hat_handle; st.gm_hat_resizing = true; }
-            else if (hat_hover >= 0)  { st.gm_drag_hat = hat_hover;  st.gm_hat_dragging = true; }
-            else {
-                gm_push_undo(st);
-                auto w = to_world(m);
-                snap(w.first, w.second);
-                st.gm_hats.push_back({w.first, w.second, st.gm_hat_radius, st.gm_hat_height});
-                st.gm_drag_hat = (int)st.gm_hats.size() - 1;
-                st.gm_hat_dragging = true;
-            }
-        } else if (st.gm_tool == 2) {                            // Erase
-            if (hover >= 0) {
-                gm_push_undo(st);
-                st.gm_points.erase(st.gm_points.begin() + hover);
-                st.gm_drag_point = -1; st.gm_dragging = false;
-            } else if (hat_hover >= 0) {
-                gm_push_undo(st);
-                st.gm_hats.erase(st.gm_hats.begin() + hat_hover);
-                st.gm_drag_hat = -1;
-            }
-        } else if (st.gm_tool == 0 && hat_handle >= 0) {         // Move: resize hat
-            st.gm_drag_hat = hat_handle;
-            st.gm_hat_resizing = true;
-        } else if (st.gm_tool == 0 && hat_hover >= 0) {          // Move: grab hat
-            st.gm_drag_hat = hat_hover;
-            st.gm_hat_dragging = true;
-        } else if (hover >= 0 && st.gm_tool == 0) {              // Move: drag node
-            st.gm_drag_point = hover;
-            st.gm_dragging = true;
-            const auto w = to_world(m);
-            st.gm_drag_off_x = st.gm_points[hover].x - w.first;
-            st.gm_drag_off_y = st.gm_points[hover].y - w.second;
-        } else if (hover < 0 && edge_hover >= 0 &&
-                   (st.gm_tool == 0 || st.gm_tool == 1)) {       // Insert into edge
-            gm_push_undo(st);
-            const int a = edge_hover;
-            const int b = (a + 1) % (int)st.gm_points.size();
-            const auto w = to_world(m);
-            const double ax = st.gm_points[a].x, ay = st.gm_points[a].y;
-            const double bx = st.gm_points[b].x, by = st.gm_points[b].y;
-            const double dx = bx - ax, dy = by - ay;
-            const double len2 = dx * dx + dy * dy;
-            double t = len2 > 1e-12 ? ((w.first - ax) * dx + (w.second - ay) * dy) / len2 : 0.0;
-            t = std::clamp(t, 0.0, 1.0);
-            double sx = ax + dx * t, sy = ay + dy * t;
-            snap(sx, sy);
-            st.gm_points.insert(st.gm_points.begin() + b, {sx, sy});
-            if (st.gm_mirror_x) mirror_insert(b, sx, sy);
-            st.gm_drag_point = b;
-            st.gm_dragging = (st.gm_tool == 0);
-            st.gm_drag_off_x = st.gm_drag_off_y = 0.0;
-        } else if (st.gm_tool == 0 || st.gm_tool == 1) {         // Add node
-            gm_push_undo(st);
-            auto w = to_world(m);
-            snap(w.first, w.second);
-            const int at = insert_at(w.first, w.second);
-            st.gm_points.insert(st.gm_points.begin() + at, {w.first, w.second});
-            if (st.gm_mirror_x) mirror_insert(at, w.first, w.second);
-            st.gm_drag_point = at;
-            st.gm_dragging = (st.gm_tool == 0);
-            st.gm_drag_off_x = st.gm_drag_off_y = 0.0;
-        }
-    }
-    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-        if (hat_hover >= 0) {                        // RMB: remove hat
-            gm_push_undo(st);
-            st.gm_hats.erase(st.gm_hats.begin() + hat_hover);
-            st.gm_drag_hat = -1;
-        } else if (hover >= 0) {                     // RMB: remove node
-            gm_push_undo(st);
-            st.gm_points.erase(st.gm_points.begin() + hover);
-            st.gm_drag_point = -1; st.gm_dragging = false;
-        }
-    }
-    // Delete key: hovered node first, else hovered hat (one per press).
-    if (hovered && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
-        if (hover >= 0) {
-            gm_push_undo(st);
-            st.gm_points.erase(st.gm_points.begin() + hover);
-            st.gm_drag_point = -1; st.gm_dragging = false;
-        } else if (hat_hover >= 0) {
-            gm_push_undo(st);
-            st.gm_hats.erase(st.gm_hats.begin() + hat_hover);
-        }
-    }
-    // Drag loops (continue even if the cursor slips off the canvas).
-    if (st.gm_dragging && st.gm_drag_point >= 0 && st.gm_drag_point < (int)st.gm_points.size()) {
-        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            auto w = to_world(ImGui::GetMousePos());
-            w.first += st.gm_drag_off_x;
-            w.second += st.gm_drag_off_y;
-            snap(w.first, w.second);
-            st.gm_points[st.gm_drag_point] = {w.first, w.second};
-        } else {
-            st.gm_dragging = false;
-            st.gm_drag_point = -1;
-        }
-    }
-    if (st.gm_hat_dragging && st.gm_drag_hat >= 0 && st.gm_drag_hat < (int)st.gm_hats.size()) {
-        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            const auto w = to_world(ImGui::GetMousePos());
-            st.gm_hats[st.gm_drag_hat].x = w.first;
-            st.gm_hats[st.gm_drag_hat].y = w.second;
-        } else {
-            st.gm_hat_dragging = false;
-            st.gm_drag_hat = -1;
-        }
-    }
-    if (st.gm_hat_resizing && st.gm_drag_hat >= 0 && st.gm_drag_hat < (int)st.gm_hats.size()) {
-        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            const auto w = to_world(ImGui::GetMousePos());
-            auto& h = st.gm_hats[st.gm_drag_hat];
-            h.radius = std::clamp(std::hypot(w.first - h.x, w.second - h.y), 5.0, 400.0);
-        } else {
-            st.gm_hat_resizing = false;
-            st.gm_drag_hat = -1;
-        }
-    }
-
-    ImGui::EndChild(); // gmg2_canvas
-
-    // ── Live 3D preview of the extruded mesh (real backend geometry) ──
-    // Rebuild whenever the sketch / extrusion changed (throttled to ~7 Hz).
-    {
-        static double s_prev_rebuild = 0.0;
-        static size_t s_prev_counts = 0;
-        const size_t counts = st.gm_points.size() * 1000003 + st.gm_hats.size() * 7 +
-                              (size_t)(st.gm_z * 4) + (size_t)(st.gm_min_depth * 4) +
-                              (size_t)(st.gm_max_depth * 4) + (size_t)(st.gm_top_angle * 4) +
-                              (size_t)st.gm_generate_top + (size_t)st.gm_dimension_object;
-        const double now = ImGui::GetTime();
-        if (st.gm_show_3d &&
-            (counts != s_prev_counts || now - s_prev_rebuild > 0.15 || !st.gm_preview_valid)) {
-            gm_rebuild_preview(st);
-            s_prev_counts = counts;
-            s_prev_rebuild = now;
-        }
-    }
-    if (st.gm_show_3d) {
-        ImGui::SameLine();
-        ImGui::BeginChild("##gmg2_3d", ImVec2(preview_w, canvas_h), ImGuiChildFlags_Borders);
-        ImGui::TextDisabled(ICON_FA_CUBE " 3D Preview");
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", st.gm_preview_valid ? "live" : "(build...)");
-        ImGui::Separator();
-        const float pvw = std::max(4.0f, ImGui::GetContentRegionAvail().x);
-        const float pvh = std::max(4.0f, ImGui::GetContentRegionAvail().y);
-        if (st.gm_preview_valid && !st.gm_preview_meshes.empty()) {
-            if (!st.gm_preview_fbo) {
-                st.gm_preview_fbo = av::create_fbo((int)pvw, (int)pvh, &st.gm_preview_fbo_tex);
-                st.gm_preview_w = (int)pvw; st.gm_preview_h = (int)pvh;
-            } else if ((int)pvw != st.gm_preview_w || (int)pvh != st.gm_preview_h) {
-                av::resize_fbo(st.gm_preview_fbo, (int)pvw, (int)pvh, &st.gm_preview_fbo_tex);
-                st.gm_preview_w = (int)pvw; st.gm_preview_h = (int)pvh;
-            }
-            // Orbit: LMB drag · zoom: wheel · pan: RMB drag (from the backup).
-            const bool prev_hovered = ImGui::IsWindowHovered();
-            if (prev_hovered && io.MouseWheel != 0.0f) {
-                const float factor = std::pow(0.94f, io.MouseWheel);
-                st.gm_preview_cam.distance = std::clamp(st.gm_preview_cam.distance * factor,
-                                                        0.5f, 2000.0f);
-            }
-            if (prev_hovered && ImGui::IsMouseDragging(0)) {
-                st.gm_preview_cam.yaw   += io.MouseDelta.x * 0.5f;
-                st.gm_preview_cam.pitch += io.MouseDelta.y * 0.5f;
-                st.gm_preview_cam.pitch = std::clamp(st.gm_preview_cam.pitch, -89.0f, 89.0f);
-            }
-            if (prev_hovered && ImGui::IsMouseDragging(1)) {
-                const float scale = st.gm_preview_cam.distance * 0.003f;
-                st.gm_preview_cam.target[0] -= std::cos(st.gm_preview_cam.yaw * 3.14159f / 180.0f) * io.MouseDelta.x * scale;
-                st.gm_preview_cam.target[2] += std::sin(st.gm_preview_cam.yaw * 3.14159f / 180.0f) * io.MouseDelta.x * scale;
-                st.gm_preview_cam.target[1] += io.MouseDelta.y * scale;
-            }
-
-            // The sketch preview is a close-up editor view: no scene fog/lights.
-            av::clear_point_lights();
-            av::set_depth_fog(false, nullptr, 0.0f, 0.0f);
-            av::begin_3d(st.gm_preview_fbo, (int)pvw, (int)pvh, st.gm_preview_cam);
-            av::render_grid_xy(60.0f, st.gm_preview_cam.target[2] - st.gm_preview_cam.distance * 0.5f);
-            float identity[16];
-            av::mat4_identity(identity);
-            for (size_t i = 0; i < st.gm_preview_meshes.size(); ++i) {
-                auto& gm = st.gm_preview_meshes[i];
-                gm.texture_id = (i < st.gm_preview_textures.size()) ? st.gm_preview_textures[i] : 0;
-                float col[4] = {1, 1, 1, 1};
-                av::render_mesh(gm, identity, col, false);
-            }
-            av::end_3d();
-
-            const ImVec2 ppos = ImGui::GetCursorScreenPos();
-            ImGui::Image((ImTextureID)(intptr_t)st.gm_preview_fbo_tex, ImVec2(pvw, pvh),
-                         ImVec2(0, 1), ImVec2(1, 0));
-            // Preview hint bar.
-            ImDrawList* pdl = ImGui::GetWindowDrawList();
-            pdl->AddRectFilled(ImVec2(ppos.x, ppos.y + pvh - 22.0f),
-                               ImVec2(ppos.x + pvw, ppos.y + pvh),
-                               IM_COL32(18, 21, 28, 215));
-            char hint[96];
-            snprintf(hint, sizeof(hint),
-                     "LMB orbit \xc2\xb7 Wheel zoom \xc2\xb7 RMB pan \xc2\xb7 Z %.0f", st.gm_z);
-            pdl->AddText(ImVec2(ppos.x + 6, ppos.y + pvh - 18.0f),
-                         IM_COL32(150, 165, 190, 255), hint);
-        } else {
-            ImGui::Dummy(ImVec2(0.0f, pvh * 0.35f));
-            ImGui::TextDisabled("Sketch a polygon (3+ points)\nto preview the extruded mesh.");
-        }
-        ImGui::EndChild(); // gmg2_3d
-    }
-
-    // ── Properties + actions ──
-    ImGui::Spacing();
-    ImGui::SetNextItemWidth(92.0f);
-    ImGui::DragFloat("Z", &st.gm_z, 0.5f, -100.0f, 300.0f, "Z %.1f");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("World depth (parallax layer) of the generated mesh. Vanilla levels use Z 30-50.");
-    ImGui::SameLine();
-    float th = std::fabs(st.gm_max_depth - st.gm_min_depth);
-    ImGui::SetNextItemWidth(92.0f);
-    if (ImGui::DragFloat("Thick", &th, 1.0f, 0.0f, 400.0f, "Thick %.0f")) {
-        const float center = (st.gm_min_depth + st.gm_max_depth) * 0.5f;
-        st.gm_min_depth = center - th * 0.5f;
-        st.gm_max_depth = center + th * 0.5f;
-    }
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(74.0f);
-    ImGui::DragFloat("Top##gmg_ang", &st.gm_top_angle, 0.5f, 0.0f, 90.0f, "%.0f\xc2\xb0");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edges flatter than this angle get a walkable top cap.");
-    ImGui::SameLine();
-    ImGui::Checkbox("Top cap", &st.gm_generate_top);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Build the top/surface cap mesh on flat-top segments.");
-    ImGui::SameLine();
-    ImGui::Checkbox("Dim obj", &st.gm_dimension_object);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Tag as DimensionObject: only visible in-game during the Dimension Rift powerup.");
-
-    ImGui::SetNextItemWidth(120.0f);
-    ImGui::InputText("Name", st.gm_obj_name, sizeof(st.gm_obj_name));
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(110.0f);
-    ImGui::InputText("TopTex", st.gm_top_tex, sizeof(st.gm_top_tex));
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(110.0f);
-    ImGui::InputText("BotTex", st.gm_bottom_tex, sizeof(st.gm_bottom_tex));
-    ImGui::SameLine();
-    ImGui::Checkbox("Mirror X", &st.gm_mirror_x);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Also place a mirrored partner point (x becomes -x).");
-    ImGui::SameLine();
-    ImGui::Checkbox("Snap", &st.gm_snap);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(64.0f);
-    ImGui::DragFloat("##gmg_snap", &st.gm_snap_grid, 0.05f, 0.05f, 20.0f, "%.2f");
-    ImGui::SameLine();
-    ImGui::Checkbox("Grid", &st.gm_show_grid);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(66.0f);
-    ImGui::DragFloat("HatR", &st.gm_hat_radius, 1.0f, 5.0f, 300.0f, "%.0f");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(66.0f);
-    ImGui::DragFloat("HatH", &st.gm_hat_height, 1.0f, 5.0f, 200.0f, "%.0f");
-    if (ImGui::Button(ICON_FA_PLUS " Add to Scene", ImVec2(126, 26))) gm_add_to_scene(st);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Generate the mesh and inject it into the open scene.");
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_FLOPPY_DISK " Save .swdm", ImVec2(122, 26))) {
-        const std::string path = st.scene.filepath.empty()
-            ? std::string("ground_mesh.swdm")
-            : fs::path(st.scene.filepath).parent_path().string() + "/" + st.gm_obj_name + ".swdm";
-        std::ofstream out(path, std::ios::trunc);
-        if (out) { out << gm_build_swdm_text(st); st.status_msg = "Saved " + path; }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Load .swdm", ImVec2(96, 26))) ImGui::OpenPopup("Load .swdm");
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_LAYER_GROUP " Import sel", ImVec2(112, 26))) gm_import_from_scene(st);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Load the selected object's ground mesh into the sketcher.");
-    if (st.gm_edit_apply_object >= 0) {
-        ImGui::SameLine();
-        if (ImGui::Button(ICON_FA_CHECK " Apply to Object", ImVec2(148, 26))) gm_apply_to_object(st);
-        ImGui::SameLine();
-        if (ImGui::Button(ICON_FA_XMARK " Cancel", ImVec2(84, 26))) {
-            st.gm_edit_apply_object = -1;
-            st.gm_workspace_mode = 0;
-            st.scene_mesh_edit = false;
-            switch_scene_tab(st, 1);
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_TRASH " Clear", ImVec2(78, 26))) {
-        gm_push_undo(st);
-        st.gm_points.clear();
-        st.gm_hats.clear();
-        st.gm_canvas_framed = false;
-        st.gm_drag_point = -1; st.gm_dragging = false;
-        st.gm_drag_hat = -1; st.gm_hat_dragging = st.gm_hat_resizing = false;
-    }
-    if (ImGui::BeginPopup("Load .swdm")) {
-        static char load_buf[512] = {};
-        ImGui::InputText("Path", load_buf, sizeof(load_buf));
-        if (ImGui::Button("Load")) {
-            std::ifstream f(load_buf, std::ios::binary);
-            if (f) {
-                std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                const boulder::GroundMesh gm = boulder::parse_ground_mesh(content);
-                if (gm.polygon.size() >= 3) {
-                    gm_push_undo(st);
-                    st.gm_points = gm.polygon;
-                    st.gm_hats = gm.hats;
-                    st.gm_min_depth = (float)gm.min_depth;
-                    st.gm_max_depth = (float)gm.max_depth;
-                    st.gm_top_angle = (float)gm.top_angle;
-                    st.gm_generate_top = gm.generate_top;
-                    st.gm_z = (float)gm.z;
-                    snprintf(st.gm_top_tex, sizeof(st.gm_top_tex), "%s", gm.top_texture.c_str());
-                    snprintf(st.gm_bottom_tex, sizeof(st.gm_bottom_tex), "%s", gm.bottom_texture.c_str());
-                    st.gm_canvas_framed = false;
-                    st.status_msg = "Loaded " + std::string(load_buf);
-                } else {
-                    st.status_msg = "Invalid .swdm file.";
-                }
-            } else {
-                st.status_msg = "Cannot open " + std::string(load_buf);
-            }
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
-}
-
-// ── Ground Mesh Generator — previous implementation, kept for reference ──
-// Disabled (never called). State fields and backend helpers are shared with
-// the v2 implementation above.
-__attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerState& st) {
 
     ImGuiIO& io = ImGui::GetIO();
-    // Professional hotkeys: V move · E add · D erase · B freehand · H hat ·
-    // F frame. Only honored when the generator window itself has focus, so
-    // they never steal keystrokes from the scene viewport or other panels.
+    // Professional hotkeys: V move · E add · D erase · B freehand · F frame.
+    // Only honored when the generator window itself has focus, so they never
+    // steal keystrokes from the scene viewport or other panels.
     const bool gm_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     const bool do_frame_key = gm_focused && ImGui::IsKeyPressed(ImGuiKey_F) && !io.WantTextInput;
     if (gm_focused && ImGui::IsKeyPressed(ImGuiKey_V) && !io.WantTextInput) st.gm_tool = 0;
@@ -7547,22 +5809,14 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
     if (gm_focused && ImGui::IsKeyPressed(ImGuiKey_D) && !io.WantTextInput) st.gm_tool = 2;
     if (gm_focused && ImGui::IsKeyPressed(ImGuiKey_B) && !io.WantTextInput) st.gm_tool = 3;
     if (gm_focused && ImGui::IsKeyPressed(ImGuiKey_H) && !io.WantTextInput) st.gm_tool = 4;
-    if (gm_focused && ImGui::IsKeyPressed(ImGuiKey_Backspace) && !io.WantTextInput &&
-        !st.gm_points.empty() && !st.gm_dragging) {
-        gm_push_undo(st);
+    if (gm_focused && ImGui::IsKeyPressed(ImGuiKey_Backspace) && !io.WantTextInput && !st.gm_points.empty()) {
         st.gm_points.pop_back();
         st.gm_sketch_dirty = true;
     }
-    // Sketch undo/redo: Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z (never while typing).
-    if (gm_focused && io.KeyCtrl && !io.WantTextInput) {
-        if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z)) gm_undo_sketch(st);
-        if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z)) gm_redo_sketch(st);
-        if (ImGui::IsKeyPressed(ImGuiKey_Y)) gm_redo_sketch(st);
-    }
 
-    // Rebuild the live 3D mesh whenever the sketch / extrusion changed.
+    // Rebuild the live 3D preview whenever the sketch / extrusion changed.
     // Throttle to ~7 Hz so continuous slider drags don't rebuild every frame.
-    if (st.gm_sketch_dirty) {
+    if (st.gm_sketch_dirty && st.gm_show_3d) {
         static double s_gm_last_rebuild = 0.0;
         const double now = ImGui::GetTime();
         if (now - s_gm_last_rebuild > 0.15 || !st.gm_preview_valid) {
@@ -7578,521 +5832,228 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
         }
     }
 
-    // ── Remastered layout ──
-    // Two compact toolbar rows on top (tools · history · transforms · view
-    // options), then the sketch canvas takes the FULL remaining width, with
-    // the depth/accuracy/material rows and the action bar docked at the
-    // bottom. The old build burned a 98px vertical rail on tool buttons and
-    // left the canvas cramped.
+    // Reserve bottom space for the properties + action bars (Depth section
+    // takes two rows plus the action bar, so give it generous room).
     const float props_h = 210.0f;
-
-    // Row 1: tools + sketch history + live stats.
-    auto gm_tool_btn = [&](int id, const char* label, const char* tip) {
-        const bool active = (st.gm_tool == id);
-        if (active) ImGui::PushStyleColor(ImGuiCol_Button, th_mix(g_theme.surface_active, g_theme.accent, 0.35f));
-        if (ImGui::Button(label, ImVec2(88.0f, 24))) st.gm_tool = id;
-        if (active) ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
-    };
-    gm_tool_btn(0, ICON_FA_HAND_POINTER " Move", "Move (V) — drag nodes · click an edge to insert a node · click empty space to add");
-    ImGui::SameLine();
-    gm_tool_btn(1, ICON_FA_PLUS " Add", "Add (E) — click to add a node (inserted into the closest edge so the outline stays sane)");
-    ImGui::SameLine();
-    gm_tool_btn(2, ICON_FA_TRASH " Erase", "Erase (D) — click a node or a hat to remove it");
-    ImGui::SameLine();
-    gm_tool_btn(3, ICON_FA_PEN " Draw", "Draw (B) — freehand an outline · hold Shift to append to the current one");
-    ImGui::SameLine();
-    gm_tool_btn(4, ICON_FA_MOUNTAIN_SUN " Hat", "Hat (H) — place round-hat domes · drag the center to move · orange handle resizes");
-    ImGui::SameLine();
-    ImGui::TextDisabled("\xe2\x94\x82");
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_ARROW_ROTATE_LEFT " Undo", ImVec2(78.0f, 24))) gm_undo_sketch(st);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Undo the last sketch edit (Ctrl+Z)");
-    ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_ARROW_ROTATE_RIGHT " Redo", ImVec2(78.0f, 24))) gm_redo_sketch(st);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Redo a sketch edit (Ctrl+Y / Ctrl+Shift+Z)");
-    ImGui::SameLine();
-    ImGui::TextDisabled("%d pts · %zu hat%s", (int)st.gm_points.size(), st.gm_hats.size(),
-                        st.gm_hats.size() == 1 ? "" : "s");
-    if (st.gm_points.size() >= 3) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("depth %.0f · top %.0f\xc2\xb0",
-                            std::fabs((double)st.gm_max_depth - (double)st.gm_min_depth),
-                            (double)st.gm_top_angle);
-    }
-    if (!st.gm_undo_points.empty()) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("%zu undo step%s", st.gm_undo_points.size(),
-                            st.gm_undo_points.size() == 1 ? "" : "s");
-    }
-
-    // Row 2: transforms + options + view framing.
-    auto gm_transform = [&](const char* label, const char* tip, auto op) {
-        if (ImGui::Button(label, ImVec2(88.0f, 22))) {
-            if (!st.gm_points.empty()) {
-                gm_push_undo(st);
-                for (auto& p : st.gm_points) op(p);
-                st.gm_sketch_dirty = true;
-            }
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
-    };
-    gm_transform("Rotate 90\xc2\xb0", "Rotate the sketch 90\xc2\xb0 (CCW)",
-                 [](boulder::PolygonPoint& p) { const double nx = -p.y; p.y = p.x; p.x = nx; });
-    ImGui::SameLine();
-    gm_transform("Flip X", "Flip the sketch horizontally (mirror X)",
-                 [](boulder::PolygonPoint& p) { p.x = -p.x; });
-    ImGui::SameLine();
-    gm_transform("Flip Y", "Flip the sketch vertically (mirror Y)",
-                 [](boulder::PolygonPoint& p) { p.y = -p.y; });
-    ImGui::SameLine();
-    gm_transform("Snap 1.0", "Snap every point to the 1.0 grid",
-                 [](boulder::PolygonPoint& p) { p.x = std::round(p.x); p.y = std::round(p.y); });
-    ImGui::SameLine();
-    ImGui::TextDisabled("\xe2\x94\x82");
-    ImGui::SameLine();
-    ImGui::Checkbox("Mirror X", &st.gm_mirror_x);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Mirror new points across the Y axis (x becomes -x)");
-    ImGui::SameLine();
-    ImGui::Checkbox("Snap", &st.gm_snap);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Snap new/moved points to the grid step below");
-    if (st.gm_snap) {
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(96.0f);
-        ImGui::DragFloat("##snapgrid", &st.gm_snap_grid, 0.05f, 0.05f, 20.0f, "step %.2f");
-    }
-    ImGui::SameLine();
-    ImGui::Checkbox("Grid", &st.gm_show_grid);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show the scale grid on the sketch canvas");
-    ImGui::SameLine();
-    bool want_frame = do_frame_key;
-    if (ImGui::Button(ICON_FA_LOCATION_DOT " Frame (F)", ImVec2(102.0f, 22))) want_frame = true;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fit the whole sketch into the canvas (F)");
-
-    // ── Sketch canvas: full remaining width, properties stay below ──
-    float canvas_h = ImGui::GetContentRegionAvail().y - props_h;
+    const float tools_w = 98.0f;
+    ImVec2 win_avail = ImGui::GetContentRegionAvail();
+    float canvas_h = win_avail.y - props_h;
     if (canvas_h < 170.0f) canvas_h = 170.0f;
-    ImGui::BeginChild("##gm_canvas_host", ImVec2(0.0f, canvas_h), ImGuiChildFlags_Borders);
-    const ImVec2 canvas_origin = ImGui::GetCursorScreenPos();
-    const int cw = std::max(4, (int)ImGui::GetContentRegionAvail().x);
-    const int ch = std::max(4, (int)canvas_h - 8);
-    ImGui::InvisibleButton("##gm_canvas", ImVec2((float)cw, (float)ch));
-    const bool canvas_hovered = ImGui::IsItemHovered();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    // Fit the whole sketch into the canvas (F key / Frame button / first
-    // time). Works from the very first point on and includes hat extents.
+    // Split the workspace: 2D sketch canvas + (optional) live 3D preview.
+    // The preview gets a healthy share (and the Mesh tab now spans the full
+    // window, so it can be comfortably wide instead of a cramped box).
+    float canvas_w = win_avail.x - tools_w - 12.0f;
+    float preview_w = 0.0f;
+    if (st.gm_show_3d) {
+        preview_w = std::clamp(canvas_w * 0.45f, 240.0f, 780.0f);
+        canvas_w -= preview_w + 6.0f;
+    }
+    if (canvas_w < 260.0f) canvas_w = 260.0f;
+
+    // ── Left tools rail ──
+    ImGui::BeginChild("##gm_tools", ImVec2(tools_w, canvas_h), ImGuiChildFlags_Borders);
+    ImGui::TextDisabled("Tools");
+    ImGui::Separator();
+    auto tool_button = [&](int id, const char* icon, const char* label) {
+        if (st.gm_tool == id) ImGui::PushStyleColor(ImGuiCol_Button, th_mix(g_theme.surface_active, g_theme.accent, 0.35f));
+        if (ImGui::Button(icon, ImVec2(tools_w - 14.0f, 24))) st.gm_tool = id;
+        if (st.gm_tool == id) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", label);
+        const float cx = ImGui::GetCursorPosX() + (tools_w - 14.0f - ImGui::CalcTextSize(label).x) * 0.5f;
+        ImGui::SetCursorPosX(cx);
+        ImGui::TextDisabled("%s", label);
+    };
+    tool_button(0, ICON_FA_HAND_POINTER, "Move  (V)");
+    tool_button(1, ICON_FA_PLUS, "Add  (E)");
+    tool_button(2, ICON_FA_TRASH, "Erase (D)");
+    tool_button(4, ICON_FA_MOUNTAIN_SUN, "Hat  (H)");
+    ImGui::Separator();
+    ImGui::Checkbox("Mirror X", &st.gm_mirror_x);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Mirror new points across the Y axis");
+    ImGui::Checkbox("3D Preview", &st.gm_show_3d);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show a live 3D view of the extruded mesh beside the sketch");
+    if (st.gm_show_3d && !st.gm_preview_valid && st.gm_points.size() >= 3)
+        st.gm_sketch_dirty = true;
+    ImGui::Separator();
+    ImGui::TextDisabled("%d pts", (int)st.gm_points.size());
+    if (st.gm_points.size() >= 3) {
+        const double depth = std::fabs((double)st.gm_max_depth - (double)st.gm_min_depth);
+        ImGui::TextDisabled("depth %.0f", depth);
+        ImGui::TextDisabled("top %.0f\xc2\xb0", st.gm_top_angle);
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+
+    // ── 2D sketch canvas ──
+    ImGui::BeginChild("##gm_canvas_host", ImVec2(canvas_w, canvas_h), ImGuiChildFlags_Borders);
+    ImVec2 canvas_origin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##gm_canvas", ImVec2(canvas_w, canvas_h - 8.0f));
+    // Shared framing: fit the whole sketch polygon into the canvas.
     auto gm_frame_sketch = [&]() {
         if (st.gm_points.empty()) return;
         double minx = st.gm_points[0].x, maxx = st.gm_points[0].x;
         double miny = st.gm_points[0].y, maxy = st.gm_points[0].y;
-        for (const auto& p : st.gm_points) {
+        for (auto& p : st.gm_points) {
             minx = std::min(minx, p.x); maxx = std::max(maxx, p.x);
             miny = std::min(miny, p.y); maxy = std::max(maxy, p.y);
         }
-        for (const auto& h : st.gm_hats) {
-            minx = std::min(minx, h.x - h.radius); maxx = std::max(maxx, h.x + h.radius);
-            miny = std::min(miny, h.y);            maxy = std::max(maxy, h.y + h.height);
-        }
-        st.gm_canvas_cx = (float)((minx + maxx) * 0.5);
-        st.gm_canvas_cy = (float)((miny + maxy) * 0.5);
-        const float ex = std::max((float)(maxx - minx), 40.0f);
-        const float ey = std::max((float)(maxy - miny), 40.0f);
-        st.gm_canvas_scale = std::clamp(0.8f * std::min((float)cw / ex, (float)ch / ey),
-                                        0.0005f, 500.0f);
-        st.gm_canvas_framed = true;
+        st.gm_canvas_cx = (minx + maxx) / 2.0;
+        st.gm_canvas_cy = (miny + maxy) / 2.0;
+        st.gm_canvas_scale = std::clamp((float)(0.8 * canvas_w / std::max(maxx - minx, maxy - miny)),
+                                        0.05f, 50.0f);
     };
-    // Frame ONLY on request: a fresh sketch (first node / import / load /
-    // clear-then-redraw resets gm_canvas_framed) or the explicit F key /
-    // Frame button. The old build re-framed on every dirty frame, so the
-    // view constantly zoomed and slid away under the cursor while dragging
-    // nodes or tweaking sliders — making detail work impossible.
-    if (want_frame || (!st.gm_points.empty() && !st.gm_canvas_framed))
-        gm_frame_sketch();
+    const bool canvas_hovered = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    // World <-> screen mapping (y is world-up, screen y grows down).
+    // Map world <-> screen: y is world-up, screen y grows down.
     auto to_screen = [&](double wx, double wy) {
-        return ImVec2(canvas_origin.x + (float)((wx - st.gm_canvas_cx) * st.gm_canvas_scale) + (float)cw * 0.5f,
-                      canvas_origin.y + (float)ch * 0.5f - (float)((wy - st.gm_canvas_cy) * st.gm_canvas_scale));
+        float sx = canvas_origin.x + (float)((wx - st.gm_canvas_cx) * st.gm_canvas_scale);
+        float sy = canvas_origin.y + canvas_h * 0.5f - (float)((wy - st.gm_canvas_cy) * st.gm_canvas_scale);
+        return ImVec2(sx, sy);
     };
-    auto to_world = [&](const ImVec2& sp) {
-        return std::make_pair((double)st.gm_canvas_cx + (sp.x - canvas_origin.x - (float)cw * 0.5f) / st.gm_canvas_scale,
-                              (double)st.gm_canvas_cy - (sp.y - canvas_origin.y - (float)ch * 0.5f) / st.gm_canvas_scale);
+    auto to_world = [&](ImVec2 sp) {
+        double wx = st.gm_canvas_cx + (sp.x - canvas_origin.x) / st.gm_canvas_scale;
+        double wy = st.gm_canvas_cy + (canvas_origin.y + canvas_h * 0.5f - sp.y) / st.gm_canvas_scale;
+        return std::make_pair(wx, wy);
     };
 
-    // Wheel zoom (anchored under the cursor) + MMB pan.
+    // Zoom with wheel; pan with middle mouse.
     if (canvas_hovered && io.MouseWheel != 0.0f) {
         const float factor = (io.MouseWheel > 0.0f) ? 1.15f : (1.0f / 1.15f);
         const ImVec2 mouse = ImGui::GetMousePos();
         auto before = to_world(mouse);
-        st.gm_canvas_scale = std::clamp(st.gm_canvas_scale * factor, 0.0005f, 500.0f);
+        st.gm_canvas_scale = std::clamp(st.gm_canvas_scale * factor, 0.02f, 50.0f);
         auto after = to_world(mouse);
-        st.gm_canvas_cx += (float)(before.first - after.first);
-        st.gm_canvas_cy += (float)(before.second - after.second);
+        st.gm_canvas_cx += before.first - after.first;
+        st.gm_canvas_cy += before.second - after.second;
     }
     if (canvas_hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-        st.gm_canvas_cx -= io.MouseDelta.x / st.gm_canvas_scale;
-        st.gm_canvas_cy += io.MouseDelta.y / st.gm_canvas_scale;
+        auto d = io.MouseDelta;
+        st.gm_canvas_cx -= d.x / st.gm_canvas_scale;
+        st.gm_canvas_cy += d.y / st.gm_canvas_scale;
     }
 
-    // ── Winding-aware helpers ──
-    // The backend normalizes the polygon CCW (gm_ensure_ccw) before meshing;
-    // mirror that here so the top-face highlights match what will actually
-    // be built. On a CCW Y-up polygon the top surface edges run right→left
-    // (≈180°); on a clockwise sketch they run left→right (≈0°). The old
-    // build always assumed 180°, so clockwise sketches highlighted their
-    // BOTTOM edges as the top cap.
-    auto sketch_ccw = [&]() {
-        double area = 0.0;
-        const int n = (int)st.gm_points.size();
-        for (int i = 0; i < n; ++i) {
-            const int j = (i + 1) % n;
-            area += st.gm_points[i].x * st.gm_points[j].y -
-                    st.gm_points[j].x * st.gm_points[i].y;
-        }
-        return area >= 0.0;
-    };
-    const bool view_ccw = sketch_ccw();
-    auto is_top_edge = [&](int i, int j) {
-        if (st.gm_top_angle <= 0.0f || st.gm_points.size() < 2) return false;
-        double ang = std::atan2(st.gm_points[j].y - st.gm_points[i].y,
-                                st.gm_points[j].x - st.gm_points[i].x) * 180.0 / M_PI;
-        if (ang < 0.0) ang += 360.0;
-        const double want = view_ccw ? 180.0 : 0.0;
-        const double d = std::fabs(ang - want);
-        return std::min(d, 360.0 - d) < (double)st.gm_top_angle;
-    };
-
-    // ── 2D Mesh Preview (replaces 3D FBO) ──
-    // Clean orthographic representation of the 3D mesh schema:
-    //   Layer 1: Depth extrusion band (shaded strip showing MinDepth..MaxDepth)
-    //   Layer 2: Side walls (colored strips along each edge)
-    //   Layer 3: Top segments (highlighted bands for near-horizontal edges)
-    //   Layer 4: Front face triangulation (faint wireframe)
-    //   Layer 5: Hat domes (circle markers)
-    {
-        // Depth band width in screen pixels (world units * scale).
-        // Clamp so it's always visible even at extreme zoom.
-        const double depth_world = std::fabs(st.gm_max_depth - st.gm_min_depth);
-        const float  depth_px    = (float)(depth_world * st.gm_canvas_scale);
-        const float  band_half   = std::clamp(depth_px * 0.5f, 4.0f, 80.0f);
-
-        // Helper: compute outward unit normal for edge i→j.
-        auto edge_normal2d = [&](int i, int j) -> std::pair<double,double> {
-            double dx = st.gm_points[j].x - st.gm_points[i].x;
-            double dy = st.gm_points[j].y - st.gm_points[i].y;
-            double len = std::sqrt(dx*dx + dy*dy);
-            if (len < 1e-8) return {0.0, 0.0};
-            return { dy / len, -dx / len };  // outward (right-hand side)
-        };
-
-        // ── Layer 1+2: Depth extrusion band + side walls ──
-        // For each edge, draw a quad perpendicular to the edge showing the
-        // full depth range. The band is centered on the polygon edge.
-        if (st.gm_points.size() >= 2) {
-            // Depth band: four-sided strip along each edge
-            for (size_t i = 0; i < st.gm_points.size(); ++i) {
-                size_t j = (i + 1) % st.gm_points.size();
-                auto [nx, ny] = edge_normal2d((int)i, (int)j);
-                ImVec2 a = to_screen(st.gm_points[i].x, st.gm_points[i].y);
-                ImVec2 b = to_screen(st.gm_points[j].x, st.gm_points[j].y);
-                // Perpendicular screen-space offset along the edge normal
-                // (screen y is down, world y is up → negate).
-                ImVec2 soff((float)(nx * band_half), (float)(-ny * band_half));
-                ImVec2 a0(a.x - soff.x, a.y - soff.y);
-                ImVec2 a1(a.x + soff.x, a.y + soff.y);
-                ImVec2 b0(b.x - soff.x, b.y - soff.y);
-                ImVec2 b1(b.x + soff.x, b.y + soff.y);
-                // Outer band (darker = back depth)
-                dl->AddQuadFilled(a0, b0, b1, a1, IM_COL32(50, 70, 90, 55));
-                // Inner stripe (brighter = front depth / walkable surface)
-                float inner = band_half * 0.45f;
-                ImVec2 io1((float)(nx * inner), (float)(-ny * inner));
-                dl->AddLine(ImVec2(a.x - io1.x, a.y - io1.y),
-                            ImVec2(b.x - io1.x, b.y - io1.y),
-                            IM_COL32(100, 160, 120, 100), 1.5f);
-                dl->AddLine(ImVec2(a.x + io1.x, a.y + io1.y),
-                            ImVec2(b.x + io1.x, b.y + io1.y),
-                            IM_COL32(100, 160, 120, 100), 1.5f);
-            }
-        }
-
-        // ── Layer 3: Top segments (near-horizontal edges get wider highlight) ──
-        // Winding-aware via is_top_edge: clockwise sketches highlight the
-        // edges that will actually become the top surface after the backend
-        // normalizes the winding (the old build assumed CCW always).
-        if (st.gm_points.size() >= 2) {
-            for (size_t i = 0; i < st.gm_points.size(); ++i) {
-                size_t j = (i + 1) % st.gm_points.size();
-                if (is_top_edge((int)i, (int)j)) {
-                    // Top segment: draw a wider highlighted band
-                    auto [nx, ny] = edge_normal2d((int)i, (int)j);
-                    float top_w = band_half * 1.6f;  // top mesh extends ~25 units
-                    ImVec2 a = to_screen(st.gm_points[i].x, st.gm_points[i].y);
-                    ImVec2 b = to_screen(st.gm_points[j].x, st.gm_points[j].y);
-                    ImVec2 soff((float)(nx * top_w), (float)(-ny * top_w));
-                    ImVec2 a0(a.x - soff.x, a.y - soff.y);
-                    ImVec2 a1(a.x + soff.x, a.y + soff.y);
-                    ImVec2 b0(b.x - soff.x, b.y - soff.y);
-                    ImVec2 b1(b.x + soff.x, b.y + soff.y);
-                    // Filled band (top face texture region)
-                    dl->AddQuadFilled(a0, b0, b1, a1, IM_COL32(120, 180, 140, 70));
-                    // Bright edge highlight
-                    dl->AddLine(a0, b0, IM_COL32(180, 230, 160, 140), 2.0f);
-                    dl->AddLine(a1, b1, IM_COL32(180, 230, 160, 140), 2.0f);
-                }
-            }
-        }
-
-        // ── Layer 4: Front-face triangulation preview (real ear clipping) ──
-        // Draws the internal diagonals the front mesh will actually get.
-        // The old build fanned every diagonal from vertex 0, which is wrong
-        // for any concave outline.
-        if (st.gm_points.size() >= 3 && st.gm_points.size() <= 512) {
-            auto cross2 = [](const boulder::PolygonPoint& o,
-                             const boulder::PolygonPoint& a,
-                             const boulder::PolygonPoint& b) {
-                return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
-            };
-            std::vector<int> ring((int)st.gm_points.size());
-            for (int i = 0; i < (int)ring.size(); ++i) ring[i] = i;
-            if (!view_ccw) std::reverse(ring.begin(), ring.end());   // clip CCW
-            bool progressed = true;
-            while (ring.size() > 3 && progressed) {
-                progressed = false;
-                for (size_t k = 0; k < ring.size(); ++k) {
-                    const int i0 = ring[(k + ring.size() - 1) % ring.size()];
-                    const int i1 = ring[k];
-                    const int i2 = ring[(k + 1) % ring.size()];
-                    const auto& P = st.gm_points[i0];
-                    const auto& Q = st.gm_points[i1];
-                    const auto& R = st.gm_points[i2];
-                    if (cross2(P, Q, R) <= 1e-12) continue;          // reflex/degenerate
-                    bool ear = true;
-                    for (int v : ring) {
-                        if (v == i0 || v == i1 || v == i2) continue;
-                        const double d1 = cross2(P, Q, st.gm_points[v]);
-                        const double d2 = cross2(Q, R, st.gm_points[v]);
-                        const double d3 = cross2(R, P, st.gm_points[v]);
-                        if (d1 >= -1e-12 && d2 >= -1e-12 && d3 >= -1e-12) { ear = false; break; }
-                    }
-                    if (!ear) continue;
-                    dl->AddLine(to_screen(P.x, P.y), to_screen(R.x, R.y),
-                                IM_COL32(90, 110, 130, 35), 1.0f);
-                    ring.erase(ring.begin() + k);
-                    progressed = true;
-                    break;
-                }
-            }
-            if (ring.size() == 3) {
-                dl->AddLine(to_screen(st.gm_points[ring[0]].x, st.gm_points[ring[0]].y),
-                            to_screen(st.gm_points[ring[2]].x, st.gm_points[ring[2]].y),
-                            IM_COL32(90, 110, 130, 35), 1.0f);
-            }
-        }
-
-        // ── Layer 5: Hat domes ──
-        for (const auto& h : st.gm_hats) {
-            ImVec2 c = to_screen(h.x, h.y);
-            float rr = (float)(h.radius * st.gm_canvas_scale);
-            dl->AddCircle(c, rr, IM_COL32(180, 140, 90, 120), 0, 2.0f);
-            dl->AddCircleFilled(c, 3.0f, IM_COL32(200, 160, 100, 180));
-            // Height indicator (small upward arrow)
-            ImVec2 apex = to_screen(h.x, h.y + h.height);
-            dl->AddLine(c, apex, IM_COL32(180, 140, 90, 100), 1.5f);
-            dl->AddCircleFilled(apex, 2.5f, IM_COL32(150, 200, 120, 160));
+    // Procedural 1-2-5 grid: minor lines stay crisp while major spacing and
+    // coordinate labels adapt continuously to the current zoom.
+    dl->AddRectFilled(canvas_origin, ImVec2(canvas_origin.x + canvas_w, canvas_origin.y + canvas_h),
+                      ImGui::ColorConvertFloat4ToU32(g_theme.background));
+    const double target_world = 90.0 / std::max(0.02f, st.gm_canvas_scale);
+    const double decade = std::pow(10.0, std::floor(std::log10(target_world)));
+    const double normalized = target_world / decade;
+    const double major_step = (normalized < 2.0 ? 2.0 : normalized < 5.0 ? 5.0 : 10.0) * decade;
+    const double minor_step = major_step / 5.0;
+    const double min_x = st.gm_canvas_cx;
+    const double max_x = st.gm_canvas_cx + canvas_w / st.gm_canvas_scale;
+    const double half_world_h = canvas_h * 0.5 / st.gm_canvas_scale;
+    const double min_y = st.gm_canvas_cy - half_world_h;
+    const double max_y = st.gm_canvas_cy + half_world_h;
+    const ImU32 minor_col = g_theme.dark ? IM_COL32(88, 96, 112, 46) : IM_COL32(70, 78, 92, 34);
+    const ImU32 major_col = g_theme.dark ? IM_COL32(116, 126, 145, 92) : IM_COL32(70, 78, 92, 70);
+    const ImU32 label_col = ImGui::ColorConvertFloat4ToU32(g_theme.text_muted);
+    char lbl[32];
+    for (double gx = std::floor(min_x / minor_step) * minor_step; gx <= max_x; gx += minor_step) {
+        float sx = to_screen(gx, 0).x;
+        const double major_index = std::round(gx / major_step);
+        const bool major = std::fabs(gx - major_index * major_step) < minor_step * 0.01;
+        dl->AddLine(ImVec2(sx, canvas_origin.y), ImVec2(sx, canvas_origin.y + canvas_h),
+                    major ? major_col : minor_col, major ? 1.0f : 1.0f);
+        if (major && std::fabs(gx) > minor_step * 0.01) {
+            snprintf(lbl, sizeof(lbl), major_step < 1.0 ? "%.2f" : "%.0f", gx);
+            dl->AddText(ImVec2(sx + 4.0f, canvas_origin.y + canvas_h - 20.0f), label_col, lbl);
         }
     }
-
-    // Optional scale grid (off by default — Grid checkbox).
-    if (st.gm_show_grid) {
-        const double target_world = 90.0 / std::max(0.0005, (double)st.gm_canvas_scale);
-        const double decade = std::pow(10.0, std::floor(std::log10(target_world)));
-        const double normalized = target_world / decade;
-        const double major_step = (normalized < 2.0 ? 2.0 : normalized < 5.0 ? 5.0 : 10.0) * decade;
-        const double minor_step = major_step / 5.0;
-        const double min_x = st.gm_canvas_cx - cw * 0.5 / st.gm_canvas_scale;
-        const double max_x = st.gm_canvas_cx + cw * 0.5 / st.gm_canvas_scale;
-        const double min_y = st.gm_canvas_cy - ch * 0.5 / st.gm_canvas_scale;
-        const double max_y = st.gm_canvas_cy + ch * 0.5 / st.gm_canvas_scale;
-        const ImU32 minor_col = g_theme.dark ? IM_COL32(88, 96, 112, 46) : IM_COL32(70, 78, 92, 34);
-        const ImU32 major_col = g_theme.dark ? IM_COL32(116, 126, 145, 92) : IM_COL32(70, 78, 92, 70);
-        char lbl[32];
-        for (double gx = std::floor(min_x / minor_step) * minor_step; gx <= max_x; gx += minor_step) {
-            const double major_index = std::round(gx / major_step);
-            const bool major = std::fabs(gx - major_index * major_step) < minor_step * 0.01;
-            const ImVec2 a = to_screen(gx, min_y);
-            const ImVec2 b = to_screen(gx, max_y);
-            dl->AddLine(a, b, major ? major_col : minor_col, 1.0f);
-            if (major && std::fabs(gx) > minor_step * 0.01) {
-                snprintf(lbl, sizeof(lbl), major_step < 1.0 ? "%.2f" : "%.0f", gx);
-                dl->AddText(ImVec2(a.x + 3.0f, a.y), ImGui::ColorConvertFloat4ToU32(g_theme.text_muted), lbl);
-            }
-        }
-        for (double gy = std::floor(min_y / minor_step) * minor_step; gy <= max_y; gy += minor_step) {
-            const double major_index = std::round(gy / major_step);
-            const bool major = std::fabs(gy - major_index * major_step) < minor_step * 0.01;
-            const ImVec2 a = to_screen(min_x, gy);
-            const ImVec2 b = to_screen(max_x, gy);
-            dl->AddLine(a, b, major ? major_col : minor_col, 1.0f);
-            if (major && std::fabs(gy) > minor_step * 0.01) {
-                snprintf(lbl, sizeof(lbl), major_step < 1.0 ? "%.2f" : "%.0f", gy);
-                dl->AddText(ImVec2(a.x + 3.0f, a.y), ImGui::ColorConvertFloat4ToU32(g_theme.text_muted), lbl);
-            }
+    for (double gy = std::floor(min_y / minor_step) * minor_step; gy <= max_y; gy += minor_step) {
+        float sy = to_screen(0, gy).y;
+        const double major_index = std::round(gy / major_step);
+        const bool major = std::fabs(gy - major_index * major_step) < minor_step * 0.01;
+        dl->AddLine(ImVec2(canvas_origin.x, sy), ImVec2(canvas_origin.x + canvas_w, sy),
+                    major ? major_col : minor_col, major ? 1.0f : 1.0f);
+        if (major && std::fabs(gy) > minor_step * 0.01) {
+            snprintf(lbl, sizeof(lbl), major_step < 1.0 ? "%.2f" : "%.0f", gy);
+            dl->AddText(ImVec2(canvas_origin.x + 5.0f, sy - ImGui::GetTextLineHeight()), label_col, lbl);
         }
     }
+    if (min_x <= 0.0 && max_x >= 0.0)
+        dl->AddLine(ImVec2(to_screen(0, 0).x, canvas_origin.y),
+                    ImVec2(to_screen(0, 0).x, canvas_origin.y + canvas_h), IM_COL32(74, 176, 96, 220), 1.5f);
+    if (min_y <= 0.0 && max_y >= 0.0)
+        dl->AddLine(ImVec2(canvas_origin.x, to_screen(0, 0).y),
+                    ImVec2(canvas_origin.x + canvas_w, to_screen(0, 0).y), IM_COL32(214, 76, 78, 220), 1.5f);
 
-    // Polygon fill + outline + top-segment hints (flat-ish edges get the cap).
+    // Polygon fill + outline + top-segment hints.
     if (st.gm_points.size() >= 3) {
         std::vector<ImVec2> pts;
-        pts.reserve(st.gm_points.size());
-        for (const auto& p : st.gm_points) pts.push_back(to_screen(p.x, p.y));
-        // The sketch polygon is the authored shape — draw it as a clear
-        // translucent fill + solid outline ON TOP of the dimmed material
-        // preview, so it's obvious this outline (not the texture behind it) is
-        // the geometry being edited. (#5)
-        dl->AddConvexPolyFilled(pts.data(), (int)pts.size(), IM_COL32(80, 150, 105, 140));
-        dl->AddPolyline(pts.data(), (int)pts.size(), IM_COL32(130, 225, 160, 255), false, 3.0f);
-        dl->AddLine(pts.back(), pts.front(), IM_COL32(130, 225, 160, 255), 3.0f);
+        for (auto& p : st.gm_points) pts.push_back(to_screen(p.x, p.y));
+        dl->AddConvexPolyFilled(pts.data(), (int)pts.size(), IM_COL32(70, 130, 90, 70));
+        dl->AddPolyline(pts.data(), (int)pts.size(), IM_COL32(120, 210, 150, 255), false, 2.0f);
+        dl->AddLine(pts.back(), pts.front(), IM_COL32(120, 210, 150, 255), 2.0f);
+        // Top-segment hints (flat-ish edges get the surface mesh).
         for (size_t i = 0; i < st.gm_points.size(); ++i) {
             const size_t a = i, b = (i + 1) % st.gm_points.size();
-            if (is_top_edge((int)a, (int)b))
+            double ang = std::atan2(st.gm_points[b].y - st.gm_points[a].y,
+                                    st.gm_points[b].x - st.gm_points[a].x) * 180.0 / M_PI;
+            if (ang < 0.0) ang += 360.0;
+            if (std::abs(ang - 180.0) < st.gm_top_angle) {
                 dl->AddLine(to_screen(st.gm_points[a].x, st.gm_points[a].y),
                             to_screen(st.gm_points[b].x, st.gm_points[b].y),
-                            IM_COL32(255, 200, 80, 90), 2.0f);
+                            IM_COL32(255, 200, 80, 220), 3.0f);
+            }
         }
     }
-
-    // Edge hover (middle-node creation): closest edge within 10 px.
-    int edge_hover = -1;
-    if (canvas_hovered && st.gm_points.size() >= 3) {
-        const ImVec2 mouse = ImGui::GetMousePos();
-        float best_d = 10.0f;
-        for (int i = 0; i < (int)st.gm_points.size(); ++i) {
-            const int j = (i + 1) % (int)st.gm_points.size();
-            const ImVec2 a = to_screen(st.gm_points[i].x, st.gm_points[i].y);
-            const ImVec2 b = to_screen(st.gm_points[j].x, st.gm_points[j].y);
-            const float abx = b.x - a.x, aby = b.y - a.y;
-            const float len2 = abx * abx + aby * aby;
-            float t = len2 > 1e-6f ? ((mouse.x - a.x) * abx + (mouse.y - a.y) * aby) / len2 : 0.0f;
-            t = std::clamp(t, 0.0f, 1.0f);
-            const float px = a.x + abx * t, py = a.y + aby * t;
-            const float d = std::hypotf(mouse.x - px, mouse.y - py);
-            if (d < best_d) { best_d = d; edge_hover = i; }
-        }
-        if (edge_hover >= 0) {
-            const int ej = (edge_hover + 1) % (int)st.gm_points.size();
-            const ImVec2 ea = to_screen(st.gm_points[edge_hover].x, st.gm_points[edge_hover].y);
-            const ImVec2 eb = to_screen(st.gm_points[ej].x, st.gm_points[ej].y);
-            const ImVec2 mid((ea.x + eb.x) * 0.5f, (ea.y + eb.y) * 0.5f);
-            dl->AddLine(ea, eb, IM_COL32(255, 215, 90, 210), 3.0f);
-            dl->AddQuadFilled(ImVec2(mid.x, mid.y - 6.0f), ImVec2(mid.x + 6.0f, mid.y),
-                              ImVec2(mid.x, mid.y + 6.0f), ImVec2(mid.x - 6.0f, mid.y),
-                              IM_COL32(255, 215, 90, 255));
-        }
-    }
-
     // Vertex handles with index labels.
     int hover = -1;
-    {
-        const ImVec2 mouse = ImGui::GetMousePos();
-        for (int i = 0; i < (int)st.gm_points.size(); ++i) {
-            const ImVec2 sp = to_screen(st.gm_points[i].x, st.gm_points[i].y);
-            const bool inside = sp.x >= canvas_origin.x && sp.x <= canvas_origin.x + cw &&
-                                sp.y >= canvas_origin.y && sp.y <= canvas_origin.y + ch;
-            if (!inside) continue;
-            const bool near_mouse = canvas_hovered &&
-                std::fabs(mouse.x - sp.x) <= 9.0f && std::fabs(mouse.y - sp.y) <= 9.0f;
-            if (near_mouse) hover = i;
-            ImU32 col = IM_COL32(255, 130, 70, 255);
-            if (i == st.gm_drag_point) col = IM_COL32(255, 255, 120, 255);
-            else if (near_mouse) col = IM_COL32(255, 190, 120, 255);
-            const float r = (i == st.gm_drag_point || near_mouse) ? 6.5f : 5.0f;
-            dl->AddCircleFilled(sp, r, col);
-            dl->AddCircle(sp, r, IM_COL32(20, 20, 30, 255), 0, 1.5f);
-            char lbl[16];
-            snprintf(lbl, sizeof(lbl), "%d", i);
-            dl->AddText(ImVec2(sp.x + 7.0f, sp.y - 11.0f), IM_COL32(225, 235, 245, 190), lbl);
-        }
-        // Coordinate readout for the hovered / dragged node — shows the exact
-        // world position so you can place features precisely.
-        const int shown = (st.gm_dragging && st.gm_drag_point >= 0) ? st.gm_drag_point : hover;
-        if (shown >= 0 && shown < (int)st.gm_points.size()) {
-            const ImVec2 sp = to_screen(st.gm_points[shown].x, st.gm_points[shown].y);
-            char coord[64];
-            snprintf(coord, sizeof(coord), "(%.2f, %.2f)",
-                     st.gm_points[shown].x, st.gm_points[shown].y);
-            const ImVec2 tsz = ImGui::CalcTextSize(coord);
-            const ImVec2 tp(sp.x + 10.0f, sp.y - 26.0f);
-            dl->AddRectFilled(ImVec2(tp.x - 4.0f, tp.y - 2.0f),
-                              ImVec2(tp.x + tsz.x + 4.0f, tp.y + tsz.y + 2.0f),
-                              IM_COL32(20, 24, 32, 225));
-            dl->AddText(tp, IM_COL32(255, 235, 150, 255), coord);
-        }
+    for (int i = 0; i < (int)st.gm_points.size(); ++i) {
+        ImVec2 sp = to_screen(st.gm_points[i].x, st.gm_points[i].y);
+        const bool inside = sp.x >= canvas_origin.x && sp.x <= canvas_origin.x + canvas_w &&
+                            sp.y >= canvas_origin.y && sp.y <= canvas_origin.y + canvas_h;
+        if (!inside) continue;
+        const bool near_mouse = canvas_hovered &&
+            std::fabs(ImGui::GetMousePos().x - sp.x) <= 9.0f &&
+            std::fabs(ImGui::GetMousePos().y - sp.y) <= 9.0f;
+        if (near_mouse) hover = i;
+        ImU32 col = IM_COL32(255, 130, 70, 255);
+        if (i == st.gm_drag_point) col = IM_COL32(255, 255, 120, 255);
+        else if (near_mouse) col = IM_COL32(255, 190, 120, 255);
+        const float r = (i == st.gm_drag_point || near_mouse) ? 6.5f : 5.0f;
+        dl->AddCircleFilled(sp, r, col);
+        dl->AddCircle(sp, r, IM_COL32(20, 20, 30, 255), 0, 1.5f);
+        snprintf(lbl, sizeof(lbl), "%d", i);
+        dl->AddText(ImVec2(sp.x + 7.0f, sp.y - 11.0f), IM_COL32(225, 235, 245, 190), lbl);
     }
 
     // ── Round-hat domes: footprint circle + radius handle + apex marker ──
     int hat_hover = -1, hat_handle_hit = -1;
-    {
+    for (int i = 0; i < (int)st.gm_hats.size(); ++i) {
+        const auto& h = st.gm_hats[i];
+        const ImVec2 c = to_screen(h.x, h.y);
+        const float rr = (float)(h.radius * st.gm_canvas_scale);
+        const bool inside = c.x >= canvas_origin.x && c.x <= canvas_origin.x + canvas_w &&
+                            c.y >= canvas_origin.y && c.y <= canvas_origin.y + canvas_h;
+        if (!inside) continue;
         const ImVec2 mouse = ImGui::GetMousePos();
-        for (int i = 0; i < (int)st.gm_hats.size(); ++i) {
-            const auto& h = st.gm_hats[i];
-            const ImVec2 c = to_screen(h.x, h.y);
-            const float rr = (float)(h.radius * st.gm_canvas_scale);
-            const bool inside = c.x >= canvas_origin.x && c.x <= canvas_origin.x + cw &&
-                                c.y >= canvas_origin.y && c.y <= canvas_origin.y + ch;
-            if (!inside) continue;
-            const bool near_center = canvas_hovered &&
-                std::fabs(mouse.x - c.x) <= 12.0f && std::fabs(mouse.y - c.y) <= 12.0f;
-            const ImVec2 handle = ImVec2(c.x + rr, c.y);
-            const bool near_handle = canvas_hovered &&
-                std::fabs(mouse.x - handle.x) <= 8.0f && std::fabs(mouse.y - handle.y) <= 8.0f;
-            if (near_center) hat_hover = i;
-            if (near_handle) hat_handle_hit = i;
-            const bool active = (i == st.gm_drag_hat) || near_center || near_handle;
-            dl->AddCircle(c, rr, active ? IM_COL32(255, 170, 60, 255)
-                                        : IM_COL32(210, 150, 110, 190), 0, 2.0f);
-            dl->AddLine(ImVec2(c.x - 9, c.y), ImVec2(c.x + 9, c.y), IM_COL32(210, 150, 110, 190));
-            dl->AddLine(ImVec2(c.x, c.y - 9), ImVec2(c.x, c.y + 9), IM_COL32(210, 150, 110, 190));
-            dl->AddCircleFilled(c, 3.5f, IM_COL32(235, 175, 95, 255));
-            dl->AddCircleFilled(handle, 4.5f, IM_COL32(255, 120, 70, 255));
-            const ImVec2 apex = to_screen(h.x, h.y + h.height);
-            dl->AddLine(c, apex, IM_COL32(210, 150, 110, 130));
-            dl->AddCircleFilled(apex, 3.0f, IM_COL32(150, 205, 120, 230));
-        }
+        const bool near_center = canvas_hovered &&
+            std::fabs(mouse.x - c.x) <= 12.0f && std::fabs(mouse.y - c.y) <= 12.0f;
+        const ImVec2 handle = ImVec2(c.x + rr, c.y);
+        const bool near_handle = canvas_hovered &&
+            std::fabs(mouse.x - handle.x) <= 8.0f && std::fabs(mouse.y - handle.y) <= 8.0f;
+        if (near_center) hat_hover = i;
+        if (near_handle) { hat_handle_hit = i; }
+        const bool active = (i == st.gm_drag_hat) || near_center || near_handle;
+        dl->AddCircle(c, rr, active ? IM_COL32(255, 170, 60, 255)
+                                    : IM_COL32(210, 150, 110, 190), 0, 2.0f);
+        dl->AddLine(ImVec2(c.x - 9, c.y), ImVec2(c.x + 9, c.y), IM_COL32(210, 150, 110, 190));
+        dl->AddLine(ImVec2(c.x, c.y - 9), ImVec2(c.x, c.y + 9), IM_COL32(210, 150, 110, 190));
+        dl->AddCircleFilled(c, 3.5f, IM_COL32(235, 175, 95, 255));
+        dl->AddCircleFilled(handle, 4.5f, IM_COL32(255, 120, 70, 255));      // radius handle
+        const ImVec2 apex = ImVec2(c.x, c.y - (float)(h.height * st.gm_canvas_scale));
+        dl->AddLine(c, apex, IM_COL32(210, 150, 110, 130));
+        dl->AddCircleFilled(apex, 3.0f, IM_COL32(150, 205, 120, 230));       // apex (height)
     }
 
-    // ── Mouse interactions (tool-aware) ──
-    // Snap helper: rounds a world position onto the snap grid when enabled.
-    auto snap_xy = [&](double& x, double& y) {
-        if (st.gm_snap) {
-            const double g = st.gm_snap_grid;
-            x = std::round(x / g) * g;
-            y = std::round(y / g) * g;
-        }
-    };
-    // Insert the Mirror-X partner of a newly inserted point. The partner
-    // belongs on the mirrored edge, traversed in REVERSE (m_b → m_a), so a
-    // symmetric outline stays symmetric. The old build inserted before the
-    // mirrored edge start (or appended blindly), which corrupted the outline.
-    auto gm_mirror_insert = [&](int insert_at, const boulder::PolygonPoint& np) {
-        const int n = (int)st.gm_points.size();
-        const int a = (insert_at - 1 + n) % n;
-        const int b = insert_at % n;
-        const double ax = st.gm_points[a].x, ay = st.gm_points[a].y;
-        const double bx = st.gm_points[b].x, by = st.gm_points[b].y;
-        for (int i = 0; i < n; ++i) {
-            const int j = (i + 1) % n;
-            if (std::fabs(st.gm_points[i].x + bx) < 1e-4 &&
-                std::fabs(st.gm_points[i].y - by) < 1e-4 &&
-                std::fabs(st.gm_points[j].x + ax) < 1e-4 &&
-                std::fabs(st.gm_points[j].y - ay) < 1e-4) {
-                st.gm_points.insert(st.gm_points.begin() + j, {-np.x, np.y});
-                return;
-            }
-        }
-        st.gm_points.push_back({-np.x, np.y});   // no mirrored edge yet
-    };
+    // Mouse interactions (tool-aware).
     if (canvas_hovered) {
         const ImVec2 mouse = ImGui::GetMousePos();
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -8105,116 +6066,48 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
                     st.gm_drag_hat = hat_hover;
                     st.gm_hat_dragging = true;
                 } else {
-                    gm_push_undo(st);
                     auto w = to_world(mouse);
-                    snap_xy(w.first, w.second);
-                    st.gm_hats.push_back({w.first, w.second, st.gm_hat_radius, st.gm_hat_height});
+                    st.gm_hats.push_back({w.first, w.second,
+                                          st.gm_hat_radius, st.gm_hat_height});
                     st.gm_drag_hat = (int)st.gm_hats.size() - 1;
                     st.gm_hat_dragging = true;
-                    st.gm_sketch_dirty = true;
-                }
-            } else if (st.gm_tool == 3) {                // Direct freehand outline
-                if (!st.gm_freehand_active) gm_push_undo(st);   // one undo step per stroke
-                if (!io.KeyShift) st.gm_points.clear();
-                auto w = to_world(mouse);
-                st.gm_points.push_back({w.first, w.second});
-                st.gm_freehand_active = true;
-                st.gm_sketch_dirty = true;
-            } else if (st.gm_tool == 2) {                // Erase: node or hat
-                if (hover >= 0) {
-                    gm_push_undo(st);
-                    st.gm_points.erase(st.gm_points.begin() + hover);
-                    st.gm_drag_point = -1;
-                    st.gm_dragging = false;
-                    st.gm_sketch_dirty = true;
-                } else if (hat_hover >= 0) {
-                    gm_push_undo(st);
-                    st.gm_hats.erase(st.gm_hats.begin() + hat_hover);
-                    st.gm_drag_hat = -1;
                     st.gm_sketch_dirty = true;
                 }
             } else if (st.gm_tool == 0 && hat_hover >= 0) {
                 st.gm_drag_hat = hat_hover;              // Move tool: grab a hat
                 st.gm_hat_dragging = true;
+            } else if (st.gm_tool == 3) {                // Direct freehand outline
+                if (!io.KeyShift) st.gm_points.clear();
+                auto w = to_world(mouse);
+                st.gm_points.push_back({w.first, w.second});
+                st.gm_freehand_active = true;
+                st.gm_sketch_dirty = true;
+            } else if (st.gm_tool == 2) {                // Erase
+                if (hover >= 0) {
+                    st.gm_points.erase(st.gm_points.begin() + hover);
+                    st.gm_drag_point = -1;
+                    st.gm_sketch_dirty = true;
+                }
             } else if (hover >= 0 && st.gm_tool == 0) {  // Move: drag existing
                 st.gm_drag_point = hover;
                 st.gm_dragging = true;
-                // Preserve the grab offset so the node doesn't jump to the
-                // cursor center on grab (matches the inline mesh editor).
+            } else {                                     // Add point
                 auto w = to_world(mouse);
-                st.gm_drag_off_x = st.gm_points[hover].x - w.first;
-                st.gm_drag_off_y = st.gm_points[hover].y - w.second;
-            } else if (hover < 0 && edge_hover >= 0 && (st.gm_tool == 0 || st.gm_tool == 1)) {
-                // Middle-node creation: insert a point snapped onto the
-                // hovered edge (click spot projected onto the segment). The
-                // hover<0 guard stops the Add tool from stacking a duplicate
-                // node right on top of an existing vertex.
-                gm_push_undo(st);
-                const int a = edge_hover;
-                const int b = (a + 1) % (int)st.gm_points.size();
-                auto w = to_world(mouse);
-                const double ax = st.gm_points[a].x, ay = st.gm_points[a].y;
-                const double bx = st.gm_points[b].x, by = st.gm_points[b].y;
-                const double dx = bx - ax, dy = by - ay;
-                const double len2 = dx * dx + dy * dy;
-                double t = len2 > 1e-12 ? ((w.first - ax) * dx + (w.second - ay) * dy) / len2 : 0.0;
-                t = std::clamp(t, 0.0, 1.0);
-                const boulder::PolygonPoint np = {ax + dx * t, ay + dy * t};
-                st.gm_points.insert(st.gm_points.begin() + b, np);
-                if (st.gm_mirror_x) gm_mirror_insert(b, np);
-                st.gm_drag_point = b;
+                st.gm_points.push_back({w.first, w.second});
+                if (st.gm_mirror_x) st.gm_points.push_back({-w.first, w.second});
+                st.gm_drag_point = (int)st.gm_points.size() - 1;
                 st.gm_dragging = (st.gm_tool == 0);
-                st.gm_drag_off_x = st.gm_drag_off_y = 0.0;
-                st.gm_sketch_dirty = true;
-            } else if (hover < 0 && edge_hover < 0 &&
-                       (st.gm_tool == 0 || st.gm_tool == 1)) {  // Add point
-                gm_push_undo(st);
-                auto w = to_world(mouse);
-                snap_xy(w.first, w.second);
-                const int n = (int)st.gm_points.size();
-                // With a closed outline (3+ nodes) the new node is inserted
-                // into the CLOSEST edge so the polygon stays sane; the old
-                // build always appended to the tail, tangling self-
-                // intersecting outlines when clicking anywhere. Below 3
-                // nodes there is no outline yet — just append.
-                int insert_at = n;
-                if (n >= 3) {
-                    double best_d2 = 1e30;
-                    for (int i = 0; i < n; ++i) {
-                        const int j = (i + 1) % n;
-                        const double ax = st.gm_points[i].x, ay = st.gm_points[i].y;
-                        const double bx = st.gm_points[j].x, by = st.gm_points[j].y;
-                        const double dx = bx - ax, dy = by - ay;
-                        const double len2 = dx * dx + dy * dy;
-                        double t = len2 > 1e-12
-                            ? ((w.first - ax) * dx + (w.second - ay) * dy) / len2 : 0.0;
-                        t = std::clamp(t, 0.0, 1.0);
-                        const double ex = ax + dx * t - w.first;
-                        const double ey = ay + dy * t - w.second;
-                        const double d2 = ex * ex + ey * ey;
-                        if (d2 < best_d2) { best_d2 = d2; insert_at = i + 1; }
-                    }
-                }
-                const boulder::PolygonPoint np = {w.first, w.second};
-                st.gm_points.insert(st.gm_points.begin() + insert_at, np);
-                if (st.gm_mirror_x) gm_mirror_insert(insert_at, np);
-                st.gm_drag_point = insert_at;
-                st.gm_dragging = (st.gm_tool == 0);
-                st.gm_drag_off_x = st.gm_drag_off_y = 0.0;
                 st.gm_sketch_dirty = true;
             }
         }
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-            if (hat_hover >= 0) {                        // RMB on a hat: remove
-                gm_push_undo(st);
+            if (hat_hover >= 0) {                        // RMB on a hat → remove it
                 st.gm_hats.erase(st.gm_hats.begin() + hat_hover);
                 st.gm_drag_hat = -1;
                 st.gm_sketch_dirty = true;
-            } else if (hover >= 0) {                     // RMB on a point: remove
-                gm_push_undo(st);
+            } else if (hover >= 0) {
                 st.gm_points.erase(st.gm_points.begin() + hover);
                 st.gm_drag_point = -1;
-                st.gm_dragging = false;
                 st.gm_sketch_dirty = true;
             }
         }
@@ -8224,7 +6117,7 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
             auto w = to_world(ImGui::GetMousePos());
             if (st.gm_points.empty() || std::hypot(w.first - st.gm_points.back().x,
                                                    w.second - st.gm_points.back().y) >=
-                                        std::max(0.25, 3.0 / st.gm_canvas_scale)) {
+                                        std::max(0.25f, 3.0f / st.gm_canvas_scale)) {
                 st.gm_points.push_back({w.first, w.second});
                 st.gm_sketch_dirty = true;
             }
@@ -8237,9 +6130,6 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
         st.gm_drag_point < (int)st.gm_points.size()) {
         if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             auto w = to_world(ImGui::GetMousePos());
-            w.first += st.gm_drag_off_x;                 // keep the grab offset
-            w.second += st.gm_drag_off_y;
-            snap_xy(w.first, w.second);
             st.gm_points[st.gm_drag_point] = {w.first, w.second};
             st.gm_sketch_dirty = true;
         } else {
@@ -8248,21 +6138,10 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
         }
     }
     if (st.gm_dragging && st.gm_tool != 0) { st.gm_dragging = false; st.gm_drag_point = -1; }
-    // Delete key removes the hovered node — vertices take priority over
-    // hats, and only ONE thing is deleted per keypress (the old build erased
-    // both when they overlapped under the cursor).
-    if (canvas_hovered && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
-        if (hover >= 0) {
-            gm_push_undo(st);
-            st.gm_points.erase(st.gm_points.begin() + hover);
-            st.gm_drag_point = -1;
-            st.gm_dragging = false;
-            st.gm_sketch_dirty = true;
-        } else if (hat_hover >= 0) {
-            gm_push_undo(st);
-            st.gm_hats.erase(st.gm_hats.begin() + hat_hover);
-            st.gm_sketch_dirty = true;
-        }
+    // Delete key removes the hovered point.
+    if (canvas_hovered && hover >= 0 && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        st.gm_points.erase(st.gm_points.begin() + hover);
+        st.gm_sketch_dirty = true;
     }
     // ── Hat drag / resize loops ──
     if (st.gm_hat_dragging && st.gm_drag_hat >= 0 && st.gm_drag_hat < (int)st.gm_hats.size()) {
@@ -8291,58 +6170,107 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
         st.gm_hat_dragging = st.gm_hat_resizing = false;
         st.gm_drag_hat = -1;
     }
-    // (Hat deletion via Delete is handled by the single merged Delete-key
-    // block above — vertices take priority over hats.)
-
-    // ── Arrow-key nudge ──
-    // While a node is grabbed (Move tool drag), arrows nudge it in world
-    // units (Shift = 5x); otherwise arrows pan the canvas view. This makes
-    // precise vertex placement possible without pixel-hunting.
-    {
-        float nx = 0.0f, ny = 0.0f;
-        if (ImGui::IsKeyDown(ImGuiKey_UpArrow))    ny += 1.0f;
-        if (ImGui::IsKeyDown(ImGuiKey_DownArrow))  ny -= 1.0f;
-        if (ImGui::IsKeyDown(ImGuiKey_LeftArrow))  nx -= 1.0f;
-        if (ImGui::IsKeyDown(ImGuiKey_RightArrow)) nx += 1.0f;
-        if ((nx != 0.0f || ny != 0.0f) && !io.WantTextInput) {
-            const float step = io.KeyShift ? 5.0f : 0.5f;
-            if (st.gm_dragging && st.gm_drag_point >= 0 &&
-                st.gm_drag_point < (int)st.gm_points.size()) {
-                double wx = st.gm_points[st.gm_drag_point].x + (double)(nx * step);
-                double wy = st.gm_points[st.gm_drag_point].y + (double)(ny * step);
-                snap_xy(wx, wy);                 // nudging honors the snap grid
-                st.gm_points[st.gm_drag_point] = {wx, wy};
-                st.gm_sketch_dirty = true;
-            } else {
-                // View pans in the pressed direction (same convention as the
-                // inline mesh editor): right arrow reveals more world to the
-                // right, up arrow reveals more world above.
-                st.gm_canvas_cx += nx * step;
-                st.gm_canvas_cy -= ny * step;
-            }
-        }
+    if (canvas_hovered && hat_hover >= 0 && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        st.gm_hats.erase(st.gm_hats.begin() + hat_hover);
+        st.gm_sketch_dirty = true;
     }
+    // Frame the sketch (F key).
+    if (do_frame_key) gm_frame_sketch();
 
-    // Hint bar + live stats.
+    // Canvas hint bar + live stats.
     const char* gm_hint =
-        (st.gm_tool == 0) ? "LMB move | edge = insert node | empty = add (splits closest edge) | RMB/Del remove | arrows nudge | Ctrl+Z undo"
-        : (st.gm_tool == 1) ? "LMB add node (inserted into the closest edge) | RMB/Del remove | arrows pan | Ctrl+Z undo"
-        : (st.gm_tool == 2) ? "LMB erase a node or a hat | RMB/Del remove | Ctrl+Z undo"
-        : (st.gm_tool == 4) ? "LMB place a round-hat dome | drag center = move | orange handle = resize | RMB/Del remove"
-        : "Drag to draw | Shift+drag appends | release simplifies | Ctrl+Z undo";
-    dl->AddRectFilled(ImVec2(canvas_origin.x, canvas_origin.y + (float)ch - 40.0f),
-                      ImVec2(canvas_origin.x + (float)cw, canvas_origin.y + (float)ch),
+        (st.gm_tool == 0) ? "LMB move \xc2\xb7 click empty = add \xc2\xb7 RMB/Del = remove \xc2\xb7 Wheel zoom \xc2\xb7 MMB pan"
+        : (st.gm_tool == 1) ? "LMB add points \xc2\xb7 RMB/Del = remove \xc2\xb7 Wheel zoom \xc2\xb7 MMB pan"
+        : (st.gm_tool == 2) ? "LMB erase points \xc2\xb7 RMB/Del = remove \xc2\xb7 Wheel zoom \xc2\xb7 MMB pan"
+        : (st.gm_tool == 4) ? "LMB place a round-hat dome \xc2\xb7 drag center = move \xc2\xb7 drag orange handle = resize \xc2\xb7 RMB/Del = remove"
+        : "Drag to draw outline \xc2\xb7 Shift+drag appends \xc2\xb7 release converts to polygon nodes";
+    dl->AddRectFilled(ImVec2(canvas_origin.x, canvas_origin.y + canvas_h - 40.0f),
+                      ImVec2(canvas_origin.x + canvas_w, canvas_origin.y + canvas_h),
                       IM_COL32(18, 21, 28, 215));
-    dl->AddText(ImVec2(canvas_origin.x + 8, canvas_origin.y + (float)ch - 34.0f),
+    dl->AddText(ImVec2(canvas_origin.x + 8, canvas_origin.y + canvas_h - 34.0f),
                 IM_COL32(160, 170, 190, 255), gm_hint);
     char gm_stats[160];
     snprintf(gm_stats, sizeof(gm_stats),
-             "%d points | Z %.1f | depth %.0f..%.0f | top %.0f deg",
+             "%d points \xc2\xb7 Z %.1f \xc2\xb7 depth %.0f..%.0f \xc2\xb7 top %.0f\xc2\xb0",
              (int)st.gm_points.size(), st.gm_z, st.gm_min_depth, st.gm_max_depth, st.gm_top_angle);
-    dl->AddText(ImVec2(canvas_origin.x + 8, canvas_origin.y + (float)ch - 18.0f),
+    dl->AddText(ImVec2(canvas_origin.x + 8, canvas_origin.y + canvas_h - 18.0f),
                 IM_COL32(140, 150, 170, 220), gm_stats);
     ImGui::EndChild(); // gm_canvas_host
 
+    // ── Live 3D preview of the extruded mesh ──
+    if (st.gm_show_3d) {
+        ImGui::SameLine();
+        ImGui::BeginChild("##gm_3d_host", ImVec2(preview_w, canvas_h), ImGuiChildFlags_Borders);
+        ImGui::TextDisabled(ICON_FA_CUBE " 3D Preview");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", st.gm_preview_valid ? "live" : "(build...)");
+        ImGui::Separator();
+
+        int pw = (int)ImGui::GetContentRegionAvail().x;
+        int ph = (int)ImGui::GetContentRegionAvail().y;
+        if (pw < 4) pw = 4;
+        if (ph < 4) ph = 4;
+        if (!st.gm_preview_fbo) {
+            st.gm_preview_fbo = av::create_fbo(pw, ph, &st.gm_preview_fbo_tex);
+            st.gm_preview_w = pw; st.gm_preview_h = ph;
+        } else if (pw != st.gm_preview_w || ph != st.gm_preview_h) {
+            av::resize_fbo(st.gm_preview_fbo, pw, ph, &st.gm_preview_fbo_tex);
+            st.gm_preview_w = pw; st.gm_preview_h = ph;
+        }
+
+        if (st.gm_preview_valid && !st.gm_preview_meshes.empty()) {
+            // Orbit: LMB drag · zoom: wheel (anchored at the pivot point).
+            const bool prev_hovered = ImGui::IsItemHovered() || ImGui::IsWindowHovered();
+            if (prev_hovered && io.MouseWheel != 0.0f) {
+                const float factor = std::pow(0.94f, io.MouseWheel);
+                st.gm_preview_cam.distance = std::clamp(st.gm_preview_cam.distance * factor,
+                                                        0.5f, 2000.0f);
+            }
+            if (prev_hovered && ImGui::IsMouseDragging(0)) {
+                st.gm_preview_cam.yaw   += io.MouseDelta.x * 0.5f;
+                st.gm_preview_cam.pitch += io.MouseDelta.y * 0.5f;
+                st.gm_preview_cam.pitch = std::clamp(st.gm_preview_cam.pitch, -89.0f, 89.0f);
+            }
+            if (prev_hovered && ImGui::IsMouseDragging(1)) {
+                const float scale = st.gm_preview_cam.distance * 0.003f;
+                st.gm_preview_cam.target[0] -= std::cos(st.gm_preview_cam.yaw * 3.14159f / 180.0f) * io.MouseDelta.x * scale;
+                st.gm_preview_cam.target[2] += std::sin(st.gm_preview_cam.yaw * 3.14159f / 180.0f) * io.MouseDelta.x * scale;
+                st.gm_preview_cam.target[1] += io.MouseDelta.y * scale;
+            }
+
+            // The sketch preview is a close-up editor view: no scene fog/lights.
+            av::clear_point_lights();
+            av::set_depth_fog(false, nullptr, 0.0f, 0.0f);
+            av::begin_3d(st.gm_preview_fbo, pw, ph, st.gm_preview_cam);
+            av::render_grid_xy(60.0f, st.gm_preview_cam.target[2] - st.gm_preview_cam.distance * 0.5f);
+            float identity[16];
+            av::mat4_identity(identity);
+            for (size_t i = 0; i < st.gm_preview_meshes.size(); ++i) {
+                auto& gm = st.gm_preview_meshes[i];
+                gm.texture_id = (i < st.gm_preview_textures.size()) ? st.gm_preview_textures[i] : 0;
+                float col[4] = {1, 1, 1, 1};
+                av::render_mesh(gm, identity, col, false);
+            }
+            av::end_3d();
+
+            const ImVec2 ppos = ImGui::GetCursorScreenPos();
+            ImGui::Image((ImTextureID)(intptr_t)st.gm_preview_fbo_tex, ImVec2((float)pw, (float)ph),
+                         ImVec2(0, 1), ImVec2(1, 0));
+            // Preview hint bar.
+            ImDrawList* pdl = ImGui::GetWindowDrawList();
+            pdl->AddRectFilled(ImVec2(ppos.x, ppos.y + ph - 22.0f),
+                               ImVec2(ppos.x + pw, ppos.y + ph),
+                               IM_COL32(18, 21, 28, 215));
+            char hint[96];
+            snprintf(hint, sizeof(hint),
+                     "LMB orbit \xc2\xb7 Wheel zoom \xc2\xb7 RMB pan \xc2\xb7 Z %.0f", st.gm_z);
+            pdl->AddText(ImVec2(ppos.x + 6, ppos.y + ph - 18.0f),
+                         IM_COL32(150, 165, 190, 255), hint);
+        } else {
+            ImGui::TextDisabled("\nSketch a polygon (3+ points)\nto preview the extruded mesh.");
+        }
+        ImGui::EndChild(); // gm_3d_host
+    }
 
     // ── Extrusion / Depth properties ──
     ImGui::Separator();
@@ -8351,45 +6279,27 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
     ImGui::TextDisabled("(mesh depth = Z layer; thickness = Min..Max)");
 
     // Z layer (world depth where the mesh sits) — always visible & prominent.
-    bool gm_depth_changed = false;
     ImGui::SetNextItemWidth(150.0f);
-    if (ImGui::SliderFloat("Z (depth layer)", &st.gm_z, -100.0f, 300.0f, "%.1f"))
-        gm_depth_changed = true;
+    const float old_z = st.gm_z;
+    ImGui::SliderFloat("Z (depth layer)", &st.gm_z, -100.0f, 300.0f, "%.1f");
     ImGui::SameLine();
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("World depth (parallax layer) where the generated ground mesh sits.\n"
                           "Real Swordigo levels use Z in the 30-50 range; pick the layer that\n"
                           "matches the objects around it.");
     }
-    // Quick presets: common depth/thickness combos for fast level building.
-    auto gm_preset = [&](const char* label, float z, float th, const char* tip) {
-        ImGui::SameLine();
-        if (ImGui::SmallButton(label)) {
-            st.gm_z = z;
-            const float center = (st.gm_min_depth + st.gm_max_depth) * 0.5f;
-            st.gm_min_depth = center - th * 0.5f;
-            st.gm_max_depth = center + th * 0.5f;
-            st.gm_sketch_dirty = true;
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
-    };
-    gm_preset("Platform", 30.0f, 40.0f,
-              "Preset: Z 30, thickness 40 (standard walkable platform)");
-    gm_preset("Wall", 40.0f, 90.0f,
-              "Preset: Z 40, thickness 90 (thick wall / cliff face)");
-    gm_preset("Cliff", 50.0f, 120.0f,
-              "Preset: Z 50, thickness 120 (deep background cliff)");
 
     // Thickness quick control — keeps Min/Max symmetric around a center.
     float thickness = std::fabs(st.gm_max_depth - st.gm_min_depth);
     ImGui::SetNextItemWidth(150.0f);
+    const float old_th = thickness;
     if (ImGui::SliderFloat("Thickness", &thickness, 0.0f, 400.0f, "%.1f")) {
         const float center = (st.gm_min_depth + st.gm_max_depth) * 0.5f;
         st.gm_min_depth = center - thickness * 0.5f;
         st.gm_max_depth = center + thickness * 0.5f;
-        gm_depth_changed = true;
     }
     ImGui::SameLine();
+    bool gm_depth_changed = (st.gm_z != old_z || thickness != old_th);
     ImGui::SetNextItemWidth(96.0f);
     if (ImGui::DragFloat("MinDepth", &st.gm_min_depth, 1.0f, -500.0f, 500.0f, "%.1f"))
         gm_depth_changed = true;
@@ -8406,11 +6316,6 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
         gm_depth_changed = true;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Build the top/surface cap mesh on flat-top segments");
-    ImGui::SameLine();
-    if (ImGui::Checkbox("Dimension Obj", &st.gm_dimension_object))
-        gm_depth_changed = true;
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Tag the generated mesh as a DimensionObject: in-game it only appears\nwhile the Dimension Rift powerup is active (hidden otherwise).");
 
     // Any depth/extrusion change rebuilds the live preview (if visible).
     if (gm_depth_changed) st.gm_sketch_dirty = true;
@@ -8476,15 +6381,9 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button(ICON_FA_TRASH " Clear", ImVec2(78, 26))) {
-        gm_push_undo(st);
-        st.gm_points.clear(); st.gm_hats.clear(); st.gm_sketch_dirty = true;
-        st.gm_canvas_framed = false;     // reframe once the new sketch has points
-        st.gm_drag_point = -1; st.gm_dragging = false;
-        st.gm_drag_hat = -1; st.gm_hat_dragging = st.gm_hat_resizing = false;
-    }
-    // (Frame moved to the top toolbar — view framing is a canvas concern,
-    // not a scene action.)
+    if (ImGui::Button(ICON_FA_TRASH " Clear", ImVec2(78, 26))) { st.gm_points.clear(); st.gm_hats.clear(); st.gm_sketch_dirty = true; }
+    ImGui::SameLine();
+    if (ImGui::Button(ICON_FA_LOCATION_DOT " Frame", ImVec2(76, 26))) gm_frame_sketch();
 
     // Load .swdm popup.
     if (ImGui::BeginPopup("Load .swdm")) {
@@ -8496,9 +6395,7 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
                 std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
                 boulder::GroundMesh gm = boulder::parse_ground_mesh(content);
                 if (gm.polygon.size() >= 3) {
-                    gm_push_undo(st);
                     st.gm_points = gm.polygon;
-                    st.gm_hats = gm.hats;
                     st.gm_min_depth = gm.min_depth;
                     st.gm_max_depth = gm.max_depth;
                     st.gm_top_angle = gm.top_angle;
@@ -8507,7 +6404,6 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
                     snprintf(st.gm_top_tex, sizeof(st.gm_top_tex), "%s", gm.top_texture.c_str());
                     snprintf(st.gm_bottom_tex, sizeof(st.gm_bottom_tex), "%s", gm.bottom_texture.c_str());
                     st.gm_sketch_dirty = true;
-                    st.gm_canvas_framed = false;   // reframe on the loaded sketch
                     st.status_msg = "Loaded " + std::string(load_buf);
                 } else {
                     st.status_msg = "Invalid .swdm file.";
@@ -8543,43 +6439,15 @@ static void template_add_to_scene(ViewerState& st, const std::string& template_n
     // dir points from target toward the eye (into the view).
     const float dir[3] = {cosp * sinf(yaw), sinf(pitch), cosp * cosf(yaw)};
     const float k = std::max(8.0f, st.camera.distance * 0.22f);
-    // Spawn along the camera's view ray (where the user is looking), snapped
-    // onto the terrain surface so the template stands on the ground.
     obj.pos_x = st.camera.target[0] + dir[0] * k;
+    obj.pos_y = st.camera.target[1] + dir[1] * k;
     obj.pos_z = st.camera.target[2] + dir[2] * k;
-    const float terrain_y = scene_terrain_top_y(st, obj.pos_x, 150.0f);
-    obj.pos_y = (terrain_y > -1e8f) ? terrain_y
-                                    : st.camera.target[1] + dir[1] * k;
     av::scene_refresh(st.scene);
-    // Fix #2: after scene_refresh() template components are resolved, so
-    // mesh_name and background_name are now populated. Load GPU caches that
-    // obj_browser_add already loads but template creation skips.
-    const fs::path scene_dir = fs::path(st.scene.filepath).parent_path();
-    {
-        // Re-fetch after refresh — idx is stable (objects only grows here).
-        const auto& resolved = st.scene.objects[idx];
-        if (!resolved.mesh_name.empty())
-            load_scene_model_to_cache(st, resolved.mesh_name, scene_dir.string());
-        if (!resolved.background_name.empty())
-            load_scene_background_texture(st, resolved.background_name, scene_dir.string());
-        if (!resolved.ground_meshes.empty())
-            resync_scene_ground_meshes(st);
-        // Lift POD templates by their feet offset (center-origin models would
-        // otherwise sink into the terrain after the Y snap above).
-        if (terrain_y > -1e8f && !resolved.mesh_name.empty() &&
-            resolved.ground_meshes.empty()) {
-            auto hit = st.scene_model_cache.find(resolved.mesh_name);
-            if (hit != st.scene_model_cache.end()) {
-                const float fo = av::pod_feet_offset(hit->second);
-                const float s = std::abs(resolved.scale_x * resolved.template_scaling);
-                if (fo > 0.0f) st.scene.objects[idx].pos_y += fo * s;
-            }
-        }
-    }
     select_scene_object(st, (int)idx);
     st.scene_dirty = true;
     st.status_msg = "Added template '" + template_name + "' to scene (components inherited).";
     switch_scene_tab(st, 1);
+    frame_scene_selection(st);
 }
 
 // ── Object Browser window (SMM2-style palette) ──
@@ -8761,17 +6629,16 @@ static void draw_scene_xray_pass(const ViewerState& st) {
             obj.ground_meshes.empty())
             continue; // non-renderable (spawn points, lights, triggers)
 
-        float obj_mat[16], world_mat[16];
-        swk::object_render_matrix(obj, obj_mat);   // model-only baked Y-rotation
-        swk::object_world_matrix(obj, world_mat); // terrain stays in object-local XY
+        float obj_mat[16];
+        swk::object_render_matrix(obj, obj_mat);   // incl. ModelComponent Y-rotation
 
         // Embedded ground meshes
         if (idx < (int)st.scene_ground_gpu_meshes.size()) {
             for (const auto& gm_raw : st.scene_ground_gpu_meshes[idx]) {
                 auto& gm = const_cast<av::GPUMesh&>(gm_raw);
                 gm.texture_id = 0;
-                av::render_mesh(gm, world_mat, ghost_fill, false);
-                av::render_mesh(gm, world_mat, ghost_wire, true);
+                av::render_mesh(gm, obj_mat, ghost_fill, false);
+                av::render_mesh(gm, obj_mat, ghost_wire, true);
             }
         }
 
@@ -8987,9 +6854,7 @@ static void draw_scene_visualizer(ViewerState& st) {
     ensure_scene_proxy_mesh(st);
     ImGuiIO& io = ImGui::GetIO();
     ImGuizmo::BeginFrame();
-    // Match the gizmo's projection assumptions to the editor camera so the
-    // handles read correctly in orthographic mode (parity with web ortho gizmo).
-    ImGuizmo::SetOrthographic(st.camera.orthographic);
+    ImGuizmo::SetOrthographic(false);
     ImGuizmo::AllowAxisFlip(false);
     ImGuizmo::SetGizmoSizeClipSpace(0.14f);
 
@@ -8998,19 +6863,6 @@ static void draw_scene_visualizer(ViewerState& st) {
     // Flat toolbar styling: no resting chrome — hover gets a soft fill and only
     // selected/active tools carry a strong accent background, so the rendered
     // scene stays the strongest element (less chrome competition around it).
-    // Keep the command strip a fixed height.  Previously its long row of
-    // buttons wrapped at narrower window sizes, which moved the image after
-    // the FBO dimensions had already been calculated.  That produced a
-    // displaced viewport and an apparent blank/void area while dragging.
-    // Two-row command strip. The toolbar used to be a single long row forced
-    // to horizontal-scroll (easy to miss, awkward to reach Rotate/Scale/etc.),
-    // which also collided with the FBO sizing done later. It is now a fixed
-    // TWO-row strip: related tools are grouped with separators and the second
-    // row carries the view/render toggles, so everything is visible at once at
-    // any reasonable window width without a hidden horizontal scrollbar.
-    ImGui::BeginChild("##SceneToolbar", ImVec2(0.0f, 70.0f),
-                      ImGuiChildFlags_Borders,
-                      ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, th_alpha(g_theme.surface_hover, 0.55f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, g_theme.surface_hover);
@@ -9073,11 +6925,27 @@ static void draw_scene_visualizer(ViewerState& st) {
         ImGui::EndDisabled();
         ImGui::EndPopup();
     }
-    // NOTE: the old "Anim" / "Anim ▾" toolbar buttons were removed — scene
-    // animation playback is driven from the "Mode → Scene Player" menu and the
-    // Inspector, so the two buttons (and their popup) were dead toolbar chrome.
-    // Their state (scene_anim_playing / scene_anim_speed / scene_obj_anim_frame)
-    // is still owned and used elsewhere; only the redundant buttons are gone.
+    ImGui::SameLine();
+    if (ImGui::Button(st.scene_anim_playing ? ICON_FA_PLAY " Anim" : ICON_FA_PAUSE " Anim")) {
+        st.scene_anim_playing = !st.scene_anim_playing;
+        if (!st.scene_anim_playing)
+            std::fill(st.scene_obj_anim_frame.begin(), st.scene_obj_anim_frame.end(), 0.0f);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(st.scene_anim_playing
+            ? "Scene animation ON — every model plays its POD animation.\nClick to freeze at bind pose."
+            : "Scene animation OFF — models frozen at bind pose (T-shape).\nClick to play all animations.");
+    ImGui::SameLine();
+    if (ImGui::Button("Anim ▾")) ImGui::OpenPopup("##scene_anim");
+    if (ImGui::BeginPopup("##scene_anim")) {
+        ImGui::MenuItem("Play scene animations", nullptr, &st.scene_anim_playing);
+        ImGui::SliderFloat("Speed", &st.scene_anim_speed, 0.05f, 4.0f, "%.2fx");
+        if (ImGui::MenuItem("Reset all frames")) {
+            std::fill(st.scene_obj_anim_frame.begin(), st.scene_obj_anim_frame.end(), 0.0f);
+            st.scene_anim_playing = true;
+        }
+        ImGui::EndPopup();
+    }
     ImGui::SameLine();
     ImGui::TextDisabled("|");
 
@@ -9150,60 +7018,16 @@ static void draw_scene_visualizer(ViewerState& st) {
         ImGui::EndPopup();
     }
 
-    // ── Transform space (World / Local) — parity with web setSpace() ──
-    ImGui::SameLine();
-    ImGui::BeginDisabled(st.gm_inline_edit);
-    if (ImGui::Button(st.gizmo_local ? "Local" : "World")) st.gizmo_local = !st.gizmo_local;
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Transform space (X): %s.\nScale always operates in Local space.",
-                          st.gizmo_local ? "Local — align handles to the object"
-                                         : "World — align handles to world axes");
-    ImGui::EndDisabled();
-
     ImGui::SameLine();
     if (ImGui::Button("Gizmo")) ImGui::OpenPopup("##gizmo_options");
     if (ImGui::BeginPopup("##gizmo_options")) {
         ImGui::MenuItem("Transform gizmo", nullptr, &st.scene_show_gizmo);
         ImGui::MenuItem("Corner axis", nullptr, &st.scene_show_axis);
-        ImGui::Separator();
-        ImGui::MenuItem("Local space", "X", &st.gizmo_local);
-        ImGui::MenuItem("Universal (move+rotate+scale)", nullptr, &st.gizmo_universal);
-        ImGui::Separator();
-        ImGui::TextDisabled("Axis mask");
-        ImGui::MenuItem("Show X", nullptr, &st.gizmo_show_x);
-        ImGui::MenuItem("Show Y", nullptr, &st.gizmo_show_y);
-        ImGui::MenuItem("Show Z", nullptr, &st.gizmo_show_z);
         ImGui::EndPopup();
     }
 
-    // ── Camera modifier (Perspective / Orthographic + zoom + frame) ──
-    ImGui::SameLine();
-    if (ImGui::Button(st.camera.orthographic ? "Ortho" : "Persp"))
-        st.camera.orthographic = !st.camera.orthographic;
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Camera projection: click to switch Perspective / Orthographic");
-    if (st.camera.orthographic) {
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(90.0f);
-        ImGui::DragFloat("##ortho_zoom", &st.camera.ortho_zoom, 0.02f, 0.05f, 20.0f, "Zoom %.2f");
-    }
-    // NOTE: the camera-modifier group used to add its OWN "Frame" button here,
-    // duplicating the render-toggles "Frame" button below. Two visible buttons
-    // with the same label share an ImGui ID — the REAL cause of the
-    // ConfigDebugHighlightIdConflicts warning (and a latent wrong-button-
-    // responds-to-click bug). There is now a single canonical Frame button (in
-    // the render-toggles group), so the duplicate is removed rather than merely
-    // re-ID'd. `frame_camera_on_selection` remains available via the "F"
-    // shortcut and the View ▸ menu.
-
-    // ── Second row: playback + render toggles ─────────────────────────
-    // Break to a new line so the render/playback group (Mode | Frame | X-Ray |
-    // PostFX) sits on its own row. This is the deliberate two-row layout that
-    // replaces the old hidden horizontal-scroll overflow: everything stays
-    // on-screen at normal window widths.
-    ImGui::Spacing();
-
     // ── Mode → Scene Player ───────────────────────────────────────────
+    ImGui::SameLine();
     const bool player_active = st.scene_player.mode != sp::Mode::Off;
     if (player_active) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.9f, 0.65f, 1.0f));
     if (ImGui::Button("Mode")) ImGui::OpenPopup("##scene_player_mode");
@@ -9253,10 +7077,7 @@ static void draw_scene_visualizer(ViewerState& st) {
     }
 
     ImGui::SameLine();
-    if (ImGui::Button("Frame")) {
-        frame_scene_selection(st);
-        st.camera.ortho_zoom = 1.0f;   // reset ortho zoom to the freshly-framed scale
-    }
+    if (ImGui::Button("Frame")) frame_scene_selection(st);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame selection or scene (F)");
 
     ImGui::SameLine();
@@ -9270,9 +7091,6 @@ static void draw_scene_visualizer(ViewerState& st) {
         st.postfx_enabled = !st.postfx_enabled;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Toggle PostFX (bloom / DOF / HD grade / vignette)");
-
-    ImGui::PopStyleColor(3);
-    ImGui::EndChild();
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
     // Logical viewport size drives all UI/picking/overlay math.
@@ -9290,10 +7108,10 @@ static void draw_scene_visualizer(ViewerState& st) {
     const int fh = rh < 1 ? 1 : rh;
 
     if (!st.fbo) {
-        st.fbo = av::create_fbo_hdr(fw, fh, &st.fbo_tex);
+        st.fbo = av::create_fbo(fw, fh, &st.fbo_tex);
         st.fbo_w = fw; st.fbo_h = fh;
     } else if (fw != st.fbo_w || fh != st.fbo_h) {
-        av::resize_fbo_hdr(st.fbo, fw, fh, &st.fbo_tex);
+        av::resize_fbo(st.fbo, fw, fh, &st.fbo_tex);
         st.fbo_w = fw; st.fbo_h = fh;
     }
 
@@ -9305,9 +7123,6 @@ static void draw_scene_visualizer(ViewerState& st) {
         sp::player_apply_camera(st.scene_player, st.camera);
 
     av::begin_3d(st.fbo, fw, fh, st.camera);
-    // HDR path: when PostFX owns tone mapping, the mesh shaders emit LINEAR
-    // light into the RGBA16F buffer (no double-ACES / gamma-on-gamma).
-    av::set_inline_tonemap(!(st.postfx_enabled && st.postfx.enabled && st.postfx.hd));
 
     // Viewport diagnostics (Settings → Rendering): flat texture view and the
     // world-normal color view. begin_3d resets these to OFF for every pass, so
@@ -9366,7 +7181,6 @@ static void draw_scene_visualizer(ViewerState& st) {
         };
         std::vector<RankedPoint> ranked_points;
         ranked_points.reserve(st.scene.lights.size());
-        st.fire_billboards.clear();   // rebuilt from fire-linked lights below
         auto hash01 = [](float value) {
             const float sample = std::sin(value * 12.9898f) * 43758.5453f;
             return sample - std::floor(sample);
@@ -9395,14 +7209,7 @@ static void draw_scene_visualizer(ViewerState& st) {
                 }
                 for (int axis = 0; axis < 3; ++axis) {
                     ddir[dir_count][axis] = direction[axis] / length;
-                    // Game-space key intensity (≈2.6–3.4 in vanilla scenes and
-                    // the generators) is for the ENGINE's lighting equation.
-                    // Feeding it raw into the renderer overshot every tone
-                    // curve (the "everything is white" brightness bug). Remap
-                    // to linear-light units here; the renderer's HDR boost
-                    // brings it to ~2.3 effective.
-                    dcol[dir_count][axis] = light.color[axis] *
-                                            std::clamp(light.intensity * 0.32f, 0.0f, 1.6f);
+                    dcol[dir_count][axis] = light.color[axis] * light.intensity;
                 }
                 ++dir_count;
             } else if (light.type == 3) {
@@ -9424,32 +7231,6 @@ static void draw_scene_visualizer(ViewerState& st) {
                                         light.color[2] * 0.0722f;
                 const float influence = 1.0f / (1.0f + normalized_distance * normalized_distance);
                 ranked_points.push_back({&light, intensity, luminance * intensity * influence});
-
-                // Fire-linked lights (FireEmitterComponent) get a real animated
-                // flame billboard. Capture pos, warm color and the CURRENT
-                // flicker value (the same 0..1 flame factor computed above) so
-                // the flame and its light pulse in sync. Flame size scales with
-                // the authored radius but is clamped small (torch/candle sized).
-                if (light.flicker) {
-                    ViewerState::FireBillboard fb;
-                    fb.pos[0] = light.pos[0];
-                    fb.pos[1] = light.pos[1];
-                    fb.pos[2] = light.pos[2];
-                    // Warm normalized tint (independent of the HDR intensity).
-                    const float lmax = std::max(0.001f, std::max(light.color[0],
-                                        std::max(light.color[1], light.color[2])));
-                    fb.col[0] = light.color[0] / lmax;
-                    fb.col[1] = light.color[1] / lmax;
-                    fb.col[2] = light.color[2] / lmax;
-                    // Current flame brightness (0..1) — recovered from the
-                    // flicker-modulated intensity relative to its base.
-                    fb.flicker = std::clamp(light.base_intensity > 1e-4f
-                                    ? intensity / light.base_intensity - 0.0f : 1.0f,
-                                    0.0f, 2.0f) * 0.5f;
-                    fb.flicker = std::clamp(fb.flicker, 0.0f, 1.0f);
-                    fb.size = std::clamp(std::max(1.0f, light.radius) * 0.12f, 6.0f, 26.0f);
-                    st.fire_billboards.push_back(fb);
-                }
             }
         }
         if (ambient_count > 0) {
@@ -9469,11 +7250,8 @@ static void draw_scene_visualizer(ViewerState& st) {
             if (point_count >= 16) break;
             const auto& light = *ranked.light;
             for (int axis = 0; axis < 3; ++axis) {
-                // 3.5 ceiling: torch/fire cores carry honest HDR energy for
-                // the bloom pass, but a stacked pile of lights can't bleach
-                // the whole scene.
                 lpos[point_count][axis] = light.pos[axis];
-                lcol[point_count][axis] = std::min(light.color[axis] * ranked.intensity, 3.5f);
+                lcol[point_count][axis] = std::min(light.color[axis] * ranked.intensity, 2.5f);
             }
             lrad[point_count] = std::max(1.0f, light.radius);
             ++point_count;
@@ -9532,16 +7310,8 @@ static void draw_scene_visualizer(ViewerState& st) {
             continue;
         bool rendered = false;
 
-        // Dimension objects (DimensionObject component) are invisible in the
-        // vanilla game unless the Dimension Rift powerup is active. Ghost them
-        // (faint + translucent) until the "Dimension Rift" toggle reveals them.
-        const bool dim_ghost = obj.is_dimension_object && !st.scene_dimension_rift;
-        float dim_col[4] = {0.75f, 0.55f, 1.0f, 0.07f};   // faint violet ghost
-        float dim_hi[4]  = {0.55f, 0.80f, 1.0f, 0.35f};  // selected ghost (still see-through)
-
-        float obj_mat[16], world_mat[16];
-        swk::object_render_matrix(obj, obj_mat);   // model-only baked Y-rotation
-        swk::object_world_matrix(obj, world_mat); // ground geometry has no model wrapper
+        float obj_mat[16];
+        swk::object_render_matrix(obj, obj_mat);   // incl. ModelComponent Y-rotation
 
         // Draw embedded ground meshes (if any)
         if (idx < (int)st.scene_ground_gpu_meshes.size()) {
@@ -9555,15 +7325,13 @@ static void draw_scene_visualizer(ViewerState& st) {
                     gm.texture_id = 0;
                 }
 
-                float* col = (idx == st.selected_object)
-                                  ? (dim_ghost ? dim_hi : highlight)
-                                  : (dim_ghost ? dim_col : white);
-                av::render_mesh(gm, world_mat, col, false);
+                float* col = (idx == st.selected_object) ? highlight : white;
+                av::render_mesh(gm, obj_mat, col, false);
                 rendered = true;
 
                 if (st.show_wireframe) {
                     float wire_col[4] = {0.2f, 0.8f, 1.0f, 0.5f};
-                    av::render_mesh(gm, world_mat, wire_col, true);
+                    av::render_mesh(gm, obj_mat, wire_col, true);
                 }
             }
         }
@@ -9637,9 +7405,7 @@ static void draw_scene_visualizer(ViewerState& st) {
                     mat_color[0] = m.diffuse[0]; mat_color[1] = m.diffuse[1]; mat_color[2] = m.diffuse[2];
                     mat_color[3] = m.opacity;
                 }
-                float* col = (idx == st.selected_object)
-                                  ? (dim_ghost ? dim_hi : highlight)
-                                  : (dim_ghost ? dim_col : mat_color);
+                float* col = (idx == st.selected_object) ? highlight : mat_color;
                 av::render_mesh(gm, final_matrix, col, false);
                 rendered = true;
 
@@ -9657,9 +7423,7 @@ static void draw_scene_visualizer(ViewerState& st) {
                     gm.texture_id = 0;
                 }
 
-                float* col = (idx == st.selected_object)
-                                  ? (dim_ghost ? dim_hi : highlight)
-                                  : (dim_ghost ? dim_col : white);
+                float* col = (idx == st.selected_object) ? highlight : white;
                 av::render_mesh(gm, obj_mat, col, false);
                 rendered = true;
 
@@ -9677,50 +7441,23 @@ static void draw_scene_visualizer(ViewerState& st) {
             rendered = true;
 
         if (!rendered && st.scene_proxy_mesh.vao) {
-                        if (obj.is_non_visual()) {
+            if (obj.is_non_visual()) {
                 // Purely non-visual (light / portal / collider / spawn point).
                 // Draw a tiny, dim neutral marker so they stay findable, but
                 // don't flag them as "missing model" dots.
-                //
-                // The designer can toggle spawn / portal / camera markers off
-                // independently (colliders / triggers / AI markers always stay
-                // visible). Each marker kind also gets a distinct hue so they're
-                // tellable at a glance.
-                enum class MarkerKind { Other, Spawn, Portal, Camera };
-                MarkerKind mkind = MarkerKind::Other;
-                if      (obj.is_camera)      mkind = MarkerKind::Camera;
-                else if (obj.is_portal)      mkind = MarkerKind::Portal;
-                else if (obj.is_spawn_point) mkind = MarkerKind::Spawn;
-                bool show_marker = true;
-                switch (mkind) {
-                    case MarkerKind::Spawn:  show_marker = st.scene_marker_spawn;  break;
-                    case MarkerKind::Portal: show_marker = st.scene_marker_portal; break;
-                    case MarkerKind::Camera: show_marker = st.scene_marker_camera; break;
-                    default: break;
+                float marker_scale = std::max(0.035f, st.camera.distance * 0.0030f);
+                float marker_s[16], marker_t[16], marker_matrix[16];
+                av::mat4_identity(marker_s);
+                marker_s[0] = marker_s[5] = marker_s[10] = marker_scale;
+                av::mat4_translate(marker_t, obj.pos_x, obj.pos_y, obj.pos_z);
+                av::mat4_multiply(marker_matrix, marker_t, marker_s);
+                float proxy_color[4] = {0.45f, 0.55f, 0.70f, obj.hidden ? 0.12f : 0.30f};
+                if (is_scene_selected(st, idx)) {
+                    proxy_color[0] = 0.25f; proxy_color[1] = 0.72f; proxy_color[2] = 1.0f;
+                    proxy_color[3] = 0.95f;
                 }
-                if (show_marker) {
-                    float marker_scale = std::max(0.035f, st.camera.distance * 0.0030f);
-                    float marker_s[16], marker_t[16], marker_matrix[16];
-                    av::mat4_identity(marker_s);
-                    marker_s[0] = marker_s[5] = marker_s[10] = marker_scale;
-                    av::mat4_translate(marker_t, obj.pos_x, obj.pos_y, obj.pos_z);
-                    av::mat4_multiply(marker_matrix, marker_t, marker_s);
-                    float proxy_color[4] = {0.45f, 0.55f, 0.70f, obj.hidden ? 0.12f : 0.30f};
-                    if (mkind == MarkerKind::Spawn) {       // green
-                        proxy_color[0] = 0.30f; proxy_color[1] = 0.82f; proxy_color[2] = 0.55f;
-                    } else if (mkind == MarkerKind::Portal) { // purple
-                        proxy_color[0] = 0.80f; proxy_color[1] = 0.55f; proxy_color[2] = 0.92f;
-                    } else if (mkind == MarkerKind::Camera) { // amber
-                        proxy_color[0] = 0.92f; proxy_color[1] = 0.82f; proxy_color[2] = 0.30f;
-                    }
-                    if (dim_ghost) proxy_color[3] *= 0.18f;   // dimension ghosts stay ghostly
-                    if (is_scene_selected(st, idx)) {
-                        proxy_color[0] = 0.25f; proxy_color[1] = 0.72f; proxy_color[2] = 1.0f;
-                        proxy_color[3] = dim_ghost ? 0.35f : 0.95f;
-                    }
-                    av::render_mesh(st.scene_proxy_mesh, marker_matrix, proxy_color, false);
-                    rendered = true;
-                }
+                av::render_mesh(st.scene_proxy_mesh, marker_matrix, proxy_color, false);
+                rendered = true;
             } else {
                 // References a mesh but it didn't load — flag as a missing model.
                 float marker_scale = std::max(0.05f, st.camera.distance * 0.0048f);
@@ -9730,10 +7467,9 @@ static void draw_scene_visualizer(ViewerState& st) {
                 av::mat4_translate(marker_t, obj.pos_x, obj.pos_y, obj.pos_z);
                 av::mat4_multiply(marker_matrix, marker_t, marker_s);
                 float proxy_color[4] = {0.95f, 0.48f, 0.16f, obj.hidden ? 0.18f : 0.50f};
-                if (dim_ghost) proxy_color[3] *= 0.18f;   // dimension ghosts stay ghostly
                 if (is_scene_selected(st, idx)) {
                     proxy_color[0] = 0.25f; proxy_color[1] = 0.72f; proxy_color[2] = 1.0f;
-                    proxy_color[3] = dim_ghost ? 0.35f : 0.95f;
+                    proxy_color[3] = 0.95f;
                 }
                 av::render_mesh(st.scene_proxy_mesh, marker_matrix, proxy_color, false);
                 rendered = true;
@@ -9756,115 +7492,6 @@ static void draw_scene_visualizer(ViewerState& st) {
                 rendered_objects, (int)st.scene.objects.size(), proxy_objects);
     st.scene_rendered_objects = rendered_objects;
     st.scene_proxy_objects = proxy_objects;
-
-    // ── Trigger / portal / spawn volume pass ───────────────────────────────
-    // Mirrors the web editor's convention of color-coding non-mesh logic
-    // volumes by category so an artist can tell trigger types apart at a
-    // glance. Each object with a LocalAABB (or a spawn/portal role) is drawn as
-    // a color-coded wireframe box in world space; spawn points additionally get
-    // a facing-direction triangle. Gated behind the Portals scene-view toggle.
-    if (st.scene_portal_enabled) {
-        // Category → color (matches the web editor's mental model):
-        //   spawn  = green, portal = magenta, secret = amber,
-        //   sewers = cyan,  generic trigger = slate blue.
-        auto category_color = [](const av::SceneObject& o, float out[4]) {
-            const std::string& n = o.name;
-            auto has_prefix = [&](const char* p) {
-                return n.rfind(p, 0) == 0;   // starts_with
-            };
-            if (o.is_spawn_point || has_prefix("spawn")) {
-                out[0] = 0.25f; out[1] = 0.95f; out[2] = 0.35f; out[3] = 0.85f;   // green
-            } else if (o.is_portal || has_prefix("portal")) {
-                out[0] = 0.95f; out[1] = 0.25f; out[2] = 0.90f; out[3] = 0.85f;   // magenta
-            } else if (has_prefix("secret")) {
-                out[0] = 1.00f; out[1] = 0.72f; out[2] = 0.15f; out[3] = 0.85f;   // amber
-            } else if (has_prefix("sewers")) {
-                out[0] = 0.20f; out[1] = 0.85f; out[2] = 0.95f; out[3] = 0.85f;   // cyan
-            } else {
-                out[0] = 0.45f; out[1] = 0.60f; out[2] = 0.95f; out[3] = 0.70f;   // slate
-            }
-        };
-
-        for (int i = 0; i < (int)st.scene.objects.size(); ++i) {
-            const auto& obj = st.scene.objects[i];
-            if (obj.hidden && !st.scene_show_hidden) continue;
-
-            float aabb[4];
-            const bool has_aabb = parse_local_aabb(obj.local_aabb, aabb);
-            // Only treat this as a trigger volume worth outlining when it is a
-            // logic object — a spawn/portal, a named trigger (portal/secret/
-            // sewers…), or a non-visual object that carries an AABB. Renderable
-            // meshes also have a LocalAABB (their bounds); drawing a box around
-            // every mesh would be pure noise, so those are skipped.
-            const std::string& nm = obj.name;
-            auto starts = [&](const char* p){ return nm.rfind(p, 0) == 0; };
-            const bool named_trigger = starts("portal") || starts("secret") ||
-                                       starts("sewers") || starts("spawn") ||
-                                       starts("trigger");
-            const bool is_volume = obj.is_spawn_point || obj.is_portal ||
-                                   named_trigger ||
-                                   (has_aabb && obj.is_non_visual());
-            if (!is_volume) continue;
-
-            // World-space rectangle: LocalAABB is an offset (x,y) + size (w,h)
-            // relative to the object's Position. 2.5D game → box lies in the XY
-            // plane at the object's Z (depth), given a thin Z extrusion so it
-            // reads as a volume rather than a flat quad.
-            float ax = obj.pos_x, ay = obj.pos_y;
-            float aw = 60.0f, ah = 90.0f;   // sane default for spawn/portal w/o AABB
-            if (has_aabb) { ax += aabb[0]; ay += aabb[1]; aw = aabb[2]; ah = aabb[3]; }
-            const float x0 = ax, y0 = ay, x1 = ax + aw, y1 = ay + ah;
-            const float z  = obj.pos_z;
-            const float zt = std::max(6.0f, aw * 0.12f);   // half depth extrusion
-
-            float col[4];
-            category_color(obj, col);
-            if (is_scene_selected(st, i)) {   // selected → bright blue, opaque
-                col[0] = 0.25f; col[1] = 0.72f; col[2] = 1.0f; col[3] = 1.0f;
-            }
-            const float lw = is_scene_selected(st, i) ? 2.5f : 1.6f;
-
-            // 12 edges of the box = 24 vertices (segment pairs) × 3 floats.
-            const float zf = z - zt, zb = z + zt;
-            const float corners[8][3] = {
-                {x0, y0, zf}, {x1, y0, zf}, {x1, y1, zf}, {x0, y1, zf},   // front face
-                {x0, y0, zb}, {x1, y0, zb}, {x1, y1, zb}, {x0, y1, zb},   // back face
-            };
-            const int edges[12][2] = {
-                {0,1},{1,2},{2,3},{3,0},   // front
-                {4,5},{5,6},{6,7},{7,4},   // back
-                {0,4},{1,5},{2,6},{3,7},   // connectors
-            };
-            float verts[12 * 2 * 3];
-            for (int e = 0; e < 12; ++e) {
-                const float* a = corners[edges[e][0]];
-                const float* b = corners[edges[e][1]];
-                float* o = &verts[e * 6];
-                o[0]=a[0]; o[1]=a[1]; o[2]=a[2];
-                o[3]=b[0]; o[4]=b[1]; o[5]=b[2];
-            }
-            av::render_lines(verts, 24, col, nullptr, lw);
-
-            // Spawn facing indicator: a triangle at the box center pointing in
-            // the facing direction (spawn_facing > 0 = right, else left).
-            if (obj.is_spawn_point || obj.name.rfind("spawn", 0) == 0) {
-                const float cx = (x0 + x1) * 0.5f;
-                const float cy = (y0 + y1) * 0.5f;
-                const float dir = obj.spawn_facing > 0 ? 1.0f : -1.0f;
-                const float ts  = std::max(14.0f, aw * 0.30f);   // triangle size
-                // Triangle: base behind center, tip ahead in facing direction.
-                const float tip[3]  = {cx + dir * ts, cy, z};
-                const float ba[3]   = {cx - dir * ts * 0.4f, cy + ts * 0.55f, z};
-                const float bb[3]   = {cx - dir * ts * 0.4f, cy - ts * 0.55f, z};
-                float tri[3 * 2 * 3] = {
-                    tip[0],tip[1],tip[2], ba[0],ba[1],ba[2],
-                    ba[0],ba[1],ba[2],   bb[0],bb[1],bb[2],
-                    bb[0],bb[1],bb[2],   tip[0],tip[1],tip[2],
-                };
-                av::render_lines(tri, 6, col, nullptr, 2.0f);
-            }
-        }
-    }
 
     // ── Ground-mesh editing overlay: strong wireframe on the edited object ──
     if (st.scene_mesh_edit && st.mesh_edit_object >= 0 &&
@@ -9929,103 +7556,11 @@ static void draw_scene_visualizer(ViewerState& st) {
         }
     }
 
-    // ── Portal effects (PortalEffectComponent swirl + PortalComponent zone) ──
-    // Editor-viewport preview parity with the web editor's live PortalEffect.
-    // Native previously only drew portals as 2D map edges (map_editor) or as a
-    // runtime post-fx (fbo_scaler); this renders them from the loaded scene's
-    // component data using the editor camera.
-    if (st.scene_portal_enabled) {
-        const float ptime = (float)ImGui::GetTime();
-        for (const auto& pobj : st.scene.objects) {
-            if (pobj.hidden && !st.scene_show_hidden) continue;
-            const auto& comps = pobj.resolved_components.empty()
-                                    ? pobj.components : pobj.resolved_components;
-            // A portal object is detected two ways, because the component's
-            // `type_name` string is frequently EMPTY: most Swordigo components
-            // identify themselves purely by their protobuf payload-field tag
-            // (PortalComponent=4002, PortalEffectComponent=4058) with no name
-            // string, so the old exact `type_name == "PortalComponent"` test
-            // matched nothing and NO portal ever rendered. We now trust the
-            // loader's already-resolved `pobj.is_portal` flag, and additionally
-            // substring-match the type_name when it IS present.
-            bool has_effect = false, has_portal = pobj.is_portal;
-            float color[3] = {0.55f, 0.35f, 0.95f};   // default swirl tint
-            float speed = 1.0f;
-            for (const auto& c : comps) {
-                if (c.type_name.find("Portal") != std::string::npos &&
-                    c.type_name.find("Effect") == std::string::npos)
-                    has_portal = true;
-                // Match the effect component by name OR by its payload tag
-                // (4058) so unnamed components still light up.
-                const bool is_effect_by_name =
-                    c.type_name.find("PortalEffect") != std::string::npos;
-                const bool is_effect_by_tag = (c.payload_field == 4058) ||
-                                              (c.type_id == 4058);
-                if (!is_effect_by_name && !is_effect_by_tag) continue;
-                has_effect = true;
-                // Pull Color (FloatColor) + Speed (Vector3) out of the fields.
-                for (const auto& f : av::scene_component_fields(c)) {
-                    if (f.name == "Color" && f.bytes_value.size() >= 12) {
-                        float rgb[3];
-                        std::memcpy(rgb, f.bytes_value.data(), 12);
-                        // Guard against NaN / absurd values from odd payloads.
-                        for (int k = 0; k < 3; ++k)
-                            if (std::isfinite(rgb[k])) color[k] = std::clamp(rgb[k], 0.0f, 1.0f);
-                    } else if (f.name == "Speed" && f.bytes_value.size() >= 4) {
-                        float sx = 0.0f;
-                        std::memcpy(&sx, f.bytes_value.data(), 4);
-                        if (std::isfinite(sx) && sx != 0.0f) speed = std::fabs(sx);
-                    }
-                }
-            }
-            if (!has_effect && !has_portal) continue;
-            const float pos[3] = {pobj.pos_x, pobj.pos_y, pobj.pos_z};
-            // Size from the object's scale so bigger portals read bigger.
-            const float sz = 2.2f * std::max(0.4f, std::fabs(pobj.scale_x));
-            if (has_effect)
-                av::render_portal_effect(pos, color, sz, speed, ptime);
-            // Trigger-zone ring outline for a PortalComponent with no effect
-            // (so functional-only portals are still visible in the editor).
-            else if (has_portal) {
-                float ring[16 * 6];
-                const int seg = 24;
-                float verts[(seg + 1) * 3];
-                const float rr = sz * 0.5f;
-                for (int s = 0; s <= seg; ++s) {
-                    const float a = (float)s / seg * 6.28318530718f;
-                    verts[s*3+0] = pos[0] + std::cos(a) * rr;
-                    verts[s*3+1] = pos[1] + std::sin(a) * rr;
-                    verts[s*3+2] = pos[2];
-                }
-                (void)ring;
-                const float rc[4] = {color[0], color[1], color[2], 0.9f};
-                // render_lines takes segment pairs; build them from the ring.
-                float segs[seg * 2 * 3];
-                for (int s = 0; s < seg; ++s) {
-                    std::memcpy(&segs[s*6+0], &verts[s*3], 12);
-                    std::memcpy(&segs[s*6+3], &verts[(s+1)*3], 12);
-                }
-                av::render_lines(segs, seg * 2, rc, nullptr, 2.0f);
-            }
-        }
-    }
-
     // ── Emissive glow sprites (torches / fire / SimpleGlow) ──
     // Additive camera-facing billboards at every point light; their bright
     // cores feed the PostFX bloom bright-pass for the vanilla torch glow.
     if (st.scene_lights_enabled && st.scene_glow_enabled)
         av::render_point_light_glows();
-
-    // ── Animated procedural fire (torches / lava / campfires) ──
-    // Real upward-flowing flames on every fire-linked light, with per-flame
-    // flicker synced to the point light so the flame and its illumination
-    // pulse together. Cheap billboards (one draw each, shared program/VAO) so
-    // even 14–34 torches in a cave stay performant.
-    if (st.scene_lights_enabled && st.scene_fire_enabled && !st.fire_billboards.empty()) {
-        const float fire_time = (float)ImGui::GetTime();
-        for (const auto& fb : st.fire_billboards)
-            av::render_fire_sprite(fb.pos, fb.col, fb.size, fb.flicker, fire_time);
-    }
 
     // ── Light debug overlay: influence-radius rings + emitter crosses ──
     if (st.scene_lights_enabled && st.scene_light_debug)
@@ -10236,17 +7771,6 @@ static void draw_scene_visualizer(ViewerState& st) {
     // The viewport is the Image item itself — capture hover right here so the
     // input block below works no matter what ImGui items get drawn afterwards.
     const bool viewport_hovered = ImGui::IsItemHovered();
-    // Sticky keyboard ownership: hovering (or clicking) the viewport grabs the
-    // keys; clicking anywhere else releases them. While held, arrow-nudging
-    // objects keeps working even with the cursor parked over a side panel —
-    // ImGui nav stays suspended so the GUI never eats the arrows.
-    if (viewport_hovered)
-        st.view_keyboard_focus = true;
-    else if (ImGui::IsMouseClicked(0))
-        st.view_keyboard_focus = false;
-    // Stamp this frame so the top-of-frame fallback clear (below) can tell
-    // the viewport is still live and must NOT stomp the sticky latch.
-    st.view_keyboard_focus_frame = ImGui::GetFrameCount();
 
     ImDrawList* overlay = ImGui::GetWindowDrawList();
 
@@ -10331,41 +7855,13 @@ static void draw_scene_visualizer(ViewerState& st) {
 
         float matrix[16];
         swk::object_world_matrix(gobj, matrix);
-        // Base operation from the active tool; Universal fuses move+rotate+
-        // uniform-scale into one gizmo (web TransformControls has separate
-        // modes, ImGuizmo offers a combined handle we expose as an option).
-        ImGuizmo::OPERATION op = st.gizmo_universal ? ImGuizmo::UNIVERSAL
-                               : st.scene_transform_mode == 1 ? ImGuizmo::TRANSLATE
-                               : st.scene_transform_mode == 2 ? ImGuizmo::ROTATE
-                               : ImGuizmo::SCALE;
-        // Per-axis masking (web showX/showY/showZ): drop the bits for any
-        // hidden axis so its handle disappears and its motion is locked.
-        if (!st.gizmo_universal) {
-            ImGuizmo::OPERATION masked = (ImGuizmo::OPERATION)0;
-            if (st.scene_transform_mode == 1) {
-                if (st.gizmo_show_x) masked = masked | ImGuizmo::TRANSLATE_X;
-                if (st.gizmo_show_y) masked = masked | ImGuizmo::TRANSLATE_Y;
-                if (st.gizmo_show_z) masked = masked | ImGuizmo::TRANSLATE_Z;
-            } else if (st.scene_transform_mode == 2) {
-                if (st.gizmo_show_x) masked = masked | ImGuizmo::ROTATE_X;
-                if (st.gizmo_show_y) masked = masked | ImGuizmo::ROTATE_Y;
-                if (st.gizmo_show_z) masked = masked | ImGuizmo::ROTATE_Z;
-            } else {
-                if (st.gizmo_show_x) masked = masked | ImGuizmo::SCALE_X;
-                if (st.gizmo_show_y) masked = masked | ImGuizmo::SCALE_Y;
-                if (st.gizmo_show_z) masked = masked | ImGuizmo::SCALE_Z;
-            }
-            if ((int)masked != 0) op = masked;   // keep full op if all axes off
-        }
-        // World/Local space (web setSpace). Scale always operates in LOCAL to
-        // match the web editor (TransformControls forces local while scaling).
-        const ImGuizmo::MODE mode =
-            (st.scene_transform_mode == 3 || st.gizmo_local) ? ImGuizmo::LOCAL
-                                                             : ImGuizmo::WORLD;
+        const ImGuizmo::OPERATION op = st.scene_transform_mode == 1 ? ImGuizmo::TRANSLATE
+                                     : st.scene_transform_mode == 2 ? ImGuizmo::ROTATE
+                                     : ImGuizmo::SCALE;
         const bool was_using = ImGuizmo::IsUsing();
         float snap[3] = {0.0f, 0.0f, 0.0f};
         if (snap_active) {
-            if (st.scene_transform_mode == 2) snap[0] = snap[1] = snap[2] = 15.0f; // degrees
+            if (op == ImGuizmo::ROTATE) snap[0] = snap[1] = snap[2] = 15.0f;      // degrees
             else snap[0] = snap[1] = snap[2] = st.scene_snap_step;
         }
         // Capture the active object's transform before this frame's drag so
@@ -10373,7 +7869,7 @@ static void draw_scene_visualizer(ViewerState& st) {
         const float pre_pos[3] = {gobj.pos_x, gobj.pos_y, gobj.pos_z};
         const float pre_rot = gobj.rot_y;
         const float pre_scl = gobj.scale_x;
-        if (ImGuizmo::Manipulate(view, proj, op, mode, matrix, nullptr,
+        if (ImGuizmo::Manipulate(view, proj, op, ImGuizmo::WORLD, matrix, nullptr,
                                  snap_active ? snap : nullptr)) {
             if (!was_using && ImGuizmo::IsUsing()) snapshot_scene(st);   // snapshot at drag start
             // Decompose the manipulated matrix back into scene fields.
@@ -10452,30 +7948,6 @@ static void draw_scene_visualizer(ViewerState& st) {
                                          IM_COL32(255, 255, 255, 200));
                 }
             }
-            // Selected sub-mesh tint (triple-tap drill-down): wash the whole
-            // mesh amber so it reads as "this mesh is selected" even before an
-            // element (vertex/face/edge) is picked.
-            if (st.mesh_edit_mesh >= 0 && st.mesh_edit_mesh < (int)eobj.ground_meshes.size() &&
-                st.mesh_edit_vertex < 0 && st.mesh_edit_triangle < 0 && st.mesh_edit_edge_a < 0) {
-                const auto& sm = eobj.ground_meshes[st.mesh_edit_mesh];
-                for (size_t t = 0; t + 2 < sm.indices.size(); t += 3) {
-                    ImVec2 pts[3];
-                    bool ok = true;
-                    for (int k = 0; k < 3; ++k) {
-                        const int vi = (int)sm.indices[t + k];
-                        if (vi < 0 || vi >= sm.num_vertices) { ok = false; break; }
-                        const float lp[3] = {sm.positions[vi*3], sm.positions[vi*3+1], sm.positions[vi*3+2]};
-                        const float wp[3] = { eobj_mat[0]*lp[0] + eobj_mat[4]*lp[1] + eobj_mat[8]*lp[2]  + eobj_mat[12],
-                                              eobj_mat[1]*lp[0] + eobj_mat[5]*lp[1] + eobj_mat[9]*lp[2]  + eobj_mat[13],
-                                              eobj_mat[2]*lp[0] + eobj_mat[6]*lp[1] + eobj_mat[10]*lp[2] + eobj_mat[14] };
-                        if (!swk::world_to_screen(st.camera, w, h, pos, wp, pts[k])) { ok = false; break; }
-                    }
-                    if (ok) {
-                        overlay->AddTriangleFilled(pts[0], pts[1], pts[2], IM_COL32(255, 180, 40, 46));
-                        overlay->AddTriangle(pts[0], pts[1], pts[2], IM_COL32(255, 200, 60, 120), 1.0f);
-                    }
-                }
-            }
             // Highlight the picked face / edge (face & edge tools).
             if (st.mesh_edit_tool == 1 && st.mesh_edit_triangle >= 0 &&
                 st.mesh_edit_mesh >= 0 && st.mesh_edit_mesh < (int)eobj.ground_meshes.size()) {
@@ -10547,24 +8019,6 @@ static void draw_scene_visualizer(ViewerState& st) {
         st.gm_edit_apply_object >= 0) {
         inline_edit_input(st, pos, w, h);
     }
-    // ── Failsafe: unstick pointer/drag flags ──
-    // The release handling inside the hover-gated block below never runs when
-    // the mouse is released over ANOTHER panel (inspector, terminal…), so
-    // scene_pointer_active stayed true forever — permanently disabling every
-    // keyboard camera control (WASD / arrows / +-). When we are NOT hovering
-    // the viewport and the button is up, nothing valid can be dragging: clear
-    // the sticky flags. (When we ARE hovering, the normal release block runs.)
-    if (!viewport_hovered && !ImGui::IsMouseDown(0)) {
-        if (st.scene_pointer_active || st.scene_transform_drag ||
-            st.mesh_edit_drag || st.gizmo_drag) {
-            st.scene_pointer_active = false;
-            st.scene_transform_drag = false;
-            st.mesh_edit_drag = false;
-            st.gizmo_drag = false;
-            st.gizmo_axis = -1;
-        }
-    }
-
     if (viewport_hovered && !using_guizmo && !st.gm_inline_edit) {
 
         // ── Keyboard shortcuts ──
@@ -10593,8 +8047,7 @@ static void draw_scene_visualizer(ViewerState& st) {
                 snapshot_scene(st);
             }
         }
-        // NOTE: S is no longer a Scale shortcut — WASD drives the camera.
-        // Scale mode: key 4 or the toolbar buttons.
+        if (ImGui::IsKeyPressed(ImGuiKey_S)) { st.scene_transform_mode = 3; st.scene_mesh_edit = false; } // Scale
         if (ImGui::IsKeyPressed(ImGuiKey_M)) {
             // M = inline 2D edit (2D-only, no legacy-3D fallback).
             if (st.selected_object >= 0 &&
@@ -10666,97 +8119,6 @@ static void draw_scene_visualizer(ViewerState& st) {
                 st.mesh_edit_mesh = st.mesh_edit_vertex = -1;
                 st.scene_dirty = true;
                 resync_scene_ground_meshes(st);
-            }
-        }
-
-        // ── WASD camera pan (W/S forward-back, A/D strafe, Q/E vertical) ──
-        // Active whenever the viewport is hovered and no drag or text field is
-        // in progress. Speed scales with the orbit distance so the camera
-        // feels consistent zoomed in or out.
-        if (!io.WantCaptureKeyboard && !st.scene_transform_drag &&
-            !st.gizmo_drag && !st.mesh_edit_drag && !st.scene_pointer_active) {
-            float right[3], up[3], fwd[3];
-            swk::camera_basis(st.camera, right, up, fwd);
-            const float speed = 0.09f * st.camera.distance * io.DeltaTime * st.cam_keyboard_speed;
-            float dx = 0.0f, dz = 0.0f, dy = 0.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_W)) { dx += fwd[0]; dz += fwd[2]; }
-            if (ImGui::IsKeyDown(ImGuiKey_S)) { dx -= fwd[0]; dz -= fwd[2]; }
-            if (ImGui::IsKeyDown(ImGuiKey_A)) { dx -= right[0]; dz -= right[2]; }
-            if (ImGui::IsKeyDown(ImGuiKey_D)) { dx += right[0]; dz += right[2]; }
-            if (ImGui::IsKeyDown(ImGuiKey_Q)) dy -= 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_E)) dy += 1.0f;
-            if (dx != 0.0f || dz != 0.0f || dy != 0.0f) {
-                st.camera.target[0] += dx * speed;
-                st.camera.target[2] += dz * speed;
-                st.camera.target[1] += dy * speed;
-            }
-        }
-
-        // ── Arrow keys ──
-        // In Move mode WITH a selection they nudge the selection (existing
-        // behaviour). Otherwise they PAN THE CAMERA (left/right on the view
-        // right vector, up/down vertical) — always-responsive navigation.
-        const bool arrow_nudge_selection =
-            st.scene_transform_mode == 1 && !st.scene_selection.empty();
-        if (!io.WantCaptureKeyboard && !st.scene_transform_drag) {
-            float mx = 0.0f, my = 0.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_UpArrow))    my += 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_DownArrow))  my -= 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_LeftArrow))  mx -= 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_RightArrow)) mx += 1.0f;
-            if (mx != 0.0f || my != 0.0f) {
-                if (arrow_nudge_selection) {
-                    const float step = snap_active ? st.scene_snap_step
-                        : std::max(5.0f, st.camera.distance * 0.01f);
-                    const float amount = step * 8.0f * io.DeltaTime * st.cam_keyboard_speed;
-                    for (int idx : st.scene_selection) {
-                        if (idx < 0 || idx >= (int)st.scene.objects.size()) continue;
-                        auto& o = st.scene.objects[idx];
-                        o.pos_x += mx * amount;
-                        o.pos_y += my * amount;
-                    }
-                    av::scene_refresh(st.scene);
-                    st.scene_dirty = true;
-                } else {
-                    float right[3], up[3], fwd[3];
-                    swk::camera_basis(st.camera, right, up, fwd);
-                    const float speed = 0.09f * st.camera.distance * io.DeltaTime * st.cam_keyboard_speed;
-                    st.camera.target[0] += mx * right[0] * speed;
-                    st.camera.target[2] += mx * right[2] * speed;
-                    st.camera.target[1] += my * speed;
-                }
-            }
-        }
-
-        // ── +/- keys ──
-        // In Scale mode WITH a selection they scale the selection (existing
-        // behaviour). Otherwise they ZOOM THE CAMERA (exponential distance,
-        // same feel as the mouse wheel). '=' (top row) and keypad +/-.
-        const bool plusminus_scale_selection =
-            st.scene_transform_mode == 3 && !st.scene_selection.empty();
-        if (!io.WantCaptureKeyboard && !st.scene_transform_drag) {
-            float dir = 0.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_Equal))       dir += 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_Minus))       dir -= 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_KeypadAdd))   dir += 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_KeypadSubtract)) dir -= 1.0f;
-            if (dir != 0.0f) {
-                if (plusminus_scale_selection) {
-                    const float dscl = expf(dir * 1.8f * io.DeltaTime);
-                    for (int idx : st.scene_selection) {
-                        if (idx < 0 || idx >= (int)st.scene.objects.size()) continue;
-                        auto& o = st.scene.objects[idx];
-                        o.scale_x = std::clamp(o.scale_x * dscl, 0.001f, 100.0f);
-                        o.scale_y = o.scale_z = o.scale_x;
-                    }
-                    av::scene_refresh(st.scene);
-                    st.scene_dirty = true;
-                } else {
-                    // '+' pulls in, '-' pushes out (wheel convention).
-                    const float factor = expf(-dir * 1.2f * io.DeltaTime);
-                    st.camera.distance = std::clamp(st.camera.distance * factor,
-                                                    0.1f, 2000.0f);
-                }
             }
         }
 
@@ -10840,13 +8202,22 @@ static void draw_scene_visualizer(ViewerState& st) {
                 }
             }
 
-            // 2) Object selection is intentionally NOT done here on press.
-            //    Selection is now RELEASE-driven (see the LMB-release handler):
-            //    a click = press+release at ~the same spot, and doing the pick
-            //    once on release (instead of on both press AND release, as the
-            //    old code did) is what makes selecting/deselecting feel instant
-            //    and lets clicking a new object immediately replace the old
-            //    selection. Press only arms drags / mesh-element edits above.
+            // 2) Object picking (Ctrl = toggle multi-select; transform drag is
+            //    ImGuizmo-driven in Move/Rotate/Scale modes)
+            //    In face/edge tools object picking only runs when empty space
+            //    was clicked (no element hit).
+            if (!st.mesh_edit_drag &&
+                (st.mesh_edit_tool == 0 || (st.mesh_edit_triangle < 0 && st.mesh_edit_edge_a < 0))) {
+                const int hit = swk::pick_scene_object(st.scene.objects, &st.scene_model_cache,
+                                                       st.scene_show_hidden, st.camera, w, h,
+                                                       pos, io.MousePos);
+                if (io.KeyCtrl) {
+                    if (hit >= 0) toggle_scene_selection(st, hit);
+                } else if (hit != st.selected_object) {
+                    select_scene_object(st, hit);
+                }
+                if (st.scene_mesh_edit) st.mesh_edit_object = st.selected_object;
+            }
         }
 
         // ── LMB drag: vertex edit / gizmo axis / free transform ──
@@ -10948,78 +8319,20 @@ static void draw_scene_visualizer(ViewerState& st) {
             st.scene_dirty = true;
         }
 
-        // ── LMB release: the SINGLE place object selection happens ──
-        // Selection is fully release-driven now (BUG-3 remaster). A click is a
-        // press+release within a small radius that wasn't a drag/gizmo/mesh
-        // edit. Doing the pick exactly once here — instead of on both press and
-        // release like before — is what makes selecting feel instant and lets
-        // clicking a new object immediately replace the old selection with no
-        // struggle. Clicking empty space deselects.
+        // ── LMB release ──
         if (st.scene_pointer_active && ImGui::IsMouseReleased(0)) {
             const float dx = io.MousePos.x - st.scene_pointer_start.x;
             const float dy = io.MousePos.y - st.scene_pointer_start.y;
-            const bool is_click = (dx*dx + dy*dy <= 16.0f) &&
-                                  !st.scene_transform_drag && !st.mesh_edit_drag &&
-                                  !st.gizmo_drag;
-            if (is_click) {
+            // Ctrl+click toggling already happened on press; on release only a
+            // plain (no-Ctrl) click activates an object (idempotent single
+            // select, so double-firing here is harmless).  Without this guard
+            // a Ctrl+click would toggle twice and cancel out.
+            if (dx*dx + dy*dy <= 16.0f && !st.scene_transform_drag && !st.mesh_edit_drag &&
+                !io.KeyCtrl) {
                 const int hit = swk::pick_scene_object(st.scene.objects, &st.scene_model_cache,
                                                        st.scene_show_hidden, st.camera, w, h,
                                                        pos, io.MousePos);
-
-                // Rapid-tap tracking runs on EVERY click (before selection logic
-                // can early-out) so the triple-tap counter is reliable. 3 taps
-                // <= 0.4 s apart within ~14 px = a deliberate sub-mesh drill-down.
-                const double now = ImGui::GetTime();
-                const bool rapid = (now - st.scene_tap_time) <= 0.4;
-                const bool same_spot = std::hypotf(io.MousePos.x - st.scene_tap_pos.x,
-                                                   io.MousePos.y - st.scene_tap_pos.y) <= 14.0f;
-                st.scene_tap_count = (rapid && same_spot) ? st.scene_tap_count + 1 : 1;
-                st.scene_tap_time = now;
-                st.scene_tap_pos = io.MousePos;
-
-                bool handled_triple = false;
-                if (st.scene_tap_count >= 3) {
-                    st.scene_tap_count = 0;
-                    int mobj = -1, mmesh = -1;
-                    if (swk::pick_scene_ground_mesh(st.scene.objects, st.scene_show_hidden,
-                                                    st.camera, w, h, pos, io.MousePos,
-                                                    mobj, mmesh)) {
-                        // Triple-tap ONLY selects the sub-mesh for transform/copy.
-                        // It must NOT enter the 3D vertex mesh-edit mode (the old
-                        // behaviour). Leave scene_mesh_edit off and the transform
-                        // mode unchanged so the user can Move/Rotate/Scale/copy the
-                        // selected mesh right away. Press M to open the 2D editor.
-                        select_scene_object(st, mobj);
-                        st.mesh_edit_object = mobj;   // active sub-mesh target
-                        st.mesh_edit_mesh = mmesh;
-                        st.mesh_edit_vertex = -1;
-                        st.mesh_edit_triangle = -1;
-                        st.mesh_edit_edge_a = st.mesh_edit_edge_b = -1;
-                        st.mesh_edit_drag = false;
-                        // Do NOT set st.scene_mesh_edit and do NOT change
-                        // st.scene_transform_mode here.
-                        char msg[208];
-                        snprintf(msg, sizeof(msg),
-                                 "Selected mesh %d of '%s' for move/copy \xe2\x80\x94 press M to edit in 2D",
-                                 mmesh, st.scene.objects[mobj].name.c_str());
-                        st.status_msg = msg;
-                        handled_triple = true;
-                    }
-                }
-
-                if (!handled_triple) {
-                    // Normal click selection — intelligent & responsive:
-                    //  • Ctrl+click on an object → toggle it in the multi-select.
-                    //  • Plain click on an object → make it THE selection
-                    //    (instantly replaces any previous selection).
-                    //  • Click on empty space → deselect everything.
-                    if (io.KeyCtrl) {
-                        if (hit >= 0) toggle_scene_selection(st, hit);
-                    } else {
-                        select_scene_object(st, hit);   // hit == -1 clears selection
-                    }
-                    if (st.scene_mesh_edit) st.mesh_edit_object = st.selected_object;
-                }
+                if (hit != st.selected_object) select_scene_object(st, hit);
             }
             st.scene_pointer_active = false;
             st.scene_transform_drag = false;
@@ -11033,13 +8346,7 @@ static void draw_scene_visualizer(ViewerState& st) {
         // leaves the viewport over a side panel, the global zoom must not fire).
         if (!st.gm_inline_edit && io.MouseWheel != 0.0f) {
             const float factor = std::pow(0.94f, io.MouseWheel * st.cam_zoom_speed);
-            // Overshoot fix: the old floor of 0.1 let a zoom-in dolly the camera
-            // almost onto (and, combined with the target-lerp below, visually
-            // PAST/BEHIND) the focus point — the "zoom goes behind the scene
-            // mesh" bug. Clamp the minimum distance to a sane floor tied to the
-            // near plane so the camera can never cross through the focus point.
-            const float min_dist = std::max(2.0f, st.camera.near_plane * 4.0f);
-            const float new_dist = std::clamp(st.camera.distance * factor, min_dist, 2000.0f);
+            const float new_dist = std::clamp(st.camera.distance * factor, 0.1f, 2000.0f);
 
             if (st.selected_object >= 0 && st.selected_object < (int)st.scene.objects.size()) {
                 // Scroll zoom converges on the active object instead of drifting
@@ -11050,34 +8357,15 @@ static void draw_scene_visualizer(ViewerState& st) {
                 st.camera.target[1] += (selected.pos_y - st.camera.target[1]) * focus;
                 st.camera.target[2] += (selected.pos_z - st.camera.target[2]) * focus;
             } else {
-                // Nothing selected: converge the camera on the scene SPAWN POINT
-                // so zooming in always heads toward the playable area instead of
-                // drifting behind the level (the reported overshoot). Find the
-                // spawn point the same way the framing helpers do; if none
-                // exists, fall back to the cursor focal point (Blender-style).
-                int spawn_idx = -1, first_spawn = -1;
-                for (int i = 0; i < (int)st.scene.objects.size(); ++i) {
-                    if (!st.scene.objects[i].is_spawn_point) continue;
-                    if (first_spawn < 0) first_spawn = i;
-                    if (st.scene.objects[i].name == "spawn_default") { spawn_idx = i; break; }
-                }
-                if (spawn_idx < 0) spawn_idx = first_spawn;
-
-                if (spawn_idx >= 0) {
-                    const auto& sp = st.scene.objects[spawn_idx];
-                    const float focus = std::min(0.35f, 0.12f * std::fabs(io.MouseWheel));
-                    st.camera.target[0] += (sp.pos_x - st.camera.target[0]) * focus;
-                    st.camera.target[1] += (sp.pos_y - st.camera.target[1]) * focus;
-                    st.camera.target[2] += (sp.pos_z - st.camera.target[2]) * focus;
-                } else {
-                    float pivot[3];
-                    if (cursor_focal_point(st.camera, w, h, pos, io.MousePos, pivot)) {
-                        // Clamp the lerp so we can never step past the pivot.
-                        const float t = std::clamp(1.0f - new_dist / st.camera.distance, 0.0f, 0.9f);
-                        st.camera.target[0] += (pivot[0] - st.camera.target[0]) * t;
-                        st.camera.target[1] += (pivot[1] - st.camera.target[1]) * t;
-                        st.camera.target[2] += (pivot[2] - st.camera.target[2]) * t;
-                    }
+                // Nothing selected: dolly toward the point under the cursor so
+                // zooming feels anchored (Blender-style), instead of drifting
+                // around a stale scene center.
+                float pivot[3];
+                if (cursor_focal_point(st.camera, w, h, pos, io.MousePos, pivot)) {
+                    const float t = 1.0f - new_dist / st.camera.distance;
+                    st.camera.target[0] += (pivot[0] - st.camera.target[0]) * t;
+                    st.camera.target[1] += (pivot[1] - st.camera.target[1]) * t;
+                    st.camera.target[2] += (pivot[2] - st.camera.target[2]) * t;
                 }
             }
             st.camera.distance = new_dist;
@@ -11128,6 +8416,7 @@ static void draw_scene_visualizer(ViewerState& st) {
             st.camera.target[2] += uz * delta.y * scale;
         }
     }
+    ImGui::PopStyleColor(3);
 }
 
 // ============================================================================
@@ -11292,14 +8581,10 @@ static void draw_text_preview(ViewerState& st) {
     std::string ext = (dot != std::string::npos) ? st.sel_path.substr(dot) : "";
     for (auto& c : ext) c = (char)tolower((unsigned char)c);
     
-    // Content probing records the actual schema when the file is opened. This
-    // keeps Save correct for extensionless/renamed decoded assets as well.
-    const bool is_protobuf = !st.text_protobuf_type.empty() && st.text_is_decoded_markup;
-    // .gmesh AND .swdm are both boulder GroundMesh sketch formats — they get the
-    // GroundMesh helpers (compile to SCL, plus "Open in Ground Mesh Studio" for a
-    // real visual viewer/editor instead of staring at raw text).
-    bool is_swdm  = (ext == ".swdm");
-    bool is_gmesh = (ext == ".gmesh") || is_swdm;
+    bool is_protobuf = (ext == ".scene" || ext == ".scl" || ext == ".gdata" || ext == ".gstate" || 
+                        ext == ".gplayer" || ext == ".gopt" || ext == ".sounds" || 
+                        ext == ".scmap" || ext == ".atlas" || ext == ".fnt");
+    bool is_gmesh = (ext == ".gmesh");
 
     // Initialize edit buffer on file change
     static std::string last_loaded_path;
@@ -11325,7 +8610,7 @@ static void draw_text_preview(ViewerState& st) {
         if (is_protobuf) {
             auto start = std::chrono::high_resolution_clock::now();
             try {
-                std::string binary_data = filerift::recode_markup(st.text_edit_buffer, st.text_protobuf_type);
+                std::string binary_data = filerift::recode_markup(st.text_edit_buffer, ext.substr(1));
                 std::ofstream out(st.sel_path, std::ios::binary | std::ios::trunc);
                 if (!out) throw std::runtime_error("failed to open output file");
                 out.write(binary_data.data(), binary_data.size());
@@ -11396,41 +8681,6 @@ static void draw_text_preview(ViewerState& st) {
                 st.status_msg = "GroundMesh compilation yielded empty markup.";
             }
         }
-
-        // Open the sketch in the visual Ground Mesh Studio instead of editing
-        // raw text. Parses the current buffer (works for both .swdm and .gmesh),
-        // loads the polygon/hats/params into the sketch canvas, then jumps to
-        // the create/sketch workspace where it can be edited visually.
-        ImGui::SameLine();
-        if (ImGui::Button(ICON_FA_MOUNTAIN_SUN " Open in Ground Mesh Studio")) {
-            boulder::GroundMesh gm = boulder::parse_ground_mesh(st.text_edit_buffer);
-            if (gm.polygon.size() >= 3) {
-                gm_push_undo(st);
-                st.gm_points       = gm.polygon;
-                st.gm_hats         = gm.hats;
-                st.gm_min_depth    = gm.min_depth;
-                st.gm_max_depth    = gm.max_depth;
-                st.gm_top_angle    = gm.top_angle;
-                st.gm_generate_top = gm.generate_top;
-                st.gm_z            = gm.z;
-                snprintf(st.gm_top_tex, sizeof(st.gm_top_tex), "%s", gm.top_texture.c_str());
-                snprintf(st.gm_bottom_tex, sizeof(st.gm_bottom_tex), "%s", gm.bottom_texture.c_str());
-                // Carry the file name over as the object/output name (strip ext).
-                {
-                    std::string stem = fs::path(st.sel_path).stem().string();
-                    if (!stem.empty())
-                        snprintf(st.gm_obj_name, sizeof(st.gm_obj_name), "%s", stem.c_str());
-                }
-                st.gm_sketch_dirty = true;
-                open_ground_mesh_studio(st);   // workspace mode 0 + switch to canvas tab
-                st.status_msg = "Opened " + st.sel_name + " in Ground Mesh Studio.";
-            } else {
-                st.status_msg = "Not a valid GroundMesh sketch (need >= 3 polygon points).";
-            }
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Edit this %s visually on the sketch canvas",
-                              is_swdm ? ".swdm" : ".gmesh");
     }
 
     // Style Selection combo box and Import button
@@ -12014,12 +9264,6 @@ static void draw_bottom_panel(ViewerState& st) {
 // UI: Center panel dispatcher
 // ============================================================================
 
-// Defined later in this file; forward-declared so the PREVIEW_MAP handler can
-// launch the Scene Creator / Procedural Generator dialogs when a map node
-// requests a new scene (map editor ↔ scene tooling fusion).
-static void open_scene_creator(ViewerState& st);
-static void open_procedural_generator(ViewerState& st);
-
 static void draw_center_panel(ViewerState& st) {
     if (st.preview_type == PREVIEW_SCENE) {
         ImGui::PushStyleColor(ImGuiCol_ChildBg, g_theme.panel_alt);
@@ -12092,56 +9336,6 @@ static void draw_center_panel(ViewerState& st) {
             }
             break;
         case PREVIEW_AUDIO:   draw_audio_player(st);     break;
-        case PREVIEW_MAP:
-            draw_map_editor(st.map_editor);
-            if (st.map_editor.open_scene_request) {
-                std::string lvl = st.map_editor.open_scene_level;
-                st.map_editor.open_scene_request = false;
-                std::string dir = fs::path(st.map_editor.map.filepath).parent_path().string();
-                std::string p = (dir.empty()) ? (lvl + ".scene")
-                                              : (dir + "/" + lvl + ".scene");
-                std::error_code ec;
-                if (fs::exists(p, ec)) {
-                    FileEntry fe;
-                    fe.name = lvl + ".scene";
-                    fe.full_path = p;
-                    fe.is_dir = false;
-                    fe.size = 0;
-                    fe.type = FTYPE_SCENE;
-                    select_file(st, fe);
-                } else {
-                    st.map_editor.status = "Scene not found next to map: " + lvl;
-                    st.map_editor.status_timer = 4.0f;
-                }
-            }
-            // Node asked to CREATE its scene from a template → open the Scene
-            // Creator pre-filled with the level name, output dir (next to the
-            // .scmap), and map-linked so create() writes the node's scene back
-            // into this map.
-            if (st.map_editor.create_scene_request) {
-                std::string lvl = st.map_editor.create_scene_level;
-                st.map_editor.create_scene_request = false;
-                std::string dir = fs::path(st.map_editor.map.filepath).parent_path().string();
-                open_scene_creator(st);
-                SceneCreatorDialogState& d = st.scene_creator;
-                if (!dir.empty())
-                    std::snprintf(d.output_path, sizeof(d.output_path), "%s", dir.c_str());
-                std::snprintf(d.level_name, sizeof(d.level_name), "%s", lvl.c_str());
-                std::snprintf(d.scene_namespace, sizeof(d.scene_namespace), "%s", lvl.c_str());
-                std::snprintf(d.map_path, sizeof(d.map_path), "%s",
-                              st.map_editor.map.filepath.c_str());
-                d.link_to_map = true;
-            }
-            // Node asked to GENERATE its scene procedurally → open the
-            // Procedural Generator pre-filled with the level name.
-            if (st.map_editor.gen_scene_request) {
-                std::string lvl = st.map_editor.gen_scene_level;
-                st.map_editor.gen_scene_request = false;
-                open_procedural_generator(st);
-                if (!lvl.empty())
-                    std::snprintf(st.proc_gen_name, sizeof(st.proc_gen_name), "%s", lvl.c_str());
-            }
-            break;
         default: {
             ImVec2 avail = ImGui::GetContentRegionAvail();
             ImVec2 text_size = ImGui::CalcTextSize("Select a file on the left to preview");
@@ -12261,14 +9455,12 @@ static void draw_properties_panel(ViewerState& st) {
 
     if (ImGui::CollapsingHeader("File", ImGuiTreeNodeFlags_DefaultOpen)) {
     ImGui::Text("%s%s", st.sel_name.c_str(),
-                (st.preview_type == PREVIEW_SCENE && st.scene_dirty) ||
-                (st.preview_type == PREVIEW_MAP && st.map_editor.dirty) ? " *" : "");
+                st.preview_type == PREVIEW_SCENE && st.scene_dirty ? " *" : "");
     ImGui::TextDisabled("%s  |  %s", format_size(st.sel_size).c_str(), filetype_label(
         st.preview_type == PREVIEW_TEXTURE ? FTYPE_TEXTURE :
         st.preview_type == PREVIEW_MODEL   ? FTYPE_MODEL   :
         st.preview_type == PREVIEW_SCENE   ? FTYPE_SCENE   :
-        st.preview_type == PREVIEW_AUDIO   ? FTYPE_AUDIO   :
-        st.preview_type == PREVIEW_MAP     ? FTYPE_MAP     : FTYPE_OTHER,
+        st.preview_type == PREVIEW_AUDIO   ? FTYPE_AUDIO   : FTYPE_OTHER,
         st.sel_path.c_str()));
     ImGui::TextDisabled("Path");
     std::string visible_path = st.sel_path;
@@ -12339,16 +9531,16 @@ static void draw_properties_panel(ViewerState& st) {
             }
         }
         
-        av_color_edit3("Key Light Color", av::g_light_color);
-        av_color_edit3("Fill Light Color", av::g_fill_color);
+        ImGui::ColorEdit3("Key Light Color", av::g_light_color);
+        ImGui::ColorEdit3("Fill Light Color", av::g_fill_color);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Cool fill from the side opposite the key light — keeps undersides and the shaded side of the hero readable instead of dead black.");
-        av_slider_float("Rim Light", &av::g_rim_strength, 0.0f, 1.5f, "%.2f");
+        ImGui::SliderFloat("Rim Light", &av::g_rim_strength, 0.0f, 1.5f, "%.2f");
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Camera-opposed edge light that pops silhouettes off the background.");
-        av_slider_float("Specular", &av::g_spec_strength, 0.0f, 0.5f, "%.3f");
-        av_color_edit3("Ambient (Sky)", av::g_ambient_color);
-        av_color_edit3("Ambient (Ground)", av::g_ambient_ground_color);
+        ImGui::SliderFloat("Specular", &av::g_spec_strength, 0.0f, 0.5f, "%.3f");
+        ImGui::ColorEdit3("Ambient (Sky)", av::g_ambient_color);
+        ImGui::ColorEdit3("Ambient (Ground)", av::g_ambient_ground_color);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Hemisphere fill: surfaces facing down (undersides, ceilings, wall bases)\nfall toward this darker value. Keeps corners readable without crushing them.");
         
@@ -12458,8 +9650,8 @@ static void draw_properties_panel(ViewerState& st) {
                     opts.flip_v           = st.convert_flip_v;
                     opts.convert_textures = st.convert_tex_pgm;
                     opts.output_pvr       = true;
-                    std::string out = (fs::path(st.sel_path).parent_path() /
-                                      (fs::path(st.sel_path).stem().string() + ".POD")).string();
+                    std::string out = fs::path(st.sel_path).parent_path() /
+                                      (fs::path(st.sel_path).stem().string() + ".POD");
                     std::vector<std::string> written;
                     std::string conv_err;
                     if (av::fbx_to_pod(st.sel_path, out, opts, &written, &conv_err)) {
@@ -12516,13 +9708,7 @@ static void draw_properties_panel(ViewerState& st) {
         ImGui::Checkbox("Flip Horizontally", &st.texture_flip_h);
         ImGui::Checkbox("Flip Vertically", &st.texture_flip_v);
         
-        // Color Tint's 4 RGBA number fields + label used to be laid out at the
-        // default full item width, which overflowed the narrow Inspector's
-        // right edge; ColorEdit's inline inputs aren't clipped to the child, so
-        // they visually bled over the file-list panel on the far left. Sizing
-        // the widget to fit inside the Inspector (reserving room for the label)
-        // keeps every sub-field inside the panel's clip rect. (bug #3)
-        av_color_edit4("Color Tint", st.texture_tint);
+        ImGui::ColorEdit4("Color Tint", st.texture_tint);
         
         if (ImGui::Button("Reset Filters")) {
             st.texture_flip_h = true;
@@ -12632,23 +9818,10 @@ static void draw_properties_panel(ViewerState& st) {
         if (!st.scene.lights.empty()) {
             if (ImGui::CollapsingHeader(ICON_FA_WAND_MAGIC_SPARKLES " Scene Lights",
                                         ImGuiTreeNodeFlags_DefaultOpen)) {
-                                ImGui::Checkbox("Render Light components", &st.scene_lights_enabled);
+                ImGui::Checkbox("Render Light components", &st.scene_lights_enabled);
                 ImGui::Checkbox("Show radius rings", &st.scene_light_debug);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Editor debug: draws a small emitter cross + influence-radius ring at every point light.\nThe ring is a marker only — it is NOT the light's actual visual size.");
-
-                // ── Scene object markers (spawn points / portals / cameras) ──
-                                if (ImGui::TreeNodeEx(ICON_FA_LOCATION_DOT " Scene Object Markers",
-                                      ImGuiTreeNodeFlags_SpanAvailWidth)) {
-                    ImGui::Checkbox("Spawn point markers", &st.scene_marker_spawn);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Draw a dot at every SpawnPoint object.");
-                    ImGui::Checkbox("Portal markers", &st.scene_marker_portal);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Draw a dot at every Portal / PortalEffect object.");
-                    ImGui::SameLine();
-                    ImGui::Checkbox("Camera markers", &st.scene_marker_camera);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Draw a dot at every CameraComponent object.\nOff by default — cameras are usually only invoked from Lua.");
-                    ImGui::TreePop();
-                }
                 int ambient = 0, directional = 0, point = 0, overlay = 0;
                 for (const auto& light : st.scene.lights) {
                     if (light.type == 1) ++ambient;
@@ -12966,80 +10139,12 @@ static void draw_properties_panel(ViewerState& st) {
                                            !obj.ground_mesh_textures[mi].empty())
                                               ? obj.ground_mesh_textures[mi].c_str() : "(none)";
                         const bool is_edited = (st.mesh_edit_mesh == mi);
-                        // Each ground sub-mesh has a role determined by its source
-                        // wire field (Swordigo GroundMesh): 9 = SurfaceMesh (TOP),
-                        // 6 = Mesh (BOTTOM/base), 8 = FrontMesh (FRONT face). Show
-                        // the role so top/bottom textures & details are legible and
-                        // editable per sub-mesh.
-                        const int gm_field = (mi < (int)obj.ground_mesh_fields.size())
-                                                 ? obj.ground_mesh_fields[mi] : 0;
-                        const char* role = gm_field == 9 ? "Top"
-                                         : gm_field == 6 ? "Bottom"
-                                         : gm_field == 8 ? "Front" : "Mesh";
                         if (ImGui::TreeNode((void*)(intptr_t)(mi + 1),
-                                            "%s %d — %d verts, %d tris [%s]%s", role, mi,
+                                            "Mesh %d — %d verts, %d tris [%s]%s", mi,
                                             gm.num_vertices, gm.num_faces, tex,
                                             is_edited ? "  *" : "")) {
-                            ImGui::TextDisabled("Role: %s (field %d)  |  Bounds X: %.1f..%.1f  Y: %.1f..%.1f  Z: %.1f..%.1f",
-                                role, gm_field, gm.min_x, gm.max_x, gm.min_y, gm.max_y, gm.min_z, gm.max_z);
-
-                            // Texture picker: thumbnail + combo of every known
-                            // texture + free-text fallback. Applying rewrites
-                            // the MeshData material so a save keeps the new look.
-                            {
-                                GLuint thumb = 0;
-                                if (st.selected_object >= 0 &&
-                                    st.selected_object < (int)st.scene_ground_textures.size() &&
-                                    mi < (int)st.scene_ground_textures[st.selected_object].size())
-                                    thumb = st.scene_ground_textures[st.selected_object][mi];
-                                if (thumb)
-                                    ImGui::Image((ImTextureID)(intptr_t)thumb, ImVec2(26, 26));
-                                else
-                                    ImGui::Dummy(ImVec2(26, 26));
-                                ImGui::SameLine();
-                                const std::string cur = (mi < (int)obj.ground_mesh_textures.size())
-                                                            ? obj.ground_mesh_textures[mi] : std::string();
-                                if (!st.gm_tex_scanned || st.gm_tex_scan_key != st.scene.filepath) {
-                                    gm_texture_scan(st);
-                                    st.gm_tex_scan_key = st.scene.filepath;
-                                }
-                                auto apply_tex = [&](const std::string& name) {
-                                    if (name.empty() || st.selected_object < 0) return;
-                                    snapshot_scene(st);
-                                    if (av::scene_set_ground_mesh_texture(
-                                            st.scene.objects[st.selected_object], (size_t)mi, name)) {
-                                        reupload_object_ground_meshes(st, st.selected_object);
-                                        av::scene_refresh(st.scene);
-                                        st.scene_dirty = true;
-                                        st.status_msg = "Mesh " + std::to_string(mi) +
-                                                        " texture \xe2\x86\x92 " + name;
-                                    }
-                                };
-                                ImGui::SetNextItemWidth(170.0f);
-                                const char* preview = cur.empty() ? "(none)" : cur.c_str();
-                                if (ImGui::BeginCombo(("##tex" + std::to_string(mi)).c_str(), preview)) {
-                                    bool cur_in_list = cur.empty();
-                                    for (const auto& name : st.gm_tex_names) {
-                                        const bool selected = (name == cur);
-                                        if (selected) cur_in_list = true;
-                                        if (ImGui::Selectable(name.c_str(), selected)) apply_tex(name);
-                                        if (selected) ImGui::SetItemDefaultFocus();
-                                    }
-                                    if (!cur_in_list && !cur.empty())
-                                        ImGui::Selectable(cur.c_str(), true);
-                                    ImGui::EndCombo();
-                                }
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(110.0f);
-                                ImGui::InputText(("##texcustom" + std::to_string(mi)).c_str(),
-                                                 st.gm_tex_custom, sizeof(st.gm_tex_custom));
-                                ImGui::SameLine();
-                                if (ImGui::SmallButton(("Apply##" + std::to_string(mi)).c_str())) {
-                                    apply_tex(st.gm_tex_custom);
-                                    st.gm_tex_custom[0] = '\0';
-                                }
-                            }
-
+                            ImGui::TextDisabled("Bounds X: %.1f..%.1f  Y: %.1f..%.1f  Z: %.1f..%.1f",
+                                gm.min_x, gm.max_x, gm.min_y, gm.max_y, gm.min_z, gm.max_z);
                             if (ImGui::SmallButton("Edit in 2D")) {
                                 // The 2D outline drives the whole object's
                                 // geometry, so this opens the inline editor.
@@ -13374,33 +10479,19 @@ static void apply_selected_theme(int theme_idx, float font_scale) {
     // than overriding it, so the widget stays legible on HiDPI monitors.
     io.FontGlobalScale = font_scale / std::max(1.0f, g_state.display_scale);
 
-    // ── Modern, sleek, professional palettes ────────────────────────────────
-    // Dark: deep neutral-slate backgrounds, subtle borders, one confident
-    // indigo/azure accent, high-contrast text. Light: clean paper neutrals with
-    // the same accent family so both variants read consistently.
     g_theme = theme_idx == 1
         ? RubyTheme{
-            // background            panel                    panel_alt
-            ImVec4(0.94f,0.945f,0.955f,1), ImVec4(0.985f,0.988f,0.992f,1), ImVec4(0.915f,0.923f,0.936f,1),
-            // surface               surface_hover            surface_active
-            ImVec4(0.90f,0.912f,0.928f,1), ImVec4(0.845f,0.865f,0.895f,1), ImVec4(0.78f,0.812f,0.86f,1),
-            // border                text                     text_muted
-            ImVec4(0.80f,0.815f,0.838f,1), ImVec4(0.12f,0.135f,0.165f,1), ImVec4(0.44f,0.475f,0.53f,1),
-            // accent                warning                  error
-            ImVec4(0.20f,0.46f,0.90f,1), ImVec4(0.86f,0.55f,0.10f,1), ImVec4(0.83f,0.24f,0.26f,1),
-            // success               selection                dark
-            ImVec4(0.13f,0.58f,0.36f,1), ImVec4(0.20f,0.46f,0.90f,0.28f), false}
+            ImVec4(0.885f,0.90f,0.915f,1), ImVec4(0.955f,0.962f,0.972f,1), ImVec4(0.925f,0.935f,0.950f,1),
+            ImVec4(0.83f,0.855f,0.885f,1), ImVec4(0.77f,0.805f,0.85f,1), ImVec4(0.62f,0.70f,0.80f,1),
+            ImVec4(0.60f,0.63f,0.68f,1), ImVec4(0.10f,0.12f,0.15f,1), ImVec4(0.42f,0.46f,0.52f,1),
+            ImVec4(0.08f,0.42f,0.76f,1), ImVec4(0.78f,0.48f,0.06f,1), ImVec4(0.78f,0.18f,0.20f,1),
+            ImVec4(0.08f,0.55f,0.30f,1), ImVec4(0.15f,0.48f,0.82f,0.30f), false}
         : RubyTheme{
-            // background            panel                    panel_alt
-            ImVec4(0.070f,0.076f,0.088f,1), ImVec4(0.098f,0.106f,0.122f,1), ImVec4(0.122f,0.132f,0.150f,1),
-            // surface               surface_hover            surface_active
-            ImVec4(0.150f,0.162f,0.185f,1), ImVec4(0.196f,0.214f,0.248f,1), ImVec4(0.242f,0.268f,0.312f,1),
-            // border                text                     text_muted
-            ImVec4(0.205f,0.222f,0.258f,1), ImVec4(0.905f,0.918f,0.940f,1), ImVec4(0.520f,0.560f,0.622f,1),
-            // accent                warning                  error
-            ImVec4(0.345f,0.560f,0.980f,1), ImVec4(0.960f,0.660f,0.235f,1), ImVec4(0.945f,0.360f,0.380f,1),
-            // success               selection                dark
-            ImVec4(0.300f,0.780f,0.520f,1), ImVec4(0.345f,0.560f,0.980f,0.35f), true};
+            ImVec4(0.075f,0.082f,0.095f,1), ImVec4(0.105f,0.115f,0.132f,1), ImVec4(0.13f,0.14f,0.16f,1),
+            ImVec4(0.16f,0.175f,0.20f,1), ImVec4(0.21f,0.235f,0.27f,1), ImVec4(0.25f,0.32f,0.42f,1),
+            ImVec4(0.25f,0.27f,0.31f,1), ImVec4(0.91f,0.92f,0.94f,1), ImVec4(0.55f,0.59f,0.65f,1),
+            ImVec4(0.25f,0.58f,0.92f,1), ImVec4(0.95f,0.64f,0.20f,1), ImVec4(0.94f,0.32f,0.34f,1),
+            ImVec4(0.34f,0.76f,0.48f,1), ImVec4(0.25f,0.58f,0.92f,0.42f), true};
 
     const RubyTheme& T = g_theme;
     const bool dark = T.dark;
@@ -13408,41 +10499,38 @@ static void apply_selected_theme(int theme_idx, float font_scale) {
     // Standardized geometry for both themes — compact, professional, not
     // "rounded-everything".
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowPadding     = ImVec2(12, 10);
-    style.FramePadding      = ImVec2(9, 5);
-    style.ItemSpacing       = ImVec2(8, 6);
-    style.ItemInnerSpacing  = ImVec2(6, 5);
-    style.IndentSpacing     = 18.0f;
-    style.ScrollbarSize     = 11.0f;
-    style.GrabMinSize       = 11.0f;
-    style.CellPadding       = ImVec2(7, 5);
+    style.WindowPadding     = ImVec2(10, 8);
+    style.FramePadding      = ImVec2(7, 4);
+    style.ItemSpacing       = ImVec2(7, 4);
+    style.ItemInnerSpacing  = ImVec2(5, 4);
+    style.IndentSpacing     = 16.0f;
+    style.ScrollbarSize     = 12.0f;
+    style.GrabMinSize       = 10.0f;
+    style.CellPadding       = ImVec2(6, 4);
     style.WindowTitleAlign  = ImVec2(0.0f, 0.5f);
     style.WindowMenuButtonPosition = ImGuiDir_None;
-    style.WindowRounding    = 7.0f;
-    style.ChildRounding     = 6.0f;
-    style.FrameRounding     = 5.0f;
-    style.GrabRounding      = 4.0f;
-    style.PopupRounding     = 7.0f;
-    style.ScrollbarRounding = 6.0f;
-    style.TabRounding       = 5.0f;
+    style.WindowRounding    = 6.0f;
+    style.ChildRounding     = 4.0f;
+    style.FrameRounding     = 4.0f;
+    style.GrabRounding      = 3.0f;
+    style.PopupRounding     = 6.0f;
+    style.ScrollbarRounding = 4.0f;
+    style.TabRounding       = 4.0f;
+    style.WindowBorderSize  = 1.0f;
     style.ChildBorderSize   = 1.0f;
     style.FrameBorderSize   = 0.0f;
     style.PopupBorderSize   = 1.0f;
     style.TabBorderSize     = 0.0f;
     style.WindowBorderSize  = 1.0f;
     style.SeparatorTextBorderSize = 1.0f;
-    style.SeparatorTextAlign   = ImVec2(0.0f, 0.5f);
-    style.SeparatorTextPadding = ImVec2(18, 4);
-    style.DisabledAlpha        = 0.45f;
 
     // Derived shades from the semantic palette (theme-safe by construction).
     const ImVec4 border       = T.border;
     const ImVec4 accent       = T.accent;
-    const ImVec4 accent_hover = dark ? th_mix(accent, T.text, 0.18f) : th_mix(accent, ImVec4(0,0,0,1), 0.22f);
-    const ImVec4 surface_hot  = dark ? th_mix(T.surface_active, accent, 0.40f) : th_mix(T.surface_active, accent, 0.42f);
-    const ImVec4 tab_active   = dark ? th_mix(T.surface_active, accent, 0.30f) : th_mix(T.surface_active, accent, 0.26f);
+    const ImVec4 accent_hover = dark ? th_mix(accent, T.text, 0.18f) : th_mix(accent, ImVec4(0,0,0,1), 0.25f);
+    const ImVec4 surface_hot  = dark ? th_mix(T.surface_active, accent, 0.45f) : th_mix(T.surface_active, accent, 0.55f);
+    const ImVec4 tab_active   = dark ? th_mix(T.surface_active, accent, 0.35f) : th_mix(T.surface_active, accent, 0.30f);
     const ImVec4 frame_hot    = th_mix(T.surface, T.surface_hover, 0.5f);
-    (void)frame_hot;
     const ImVec4 popup_bg     = dark ? th_mix(T.panel, T.surface, 0.18f) : th_mix(T.panel, ImVec4(1,1,1,1), 0.3f);
 
     ImVec4* c = style.Colors;
@@ -13451,54 +10539,53 @@ static void apply_selected_theme(int theme_idx, float font_scale) {
     c[ImGuiCol_WindowBg]             = T.background;
     c[ImGuiCol_ChildBg]              = T.panel;
     c[ImGuiCol_PopupBg]              = popup_bg;
-    c[ImGuiCol_Border]               = th_alpha(border, dark ? 0.85f : 0.9f);
+    c[ImGuiCol_Border]               = border;
     c[ImGuiCol_BorderShadow]         = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_FrameBg]              = th_alpha(T.surface, dark ? 0.85f : 1.0f);
+    c[ImGuiCol_FrameBg]              = T.surface;
     c[ImGuiCol_FrameBgHovered]       = T.surface_hover;
     c[ImGuiCol_FrameBgActive]        = T.surface_active;
     c[ImGuiCol_TitleBg]              = T.panel_alt;
-    c[ImGuiCol_TitleBgActive]        = dark ? th_mix(T.panel_alt, accent, 0.18f) : th_mix(T.panel_alt, accent, 0.16f);
+    c[ImGuiCol_TitleBgActive]        = dark ? th_mix(T.surface_active, accent, 0.30f) : th_mix(T.surface_active, accent, 0.25f);
     c[ImGuiCol_TitleBgCollapsed]     = T.panel_alt;
-    c[ImGuiCol_MenuBarBg]            = dark ? th_mix(T.panel_alt, T.background, 0.35f) : T.panel_alt;
-    c[ImGuiCol_ScrollbarBg]          = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_ScrollbarGrab]        = th_alpha(T.surface_active, dark ? 0.55f : 0.70f);
-    c[ImGuiCol_ScrollbarGrabHovered] = th_alpha(T.surface_active, dark ? 0.80f : 0.90f);
-    c[ImGuiCol_ScrollbarGrabActive]  = accent;
+    c[ImGuiCol_MenuBarBg]            = T.panel_alt;
+    c[ImGuiCol_ScrollbarBg]          = th_alpha(T.background, dark ? 0.55f : 0.85f);
+    c[ImGuiCol_ScrollbarGrab]        = T.surface;
+    c[ImGuiCol_ScrollbarGrabHovered] = T.surface_hover;
+    c[ImGuiCol_ScrollbarGrabActive]  = T.surface_active;
     c[ImGuiCol_CheckMark]            = accent;
-    c[ImGuiCol_SliderGrab]           = th_mix(T.surface_hover, accent, 0.35f);
+    c[ImGuiCol_SliderGrab]           = T.surface_hover;
     c[ImGuiCol_SliderGrabActive]     = accent;
     c[ImGuiCol_Button]               = T.surface;
     c[ImGuiCol_ButtonHovered]        = T.surface_hover;
     c[ImGuiCol_ButtonActive]         = surface_hot;
-    c[ImGuiCol_Header]               = th_alpha(T.surface, dark ? 0.85f : 0.9f);
+    c[ImGuiCol_Header]               = T.surface;
     c[ImGuiCol_HeaderHovered]        = T.surface_hover;
     c[ImGuiCol_HeaderActive]         = T.surface_active;
-    c[ImGuiCol_Separator]            = th_alpha(border, dark ? 0.7f : 0.8f);
+    c[ImGuiCol_Separator]            = border;
     c[ImGuiCol_SeparatorHovered]     = accent_hover;
     c[ImGuiCol_SeparatorActive]      = accent;
-    c[ImGuiCol_ResizeGrip]           = th_alpha(border, 0.0f);
-    c[ImGuiCol_ResizeGripHovered]    = th_alpha(accent, 0.55f);
+    c[ImGuiCol_ResizeGrip]           = th_alpha(border, 0.30f);
+    c[ImGuiCol_ResizeGripHovered]    = th_alpha(accent, 0.70f);
     c[ImGuiCol_ResizeGripActive]     = accent;
     c[ImGuiCol_Tab]                  = T.panel_alt;
     c[ImGuiCol_TabHovered]           = T.surface_hover;
     c[ImGuiCol_TabActive]            = tab_active;
     c[ImGuiCol_TabUnfocused]         = T.panel_alt;
-    c[ImGuiCol_TabUnfocusedActive]   = th_mix(T.panel_alt, T.surface, 0.5f);
+    c[ImGuiCol_TabUnfocusedActive]   = T.surface;
     c[ImGuiCol_TabSelectedOverline]  = accent;
     c[ImGuiCol_TabDimmed]            = T.panel_alt;
-    c[ImGuiCol_TabDimmedSelected]    = th_mix(T.panel_alt, T.surface, 0.5f);
-    c[ImGuiCol_TabDimmedSelectedOverline] = th_alpha(accent, 0.5f);
+    c[ImGuiCol_TabDimmedSelected]    = T.surface;
     c[ImGuiCol_TableHeaderBg]        = T.panel_alt;
     c[ImGuiCol_TableBorderStrong]    = border;
     c[ImGuiCol_TableBorderLight]     = th_alpha(border, 0.5f);
     c[ImGuiCol_TableRowBg]           = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_TableRowBgAlt]        = dark ? ImVec4(1, 1, 1, 0.020f) : ImVec4(0, 0, 0, 0.030f);
+    c[ImGuiCol_TableRowBgAlt]        = dark ? ImVec4(1, 1, 1, 0.025f) : ImVec4(0, 0, 0, 0.025f);
     c[ImGuiCol_TextSelectedBg]       = T.selection;
     c[ImGuiCol_DragDropTarget]       = accent;
     c[ImGuiCol_NavCursor]            = accent;
     c[ImGuiCol_NavWindowingHighlight]= accent;
     c[ImGuiCol_NavWindowingDimBg]    = ImVec4(0, 0, 0, 0.18f);
-    c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0, 0, 0, dark ? 0.55f : 0.35f);
+    c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0, 0, 0, dark ? 0.45f : 0.35f);
 }
 
 static fs::path workspace_layout_path() {
@@ -14401,776 +11488,6 @@ static void blender_shutdown(ViewerState& st) {
     if (st.blender_daemon.joinable()) st.blender_daemon.join();
 }
 
-static void open_scene_creator(ViewerState& st) {
-    SceneCreatorDialogState& dialog = st.scene_creator;
-    dialog.open         = true;
-    dialog.request_open = true;
-    dialog.error.clear();
-    const std::string directory = st.current_dir.empty()
-        ? fs::current_path().string()
-        : st.current_dir;
-    std::snprintf(dialog.output_path, sizeof(dialog.output_path), "%s", directory.c_str());
-}
-
-// ── Procedural Scene Generator (v2) ──────────────────────────────────────
-// Advanced algorithm: Perlin/fBm/ridged noise + biome presets harvested from
-// real scene files (textures, tree/rock sets, water colors, torch composites).
-// Generates a full level, writes it next to the open scene, and loads it.
-static void open_procedural_generator(ViewerState& st) {
-    st.proc_gen_open = true;
-    st.proc_gen_request = true;
-    st.proc_gen_status.clear();
-}
-
-static void proc_gen_generate(ViewerState& st) {
-    const sgen::Biome biome = (sgen::Biome)std::clamp(st.proc_gen_biome, 0,
-                                                       (int)sgen::Biome::Count - 1);
-
-    sgen::Result r;
-    std::string generator;
-    if (st.proc_gen_use_v3) {
-        // ── v3 "Ultimate" generator: data-driven from the embedded biome DB ──
-        // Fixes v1/v2 issues: correct top vs front mesh textures, true per-biome
-        // differentiation, pushed-back background design layers, and real
-        // enclosed caves. See scene_generator_v3.* / scene_v3_biomes.json.
-        sgen::TerrainOptions opt;
-        opt.biome = biome;
-        opt.seed = st.proc_gen_seed;
-        opt.width = std::max(600.0f, st.proc_gen_width);
-        opt.height = std::max(200.0f, st.proc_gen_height);
-        opt.platform_count = std::clamp(st.proc_gen_platforms, 2, 24);
-        opt.add_water = st.proc_gen_water;
-        opt.spill_torches = st.proc_gen_torches;
-        opt.mountains = st.proc_gen_mountains;
-        opt.islands = st.proc_gen_islands;
-        opt.deco_density = st.proc_gen_deco;
-        opt.scene_name = st.proc_gen_name;
-        opt.randomize_deco_rotation = st.proc_gen_rand_deco_rot;
-        opt.randomize_deco_scale    = st.proc_gen_rand_deco_scale;
-        opt.add_portal              = st.proc_gen_portal;
-        opt.portal_destination      = st.proc_gen_portal_dest;
-        r = sgen::v3::generate_biome_scene_v3(opt);
-        generator = "v3";
-    } else if (st.proc_gen_use_3d) {
-        // ── v2-3d generator: full-3D Minecraft-style voxel world ────────────
-        // One continuous heightfield over (X, Z), block-quantized and sliced
-        // into depth rows: walkable gameplay row at Z=0 + parallax terrain
-        // rows receding behind it. v1 camera semantics (no camera shapes).
-        sgen::v2_3d::TerrainOptions3D opt;
-        opt.biome = biome;
-        opt.seed = st.proc_gen_seed;
-        opt.width = std::max(600.0f, st.proc_gen_width);
-        opt.height = std::max(200.0f, st.proc_gen_height);
-        opt.platform_count = std::clamp(st.proc_gen_platforms, 2, 24);
-        opt.add_water = st.proc_gen_water;
-        opt.spill_torches = st.proc_gen_torches;
-        opt.mountains = st.proc_gen_mountains;
-        opt.deco_density = st.proc_gen_deco;
-        opt.scene_name = st.proc_gen_name;
-        opt.depth_rows        = std::clamp(st.proc_gen_3d_rows, 0, 24);
-        opt.front_rows        = std::clamp(st.proc_gen_3d_front_rows, 0, 12);
-        opt.row_band          = std::clamp(st.proc_gen_3d_band, 30.0f, 140.0f);
-        opt.block_size        = std::clamp(st.proc_gen_3d_block, 16.0f, 120.0f);
-        opt.add_caves         = st.proc_gen_3d_caves;
-        opt.sky_islands       = st.proc_gen_3d_islands;
-        opt.scatter_far_trees = st.proc_gen_3d_far_trees;
-        opt.randomize_deco_rotation = st.proc_gen_rand_deco_rot;
-        opt.randomize_deco_scale    = st.proc_gen_rand_deco_scale;
-        opt.add_portal              = st.proc_gen_portal;
-        opt.portal_destination      = st.proc_gen_portal_dest;
-        r = sgen::v2_3d::generate_biome_scene_v2_3d(opt);
-        generator = "v2-3d";
-    } else if (st.proc_gen_use_v2) {
-        // ── v2 generator: superset of v1 (Z-layers, bg/fg terrain, z-path) ──
-        sgen::v2::TerrainOptionsV2 opt;
-        opt.biome = biome;
-        opt.seed = st.proc_gen_seed;
-        opt.width = std::max(600.0f, st.proc_gen_width);
-        opt.height = std::max(200.0f, st.proc_gen_height);
-        opt.platform_count = std::clamp(st.proc_gen_platforms, 2, 24);
-        opt.add_water = st.proc_gen_water;
-        opt.spill_torches = st.proc_gen_torches;
-        opt.mountains = st.proc_gen_mountains;
-        opt.islands = st.proc_gen_islands;
-        opt.deco_density = st.proc_gen_deco;
-        opt.scene_name = st.proc_gen_name;
-        opt.enable_bg_terrain  = st.proc_gen_v2_bg_terrain;
-        opt.enable_fg_terrain  = st.proc_gen_v2_fg_terrain;
-        opt.enable_z_path      = st.proc_gen_v2_z_path;
-        opt.z_path_amplitude   = st.proc_gen_v2_z_amp;
-        opt.bg_layers          = std::clamp(st.proc_gen_v2_bg_layers, 1, 4);
-        opt.scatter_background_decos = st.proc_gen_v2_bg_decos;
-        opt.scatter_foreground_decos = st.proc_gen_v2_fg_decos;
-        opt.add_terracing      = st.proc_gen_v2_terracing;
-        opt.terrace_strength   = st.proc_gen_v2_terrace;
-        opt.add_overhangs      = st.proc_gen_v2_overhangs;
-        opt.emit_camera_shapes = st.proc_gen_v2_camera;
-        opt.randomize_deco_rotation = st.proc_gen_rand_deco_rot;
-        opt.randomize_deco_scale    = st.proc_gen_rand_deco_scale;
-        opt.add_portal              = st.proc_gen_portal;
-        opt.portal_destination      = st.proc_gen_portal_dest;
-        r = sgen::v2::generate_biome_scene_v2(opt);
-        generator = "v2";
-    } else {
-        // ── v1 generator ──
-        sgen::TerrainOptions opt;
-        opt.biome = biome;
-        opt.seed = st.proc_gen_seed;
-        opt.width = std::max(600.0f, st.proc_gen_width);
-        opt.height = std::max(200.0f, st.proc_gen_height);
-        opt.platform_count = std::clamp(st.proc_gen_platforms, 2, 24);
-        opt.add_water = st.proc_gen_water;
-        opt.spill_torches = st.proc_gen_torches;
-        opt.mountains = st.proc_gen_mountains;
-        opt.islands = st.proc_gen_islands;
-        opt.deco_density = st.proc_gen_deco;
-        opt.scene_name = st.proc_gen_name;
-        opt.randomize_deco_rotation = st.proc_gen_rand_deco_rot;
-        opt.randomize_deco_scale    = st.proc_gen_rand_deco_scale;
-        opt.add_portal              = st.proc_gen_portal;
-        opt.portal_destination      = st.proc_gen_portal_dest;
-        r = sgen::generate_biome_scene(opt);
-        generator = "v1";
-    }
-    if (!r.ok()) {
-        st.proc_gen_status = "Generation failed: " + r.error;
-        return;
-    }
-
-    // Write next to the open scene (or the browser directory).
-    std::string dir = st.scene.filepath.empty()
-        ? (st.current_dir.empty() ? fs::current_path().string() : st.current_dir)
-        : fs::path(st.scene.filepath).parent_path().string();
-    std::string name(st.proc_gen_name[0] ? st.proc_gen_name : "procedural_scene");
-    std::string path = (fs::path(dir) / (name + ".scene")).string();
-    {
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        if (!out) { st.proc_gen_status = "Cannot write " + path; return; }
-        out.write(r.scene_bytes.data(), static_cast<std::streamsize>(r.scene_bytes.size()));
-    }
-
-    // Load it into the editor (same flow as a freshly created scene).
-    st.current_dir = dir;
-    refresh_directory(st);
-    apply_filters(st);
-    FileEntry entry;
-    entry.name = name + ".scene";
-    entry.full_path = path;
-    entry.is_dir = false;
-    std::error_code ec;
-    entry.size = static_cast<size_t>(fs::file_size(path, ec));
-    entry.type = FTYPE_SCENE;
-    select_file(st, entry);
-    st.status_msg = "Procedural scene '" + name + "' generated (" +
-                    std::to_string(r.objects) + " objects, seed " +
-                    std::to_string(st.proc_gen_seed) + ").";
-    st.proc_gen_open = false;
-    st.proc_gen_request = false;
-    st.proc_gen_status = "Generated: " + path;
-    log_file_event("Procedural", "Generated " + path + " | gen=" + generator +
-                   " biome=" + sgen::biome_name(biome) + " seed=" +
-                   std::to_string(st.proc_gen_seed) + " objects=" +
-                   std::to_string(r.objects));
-}
-
-static void draw_procedural_generator(ViewerState& st) {
-    if (!st.proc_gen_open) return;
-    if (st.proc_gen_request) {
-        ImGui::OpenPopup("  " ICON_FA_MOUNTAIN_SUN "  Procedural Scene Generator");
-        st.proc_gen_request = false;
-    }
-    ImGui::SetNextWindowSize(ImVec2(520, 640), ImGuiCond_FirstUseEver);
-    if (!ImGui::BeginPopupModal("  " ICON_FA_MOUNTAIN_SUN "  Procedural Scene Generator",
-                                &st.proc_gen_open, ImGuiWindowFlags_NoCollapse)) {
-        return;
-    }
-
-    ImGui::TextColored(g_theme.accent, "Base the scene on a real Swordigo biome");
-    ImGui::TextDisabled("Textures, water colors, tree/rock sets, torch style and light "
-                        "colors are harvested from the actual shipped scenes.");
-    ImGui::Spacing();
-
-    // ── Generator version selector ──
-    {
-        const bool v3u = st.proc_gen_use_v3;
-        const bool v1 = !st.proc_gen_use_v2 && !st.proc_gen_use_3d && !v3u;
-        const bool v2 = st.proc_gen_use_v2 && !st.proc_gen_use_3d && !v3u;
-        const bool v3d = st.proc_gen_use_3d && !v3u;
-        ImGui::Text("Generator:");
-        ImGui::SameLine();
-        if (ImGui::RadioButton("v1 (classic)", v1)) {
-            st.proc_gen_use_v2 = false; st.proc_gen_use_3d = false; st.proc_gen_use_v3 = false;
-        }
-        ImGui::SameLine();
-        if (ImGui::RadioButton("v2 (layered Z-terrain)", v2)) {
-            st.proc_gen_use_v2 = true; st.proc_gen_use_3d = false; st.proc_gen_use_v3 = false;
-        }
-        ImGui::SameLine();
-        if (ImGui::RadioButton("v2-3d (Minecraft world)", v3d)) {
-            st.proc_gen_use_3d = true; st.proc_gen_use_v2 = false; st.proc_gen_use_v3 = false;
-        }
-        ImGui::SameLine();
-        if (ImGui::RadioButton("v3 (Ultimate)", v3u)) {
-            st.proc_gen_use_v3 = true; st.proc_gen_use_v2 = false; st.proc_gen_use_3d = false;
-        }
-        if (v3u)
-            ImGui::TextDisabled("Data-driven from the embedded per-biome database (real "
-                                "vanilla textures/deco/depths). Correct top vs cliff mesh "
-                                "textures, true per-biome identity, pushed-back background "
-                                "design layers, and real enclosed caves.");
-        else if (v3d)
-            ImGui::TextDisabled("Full 3D voxel-style world: one heightfield over X and Z, "
-                                "blocky columns, depth rows into the screen, ravines, "
-                                "sky islands and sea-level oceans. v1 camera.");
-        else if (v2)
-            ImGui::TextDisabled("Adds background/foreground Z-layers, winding terrain "
-                                "path, terracing and overhangs.");
-        else
-            ImGui::TextDisabled("Single-layer heightfield with mountains and island hats.");
-        ImGui::Spacing();
-    }
-
-    // ── Biome preset picker ──
-    const char* preview = sgen::biome_name((sgen::Biome)st.proc_gen_biome);
-    if (ImGui::BeginCombo("Biome", preview)) {
-        for (int b = 0; b < (int)sgen::Biome::Count; ++b) {
-            const sgen::BiomeSpec& spec = sgen::biome_spec((sgen::Biome)b);
-            if (ImGui::Selectable(spec.name, st.proc_gen_biome == b))
-                st.proc_gen_biome = b;
-            if (st.proc_gen_biome == b) ImGui::SetItemDefaultFocus();
-        }
-        ImGui::EndCombo();
-    }
-    const sgen::BiomeSpec& bio = sgen::biome_spec((sgen::Biome)st.proc_gen_biome);
-    ImGui::TextDisabled("ground: %s / %s  ·  bg: %s", bio.ground_top,
-                        bio.ground_front, bio.background);
-    ImGui::Spacing();
-
-    // ── World parameters ──
-    if (ImGui::CollapsingHeader("World", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::InputScalar("Seed", ImGuiDataType_U32, &st.proc_gen_seed);
-        ImGui::SameLine();
-        if (ImGui::SmallButton(ICON_FA_SHUFFLE " Random")) {
-            uint64_t rng = (uint64_t)time(nullptr) ^ 0x5DEECE66Dull;
-            st.proc_gen_seed = (uint32_t)sgen::rng_next(rng);
-        }
-        ImGui::SliderFloat("Width", &st.proc_gen_width, 800.0f, 16000.0f, "%.0f");
-        ImGui::SliderFloat("Height range", &st.proc_gen_height, 200.0f, 3000.0f, "%.0f");
-        ImGui::SliderInt("Platform strips", &st.proc_gen_platforms, 2, 24);
-        ImGui::SliderFloat("Decoration density", &st.proc_gen_deco, 0.0f, 2.0f, "%.1f");
-        if (st.proc_gen_use_3d) {
-            ImGui::Separator();
-            ImGui::TextDisabled("Rows tile the Z axis and share boundary depth planes — "
-                                "one continuous slab on BOTH sides of the hero plane "
-                                "(z=0 is the walkable slice).");
-            ImGui::SliderInt("Depth rows behind", &st.proc_gen_3d_rows, 0, 24);
-            ImGui::SliderInt("Depth rows in front", &st.proc_gen_3d_front_rows, 0, 12);
-            ImGui::SliderFloat("Row band (half Z)", &st.proc_gen_3d_band,
-                               40.0f, 140.0f, "%.0f");
-            ImGui::SliderFloat("Block size", &st.proc_gen_3d_block, 24.0f, 96.0f, "%.0f");
-        } else if (st.proc_gen_use_v2) {
-            ImGui::Separator();
-            ImGui::Checkbox("Background terrain (2 silhouette layers at Z -130/-165)",
-                            &st.proc_gen_v2_bg_terrain);
-            if (st.proc_gen_v2_bg_terrain) {
-                ImGui::Indent();
-                ImGui::SliderInt("BG layers", &st.proc_gen_v2_bg_layers, 1, 4);
-                ImGui::Unindent();
-            }
-            ImGui::Checkbox("Winding terrain path (Z variation)", &st.proc_gen_v2_z_path);
-            if (st.proc_gen_v2_z_path) {
-                ImGui::Indent();
-                ImGui::SliderFloat("Path amplitude (±Z)", &st.proc_gen_v2_z_amp,
-                                   0.0f, 40.0f, "%.0f");
-                ImGui::Unindent();
-            }
-            ImGui::Separator();
-            ImGui::Checkbox("Camera follows hero (vertical follow shape)",
-                            &st.proc_gen_v2_camera);
-            ImGui::SameLine();
-            ImGui::TextDisabled("(?)");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Emits a camera_follow_y_shape over the walkable band "
-                                  "and derives scene Bounds from the terrain top "
-                                  "profile — the in-game camera pans with the hero "
-                                  "and starts centered on the level.");
-        }
-    }
-
-    // ── Features ──
-    if (ImGui::CollapsingHeader("Features", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Checkbox("Water sheet", &st.proc_gen_water);
-        ImGui::Checkbox("Torches + glow lights on walkable edges", &st.proc_gen_torches);
-        if (st.proc_gen_use_3d) {
-            ImGui::Checkbox("Caves / winding ravines", &st.proc_gen_3d_caves);
-            ImGui::Checkbox("Floating sky islands", &st.proc_gen_3d_islands);
-            ImGui::Checkbox("Far forest on depth rows (parallax)", &st.proc_gen_3d_far_trees);
-            ImGui::Separator();
-        } else if (st.proc_gen_use_v2) {
-            ImGui::Checkbox("Foreground cliff framing (Z +80)", &st.proc_gen_v2_fg_terrain);
-            ImGui::Checkbox("Background parallax decos (deep-Z trees/rocks)",
-                            &st.proc_gen_v2_bg_decos);
-            ImGui::Checkbox("Foreground parallax decos (near-Z rocks/shrubs)",
-                            &st.proc_gen_v2_fg_decos);
-            ImGui::Checkbox("Terracing (stepped bands)", &st.proc_gen_v2_terracing);
-            if (st.proc_gen_v2_terracing) {
-                ImGui::Indent();
-                ImGui::SliderFloat("Terrace strength", &st.proc_gen_v2_terrace,
-                                   0.0f, 1.0f, "%.2f");
-                ImGui::Unindent();
-            }
-            ImGui::Checkbox("Overhangs (cliff-edge ledges)", &st.proc_gen_v2_overhangs);
-            ImGui::Separator();
-        }
-        ImGui::Checkbox("Mountain ridges (ridged multifractal)", &st.proc_gen_mountains);
-        if (!st.proc_gen_use_3d)
-            ImGui::Checkbox("Island hats on even platforms", &st.proc_gen_islands);
-        ImGui::Separator();
-        ImGui::Checkbox("Randomize decoration rotation", &st.proc_gen_rand_deco_rot);
-        ImGui::SameLine();
-        ImGui::TextDisabled("(?)");
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Trees/bushes may be rotated a quarter-turn for variety.\nUncheck for upright, vanilla-style placement.");
-        ImGui::Checkbox("Randomize decoration size", &st.proc_gen_rand_deco_scale);
-        ImGui::SameLine();
-        ImGui::TextDisabled("(?)");
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Decorations spawn at random scales.\nUncheck for uniform (1.0) size.");
-    }
-
-    // ── Portal ──
-    if (ImGui::CollapsingHeader("Portal", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Checkbox("Spawn a portal somewhere in the scene", &st.proc_gen_portal);
-        if (st.proc_gen_portal) {
-            ImGui::Indent();
-            ImGui::InputText("Destination scene", st.proc_gen_portal_dest,
-                             sizeof(st.proc_gen_portal_dest));
-            ImGui::TextDisabled("The portal is placed at a random walkable spot "
-                                "away from spawn; the area around it is filled "
-                                "with biome brick/stone ruins, signs and torches.");
-            ImGui::Unindent();
-        }
-    }
-
-    // ── Output ──
-    if (ImGui::CollapsingHeader("Output", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::InputText("Scene name", st.proc_gen_name, sizeof(st.proc_gen_name));
-        ImGui::TextDisabled("Saved next to the open scene (or the current folder).");
-    }
-
-    ImGui::Separator();
-    if (!st.proc_gen_status.empty()) {
-        ImGui::TextWrapped("%s", st.proc_gen_status.c_str());
-        ImGui::Spacing();
-    }
-    ImGui::TextDisabled("NPCs/entities are NOT generated — add characters yourself "
-                        "afterwards; the terrain, decor and lights are ready.");
-    if (ImGui::Button(ICON_FA_WAND_MAGIC_SPARKLES "  Generate & Open", ImVec2(-1, 32))) {
-        proc_gen_generate(st);
-    }
-    ImGui::EndPopup();
-}
-
-
-static void draw_scene_creator_dialog(ViewerState& st) {
-    SceneCreatorDialogState& dialog = st.scene_creator;
-    if (!dialog.open) return;
-    if (dialog.request_open) {
-        ImGui::OpenPopup("  " ICON_FA_WAND_MAGIC_SPARKLES "  New Swordigo Scene");
-        dialog.request_open = false;
-    }
-
-    ImGui::SetNextWindowSize(ImVec2(820, 740), ImGuiCond_FirstUseEver);
-    if (!ImGui::BeginPopupModal("  " ICON_FA_WAND_MAGIC_SPARKLES "  New Swordigo Scene",
-                                &dialog.open, ImGuiWindowFlags_NoCollapse)) {
-        return;
-    }
-
-    ImGui::TextColored(g_theme.accent, ICON_FA_WAND_MAGIC_SPARKLES "  Scene Creator");
-    ImGui::TextWrapped("Generate a gameplay-compatible Swordigo scene from a template. "
-                       "Every scene gets a canonical DirectionalLight triple, "
-                       "spawn_default, Background, ground collision mesh, and correct Bounds — "
-                       "all evidence-backed from 118 decoded shipped scenes.");
-    ImGui::Spacing();
-    ImGui::Separator();
-
-    if (ImGui::BeginTabBar("##sc_tabs")) {
-
-        // ── Tab 1: Template & Identity ────────────────────────────────────
-        if (ImGui::BeginTabItem(ICON_FA_LAYER_GROUP "  Template")) {
-            ImGui::Spacing();
-            ImGui::TextDisabled("SCENE TEMPLATE");
-            // Template combo — maps to scenecreate::SceneTemplate enum order
-            static const char* kTemplateLabels[] = {
-                "Minimal — bare starter (ground + spawn + light)",
-                "Standard — outdoor story scene (default)",
-                "Outdoor — wide open world (large bounds)",
-                "Indoor — house / shop (compact bounds + point lights)",
-                "Dungeon — cave / jail / ice (medium bounds, cave bg)",
-                "Boss Arena — arena scale + portal exits",
-                "Portal Hub — transition / hub (portal objects)",
-                "Menu Scene — attract / idle (menu.scene pattern)",
-            };
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::Combo("##template", &dialog.scene_template, kTemplateLabels,
-                             IM_ARRAYSIZE(kTemplateLabels))) {
-                // Auto-fill background if user hasn't typed one yet
-                if (!dialog.background[0]) {
-                    const auto t = static_cast<scenecreate::SceneTemplate>(dialog.scene_template);
-                    std::snprintf(dialog.background, sizeof(dialog.background), "%s",
-                                  scenecreate::template_default_background(t));
-                }
-            }
-            ImGui::Spacing();
-
-            // Template summary card
-            {
-                ImGui::BeginChild("##tpl_summary", ImVec2(0, 90), ImGuiChildFlags_Borders);
-                const auto t = static_cast<scenecreate::SceneTemplate>(dialog.scene_template);
-                ImGui::TextColored(g_theme.accent, ICON_FA_CIRCLE_INFO "  Auto-generated objects");
-                ImGui::BulletText("Background (BackgroundComponent, field 1602)");
-                ImGui::BulletText("DirectionalLight triple (Type 2/1/4, field 1042)");
-                ImGui::BulletText("world_base (GroundPolygon+GroundMesh+Collision)");
-                ImGui::BulletText("spawn_default (SpawnPointComponent, field 4010)");
-                if (dialog.scene_template >= 5 /*BossArena*/ || dialog.scene_template == 6 /*Portal*/)
-                    ImGui::BulletText("Portal exits (PortalComponent, SpecialType:2)");
-                (void)t;
-                ImGui::EndChild();
-            }
-
-            ImGui::Spacing();
-            ImGui::TextDisabled("IDENTITY & OUTPUT");
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##output_path", "Output folder or .scene path",
-                                     dialog.output_path, sizeof(dialog.output_path));
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Enter a directory to place <level>.scene, or an explicit .scene path.");
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
-            ImGui::InputTextWithHint("##level_name", "Level name (e.g. my_level)", dialog.level_name,
-                                     sizeof(dialog.level_name));
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##ns", "Namespace (e.g. my_mod)", dialog.scene_namespace,
-                                     sizeof(dialog.scene_namespace));
-            ImGui::TextDisabled("Level name → runtime ID.  Namespace → ObjectLibrary tag (no spaces/dots).");
-            ImGui::EndTabItem();
-        }
-
-        // ── Tab 2: Visuals (Background, Ground, Base Mesh) ───────────────
-        if (ImGui::BeginTabItem(ICON_FA_IMAGE "  Visuals")) {
-            ImGui::Spacing();
-            ImGui::SeparatorText("Background object");
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##bg", "Background texture stem (e.g. grasslandsbackground_day)",
-                                     dialog.background, sizeof(dialog.background));
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Observed stems across 118 scenes:\n"
-                                  "  grasslandsbackground_day  cavesbackground2\n"
-                                  "  townbackground  fire_background  graveyardback\n"
-                                  "(leave blank to use the template default)");
-            ImGui::TextDisabled("BackgroundComponent payload field 1602, inner TextureName field 10.");
-
-            ImGui::Spacing();
-            ImGui::SeparatorText("Starter ground mesh");
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.48f);
-            ImGui::InputTextWithHint("##gtop",  "Surface texture (e.g. fire_grass)",
-                                     dialog.ground_top, sizeof(dialog.ground_top));
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##gside", "Side texture (e.g. graveyard_ground)",
-                                     dialog.ground_side, sizeof(dialog.ground_side));
-            ImGui::DragFloat3("Platform W / H / Depth", dialog.platform_size,
-                              1.0f, 8.0f, 10000.0f, "%.0f");
-            ImGui::TextDisabled("Boulder generates: GroundPolygon(980)+GroundMesh(981)+GroundMeshGenerator(982)"
-                                "+CollisionShape(983,IsGround:1)+TextureMapping(984,985).");
-
-            ImGui::Spacing();
-            ImGui::SeparatorText("Optional base Model (decoration)");
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##mesh", "Model .pod stem (optional)",
-                                     dialog.base_mesh, sizeof(dialog.base_mesh));
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Leave blank to omit. Extension (.pod) is stripped automatically.");
-            ImGui::EndTabItem();
-        }
-
-        // ── Tab 3: World Spawn ───────────────────────────────────────────
-        if (ImGui::BeginTabItem(ICON_FA_LOCATION_DOT "  Spawn")) {
-            ImGui::Spacing();
-            ImGui::TextDisabled("PLAYABLE ENTRY POINT (spawn_default)");
-            ImGui::TextWrapped("Ruby creates the conventional 'spawn_default' object "
-                               "(SpawnPointComponent payload field 4010, FacingDirection field 8). "
-                               "The engine uses this spawn when entering from a portal or on continue.");
-            ImGui::Spacing();
-            ImGui::DragFloat3("Spawn X / Y / Z", dialog.spawn, 1.0f, -100000.0f, 100000.0f, "%.1f");
-            ImGui::Text("Facing direction");
-            ImGui::SameLine();
-            if (ImGui::RadioButton("Right (1)", dialog.facing == 1))  dialog.facing = 1;
-            ImGui::SameLine();
-            if (ImGui::RadioButton("Left (-1)", dialog.facing == -1)) dialog.facing = -1;
-            ImGui::Spacing();
-            ImGui::BeginChild("##spawn_card", ImVec2(0, 100), ImGuiChildFlags_Borders);
-            ImGui::TextColored(g_theme.success, ICON_FA_LOCATION_DOT "  spawn_default");
-            ImGui::BulletText("SpawnPointComponent — payload field 4010");
-            ImGui::BulletText("FacingDirection field 8 = %d  (1=right, -1=left)", dialog.facing);
-            ImGui::BulletText("Position: %.1f, %.1f, %.1f",
-                              dialog.spawn[0], dialog.spawn[1], dialog.spawn[2]);
-            ImGui::BulletText("SpawnOffset (0, 0, 0) — field 18");
-            ImGui::EndChild();
-            ImGui::EndTabItem();
-        }
-
-        // ── Tab 4: Lighting ──────────────────────────────────────────────
-        if (ImGui::BeginTabItem(ICON_FA_LIGHTBULB "  Lighting")) {
-            ImGui::Spacing();
-            ImGui::TextDisabled("DIRECTIONAL LIGHT TRIPLE (canonical — docs/scenecreator/03)");
-            ImGui::TextWrapped("Every Swordigo scene has exactly one DirectionalLight object "
-                               "with three LightComponent (field 1042) sub-components at IDs 101/103/105. "
-                               "Type 2 = Key sun, Type 1 = Ambient fill, Type 4 = Black shadow contrast.");
-            ImGui::Spacing();
-            ImGui::Checkbox("Show light overrides", &dialog.light_advanced);
-            ImGui::BeginDisabled(!dialog.light_advanced);
-            ImGui::SliderFloat("Key light intensity (Type 2)", &dialog.key_intensity,   0.0f, 5.0f);
-            ImGui::ColorEdit3("Key light color",  dialog.key_color);
-            ImGui::SliderFloat("Ambient intensity  (Type 1)", &dialog.ambient_intensity, 0.0f, 2.0f);
-            ImGui::SliderFloat("Shadow fill        (Type 4)", &dialog.shadow_intensity,  0.0f, 3.0f);
-            ImGui::EndDisabled();
-            ImGui::Spacing();
-            // Live preview card
-            ImGui::BeginChild("##light_card", ImVec2(0, 120), ImGuiChildFlags_Borders);
-            ImGui::TextColored(g_theme.accent, ICON_FA_LIGHTBULB "  DirectionalLight");
-            ImGui::BulletText("comp 101 — LightComponent Type:2 Intensity:%.2f  (key/sun)",
-                              dialog.light_advanced ? dialog.key_intensity : 3.0f);
-            ImGui::BulletText("comp 103 — LightComponent Type:1 Intensity:%.2f  (ambient)",
-                              dialog.light_advanced ? dialog.ambient_intensity : 0.3f);
-            ImGui::BulletText("comp 105 — LightComponent Type:4 Intensity:%.2f  Color:(0,0,0) (shadow)",
-                              dialog.light_advanced ? dialog.shadow_intensity : 0.4f);
-            ImGui::BulletText("Object Depth = 620.097656  (canonical for all 118 scenes)");
-            ImGui::EndChild();
-            ImGui::EndTabItem();
-        }
-
-        // ── Tab 5: Bounds ────────────────────────────────────────────────
-        if (ImGui::BeginTabItem(ICON_FA_BOX "  Bounds")) {
-            ImGui::Spacing();
-            ImGui::TextDisabled("SCENE BOUNDS (root field 3 — required, 118/118 shipped scenes)");
-            ImGui::TextWrapped("SceneBounds is a 20-byte protobuf sub-message (four fixed32 floats: X, Y, Width, Height). "
-                               "Without it Camera.ResetFocus() has nothing to clamp — a new scene will appear to have a broken camera. "
-                               "By default Ruby derives bounds from the template category.");
-            ImGui::Spacing();
-            ImGui::Checkbox("Override template bounds", &dialog.bounds_override);
-            ImGui::BeginDisabled(!dialog.bounds_override);
-            ImGui::DragFloat4("X / Y / Width / Height", dialog.bounds, 10.0f, -50000.0f, 50000.0f, "%.0f");
-            ImGui::EndDisabled();
-            if (!dialog.bounds_override) {
-                const auto t = static_cast<scenecreate::SceneTemplate>(dialog.scene_template);
-                switch (t) {
-                case scenecreate::SceneTemplate::Outdoor:
-                    ImGui::TextColored(g_theme.success, "Using Outdoor preset: X=-3500 Y=-500 W=5500 H=2000"); break;
-                case scenecreate::SceneTemplate::Standard:
-                    ImGui::TextColored(g_theme.success, "Using Standard preset: X=-3500 Y=-1000 W=5500 H=2500"); break;
-                case scenecreate::SceneTemplate::Indoor:
-                    ImGui::TextColored(g_theme.success, "Using Indoor preset: X=-450 Y=-300 W=1750 H=1000"); break;
-                case scenecreate::SceneTemplate::Dungeon:
-                    ImGui::TextColored(g_theme.success, "Using Dungeon preset: X=-2900 Y=-1200 W=4000 H=2200"); break;
-                case scenecreate::SceneTemplate::BossArena:
-                    ImGui::TextColored(g_theme.success, "Using BossArena preset: X=-3500 Y=-500 W=7000 H=3000"); break;
-                case scenecreate::SceneTemplate::Portal:
-                    ImGui::TextColored(g_theme.success, "Using Portal preset: X=-1600 Y=-500 W=3200 H=1500"); break;
-                default:
-                    ImGui::TextColored(g_theme.success, "Derived from ground AABB + 200 px margin"); break;
-                }
-            }
-            ImGui::EndTabItem();
-        }
-
-        // ── Tab 6: Portals ───────────────────────────────────────────────
-        if (ImGui::BeginTabItem(ICON_FA_DOOR_OPEN "  Portals")) {
-            ImGui::Spacing();
-            ImGui::TextDisabled("PORTAL OBJECTS (docs/scenecreator/04 §2)");
-            ImGui::TextWrapped("Each portal = Portal (id 101) + CollisionShape (id 102, SpecialType:2) "
-                               "+ SpawnPoint (id 105). Object name = 'spawn_from_<destination>'. "
-                               "Add a matching 'spawn_from_<this_scene>' in the destination scene.");
-            ImGui::Spacing();
-            if (dialog.portal_count < SceneCreatorDialogState::kMaxPortals) {
-                if (ImGui::Button(ICON_FA_PLUS "  Add Portal")) {
-                    SceneCreatorPortalEntry& pe = dialog.portals[dialog.portal_count++];
-                    pe = SceneCreatorPortalEntry{};
-                    pe.y = 56.0f;
-                }
-            }
-            ImGui::SameLine();
-            if (dialog.portal_count > 0) {
-                if (ImGui::Button(ICON_FA_TRASH "  Remove Last"))
-                    dialog.portal_count--;
-            }
-            ImGui::Spacing();
-            for (int pi = 0; pi < dialog.portal_count; ++pi) {
-                auto& pe = dialog.portals[pi];
-                ImGui::PushID(pi);
-                char hdr[64];
-                std::snprintf(hdr, sizeof(hdr), "Portal %d: spawn_from_%s",
-                              pi + 1, pe.destination[0] ? pe.destination : "?");
-                if (ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen)) {
-                    ImGui::InputTextWithHint("##dest", "Destination scene stem (e.g. grass_part1)",
-                                            pe.destination, sizeof(pe.destination));
-                    ImGui::InputTextWithHint("##spname", "SpawnPointName (blank = default)",
-                                            pe.spawn_name, sizeof(pe.spawn_name));
-                    ImGui::Checkbox("TapToEnter", &pe.tap_to_enter);
-                    ImGui::DragFloat2("Position X/Y", &pe.x, 1.0f);
-                    ImGui::DragFloat2("Touch rect W/H", &pe.rect_w, 1.0f, 10.0f, 1000.0f);
-                    ImGui::Text("Facing"); ImGui::SameLine();
-                    if (ImGui::RadioButton("Right##p", pe.facing == 1))  pe.facing = 1;
-                    ImGui::SameLine();
-                    if (ImGui::RadioButton("Left##p",  pe.facing == -1)) pe.facing = -1;
-                }
-                ImGui::PopID();
-            }
-            if (dialog.portal_count == 0)
-                ImGui::TextDisabled("No portals — add them here or in the scene editor after creation.");
-            ImGui::EndTabItem();
-        }
-
-        // ── Tab 7: Map Link ──────────────────────────────────────────────
-        if (ImGui::BeginTabItem(ICON_FA_MAP "  Map")) {
-            ImGui::Spacing();
-            ImGui::Checkbox("Link this scene to a world map project", &dialog.link_to_map);
-            ImGui::BeginDisabled(!dialog.link_to_map);
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##mappath", "World map (.scmap)", dialog.map_path,
-                                     sizeof(dialog.map_path));
-            ImGui::EndDisabled();
-            ImGui::Spacing();
-            ImGui::TextWrapped("The .swscene sidecar records this link without touching the vanilla .scene protobuf.");
-            ImGui::Spacing();
-            ImGui::BeginChild("##manifest_card", ImVec2(0, 180), ImGuiChildFlags_Borders);
-            ImGui::TextDisabled("GENERATED PROJECT MANIFEST (.swscene)");
-            ImGui::BulletText("scene = %s.scene", dialog.level_name[0] ? dialog.level_name : "new_level");
-            ImGui::BulletText("level_name = %s", dialog.level_name);
-            ImGui::BulletText("namespace = %s", dialog.scene_namespace);
-            ImGui::BulletText("template = %s",
-                              scenecreate::template_label(
-                                  static_cast<scenecreate::SceneTemplate>(dialog.scene_template)));
-            ImGui::BulletText("map_link_enabled = %s", dialog.link_to_map ? "true" : "false");
-            ImGui::BulletText("map_path = %s", dialog.link_to_map && dialog.map_path[0]
-                              ? dialog.map_path : "(none)");
-            ImGui::EndChild();
-            ImGui::EndTabItem();
-        }
-
-        ImGui::EndTabBar();
-    }
-
-    // Error display
-    if (!dialog.error.empty()) {
-        ImGui::Spacing();
-        ImGui::TextColored(g_theme.error, ICON_FA_TRIANGLE_EXCLAMATION "  %s",
-                           dialog.error.c_str());
-    }
-
-    // Bottom bar
-    const bool identity_ready   = dialog.level_name[0] && dialog.scene_namespace[0] &&
-                                  dialog.output_path[0];
-    const bool dimensions_ready = dialog.platform_size[0] >= 32.0f &&
-                                  dialog.platform_size[1] >= 8.0f  &&
-                                  dialog.platform_size[2] >= 8.0f;
-    ImGui::Separator();
-    // Quick summary of what will be created
-    char creates[256];
-    std::snprintf(creates, sizeof(creates), "Creates: Background + DirectionalLight + world_base + spawn_default%s%s%s",
-                  dialog.base_mesh[0]   ? " + base_mesh"   : "",
-                  dialog.portal_count   ? " + portals"     : "",
-                  dialog.link_to_map    ? " + map link"    : "");
-    ImGui::TextDisabled("%s", creates);
-
-    ImGui::SameLine(ImGui::GetWindowWidth() - 280.0f);
-    if (ImGui::Button("Cancel", ImVec2(100, 0))) {
-        dialog.open = false;
-        ImGui::CloseCurrentPopup();
-    }
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!identity_ready || !dimensions_ready);
-    if (ImGui::Button(ICON_FA_WAND_MAGIC_SPARKLES "  Create Scene", ImVec2(160, 0))) {
-        scenecreate::Options options;
-        options.output_path     = dialog.output_path;
-        options.level_name      = dialog.level_name;
-        options.scene_namespace = dialog.scene_namespace;
-        options.scene_template  = static_cast<scenecreate::SceneTemplate>(dialog.scene_template);
-        options.base_mesh              = dialog.base_mesh;
-        options.background             = dialog.background;
-        options.ground_top_texture     = dialog.ground_top;
-        options.ground_side_texture    = dialog.ground_side;
-        options.map_path               = dialog.map_path;
-        options.platform_width  = dialog.platform_size[0];
-        options.platform_height = dialog.platform_size[1];
-        options.platform_depth  = dialog.platform_size[2];
-        options.spawn_x         = dialog.spawn[0];
-        options.spawn_y         = dialog.spawn[1];
-        options.spawn_z         = dialog.spawn[2];
-        options.spawn_facing    = dialog.facing;
-        options.link_to_map     = dialog.link_to_map;
-
-        // DirectionalLight overrides
-        if (dialog.light_advanced) {
-            options.key_light   = { 2, dialog.key_intensity,
-                                    dialog.key_color[0], dialog.key_color[1],
-                                    dialog.key_color[2], 1.0f };
-            options.ambient     = { 1, dialog.ambient_intensity, 1, 1, 1, 1 };
-            options.shadow_fill = { 4, dialog.shadow_intensity, 0, 0, 0, 1 };
-        }
-
-        // Bounds override
-        if (dialog.bounds_override) {
-            options.bounds_x = dialog.bounds[0];
-            options.bounds_y = dialog.bounds[1];
-            options.bounds_w = dialog.bounds[2];
-            options.bounds_h = dialog.bounds[3];
-        }
-
-        // Portals
-        for (int pi = 0; pi < dialog.portal_count; ++pi) {
-            const auto& pe = dialog.portals[pi];
-            if (!pe.destination[0]) continue;
-            scenecreate::PortalParams pp;
-            pp.destination  = pe.destination;
-            pp.spawn_name   = pe.spawn_name;
-            pp.tap_to_enter = pe.tap_to_enter;
-            pp.x            = pe.x;
-            pp.y            = pe.y;
-            pp.rect_w       = pe.rect_w;
-            pp.rect_h       = pe.rect_h;
-            pp.facing       = pe.facing;
-            options.portals.push_back(pp);
-        }
-
-        scenecreate::Result result;
-        std::string error;
-        if (scenecreate::create(options, result, error)) {
-            dialog.open = false;
-            ImGui::CloseCurrentPopup();
-            st.current_dir = fs::path(result.scene_path).parent_path().string();
-            refresh_directory(st);
-            apply_filters(st);
-            FileEntry entry;
-            entry.name      = fs::path(result.scene_path).filename().string();
-            entry.full_path = result.scene_path;
-            entry.is_dir    = false;
-            std::error_code ec;
-            entry.size = static_cast<size_t>(fs::file_size(result.scene_path, ec));
-            entry.type = FTYPE_SCENE;
-            select_file(st, entry);
-            st.status_msg = "Created playable scene '" + entry.name + "' with " +
-                            std::to_string(result.object_count) + " starter objects.";
-            log_file_event("SceneCreate", "Created scene from scratch: " + result.scene_path +
-                           " | manifest=" + result.manifest_path);
-        } else {
-            dialog.error = error;
-        }
-    }
-    ImGui::EndDisabled();
-    ImGui::EndPopup();
-}
-
 static void draw_settings_dialog(ViewerState& st) {
     if (!st.show_settings) return;
 
@@ -15231,9 +11548,6 @@ static void draw_settings_dialog(ViewerState& st) {
             ImGui::Checkbox("Dynamic Lighting (Lambert)", &st.scene_lighting_enabled);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("The full Lambert equation (hemisphere ambient + directional/point diffuse). Turn OFF to see the raw texture \u00d7 material color — the diagnostic that separates \"the texture is dark\" from \"the lighting is wrong\".");
-            ImGui::Checkbox("Dimension Rift (reveal dim objects)", &st.scene_dimension_rift);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Objects tagged DimensionObject only appear in-game while the Dimension Rift powerup is active (e.g. the obj5#5 bridge in lowergrove_part1).\nOFF: they render as faint violet ghosts. ON: fully visible — exactly like using the rift powerup.");
             ImGui::Checkbox("Normal View (debug)", &st.scene_normals_debug);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Color = world-space normal (RGB = N*0.5+0.5). Surfaces whose normals point INTO the mesh show purple/blue instead of their surface tint — the classic \"black wood\" inverted-normal symptom.");
@@ -15244,12 +11558,6 @@ static void draw_settings_dialog(ViewerState& st) {
             ImGui::Checkbox("Water & Lava (fluid sheets)", &st.scene_water_enabled);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Render animated WaterMesh fluid surfaces (water pools, lava) as semi-transparent sheets.");
-            ImGui::Checkbox("Portals (swirl effect + trigger outline)", &st.scene_portal_enabled);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Render animated PortalEffectComponent swirl billboards and PortalComponent trigger-ring outlines.");
-            ImGui::Checkbox("Animated Fire (torches / lava)", &st.scene_fire_enabled);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Render procedural animated flames on fire-linked lights, with flicker synced to the point light.");
             ImGui::Checkbox("Contact Shadows (ShadowComponent + Hiro)", &st.scene_shadows_enabled);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Render soft ground-aligned shadow blobs under objects with a ShadowComponent, plus the grounding shadow under Hiro in Play mode.");
@@ -15295,9 +11603,6 @@ static void draw_settings_dialog(ViewerState& st) {
             ImGui::SliderFloat("Orbit Sensitivity", &st.cam_orbit_speed, 0.1f, 2.0f, "%.1f");
             ImGui::SliderFloat("Zoom Sensitivity", &st.cam_zoom_speed, 0.05f, 1.0f, "%.2f");
             ImGui::SliderFloat("Pan Sensitivity", &st.cam_pan_speed, 0.001f, 0.02f, "%.3f");
-            ImGui::SliderFloat("Keyboard Move Speed", &st.cam_keyboard_speed, 0.25f, 4.0f, "%.2f");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Multiplier for WASD camera pan, arrow-key camera pan and arrow-key object nudging.");
             ImGui::Checkbox("Invert Orbit X (Yaw)", &st.cam_invert_x);
             ImGui::Checkbox("Invert Orbit Y (Pitch)", &st.cam_invert_y);
             
@@ -15367,24 +11672,21 @@ static void draw_settings_dialog(ViewerState& st) {
                 pf.vignette = true; pf.grain = false;
                 if (fx_profile == 0) {          // Vanilla Swordigo (default)
                     pf.exposure = 1.0f;
-                    pf.bloom_strength = 0.38f; pf.bloom_threshold = 0.95f;
-                    pf.ssao = true; pf.ssao_strength = 0.45f; pf.ssao_radius = 90.0f;
-                    pf.saturation = 1.08f; pf.contrast = 1.12f;
-                    pf.brightness = 0.0f; pf.warmth = 0.05f;
+                    pf.bloom_strength = 0.22f; pf.bloom_threshold = 0.95f;
+                    pf.saturation = 1.05f; pf.contrast = 1.04f;
+                    pf.brightness = 0.03f; pf.warmth = 0.05f;
                     pf.sharpen_amount = 0.30f; pf.vignette_strength = 0.22f;
                 } else if (fx_profile == 1) {   // Cinematic
                     pf.exposure = 1.15f;
-                    pf.bloom_strength = 0.55f; pf.bloom_threshold = 0.90f;
-                    pf.ssao = true; pf.ssao_strength = 0.65f; pf.ssao_radius = 130.0f;
-                    pf.saturation = 1.18f; pf.contrast = 1.15f;
+                    pf.bloom_strength = 0.45f; pf.bloom_threshold = 0.80f;
+                    pf.saturation = 1.18f; pf.contrast = 1.12f;
                     pf.brightness = 0.0f; pf.warmth = 0.10f;
                     pf.sharpen_amount = 0.45f; pf.vignette_strength = 0.45f;
                 } else {                        // Clean / Neutral
                     pf.exposure = 1.0f;
-                    pf.bloom_strength = 0.18f; pf.bloom_threshold = 1.10f;
-                    pf.ssao = false;
-                    pf.saturation = 1.0f; pf.contrast = 1.05f;
-                    pf.brightness = 0.0f; pf.warmth = 0.0f;
+                    pf.bloom_strength = 0.12f; pf.bloom_threshold = 1.00f;
+                    pf.saturation = 1.0f; pf.contrast = 1.0f;
+                    pf.brightness = 0.02f; pf.warmth = 0.0f;
                     pf.sharpen_amount = 0.20f; pf.vignette_strength = 0.10f;
                 }
             }
@@ -15398,17 +11700,7 @@ static void draw_settings_dialog(ViewerState& st) {
             ImGui::Checkbox("Enable Bloom", &st.postfx.bloom);
             if (st.postfx.bloom) {
                 ImGui::SliderFloat("Bloom Strength", &st.postfx.bloom_strength, 0.0f, 2.0f, "%.2f");
-                ImGui::SliderFloat("Bloom Threshold", &st.postfx.bloom_threshold, 0.1f, 2.5f, "%.2f");
-                ImGui::TextDisabled("Two-band HDR bloom (tight cores + wide halo) over linear light.");
-            }
-
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(0.85f, 0.75f, 0.45f, 1.0f), "Ambient Occlusion (SSAO)");
-            ImGui::Checkbox("Enable SSAO", &st.postfx.ssao);
-            if (st.postfx.ssao) {
-                ImGui::SliderFloat("AO Strength", &st.postfx.ssao_strength, 0.0f, 1.0f, "%.2f");
-                ImGui::SliderFloat("AO Radius", &st.postfx.ssao_radius, 20.0f, 300.0f, "%.0f");
-                ImGui::TextDisabled("Half-res depth-based contact shadows; needs the depth buffer.");
+                ImGui::SliderFloat("Bloom Threshold", &st.postfx.bloom_threshold, 0.1f, 1.5f, "%.2f");
             }
 
             ImGui::Separator();
@@ -15481,12 +11773,8 @@ static bool handle_shortcuts(ViewerState& st) {
         return true;
     }
 
-    // W/T display toggles yield to the viewport camera keys while the 3D view
-    // is hovered (W is camera-forward there, not wireframe).
-    if (!st.view_keyboard_focus) {
-        if (ImGui::IsKeyPressed(ImGuiKey_W)) st.show_wireframe = !st.show_wireframe;
-        if (ImGui::IsKeyPressed(ImGuiKey_T)) st.show_textured = !st.show_textured;
-    }
+    if (ImGui::IsKeyPressed(ImGuiKey_W)) st.show_wireframe = !st.show_wireframe;
+    if (ImGui::IsKeyPressed(ImGuiKey_T)) st.show_textured = !st.show_textured;
     
     // Toggle bottom panel via Ctrl+` (or just GraveAccent alone when not focused in input fields)
     if ((io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) || ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) {
@@ -15526,8 +11814,7 @@ static bool handle_shortcuts(ViewerState& st) {
         st.workspace_layout_dirty = true;
     }
 
-    // Ctrl+S — save the CURRENTLY ACTIVE editor (global across editor systems).
-    // Consume the trigger once, then dispatch on st.preview_type.
+    // Ctrl+S — save current scene (if scene is loaded and has a path)
     if (st.scene_save_requested || (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S))) {
         st.scene_save_requested = false;
         if (st.preview_type == PREVIEW_SCENE && !st.scene.filepath.empty()) {
@@ -15566,35 +11853,6 @@ static bool handle_shortcuts(ViewerState& st) {
             st.scene_save_msg_timer = 4.0f;
             log_file_event("SceneSave", saved ? "Saved scene (Ctrl+S): " + st.scene.filename
                                                : "ERROR: " + save_error);
-        } else if (st.preview_type == PREVIEW_MAP && st.map_editor.loaded) {
-            // World-map editor: byte-exact .scmap save via map_loader.
-            std::string err;
-            const bool saved = mapedit::map_editor_save(st.map_editor, &err);
-            if (saved) {
-                st.map_editor.dirty = false;
-                st.map_editor.status = "Saved (byte-exact)";
-            } else {
-                st.map_editor.status = "Save failed: " + err;
-            }
-            st.map_editor.status_timer = 4.0f;
-            log_file_event("MapSave", saved ? "Saved map (Ctrl+S)" : "ERROR: " + err);
-            return false;
-        } else if (st.preview_type == PREVIEW_TEXTURE && st.tex_edit_dirty &&
-                   st.tex_edit_valid && !st.tex_edit_src.empty()) {
-            // Texture editor: mirror the Save button's "Overwrite Source" branch —
-            // containers (.tex/.pvr) go through tex_edit_save_tex, plain images
-            // (PNG) through tex_edit_save_png. Same helpers the manual Save uses.
-            const bool ok = tex_edit_is_container(st)
-                                ? tex_edit_save_tex(st, st.tex_edit_src)
-                                : tex_edit_save_png(st, st.tex_edit_src);
-            if (ok) {
-                st.tex_edit_dirty = false;
-                st.status_msg = "Saved back to " + st.tex_edit_src;
-                log_file_event("TextureEdit", "Overwrote (Ctrl+S): " + st.tex_edit_src);
-            } else {
-                st.status_msg = "Overwrite failed: " + st.tex_edit_src;
-            }
-            return false;
         }
     }
 
@@ -15618,86 +11876,6 @@ static bool handle_shortcuts(ViewerState& st) {
     }
     if (st.preview_type == PREVIEW_SCENE && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D))
         duplicate_scene_selection(st);
-
-    // Ctrl+C — copy the selected map node (world-map editor). Synced with the
-    // scene copy above so Ctrl+C works across editor systems.
-    if (st.preview_type == PREVIEW_MAP && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) {
-        auto& m = st.map_editor;
-        if (m.sel_zone >= 0 && m.sel_zone < (int)m.map.zones.size() &&
-            m.sel_node >= 0 && m.sel_node < (int)m.map.zones[m.sel_zone].nodes.size()) {
-            m.node_clipboard = m.map.zones[m.sel_zone].nodes[m.sel_node];
-            m.node_clipboard_valid = true;
-            m.status = "Copied node '" + m.node_clipboard.level_name + "'";
-            m.status_timer = 4.0f;
-        }
-        return false;
-    }
-    // Ctrl+V — paste the copied node into the selected zone (world-map editor).
-    // The edit goes through the generic markup tree (m.map.root) then
-    // map_rebuild/map_validate so the byte-exact .scmap save stays intact.
-    if (st.preview_type == PREVIEW_MAP && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V)) {
-        auto& m = st.map_editor;
-        if (!m.node_clipboard_valid) {
-            m.status = "Nothing to paste — copy a node first (Ctrl+C)";
-            m.status_timer = 4.0f;
-            return false;
-        }
-        if (m.sel_zone < 0 || m.sel_zone >= (int)m.map.zones.size()) {
-            m.status = "Paste target: select a zone first";
-            m.status_timer = 4.0f;
-            return false;
-        }
-        // Find the sel_zone-th "Zone" block in the generic tree. The typed
-        // overlay (m.map.zones) and the root "Zone" blocks share the same order.
-        mapedit::MkBlock* zoneBlock = nullptr;
-        {
-            int zi = 0;
-            for (auto& b : m.map.root) {
-                if (b.type == "Zone") {
-                    if (zi == m.sel_zone) { zoneBlock = &b; break; }
-                    ++zi;
-                }
-            }
-        }
-        if (!zoneBlock) {
-            m.status = "Paste failed: zone block not found";
-            m.status_timer = 4.0f;
-            return false;
-        }
-        // Unique level name: clipboard name + "_copy" (incremented until free).
-        const mapedit::MapNodeData& src = m.node_clipboard;
-        std::string base = src.level_name.empty() ? "node" : src.level_name;
-        std::string new_name = base + "_copy";
-        int suffix = 1;
-        while (m.map.node_index.count(new_name)) {
-            new_name = base + "_copy" + std::to_string(++suffix);
-        }
-        // Add a fresh Node message to the zone block and copy scalar fields.
-        // NOTE: portals are intentionally NOT replicated — duplicating portal
-        // targets/directions is fiddly and would create ambiguous graph edges;
-        // the pasted node is a clean copy of the node's own scalar fields.
-        mapedit::MkField* nf = mapedit::mk_add_msg(*zoneBlock, "Node");
-        if (nf) {
-            mapedit::mk_msg_set_str(*nf, "LevelName", new_name);
-            if (!src.title.empty())  mapedit::mk_msg_set_str(*nf, "Title", src.title);
-            if (!src.music.empty())  mapedit::mk_msg_set_str(*nf, "Music", src.music);
-            mapedit::mk_msg_set_int(*nf, "Type", src.type);
-            mapedit::mk_msg_set_int(*nf, "Hidden", src.hidden ? 1 : 0);
-            mapedit::mk_msg_set_int(*nf, "ExperienceLevel", src.experience_level);
-            mapedit::mk_msg_set_int(*nf, "NumTreasures", src.num_treasures);
-            mapedit::mk_msg_set_int(*nf, "HasPortal", src.has_portal ? 1 : 0);
-            mapedit::mk_msg_set_int(*nf, "IgnoreInStatistics", src.ignore_in_statistics ? 1 : 0);
-            mapedit::map_rebuild(m.map);
-            mapedit::map_validate(m.map);
-            m.dirty = true;
-            m.status = "Pasted node '" + new_name + "' (portals not copied)";
-            m.status_timer = 4.0f;
-        } else {
-            m.status = "Paste failed: could not add node";
-            m.status_timer = 4.0f;
-        }
-        return false;
-    }
 
     if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
         if (st.selected_idx > 0) {
@@ -15879,17 +12057,12 @@ int main(int argc, char* argv[]) {
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
     SDL_Window* window = SDL_CreateWindow(WIN_TITLE, WIN_W, WIN_H,
-                                          SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
-                                          SDL_WINDOW_BORDERLESS | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                                          SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_Quit();
         return 1;
     }
-    // Best-effort: compositors that support SDL hit testing provide native
-    // drag/resize behavior for the custom title bar. The app remains usable
-    // on platforms which do not expose it.
-    SDL_SetWindowHitTest(window, ruby_window_hit_test, nullptr);
 
     // Ruby window icon — same launcher icon, from embedded assets (permanent fix)
     {
@@ -15948,7 +12121,6 @@ int main(int argc, char* argv[]) {
     ImGui_ImplOpenGL3_Init(GLSL_VERSION);
 
     // Font loading — Inter + Font Awesome solid icons, DPI-aware
-    // Embedded assets FIRST (permanent fix — works from any install path)
     {
         float font_size_main = 16.0f * dpi_scale;
 
@@ -15966,85 +12138,46 @@ int main(int argc, char* argv[]) {
         icon_cfg.GlyphMinAdvanceX = font_size_main;
         icon_cfg.GlyphOffset = ImVec2(0, 2);
 
-        // ── Try embedded fonts first (always available) ──
-        const unsigned char* emb_main = nullptr; size_t emb_main_size = 0;
-        const unsigned char* emb_fa   = nullptr; size_t emb_fa_size   = 0;
-        const char* emb_font_names[] = {
-            "fonts/Inter-Regular.ttf",
-            "fonts/MegalopolisExtra-Regular.otf",
-            "fonts/SpaceGrotesk-VariableFont_wght.ttf",
+        std::string inter_paths[] = {
+            "src/assets/fonts/Inter-Regular.ttf",
+            get_data_path("src/assets/fonts/Inter-Regular.ttf"),
+            get_user_data_dir() + "launcher/fonts/Inter-Regular.ttf",
+            get_user_data_dir() + "src/assets/fonts/Inter-Regular.ttf",
+            "src/assets/fonts/MegalopolisExtra-Regular.otf",
+            "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
         };
-        for (const char* n : emb_font_names) {
-            if (embedded_asset(n, &emb_main, &emb_main_size)) break;
-        }
-        if (!embedded_asset("fonts/fa-solid-900.ttf", &emb_fa, &emb_fa_size))
-            embedded_asset("fonts/fa-solid-900.otf", &emb_fa, &emb_fa_size);
 
-        bool font_loaded = false;
-        if (emb_main && emb_main_size > 0) {
-            ImFont* font = io.Fonts->AddFontFromMemoryTTF((void*)emb_main, (int)emb_main_size,
-                                                          font_size_main, &text_cfg);
-            if (font && emb_fa && emb_fa_size > 0) {
-                io.Fonts->AddFontFromMemoryTTF((void*)emb_fa, (int)emb_fa_size,
-                                               font_size_main * 0.85f, &icon_cfg, icon_ranges);
-                std::cout << "[Ruby] FontAwesome icons merged from embedded font" << std::endl;
+        std::string fa_paths[] = {
+            get_user_data_dir() + "launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+            "/usr/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+            "src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+            get_data_path("src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf"),
+            get_user_data_dir() + "launcher/fonts/fa-solid-900.ttf",
+            get_user_data_dir() + "launcher/fonts/fa-solid-900.otf",
+            "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf",
+            "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.otf",
+            "src/assets/fonts/fa-solid-900.ttf",
+            "src/assets/fonts/fa-solid-900.otf",
+            get_data_path("src/assets/fonts/fa-solid-900.ttf"),
+            get_data_path("src/assets/fonts/fa-solid-900.otf"),
+        };
+
+        std::string inter_path, fa_path;
+        for (auto& fp : inter_paths) {
+            if (fs::exists(fp)) { inter_path = fp; break; }
+        }
+        for (auto& fp : fa_paths) {
+            if (fs::exists(fp)) { fa_path = fp; break; }
+        }
+
+        if (!inter_path.empty()) {
+            ImFont* font = io.Fonts->AddFontFromFileTTF(inter_path.c_str(), font_size_main, &text_cfg);
+            if (font && !fa_path.empty()) {
+                io.Fonts->AddFontFromFileTTF(fa_path.c_str(), font_size_main * 0.85f, &icon_cfg, icon_ranges);
+                std::cout << "[Ruby] FontAwesome icons merged successfully from: " << fa_path << std::endl;
             }
             io.FontGlobalScale = 1.0f / dpi_scale;
-            g_state.mono_font = font;
-            font_loaded = true;
-            std::cout << "[Ruby] Embedded font loaded (size=" << font_size_main << "px)" << std::endl;
-        }
-
-        // ── Disk fallback (legacy path search) ──
-        if (!font_loaded) {
-            std::string inter_paths[] = {
-                "src/assets/fonts/Inter-Regular.ttf",
-                get_data_path("src/assets/fonts/Inter-Regular.ttf"),
-                get_user_data_dir() + "launcher/fonts/Inter-Regular.ttf",
-                get_user_data_dir() + "src/assets/fonts/Inter-Regular.ttf",
-                "src/assets/fonts/MegalopolisExtra-Regular.otf",
-                "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
-            };
-
-            std::string fa_paths[] = {
-                get_user_data_dir() + "launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
-                "/usr/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
-                "src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
-                get_data_path("src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf"),
-                get_user_data_dir() + "launcher/fonts/fa-solid-900.ttf",
-                get_user_data_dir() + "launcher/fonts/fa-solid-900.otf",
-                "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf",
-                "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.otf",
-                "src/assets/fonts/fa-solid-900.ttf",
-                "src/assets/fonts/fa-solid-900.otf",
-                get_data_path("src/assets/fonts/fa-solid-900.ttf"),
-                get_data_path("src/assets/fonts/fa-solid-900.otf"),
-            };
-
-            std::string inter_path, fa_path;
-            for (auto& fp : inter_paths) {
-                if (fs::exists(fp)) { inter_path = fp; break; }
-            }
-            for (auto& fp : fa_paths) {
-                if (fs::exists(fp)) { fa_path = fp; break; }
-            }
-
-            if (!inter_path.empty()) {
-                ImFont* font = io.Fonts->AddFontFromFileTTF(inter_path.c_str(), font_size_main, &text_cfg);
-                if (font && !fa_path.empty()) {
-                    io.Fonts->AddFontFromFileTTF(fa_path.c_str(), font_size_main * 0.85f, &icon_cfg, icon_ranges);
-                    std::cout << "[Ruby] FontAwesome icons merged from: " << fa_path << std::endl;
-                }
-                io.FontGlobalScale = 1.0f / dpi_scale;
-                g_state.mono_font = font;
-                font_loaded = true;
-            }
-        }
-
-        if (!font_loaded) {
-            g_state.mono_font = io.Fonts->AddFontDefault();
-            io.FontGlobalScale = 1.0f / dpi_scale;
-            std::cout << "[Ruby] WARNING: Using ImGui default font" << std::endl;
+            g_state.mono_font = font; // Use the verified main font for everything, ensuring zero icon breakages
         }
     }
 
@@ -16208,25 +12341,6 @@ int main(int argc, char* argv[]) {
         // Poll the Blender round-trip daemon for completed exports.
         blender_poll_result(g_state);
 
-        // ── Keyboard-nav handoff ──
-        // NavEnableKeyboard makes ImGui consume WASD / arrows / Enter to move
-        // focus between GUI buttons — while the 3D viewport owns the keyboard
-        // those keys must drive the camera / selection instead. Ownership is
-        // STICKY (set by hovering/clicking the viewport, cleared by clicking
-        // another panel) and always yields to text inputs. Applied here,
-        // before NewFrame processes the queued key events.
-        {
-            const bool scene_view_active =
-                (g_state.preview_type == PREVIEW_SCENE) && (g_state.scene_preview_tab == 1);
-            if (!scene_view_active)
-                g_state.view_keyboard_focus = false;
-            ImGuiIO& nio = ImGui::GetIO();
-            if (g_state.view_keyboard_focus && !nio.WantTextInput)
-                nio.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
-            else
-                nio.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        }
-
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
@@ -16251,42 +12365,11 @@ int main(int argc, char* argv[]) {
         }
 
         if (handle_shortcuts(g_state)) running = false;
-        // Consume the viewport-hover latch AFTER the consumers above (nav
-        // handoff ran before NewFrame, shortcuts just now). The scene viewport
-        // draw later this frame re-latches it (sticky: hovering grabs it,
-        // clicking another panel releases it). We only fall back to false when
-        // the viewport did NOT draw last frame — tab switch or panel layout
-        // hiding it — so a stale latch can't lock the keyboard away from the
-        // GUI. While the viewport is live we leave the latch alone: that is
-        // what keeps arrow-nudging an object working with the cursor parked
-        // over a side panel (ImGui nav stays suspended, arrows never hit the
-        // GUI buttons).
-        if (g_state.view_keyboard_focus_frame != ImGui::GetFrameCount() - 1)
-            g_state.view_keyboard_focus = false;
 
         // Draw top Blender-style main menu bar
         bool open_about = false;
         if (ImGui::BeginMainMenuBar()) {
-            // Brand the application in the same palette and compact visual
-            // language as the editor, rather than leaving the OS window title
-            // as the only "Ruby / Swordigo Studio" identity.
-            ImGui::PushStyleColor(ImGuiCol_Text, g_theme.accent);
-            ImGui::TextUnformatted(ICON_FA_GEM "  RUBY");
-            ImGui::PopStyleColor();
-            ImGui::SameLine(0.0f, 5.0f);
-            ImGui::TextDisabled("SWORDIGO STUDIO");
-            ImGui::SameLine(0.0f, 10.0f);
-            ImGui::TextDisabled("|");
-            ImGui::SameLine(0.0f, 6.0f);
             if (ImGui::BeginMenu("File")) {
-                if (ImGui::BeginMenu("Create")) {
-                    if (ImGui::MenuItem(ICON_FA_WAND_MAGIC_SPARKLES "  Scene..."))
-                        open_scene_creator(g_state);
-                    if (ImGui::MenuItem(ICON_FA_MOUNTAIN_SUN "  Procedural Scene..."))
-                        open_procedural_generator(g_state);
-                    ImGui::EndMenu();
-                }
-                ImGui::Separator();
                 if (ImGui::MenuItem("Open Vanilla Assets Folder")) {
                     std::error_code ec;
                     g_state.current_dir = expand_home("~/.local/share/swordigo-desktop/assets/resources/");
@@ -16443,40 +12526,6 @@ int main(int argc, char* argv[]) {
                 }
                 ImGui::EndMenu();
             }
-
-            // Native-looking window controls, owned and styled by Ruby. They
-            // sit in the same app bar instead of consuming a separate OS
-            // title strip above the workspace.
-            constexpr float kWindowButtonW = 34.0f;
-            const float controls_x = std::max(ImGui::GetCursorPosX() + 12.0f,
-                                              ImGui::GetWindowWidth() - kWindowButtonW * 3.0f - 7.0f);
-            ImGui::SetCursorPosX(controls_x);
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 3.0f));
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2.0f, 0.0f));
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, g_theme.surface_hover);
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, g_theme.surface_active);
-            if (ImGui::Button(ICON_FA_WINDOW_MINIMIZE "##window_min", ImVec2(kWindowButtonW, 24.0f)))
-                SDL_MinimizeWindow(window);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimize");
-            ImGui::SameLine();
-            const bool maximized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
-            if (ImGui::Button(maximized ? "\xe2\x9d\x90##window_restore" : "\xe2\x96\xa1##window_max", ImVec2(kWindowButtonW, 24.0f))) {
-                if (maximized) SDL_RestoreWindow(window);
-                else SDL_MaximizeWindow(window);
-            }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip(maximized ? "Restore" : "Maximize");
-            ImGui::SameLine();
-            ImGui::PopStyleColor(3);
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.14f, 0.65f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.88f, 0.18f, 0.22f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.68f, 0.10f, 0.13f, 1.0f));
-            if (ImGui::Button(ICON_FA_XMARK "##window_close", ImVec2(kWindowButtonW, 24.0f)))
-                running = false;
-            ImGui::PopStyleColor(3);
-            ImGui::PopStyleVar(3);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close");
             ImGui::EndMainMenuBar();
         }
 
@@ -16515,9 +12564,9 @@ int main(int argc, char* argv[]) {
         if (g_mcp_console_open)
             draw_mcp_console();
 
-        draw_scene_creator_dialog(g_state);
-        draw_procedural_generator(g_state);
         draw_settings_dialog(g_state);
+
+
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
@@ -16531,9 +12580,7 @@ int main(int argc, char* argv[]) {
         ImGui::Begin("##MainWindow", nullptr, wflags);
 
         float total_h = ImGui::GetContentRegionAvail().y;
-        // Never request a child taller than its host.  This matters while a
-        // window is being resized or restored on a small display.
-        float content_h = std::max(1.0f, total_h - STATUS_BAR_H);
+        float content_h = total_h - STATUS_BAR_H;
 
         ImGui::BeginChild("ContentArea", ImVec2(0, content_h));
 
@@ -16598,33 +12645,22 @@ int main(int argc, char* argv[]) {
         }
 
         // Center editor — flexes to swallow all remaining width.
-        // Side panels are already dropped above when space is tight.  Do not
-        // force MIN_EDITOR_W here: doing so made CenterPanel wider than its
-        // parent below that threshold, creating horizontal dead space.
-        const float editor_w = std::max(1.0f, available_w - xcur - w_inspector -
-                                        (show_inspector_now ? split : 0.0f));
+        const float editor_w = std::max(MIN_EDITOR_W, available_w - xcur - w_inspector - (show_inspector_now ? split : 0.0f));
         ImGui::SetCursorPos(ImVec2(xcur, 0.0f));
         ImGui::BeginChild("CenterPanel", ImVec2(editor_w, content_h));
 
-        float center_panel_total_h = std::max(1.0f, ImGui::GetContentRegionAvail().y);
-        // Preserve a usable preview before allowing the optional bottom panel.
-        // On short windows it is temporarily suppressed rather than forcing
-        // children outside their parent (the old source of vertical voids).
-        constexpr float kAbsoluteMinPreviewH = 80.0f;
-        const float max_bottom_h = std::max(0.0f, center_panel_total_h -
-                                                   kAbsoluteMinPreviewH - split);
-        const bool show_bottom_now = g_state.show_bottom_panel && max_bottom_h >= 120.0f;
-        if (show_bottom_now)
-            g_state.bottom_panel_height = std::clamp(g_state.bottom_panel_height, 120.0f, max_bottom_h);
-        float bottom_panel_h = show_bottom_now ? g_state.bottom_panel_height : 0.0f;
-        float top_part_h = std::max(1.0f, center_panel_total_h - bottom_panel_h -
-                                    (show_bottom_now ? split : 0.0f));
+        float center_panel_total_h = ImGui::GetContentRegionAvail().y;
+        const float max_bottom_h = std::max(120.0f, center_panel_total_h - MIN_EDITOR_H - split);
+        g_state.bottom_panel_height = std::clamp(g_state.bottom_panel_height, 120.0f, max_bottom_h);
+        float bottom_panel_h = g_state.show_bottom_panel ? g_state.bottom_panel_height : 0.0f;
+        float top_part_h = std::max(MIN_EDITOR_H, center_panel_total_h - bottom_panel_h -
+                                    (g_state.show_bottom_panel ? split : 0.0f));
 
         ImGui::BeginChild("TopPartPreview", ImVec2(0, top_part_h));
         draw_center_panel(g_state);
         ImGui::EndChild();
 
-        if (show_bottom_now) {
+        if (g_state.show_bottom_panel) {
             ImGui::InvisibleButton("##bottom_splitter", ImVec2(-1.0f, split));
             if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
             if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {

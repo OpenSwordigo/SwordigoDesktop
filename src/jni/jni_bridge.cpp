@@ -3675,9 +3675,12 @@ void bridge_gl_load_matrixf(void* emu_ptr) {
                 std::cerr << " " << std::hex << insn;
             }
             std::cerr << std::dec << std::endl;
-        } else if (nan_count % 1000 == 0) {
+        } else if (++nan_count <= 10) {
             std::cout << "[MATRIX] NaN/Inf #" << nan_count << " at LR=0x" << std::hex << lr << std::dec
                       << " [" << m[0] << " " << m[1] << " / " << m[4] << " " << m[5] << "]" << std::endl;
+            if (nan_count == 10) {
+                std::cout << "[MATRIX] Maximum NaN warnings reached (10); suppressing further matrix logs." << std::endl;
+            }
         }
         // Instead of replacing with identity (puts objects at origin = invisible),
         // sanitize each NaN/Inf element to the corresponding identity value.

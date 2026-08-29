@@ -103,10 +103,14 @@ struct SceneObject {
     float       model_transform_axis[3] = {0.0f, 1.0f, 0.0f};
     float       model_transform_angle = 0.0f;
     float       model_transform_speed = 0.0f;
-    bool        is_portal = false;
+                bool        is_portal = false;
     std::string portal_destination;
     std::string portal_spawn_point;
     bool        portal_tap_to_enter = false;
+    // CameraComponent: an in-game camera object (focus target / camera marker).
+    // Flagged defensively — real Swordigo scenes mostly invoke the camera from
+    // Lua, but a CameraComponent may be present in some scene graphs.
+    bool        is_camera = false;
     // DimensionObject component: the object only appears in-game while the
     // Dimension Rift powerup is active (obj5#5 in lowergrove_part1, etc).
     // Ruby ghosts it (very faint + transparent) unless the rift is toggled on.

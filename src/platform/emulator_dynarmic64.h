@@ -123,6 +123,11 @@ private:
     uint64_t recovery_depth_addr = 0;
     uint64_t recovery_stack_addr = 0;
     uint32_t recovery_stack_bytes = 0;
+
+    // run_pending_threads() may be entered while another guest call is
+    // suspended at a bridge/spin yield. Each nesting level needs an independent
+    // guest stack; register save/restore alone does not protect stack frames.
+    uint32_t deferred_thread_depth = 0;
 };
 
 #endif

@@ -635,6 +635,138 @@ std::string build_glow_light(const TorchLight& t, const std::string& name) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// v3.1: Advanced vanilla-matching object builders
+// ─────────────────────────────────────────────────────────────────────────
+
+// Breakable object: TemplateName + CollisionShape (IsGround=0, receives damage).
+// Vanilla pots/boards are TemplateName references with a CollisionShape.
+std::string build_breakable_object(const std::string& tmpl, const std::string& name,
+                                    float x, float y, float depth) {
+    if (tmpl.empty()) return "";
+    // CollisionShape — small rect, not ground, receives damage.
+    proto::Writer rect;
+    rect.write_float_field(1, -20.0f); rect.write_float_field(2, -30.0f);
+    rect.write_float_field(3, 40.0f);  rect.write_float_field(4, 60.0f);
+    proto::Writer shape_pay;
+    shape_pay.write_nested_field(1, rect);
+    proto::Writer coll_pay;
+    coll_pay.write_varint_field(1, 0);     // IsGround = 0
+    coll_pay.write_varint_field(2, 1);     // Collides = 1
+    coll_pay.write_varint_field(3, 1);     // ReceivesDamage = 1
+    coll_pay.write_float_field(6, -45.0f); // MinDepth
+    coll_pay.write_float_field(7, 45.0f);  // MaxDepth
+    coll_pay.write_varint_field(11, 1);    // Enabled
+    proto::Writer cs_comp;
+    cs_comp.write_string_field(1, "CollisionShape");
+    cs_comp.write_varint_field(2, 101);
+    cs_comp.write_nested_field(120, shape_pay);
+    cs_comp.write_nested_field(121, coll_pay);
+
+    proto::Writer obj;
+    obj.write_string_field(1, tmpl);      // TemplateName
+    obj.write_string_field(2, name);      // Identifier
+    obj.write_bytes_field(3, cs_comp.to_string());
+    obj.write_nested_field(4, v2(x, y));
+    obj.write_float_field(5, depth);
+    obj.write_float_field(6, 0.0f);      // Rotation
+    obj.write_float_field(7, 1.0f);      // Scaling
+    obj.write_nested_field(8, rect_msg(-20, -30, 40, 60));
+    obj.write_varint_field(9, 0);         // Hidden
+    return scene_wrap_object(obj);
+}
+
+// Collectable item: TemplateName + CollectableItem component.
+std::string build_collectable_object(const std::string& tmpl, const std::string& name,
+                                      float x, float y, float depth) {
+    if (tmpl.empty()) return "";
+    proto::Writer ci_pay;
+    ci_pay.write_string_field(1, "");     // ItemName (resolved by engine)
+    ci_pay.write_varint_field(2, 1);      // Amount = 1
+    proto::Writer ci_comp = component("CollectableItem", 102, 112, ci_pay);
+
+    proto::Writer obj;
+    obj.write_string_field(1, tmpl);      // TemplateName
+    obj.write_string_field(2, name);      // Identifier
+    obj.write_bytes_field(3, ci_comp.to_string());
+    obj.write_nested_field(4, v2(x, y));
+    obj.write_float_field(5, depth);
+    obj.write_float_field(6, 0.0f);
+    obj.write_float_field(7, 1.0f);
+    obj.write_nested_field(8, rect_msg(-20, -20, 40, 40));
+    obj.write_varint_field(9, 0);
+    return scene_wrap_object(obj);
+}
+
+// Ambient particle emitter: TemplateName reference (engine handles emission).
+std::string build_particle_object(const std::string& tmpl, const std::string& name,
+                                   float x, float y, float depth) {
+    if (tmpl.empty()) return "";
+    proto::Writer obj;
+    obj.write_string_field(1, tmpl);      // TemplateName
+    obj.write_string_field(2, name);      // Identifier
+    obj.write_nested_field(4, v2(x, y));
+    obj.write_float_field(5, depth);
+    obj.write_float_field(6, 0.0f);
+    obj.write_float_field(7, 1.0f);
+    obj.write_nested_field(8, rect_msg(-30, -30, 60, 60));
+    obj.write_varint_field(9, 0);
+    return scene_wrap_object(obj);
+}
+
+// Fire emitter: TemplateName reference for fire/glow effects.
+std::string build_fire_emitter_object(const std::string& tmpl, const std::string& name,
+                                       float x, float y, float depth) {
+    if (tmpl.empty()) return "";
+    proto::Writer obj;
+    obj.write_string_field(1, tmpl);      // TemplateName
+    obj.write_string_field(2, name);      // Identifier
+    obj.write_nested_field(4, v2(x, y));
+    obj.write_float_field(5, depth);
+    obj.write_float_field(6, 0.0f);
+    obj.write_float_field(7, 1.0f);
+    obj.write_nested_field(8, rect_msg(-40, -40, 80, 80));
+    obj.write_varint_field(9, 0);
+    return scene_wrap_object(obj);
+}
+
+// Sound effect: a SoundEffect component at a position with radius.
+std::string build_sound_object(const std::string& sound_name, const std::string& name,
+                                float x, float y, float radius) {
+    if (sound_name.empty()) return "";
+    proto::Writer se_pay;
+    se_pay.write_string_field(1, sound_name);  // SoundName
+    se_pay.write_float_field(2, radius);       // Radius
+    proto::Writer se_comp = component("SoundEffect", 101, 106, se_pay);
+
+    proto::Writer obj;
+    obj.write_string_field(2, name);
+    obj.write_bytes_field(3, se_comp.to_string());
+    obj.write_nested_field(4, v2(x, y));
+    obj.write_float_field(5, 0.0f);
+    obj.write_float_field(6, 0.0f);
+    obj.write_float_field(7, 1.0f);
+    obj.write_nested_field(8, rect_msg(-30, -30, 60, 60));
+    obj.write_varint_field(9, 0);
+    return scene_wrap_object(obj);
+}
+
+// Moving platform: PhysicsPlatform template reference.
+std::string build_moving_platform_object(const std::string& tmpl, const std::string& name,
+                                          float x, float y, float depth) {
+    if (tmpl.empty()) return "";
+    proto::Writer obj;
+    obj.write_string_field(1, tmpl);      // TemplateName
+    obj.write_string_field(2, name);      // Identifier
+    obj.write_nested_field(4, v2(x, y));
+    obj.write_float_field(5, depth);
+    obj.write_float_field(6, 0.0f);
+    obj.write_float_field(7, 1.0f);
+    obj.write_nested_field(8, rect_msg(-80, -20, 160, 40));
+    obj.write_varint_field(9, 0);
+    return scene_wrap_object(obj);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Decorative portal hub (research-backed, byte-exact vs forest_part1)
 // ─────────────────────────────────────────────────────────────────────────
 

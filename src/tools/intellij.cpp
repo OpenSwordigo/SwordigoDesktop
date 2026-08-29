@@ -1,7 +1,10 @@
 #include "intellij.h"
+#if defined(SWORDIGO_HAS_IMGUI)
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "imgui_internal.h"
 #include "platform/IconsFontAwesome6.h"
+#endif
+
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -9,6 +12,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <cctype>
+#include <cmath>
 
 
 
@@ -1059,10 +1063,12 @@ struct EditorRenderCache {
     std::vector<LexState> line_states;
 };
 
+#if defined(SWORDIGO_HAS_IMGUI)
 // Render unified code editor + viewer
 void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modified, const std::string& filepath, ImFont* mono_font, ImVec4& custom_bg,
                            bool has_compile_result, bool compile_success, const std::string& compile_error_msg, double compile_time_ms) {
     ImGuiContext& g = *GImGui;
+
     
     // The editor is a self-contained canvas: pick its background (custom > style
     // sheet > dark default) and derive dark/light from that actual background.
@@ -1126,9 +1132,36 @@ void IntelliJ::draw_editor(const char* label, std::string* buffer, bool& modifie
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), ICON_FA_CODE " Swordfare Editor");
     ImGui::SameLine();
-    ImGui::TextDisabled("— %s", filepath.c_str());
-    
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 220.0f);
+    // The path used to print in full on the same line, so a long path ran
+    // straight under the zoom slider + "Copy All" button that are pinned at a
+    // fixed offset from the right edge. Reserve that toolbar region first, then
+    // elide the path (from the LEFT, keeping the filename visible) into exactly
+    // the space that remains, with the full path on hover. This guarantees the
+    // controls always keep their own space no matter how long the path is.
+    const float kRightControlsW = 220.0f;   // zoom slider + Copy All + spacing
+    {
+        const float path_start_x = ImGui::GetCursorPosX();
+        const float region_right = ImGui::GetContentRegionMax().x;
+        float path_budget = (region_right - kRightControlsW) - path_start_x
+                            - ImGui::GetStyle().ItemSpacing.x;
+        std::string full = "— " + filepath;
+        if (path_budget < 24.0f) {
+            // Toolbar too narrow to show any path — skip it, keep the controls.
+            ImGui::NewLine();
+        } else if (ImGui::CalcTextSize(full.c_str()).x <= path_budget) {
+            ImGui::TextDisabled("%s", full.c_str());
+        } else {
+            const float ell_w = ImGui::CalcTextSize("… ").x + ImGui::CalcTextSize("— ").x;
+            std::string tail = filepath;
+            // Drop leading chars until "— …<tail>" fits the budget.
+            while (!tail.empty() && ImGui::CalcTextSize(tail.c_str()).x > path_budget - ell_w)
+                tail.erase(0, 1);
+            ImGui::TextDisabled("— …%s", tail.c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", filepath.c_str());
+        }
+    }
+
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - kRightControlsW);
     ImGui::SetNextItemWidth(70.0f);
     ImGui::SliderFloat("##zoom", &zoom, 0.7f, 2.0f, "%.1fx");
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Font Zoom Scale");
@@ -1352,5 +1385,8 @@ if (editor_h < 16.0f) editor_h = 16.0f;
     ImGui::EndChild(); // StatusBar
     ImGui::EndChild(); // EditorContainer
 }
+#else
+void IntelliJ::draw_editor(const char*, std::string*, bool&, const std::string&, ImFont*, ImVec4&, bool, bool, const std::string&, double) {}
+#endif
 
 } // namespace intel

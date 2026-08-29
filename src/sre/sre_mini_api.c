@@ -6600,9 +6600,18 @@ extern lua_State* g_sre_last_lua_state;
 void sre_mini_zwalk_poll(void) {
     lua_State* L = g_sre_last_lua_state;
     if (!L) return;
-    if (!g_lua_getfield || !g_lua_type || !g_lua_pcall || !g_lua_settop) return;
+    /* Full null-guard — g_lua_gettop was previously missing and called unchecked */
+    if (!g_lua_getfield || !g_lua_type || !g_lua_pcall || !g_lua_settop || !g_lua_gettop) return;
+
+    /* Sanity check: after an emergency VM reset (sre_lua_emergency_reset) the
+     * stack is unwound to top=stack+1, so gettop returns 0 and the state is
+     * bare. An in-flight call into a reset state causes the "16 consecutive
+     * identical returns at 0x4800004c" loop (Dynarmic executing JNI strings
+     * as ARM64 code). If gettop == 0 the state was just reset — skip this
+     * frame; sre_mini_ensure_injected will re-inject on the next lua_call. */
     int base = g_lua_gettop(L);
-    if (base < 0) return;
+    if (base < 0) return;  /* underflow — corrupt state */
+
     g_lua_getfield(L, LUA_GLOBALSINDEX, "sre_zwalk_poll");
     if (g_lua_type(L, -1) == 6 /* LUA_TFUNCTION */) {
         if (g_lua_pcall(L, 0, 0, 0) != 0 && g_lua_tolstring) {
@@ -6612,6 +6621,7 @@ void sre_mini_zwalk_poll(void) {
     }
     g_lua_settop(L, base);
 }
+
 
 void sre_mini_ensure_injected(lua_State* L) {
     if (!L) return;
@@ -6649,11 +6659,125 @@ void sre_mini_ensure_injected(lua_State* L) {
      * injection ("C stack overflow" observed in Thronfield boot). */
     {
         for (int qi = 0; qi < g_injected_count; qi++) {
-            if (g_injected_states[qi] == L) return;   /* already injected — O(1) fast path */
+            if (g_injected_states[qi] == L) {
+                /* Already fully injected — O(1) fast path for the common case.
+                 * Still re-apply the lightweight per-scene patches that need to
+                 * survive engine-side RegisterLibrary table swaps on scene reload. */
+
+                /* Re-patch C stubs (cheap, no-op if already set) */
+                sre_register_rlsw_stubs(L);
+
+                /* Re-add SceneObject.Destroy/SetAlwaysActive — the engine's
+                 * per-scene RegisterLibrary re-registers the SceneObject table
+                 * without them; without this re-patch, obj:destroy() falls back
+                 * to a nil global and mods (Thronfield) crash on :destroy(). */
+                sre_ensure_sceneobject_fallbacks(L);
+
+                /* Re-wrap Scene/Find/New — a scene reload (mod boot or portal)
+                 * can replace the global Scene table, silently dropping the
+                 * sre_hook_obj wrapper and breaking obj:destroy() on objects
+                 * created after the reload. The wrap guard (__sre_wrapped /
+                 * __sre_so_hooked) makes this idempotent. */
+                sre_eval_lua(L,
+                    "if _G.__sre_so_hooked then\n"
+                    "  if _G.Scene then _G.__sre_wrap_scene_table(_G.Scene) end\n"
+                    "  if _G.Find then _G.Find = _G.__sre_wrap_func(_G.Find) end\n"
+                    "  if _G.New then _G.New = _G.__sre_wrap_func(_G.New) end\n"
+                    "end\n"
+                );
+
+                /* Check if ItemDrop needs proxy installation */
+                int need_proxy = 1;
+                if (g_lua_getfield && g_lua_type && g_lua_settop) {
+                    g_lua_getfield(L, LUA_GLOBALSINDEX, "ItemDrop");
+                    if (g_lua_type(L, -1) == LUA_TTABLE) {
+                        g_lua_getfield(L, -1, "__is_sre_proxy");
+                        if (g_lua_type(L, -1) != LUA_TNIL) {
+                            need_proxy = 0;
+                        }
+                        g_lua_settop(L, -2);
+                    }
+                    g_lua_settop(L, -2);
+                }
+
+                /* Check if Character needs guarding */
+                int need_guard = 1;
+                if (g_lua_getfield && g_lua_type && g_lua_settop) {
+                    g_lua_getfield(L, LUA_GLOBALSINDEX, "Character");
+                    if (g_lua_type(L, -1) == LUA_TTABLE) {
+                        g_lua_getfield(L, -1, "__is_sre_guarded");
+                        if (g_lua_type(L, -1) != LUA_TNIL) {
+                            need_guard = 0;
+                        }
+                        g_lua_settop(L, -2);
+                    }
+                    g_lua_settop(L, -2);
+                }
+
+                if (need_proxy) {
+                    sre_eval_lua(L,
+                        "local _o = rawget(_G,'ItemDrop') or {}\n"
+                        "local _p = {}\n"
+                        "local _fb = {\n"
+                        "  NumItems=function(o) local f=_o.NumItems; return f and f(o) or 0 end,\n"
+                        "  ItemIdentifier=function(o,i) local f=_o.ItemIdentifier; return f and f(o,i) or '' end,\n"
+                        "  SetItemIdentifier=function(o,i,v) local f=_o.SetItemIdentifier; if f then f(o,i,v) end end,\n"
+                        "  AllItemsCollected=function(o) local f=_o.AllItemsCollected; return f and f(o) or false end,\n"
+                        "  GetItem=function(o,i) local f=_o.GetItem; return f and f(o,i) or nil end,\n"
+                        "  Drop=function(...) local f=_o.Drop; if f then f(...) end end,\n"
+                        "  Trigger=function(...) local f=_o.Trigger; if f then f(...) end end,\n"
+                        "  __is_sre_proxy=true\n"
+                        "}\n"
+                        "setmetatable(_p,{\n"
+                        "  __index=function(t,k) return _fb[k] or _o[k] end,\n"
+                        "  __newindex=function(t,k,v) _o[k]=v end\n"
+                        "})\n"
+                        "rawset(_G,'ItemDrop',_p)\n"
+                    );
+                }
+
+                if (need_guard) {
+                    sre_eval_lua(L,
+                        "if Character then\n"
+                        "  Character.__is_sre_guarded = true\n"
+                        "  _G.__last_coins = nil\n"
+                        "  if Character.SetNumCoins then\n"
+                        "    local _os=Character.SetNumCoins\n"
+                        "    Character.SetNumCoins=function(n)\n"
+                        "      if type(n)=='number' then\n"
+                        "        _G.__last_coins=n; _os(n)\n"
+                        "      else _os(n) end\n"
+                        "    end\n"
+                        "  end\n"
+                        "  if Character.SetNumCoin then\n"
+                        "    local _os=Character.SetNumCoin\n"
+                        "    Character.SetNumCoin=function(n)\n"
+                        "      if type(n)=='number' then\n"
+                        "        _G.__last_coins=n; _os(n)\n"
+                        "      else _os(n) end\n"
+                        "    end\n"
+                        "  end\n"
+                        "  if Character.NumCoins then\n"
+                        "    local _og=Character.NumCoins\n"
+                        "    Character.NumCoins=function() local c=_og(); _G.__last_coins=c; return c end\n"
+                        "  end\n"
+                        "  if Character.NumCoin then\n"
+                        "    local _og=Character.NumCoin\n"
+                        "    Character.NumCoin=function() local c=_og(); _G.__last_coins=c; return c end\n"
+                        "  end\n"
+                        "end\n"
+                    );
+                }
+
+                /* Lazy-spawn the Z-walk coroutine once Program.NewThread exists */
+                sre_eval_lua(L, "if _G.sre_ensure_zwalk_loop then _G.sre_ensure_zwalk_loop() end\n");
+                return;
+            }
         }
         if (g_injected_count < MAX_INJECTED_STATES)
             g_injected_states[g_injected_count++] = L;
     }
+
 
     /* Inject standard Lua libraries (math, table, os, debug, io) FIRST so the
      * hook chunk below captures debug.getmetatable — the engine's SceneObjectLib
@@ -6831,120 +6955,12 @@ void sre_mini_ensure_injected(lua_State* L) {
         "end\n"
     );
 
-    /* Check if already injected for this state */
-    int i;
-    for (i = 0; i < g_injected_count; i++) {
-        if (g_injected_states[i] == L) {
-            /* Re-patch C stubs (cheap, no-op if already set) */
-            sre_register_rlsw_stubs(L);
+    /* NOTE: The early-insertion of L into g_injected_states (above) means any
+     * secondary "already injected" for-loop here would ALWAYS hit and return
+     * before sre_register_mini_api / ButtonController / Mini etc. are ever
+     * registered. The fast-path guard at the top of this function (qi loop,
+     * lines ~6651-6652) is the sole correct already-injected gate. */
 
-            /* Re-add SceneObject.Destroy/SetAlwaysActive — the engine's
-             * per-scene RegisterLibrary re-registers the SceneObject table
-             * without them; without this re-patch, obj:destroy() falls back
-             * to a nil global and mods (Thronfield) crash on :destroy(). */
-            sre_ensure_sceneobject_fallbacks(L);
-
-            /* Re-wrap Scene/Find/New — a scene reload (mod boot or portal)
-             * can replace the global Scene table, silently dropping the
-             * sre_hook_obj wrapper and breaking obj:destroy() on objects
-             * created after the reload. The wrap guard (__sre_wrapped /
-             * __sre_so_hooked) makes this idempotent. */
-            sre_eval_lua(L,
-                "if _G.__sre_so_hooked then\n"
-                "  if _G.Scene then _G.__sre_wrap_scene_table(_G.Scene) end\n"
-                "  if _G.Find then _G.Find = _G.__sre_wrap_func(_G.Find) end\n"
-                "  if _G.New then _G.New = _G.__sre_wrap_func(_G.New) end\n"
-                "end\n"
-            );
-
-            /* Check if ItemDrop needs proxy installation */
-            int need_proxy = 1;
-            if (g_lua_getfield && g_lua_type && g_lua_settop) {
-                g_lua_getfield(L, LUA_GLOBALSINDEX, "ItemDrop");
-                if (g_lua_type(L, -1) == LUA_TTABLE) {
-                    g_lua_getfield(L, -1, "__is_sre_proxy");
-                    if (g_lua_type(L, -1) != LUA_TNIL) {
-                        need_proxy = 0;
-                    }
-                    g_lua_settop(L, -2);
-                }
-                g_lua_settop(L, -2);
-            }
-
-            /* Check if Character needs guarding */
-            int need_guard = 1;
-            if (g_lua_getfield && g_lua_type && g_lua_settop) {
-                g_lua_getfield(L, LUA_GLOBALSINDEX, "Character");
-                if (g_lua_type(L, -1) == LUA_TTABLE) {
-                    g_lua_getfield(L, -1, "__is_sre_guarded");
-                    if (g_lua_type(L, -1) != LUA_TNIL) {
-                        need_guard = 0;
-                    }
-                    g_lua_settop(L, -2);
-                }
-                g_lua_settop(L, -2);
-            }
-
-            if (need_proxy) {
-                sre_eval_lua(L,
-                    "local _o = rawget(_G,'ItemDrop') or {}\n"
-                    "local _p = {}\n"
-                    "local _fb = {\n"
-                    "  NumItems=function(o) local f=_o.NumItems; return f and f(o) or 0 end,\n"
-                    "  ItemIdentifier=function(o,i) local f=_o.ItemIdentifier; return f and f(o,i) or '' end,\n"
-                    "  SetItemIdentifier=function(o,i,v) local f=_o.SetItemIdentifier; if f then f(o,i,v) end end,\n"
-                    "  AllItemsCollected=function(o) local f=_o.AllItemsCollected; return f and f(o) or false end,\n"
-                    "  GetItem=function(o,i) local f=_o.GetItem; return f and f(o,i) or nil end,\n"
-                    "  Drop=function(...) local f=_o.Drop; if f then f(...) end end,\n"
-                    "  Trigger=function(...) local f=_o.Trigger; if f then f(...) end end,\n"
-                    "  __is_sre_proxy=true\n"
-                    "}\n"
-                    "setmetatable(_p,{\n"
-                    "  __index=function(t,k) return _fb[k] or _o[k] end,\n"
-                    "  __newindex=function(t,k,v) _o[k]=v end\n"
-                    "})\n"
-                    "rawset(_G,'ItemDrop',_p)\n"
-                );
-            }
-
-            if (need_guard) {
-                sre_eval_lua(L,
-                    "if Character then\n"
-                    "  Character.__is_sre_guarded = true\n"
-                     "  _G.__last_coins = nil\n"
-                    "  if Character.SetNumCoins then\n"
-                    "    local _os=Character.SetNumCoins\n"
-                    "    Character.SetNumCoins=function(n)\n"
-                    "      if type(n)=='number' then\n"
-                     "        _G.__last_coins=n; _os(n)\n"
-                    "      else _os(n) end\n"
-                    "    end\n"
-                    "  end\n"
-                    "  if Character.SetNumCoin then\n"
-                    "    local _os=Character.SetNumCoin\n"
-                    "    Character.SetNumCoin=function(n)\n"
-                    "      if type(n)=='number' then\n"
-                     "        _G.__last_coins=n; _os(n)\n"
-                    "      else _os(n) end\n"
-                    "    end\n"
-                    "  end\n"
-                    "  if Character.NumCoins then\n"
-                    "    local _og=Character.NumCoins\n"
-                     "    Character.NumCoins=function() local c=_og(); _G.__last_coins=c; return c end\n"
-                    "  end\n"
-                    "  if Character.NumCoin then\n"
-                    "    local _og=Character.NumCoin\n"
-                     "    Character.NumCoin=function() local c=_og(); _G.__last_coins=c; return c end\n"
-                    "  end\n"
-                    "end\n"
-                );
-            }
-
-            /* Lazy-spawn the Z-walk coroutine once Program.NewThread exists */
-            sre_eval_lua(L, "if _G.sre_ensure_zwalk_loop then _G.sre_ensure_zwalk_loop() end\n");
-            return;
-        }
-    }
 
     /* Inject Caver engine API (hero, components, health, transform, etc.) */
     extern void sre_open_caver_lib(lua_State* L);

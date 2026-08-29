@@ -5,8 +5,19 @@
 #include <regex>
 #include <cstdint>
 #include <stack>
+
+#if !defined(SWORDIGO_NO_IMGUI) && !defined(GODOT_ENABLED)
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "imgui.h"
+#define SWORDIGO_HAS_IMGUI 1
+#else
+struct ImVec4 {
+    float x = 1.0f, y = 1.0f, z = 1.0f, w = 1.0f;
+    ImVec4() = default;
+    ImVec4(float _x, float _y, float _z, float _w) : x(_x), y(_y), z(_z), w(_w) {}
+};
+struct ImFont;
+#endif
 
 // Forward declaration of ViewerState (so we don't need to include asset_viewer.cpp details here)
 struct ViewerState;
@@ -19,6 +30,7 @@ struct StyxColor {
     bool italic = false;
     bool underline = false;
 };
+
 
 struct StyxPattern {
     std::string style_name;

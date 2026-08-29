@@ -15,9 +15,19 @@
 
 #include "av_renderer.h"
 #include "scene_loader.h"
+
+#if !defined(SWORDIGO_NO_IMGUI) && !defined(GODOT_ENABLED)
 #include "imgui.h"
+#else
+struct ImVec2 {
+    float x = 0.0f, y = 0.0f;
+    ImVec2() = default;
+    ImVec2(float _x, float _y) : x(_x), y(_y) {}
+};
+#endif
 
 namespace swk {
+
 
 // ============================================================================
 // Camera / projection math

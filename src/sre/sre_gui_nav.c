@@ -114,6 +114,12 @@ void sre_GUINavigationController_Update(void* self, float dt) {
     /* IDA: v3 = *((QWORD*)this + 10) → byte offset 80 = 0x50 */
     uint64_t pending_vc = *(uint64_t*)((char*)self + 0x50);
 
+    /* NOTE: Previous forced VC swap attempt was REVERTED — writing
+     * captured_gvc into nav+0x50 before BackgroundLoad finishes setting
+     * up the new VC causes AudioSystem::Update to dispatch through
+     * uninitialized vtable slots → .dynstr crash cascade.
+     * The VC swap MUST complete through FinishTransitionToViewController. */
+
     if (pending_vc) {
         /* Read vtable pointer (first 8 bytes of the VC object) */
         uint64_t vtable = *(uint64_t*)(uintptr_t)pending_vc;
@@ -167,8 +173,7 @@ void sre_GUINavigationController_VCLoaded(void* self, void* vc) {
  * Same reasoning as VCLoaded: arguments are live objects from the transition
  * system, not stale pointers. The original implementation is called directly.
  *
- * CAPTURE: with the menu→game transition stalling inside __do_upcast, this
- * is the only reliable early handle on the freshly-loaded GameViewController
+ * CAPTURE: this is an early handle on the freshly-loaded GameViewController
  * (arg2 = const shared_ptr<GUIViewController>& — px at offset 0). The frame
  * loop's GUI repair drive reads GVC+0xD8 (shared_ptr<GameSceneView> px, from
  * GameViewController::BackgroundLoad) off the captured VC to dispatch the

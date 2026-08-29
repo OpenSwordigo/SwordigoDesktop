@@ -416,15 +416,16 @@ static void resolve_object_render_data(SceneObject& obj) {
     obj.model_transform_axis[0] = obj.model_transform_axis[2] = 0.0f;
     obj.model_transform_axis[1] = 1.0f;
     obj.model_transform_angle = obj.model_transform_speed = 0.0f;
-    obj.is_portal = false;
+            obj.is_portal = false;
     obj.portal_destination.clear();
     obj.portal_spawn_point.clear();
     obj.portal_tap_to_enter = false;
+    obj.is_camera = false;
     obj.is_dimension_object = false;
     // When the object's ground meshes were edited in the SDK, keep the parsed
     // (modified) mesh data instead of re-deriving it from the original raw
     // component bytes — scene_refresh() is called during interactive edits.
-    const bool preserve_meshes = obj.ground_meshes_dirty && !obj.ground_meshes.empty();
+    const bool preserve_meshes = obj.ground_meshes_dirty;
     if (!preserve_meshes) {
         obj.ground_meshes.clear();
         obj.ground_mesh_textures.clear();
@@ -463,6 +464,10 @@ static void resolve_object_render_data(SceneObject& obj) {
                 }
             } catch (...) {}
         }
+
+                // CameraComponent: in-game camera objects (rendered as a marker dot).
+        if (schema_name == "CameraComponent" || comp.type_name == "Camera")
+            obj.is_camera = true;
 
         if (schema_name == "ModelTransformControllerComponent") {
             const int payload = component_payload_field(comp);
@@ -506,6 +511,40 @@ static void resolve_object_render_data(SceneObject& obj) {
             } catch (...) {}
         }
 
+        // Editor-parity portal detection. The web editor (Three.js) treats an
+        // object as a portal in THREE ways, not just via PortalComponent:
+        //   1. a PortalComponent               (handled above)
+        //   2. a PortalEffectComponent         (visual-only portal swirl)
+        //   3. a Sprite/object SpecialType == 2 (tag 40 → "2: Portal")
+        // Ruby previously only recognised (1), so effect-only and SpecialType
+        // portals never got flagged and never rendered. Flag them here so the
+        // viewport portal pass lights up for every portal the editor shows.
+        if (schema_name == "PortalEffectComponent")
+            obj.is_portal = true;
+
+        // SpecialType lives on a Sprite/Model-ish component as scalar field 40
+        // (0:None 1:Pickup 2:Portal 3:Collectable …). A value of 2 marks a
+        // functional portal even with no dedicated Portal component.
+        {
+            const int payload = component_payload_field(comp);
+            if (payload > 0) {
+                try {
+                    proto::Reader wrapper(comp.raw_data); proto::Field field;
+                    while (wrapper.read_field(field)) {
+                        if (field.field_number != static_cast<uint32_t>(payload) ||
+                            field.wire_type != proto::WIRE_LEN) continue;
+                        proto::Reader data(field.bytes_val); proto::Field value;
+                        while (data.read_field(value)) {
+                            if (value.field_number == 40 && value.wire_type == proto::WIRE_VARINT &&
+                                value.varint_val == 2)
+                                obj.is_portal = true;
+                        }
+                        break;
+                    }
+                } catch (...) {}
+            }
+        }
+
         if (comp.type_name == "MeshRenderer" || comp.type_name == "SkinnedMeshRenderer")
             scan_for_asset_refs(comp.raw_data, obj.mesh_name, obj.texture_name);
 
@@ -540,7 +579,7 @@ static void resolve_object_render_data(SceneObject& obj) {
             }
         }
 
-        if (comp.type_name == "Background") {
+        if (schema_name == "BackgroundComponent" || comp.type_name == "Background") {
             // BackgroundComponent stores TextureName in payload field 1 as a
             // bare stem without extension (e.g. "graveyardback", matching
             // graveyardback_2x.tex.png). scan_for_asset_refs only catches
@@ -1257,12 +1296,14 @@ static std::string rewrite_mesh_material(const std::string& original,
     mat.write_bytes_field(5, tex.to_string());
 
     proto::Writer w;
+    bool wrote_material = false;
     try {
         proto::Reader reader(original);
         proto::Field f;
         while (reader.read_field(f)) {
             if (f.field_number == 10 && f.wire_type == proto::WIRE_LEN) {
                 w.write_bytes_field(10, mat.to_string());
+                wrote_material = true;
             } else {
                 w.write_field(f);
             }
@@ -1270,6 +1311,15 @@ static std::string rewrite_mesh_material(const std::string& original,
     } catch (...) {
         return original; // malformed — leave untouched
     }
+    // If the MeshData had NO Material (field 10) yet, APPEND one. Without this
+    // the texture was silently dropped for any sub-mesh that never carried a
+    // material — the "top/bottom texture doesn't save" bug. A ground object's
+    // top (SurfaceMesh, field 9), bottom/base (Mesh, field 6) and front
+    // (FrontMesh, field 8) sub-meshes each own their own material, so a newly
+    // authored top or bottom texture must be writable even when the source had
+    // none.
+    if (!wrote_material)
+        w.write_bytes_field(10, mat.to_string());
     return w.to_string();
 }
 
@@ -1689,7 +1739,8 @@ static void parse_scene_waters(SceneData& scene) {
         const auto& obj = scene.objects[oi];
         const auto& comps = obj.resolved_components.empty() ? obj.components : obj.resolved_components;
         for (const auto& comp : comps) {
-            if (comp.type_name != "WaterMesh") continue;
+            const std::string schema_name = component_schema_name(comp);
+            if (schema_name != "WaterMeshComponent" && comp.type_name != "WaterMesh") continue;
             const int payload = component_payload_field(comp);
             if (payload == 0) continue;
 

@@ -183,6 +183,7 @@ float g_sre_cam_aspect = 1.777778f;
 int g_sre_cam_pov_mode = 0;
 float g_sre_cam_pov_facing = 1.0f;
 void (*g_Camera_SetPerspectiveProjection)(void* camera, float fov, float aspect, float near, float far) = 0;
+void (*g_Camera_EvaluateViewMatrix)(void* camera) = 0;
 void (*g_orig_CameraController_Update)(void* self, float dt) = 0;
 void (*g_orig_SceneGrid_UpdateVisibleAreasWithCamera)(void* self, void* camera) = 0;
 
@@ -246,6 +247,11 @@ void sre_caver_init(uint64_t swordigo_base) {
     (void)swordigo_base;
 }
 
+/* Helper: detect NaN or Inf without pulling in libc math dependencies */
+static inline int sre_float_is_bad(float x) {
+    return (x != x) || (x > 1e30f) || (x < -1e30f);
+}
+
 /* Our guest-side CameraController::Update hook function */
 void sre_CameraController_Update(void* self, float dt) {
     if (!self) return;
@@ -257,6 +263,47 @@ void sre_CameraController_Update(void* self, float dt) {
 
     if (g_orig_CameraController_Update) {
         g_orig_CameraController_Update(self, dt);
+    }
+
+    /* Sanitize CameraController internal state against NaN/Inf (e.g. from
+     * degenerate FocusAtShape(0,0,0,0) or collinear LookAt in cutscenes). */
+    float* c_ctrl_floats = (float*)((char*)self + 0x10);
+    for (int i = 0; i < 20; i++) {
+        if (sre_float_is_bad(c_ctrl_floats[i])) {
+            c_ctrl_floats[i] = 0.0f;
+        }
+    }
+
+    /* Sanitize Camera object's position, quaternion, and view matrix */
+    void* cam_ptr = *(void**)((char*)self + 0x58);
+    if (cam_ptr) {
+        float* cpos = (float*)((char*)cam_ptr + 0x10);
+        float* cquat = (float*)((char*)cam_ptr + 0x1c);
+        float* vmat = (float*)((char*)cam_ptr + 0x2c);
+        int bad = 0;
+        for (int i = 0; i < 3; i++) {
+            if (sre_float_is_bad(cpos[i])) { bad = 1; cpos[i] = 0.0f; }
+        }
+        for (int i = 0; i < 4; i++) {
+            if (sre_float_is_bad(cquat[i])) { bad = 1; }
+        }
+        if (bad) {
+            cquat[0] = 0.0f; cquat[1] = 0.0f; cquat[2] = 0.0f; cquat[3] = 1.0f;
+        }
+        for (int i = 0; i < 16; i++) {
+            if (sre_float_is_bad(vmat[i])) {
+                bad = 1;
+                break;
+            }
+        }
+        if (bad) {
+            if (g_Camera_EvaluateViewMatrix) {
+                g_Camera_EvaluateViewMatrix(cam_ptr);
+            } else {
+                static const float s_ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                for (int i = 0; i < 16; i++) vmat[i] = s_ident[i];
+            }
+        }
     }
 
     static int s_was_active = 0;

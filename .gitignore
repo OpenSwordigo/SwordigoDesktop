@@ -4,6 +4,11 @@
 # -------- BUILDS / OUTPUTS / BINARIES --------
 # Build artifacts
 build/
+.agent/
+.gemini/
+bin/
+rl_builder/
+tools/
 build-cmake/
 srcs/
 bin/

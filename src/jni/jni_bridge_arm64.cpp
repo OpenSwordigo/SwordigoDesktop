@@ -5741,16 +5741,32 @@ static void bridge_gl_load_matrixf(void* emu_ptr) {
     if (has_bad) {
         uint32_t lr = emu->get_lr();
         static uint32_t nan_count = 0;
-        if ((++nan_count <= 3) || (nan_count % 1000 == 0)) {
+        if (++nan_count <= 10) {
             std::cout << "[MATRIX] NaN/Inf #" << nan_count << " at LR=0x" << std::hex << lr << std::dec
                       << " [" << m[0] << " " << m[1] << " / " << m[4] << " " << m[5] << "]" << std::endl;
+            if (nan_count == 10) {
+                std::cout << "[MATRIX] Maximum NaN warnings reached (10); suppressing further matrix logs." << std::endl;
+            }
         }
         if (g_display_active) {
             if (g_current_matrix_mode == GL_PROJECTION) {
                 glOrtho(0, g_draw_w, g_draw_h, 0, -1, 1);
                 g_current_projection_is_ortho = true;
             } else {
-                glLoadIdentity();
+                static const GLfloat identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                GLfloat fixed[16];
+                for (int i = 0; i < 16; i++) {
+                    if (std::isnan(m[i]) || std::isinf(m[i])) {
+                        fixed[i] = identity[i];
+                    } else {
+                        fixed[i] = m[i];
+                    }
+                }
+                glLoadMatrixf(fixed);
+                if (g_batching_enabled) {
+                    g_batcher.flush();
+                    g_batcher.set_modelview(fixed);
+                }
             }
         }
         return;

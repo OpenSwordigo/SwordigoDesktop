@@ -599,10 +599,18 @@ int sre_lua_resume_safe(lua_State* L, int narg) {
     if (g_sre_lua_vm_faulted) {
         g_sre_lua_vm_faulted = 0;
         if (L) sre_lua_emergency_reset(L);
+        /* Clear the per-frame Lua state pointer so that sre_mini_zwalk_poll
+         * and other per-frame callers don't attempt to pcall into the freshly
+         * reset (empty) state on the very next frame. The mainthread probe in
+         * the block below will re-populate g_sre_last_lua_state on the next
+         * successful lua_resume. */
+        extern lua_State* g_sre_last_lua_state;
+        if (g_sre_last_lua_state == L) g_sre_last_lua_state = NULL;
         /* Return LUA_ERRRUN — the caller (ProgramState::Update) will mark
          * the coroutine as completed and not resume it again. */
         return 2;  /* LUA_ERRRUN */
     }
+
 
     pthread_mutex_lock(&g_lua_mutex);
 
@@ -1163,7 +1171,10 @@ static void sre_run_console(lua_State* L) {
     lua_pop(L, 1);
     int call_base = g_lua_gettop(L);
 
-    /* Execute compiled function — capture ALL return values */
+    /* Execute the compiled chunk synchronously via pcall. This is the plain,
+     * proven path: a compiled function is called and returns in one shot.
+     * (No coroutine/lua_resume — Program.Wait-style yielding scripts are not
+     * supported from the console, which matches the original behavior.) */
     r = g_lua_pcall(L, 0, LUA_MULTRET, 0);
     if (r != 0) {
         const char* err = g_lua_tolstring ? g_lua_tolstring(L, -1, 0) : "runtime error";
@@ -1738,10 +1749,27 @@ volatile uint64_t g_sre_update_application_ticks = 0;
 volatile uint64_t g_sre_console_service_entries = 0;  /* diag */
 volatile uint64_t g_sre_console_pending_seen     = 0;  /* diag */
 volatile uint64_t g_sre_console_runs             = 0;  /* diag */
+volatile uint64_t g_sre_console_direct_runs      = 0;  /* diag: serviced via host direct-call */
 
-void sre_updateApplication(void* env, void* obj) {
-    g_sre_update_application_ticks++;
-    /* 1. Service Lua console & Mini injection BEFORE the frame tick */
+/* ── Shared console servicer ────────────────────────────────────────────────
+ * Services a single pending console command on a valid, game-ready lua_State.
+ * Returns 1 if a command was actually executed this call, 0 otherwise.
+ *
+ * This is the ONE place the console mailbox is drained. It is called from two
+ * sites with identical semantics:
+ *   1. sre_console_run_pending()  — invoked SYNCHRONOUSLY by the host right
+ *      after updateApp returns (same thread, VM idle) so a command runs in the
+ *      SAME frame it was submitted → zero frame-latency round-trip.
+ *   2. sre_updateApplication()    — the per-frame fallback, so a command still
+ *      runs even if the host direct-call path is unavailable (e.g. no valid
+ *      state yet at submit time, or mid scene-load).
+ *
+ * Whichever fires first clears g_lua_console_pending, so the other is a no-op —
+ * the command can never run twice. All the existing safety guards are reused:
+ * validity probe, stale-state drop, live-state re-lock, and Mini injection. */
+static int sre_console_service_pending(void) {
+    if (!g_lua_console_pending) return 0;
+
     if (g_sre_last_lua_state) {
         g_sre_console_service_entries++;
         if (!sre_state_is_valid_game_state(g_sre_last_lua_state)) {
@@ -1758,6 +1786,7 @@ void sre_updateApplication(void* env, void* obj) {
                 g_lua_console_pending = 0;
                 g_sre_console_runs++;
                 sre_run_console(g_sre_last_lua_state);
+                return 1;
             }
         }
     }
@@ -1776,8 +1805,29 @@ void sre_updateApplication(void* env, void* obj) {
             g_lua_console_pending = 0;
             g_sre_console_runs++;
             sre_run_console(fresh);
+            return 1;
         }
     }
+    return 0;
+}
+
+void sre_updateApplication(void* env, void* obj) {
+    g_sre_update_application_ticks++;
+    /* 1. Service Lua console & Mini injection BEFORE the frame tick.
+     *
+     * This runs INSIDE the guest updateApp frame — the only context where the
+     * JNI/host bridge is fully set up, so any engine Lua the command triggers
+     * (which may call back through JniBridge64::call_handler into host GL) is
+     * safe. An earlier attempt to service it from a SEPARATE host-initiated
+     * emulator->call (right after updateApp returned) SIGSEGV'd for exactly
+     * that reason: the console command's Lua reached a bridge call with no
+     * valid frame/bridge context. Servicing here, at the very top of the frame,
+     * already runs the command with zero added intra-frame latency and full
+     * bridge safety — so this hook is the single, correct servicer.
+     *
+     * The per-command validation cost was removed separately (the stdlib
+     * re-open fix), so this is cheap when nothing is pending. */
+    sre_console_service_pending();
 
     /* 2. Compute delta time from host wall clock.
      *    We maintain our own dt here so we can apply g_sre_game_speed and

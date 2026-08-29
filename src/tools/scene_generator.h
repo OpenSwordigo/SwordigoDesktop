@@ -337,4 +337,24 @@ std::string build_glow_light(const TorchLight& t, const std::string& name);
 // YRotation field 2 (game form) — same layout build_pod_object produces.
 std::string build_deco_object(const Deco& d, const std::string& name);
 
+// ── v3.1: Advanced vanilla-matching object builders ───────────────────────
+// Breakable object: TemplateName + CollisionShape (IsGround=0, receives damage).
+std::string build_breakable_object(const std::string& tmpl, const std::string& name,
+                                    float x, float y, float depth);
+// Collectable item: TemplateName + CollectableItem component.
+std::string build_collectable_object(const std::string& tmpl, const std::string& name,
+                                      float x, float y, float depth);
+// Ambient particle emitter: TemplateName reference (engine handles emitter).
+std::string build_particle_object(const std::string& tmpl, const std::string& name,
+                                   float x, float y, float depth);
+// Fire emitter: TemplateName reference for fire/glow effects.
+std::string build_fire_emitter_object(const std::string& tmpl, const std::string& name,
+                                       float x, float y, float depth);
+// Sound effect: a SoundEffect component at a position.
+std::string build_sound_object(const std::string& sound_name, const std::string& name,
+                                float x, float y, float radius);
+// Moving platform: a PhysicsPlatform template reference.
+std::string build_moving_platform_object(const std::string& tmpl, const std::string& name,
+                                          float x, float y, float depth);
+
 } // namespace sgen

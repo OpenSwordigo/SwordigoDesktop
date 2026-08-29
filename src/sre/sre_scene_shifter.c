@@ -7,11 +7,8 @@
  *      which shows the loading screen and transitions normally.
  *      Safe for all scenes; correct GameState wiring.
  *
- *   2. FORCED GATEWAY  — hooks SceneLoadingView::Update to instantly
- *      force-complete the loading phase (0-frame) by writing 1.0f to
- *      the progress float and 1 to the load_complete flag at the known
- *      struct offsets, then releasing the hook after first call.
- *      Mimics doc 02 Technique 1 (highest stability rating).
+ *   2. FORCED GATEWAY  — retained as a UI alias for the normal engine path.
+ *      ARM64 SceneLoadingView has no verified force-completion fields.
  *
  * Scene list scanning:
  *   Scans the VFS mod directory (data_dir/mods/<active_mod>/) for
@@ -96,8 +93,8 @@ extern volatile void* g_sre_last_slv;
  *
  * SceneLoadingView::Update:
  *   0x0043650C — Caver::SceneLoadingView::Update(this, float dt)
- *   At SceneLoadingView + 0x48: float progress   (set to 1.0f to instant-complete)
- *   At SceneLoadingView + 0x50: int  load_complete (set to 1 to trigger transition)
+ *   Its ARM64-only state begins around +0x180. The old +0x48/+0x50 offsets
+ *   were inherited GUIView members and must never be written as load flags.
  *
  * std::string helpers (hooked trampolines in libsre.so):
  *   sre_CppString_from_char_p — constructs std::string from char*
@@ -118,10 +115,6 @@ extern volatile void* g_sre_last_slv;
  *   ldr x21, [x19, #88]  ; #88 = 0x58 = pn (refcount block) of shared_ptr<GVC>
  * So: nav_ctrl+0x50 = px of current view controller (raw GVC*) */
 #define NAVCTRL_OFF_CURRENT_VC_PX   0x50
-
-/* Struct offsets inside SceneLoadingView */
-#define SLVIEW_OFF_PROGRESS      0x48
-#define SLVIEW_OFF_LOAD_COMPLETE 0x50
 
 /* Struct offsets inside GameViewController (ARM64, Ghidra BackgroundLoad) */
 #define GVC_OFF_GAMESTATE        0xa8  /* GameState* (confirmed BackgroundLoad line 207) */
@@ -199,6 +192,16 @@ static void* sre_get_active_gvc(void) {
         return NULL;
     }
 
+    /* Never invoke GameViewController::GotoLevel on a MainMenuViewController.
+     * Both are plausible heap objects, so range checks alone are insufficient. */
+    if (*(uint64_t*)gvc != g_swordigo_base + 0x6cb880ULL) {
+        fprintf(stderr,
+                "[SRE/SceneShifter] Current controller is not GameViewController "
+                "(gvc=%p vtable=0x%llx)\n",
+                gvc, (unsigned long long)*(uint64_t*)gvc);
+        return NULL;
+    }
+
     return gvc;
 }
 
@@ -210,10 +213,13 @@ pfn_SceneLoadingView_Update g_orig_SceneLoadingView_Update = NULL;
 void* g_orig_SceneLoadingView_AnimateIn = NULL;
 
 void sre_SceneLoadingView_Update(void* self, float dt) {
+    /* SceneLoadingView completion is owned by GameViewController::BackgroundLoad
+     * and Update. Do not poke guessed layout fields here. */
     if (g_orig_SceneLoadingView_Update) {
         g_orig_SceneLoadingView_Update(self, dt);
     }
 }
+
 
 /* =========================================================================
  * sre_scene_shifter_call_goto_level
@@ -226,10 +232,6 @@ void sre_SceneLoadingView_Update(void* self, float dt) {
  *   2. Creates a SceneLoadingView and calls InitWithGameState
  *   3. Calls TransitionToViewController → shows loading screen
  *   4. Background thread loads .scene file via Scene::LoadFromFile
- *
- * For the FORCED gateway, g_sre_instant_scene_load_enabled is set BEFORE
- * this call so that the very first SceneLoadingView::Update fires instant-
- * complete.
  * ========================================================================= */
 static int sre_scene_shifter_call_goto_level(const char* level_name,
                                               const char* spawn_point) {
@@ -276,43 +278,30 @@ static int sre_scene_shifter_call_goto_level(const char* level_name,
      * if no SceneLoadingView hook fires (e.g. hook not installed), the UI unfreezes. */
     snprintf(g_sre_scene_shift_last_error, sizeof(g_sre_scene_shift_last_error), "OK");
     /* Note: g_sre_scene_shift_active is cleared by sre_scene_shifter_tick after
-     * next successful frame, or by the forced gateway after instant-complete. */
+     * the engine reports the target scene as current. */
     return 1;
 }
 
 /* =========================================================================
- * sre_scene_shifter_wait_complete
+ * sre_scene_shifter_poll_complete
  * =========================================================================
- * Shared completion step for BOTH gateways. Waits for the SceneLoadingView
- * background load (created by GotoLevel → InitWithGameState, tracked in
- * g_sre_last_slv) to finish, then pokes progress=1.0 so the loading screen
- * completes deterministically.
- *
- * The OLD normal gateway returned to the frame loop immediately and let the
- * loading screen render on its own — which crashed the game (stale VC vtable
- * dispatch / matrix render corruption during the transition). Forcing the
- * same proven completion the forced gateway uses fixes the crash.
+ * Tracks completion for the host UI without mutating SceneLoadingView. The
+ * engine's BackgroundLoad/GameViewController::Update path owns the actual swap.
  * ========================================================================= */
 static void sre_scene_shifter_poll_complete(void) {
     if (!g_sre_scene_shift_active) return;
     g_sre_scene_shift_wait_frames++;
 
-    if (g_sre_last_slv) {
-        volatile int* is_complete =
-            (volatile int*)((char*)g_sre_last_slv + SLVIEW_OFF_LOAD_COMPLETE);
-        if (*is_complete) {
-            volatile float* progress =
-                (volatile float*)((char*)g_sre_last_slv + SLVIEW_OFF_PROGRESS);
-            *progress = 1.0f;
-            g_sre_scene_shift_active = 0;
-            g_sre_instant_scene_load_enabled = 0;
-            g_sre_scene_shift_wait_frames = 0;
-            snprintf(g_sre_scene_shift_last_error,
-                     sizeof(g_sre_scene_shift_last_error), "OK");
-            strncpy(g_sre_current_scene_name, g_sre_scene_shift_target, 127);
-            g_sre_current_scene_name[127] = '\0';
-            return;
-        }
+    /* BackgroundLoad publishes the target name after FinishLoad. This is a
+     * status update only; the engine remains solely responsible for the swap. */
+    if (g_sre_current_scene_name[0] &&
+        strcmp(g_sre_current_scene_name, g_sre_scene_shift_target) == 0) {
+        g_sre_scene_shift_active = 0;
+        g_sre_instant_scene_load_enabled = 0;
+        g_sre_scene_shift_wait_frames = 0;
+        snprintf(g_sre_scene_shift_last_error,
+                 sizeof(g_sre_scene_shift_last_error), "OK");
+        return;
     }
 
     if (g_sre_scene_shift_wait_frames > 3600) {
@@ -326,18 +315,10 @@ static void sre_scene_shifter_poll_complete(void) {
 
 /* =========================================================================
  * sre_scene_shifter_normal
- * Normal gateway — calls GotoLevel with instant-complete to avoid the
- * loading-screen rendering crash (stale VC vtable/matrix corruption).
- *
- * NOTE: Previously this left g_sre_instant_scene_load_enabled=0 so the
- * loading screen would render on its own — this caused reliable crashes
- * due to stale vtable dispatch in the SceneLoadingView render path during
- * the transition. Both Normal and Forced now arm instant-complete; the
- * difference is UI presentation only.
+ * Normal gateway — calls GotoLevel and leaves completion to the engine.
  * ========================================================================= */
 int sre_scene_shifter_normal(const char* level_name, const char* spawn_point) {
-    /* Arm instant-complete: same as forced to avoid SLV rendering crash */
-    g_sre_instant_scene_load_enabled = 1;
+    g_sre_instant_scene_load_enabled = 0;
     g_sre_scene_shift_active         = 1;
     g_sre_last_slv = NULL;
     g_sre_scene_shift_wait_frames = 0;
@@ -356,10 +337,10 @@ int sre_scene_shifter_normal(const char* level_name, const char* spawn_point) {
 
 /* =========================================================================
  * sre_scene_shifter_forced
- * Forced gateway — arms the instant-load short-circuit, then calls GotoLevel
+ * Forced gateway — compatibility alias for the verified normal engine path.
  * ========================================================================= */
 int sre_scene_shifter_forced(const char* level_name, const char* spawn_point) {
-    g_sre_instant_scene_load_enabled = 1;
+    g_sre_instant_scene_load_enabled = 0;
     g_sre_scene_shift_active         = 1;
     g_sre_last_slv = NULL;
     g_sre_scene_shift_wait_frames = 0;

@@ -1,9 +1,9 @@
 /* ============================================================
- * sre_scene_update.c — GameSceneView::Update reimplementation
+ * sre_scene_update.c — GameSceneView update relay and SRE exports
  * ============================================================
- * Complete reimplementation of Caver::GameSceneView::Update(float).
- * Calls every sub-function the original does, with non-atomic
- * shared_ptr refcounting where needed.
+ * Keeps the original Caver::GameSceneView::Update(float) as the sole owner of
+ * gameplay, HUD, effects and GUI updates, then publishes validated read-only
+ * state for SRE/host features.
  *
  * Recovered from TVPG snapshot — this was the OLD sre_gui.c before
  * it was replaced by the Phase 2 GUI rendering stack.
@@ -34,6 +34,12 @@ volatile int g_sre_scene_loading = 0;  /* 1 = scene load in progress */
  * this to 2 whenever it force-clears g_sre_scene_loading so that we don't
  * spam stale game-state reads during the frame where the new scene is activating. */
 volatile int g_sre_suppress_hud_frames = 0;
+/* AudioSystem suppression counter: when > 0, AudioSystem::Update is skipped.
+ * Set to 60 by InitWithGameState to prevent AudioSystem from dispatching
+ * through child objects destroyed during scene transitions. Decremented by
+ * sre_frame_update each frame. */
+volatile int g_sre_audio_suppressed_frames = 0;
+
 
 /* Extern for force-unlocking the Lua mutex after a scene load completes.
  * The mutex may have been left locked by a longjmp escape during loading.
@@ -331,18 +337,239 @@ static void sp_release(void* pn) {
 }
 
 /* =========================================================================
- * sre_GameSceneView_Update — FULL reimplementation
+ * g_orig_GameSceneView_Update_fn — relay pointer (set by TrampolineMgr)
  * =========================================================================
+ * Points to the relay cave that executes the original GameSceneView::Update.
+ * Set by install_relay() in main.cpp during nav_relays[] initialization.
+ */
+pfn_orig_GSV_Update g_orig_GameSceneView_Update_fn = NULL;
+
+static int sre_gsv_guest_object_valid(uint64_t ptr) {
+    return ptr >= 0x20000000ULL && ptr < 0xE0000000ULL &&
+           (ptr & 7) == 0 && sre_is_valid_vtable_ptr(*(uint64_t*)ptr);
+}
+
+/* Export state that the original GameSceneView::Update consumes but does not
+ * publish to SRE. This intentionally performs reads only; gameplay/HUD/effect
+ * behavior remains owned by the original relay. */
+static void sre_GameSceneView_ExportState(void* self) {
+    if (!sre_gsv_guest_object_valid((uint64_t)(uintptr_t)self)) return;
+    char* view = (char*)self;
+    uint64_t ctrl = *(uint64_t*)(view + 0xF0);
+    uint64_t overlay = *(uint64_t*)(view + 0x100);
+    if (!sre_gsv_guest_object_valid(ctrl) ||
+        (overlay && !sre_gsv_guest_object_valid(overlay))) {
+        return;
+    }
+
+    uint64_t gamestate = *(uint64_t*)(ctrl + 0x08);
+    if (gamestate < 0x20000000ULL || gamestate >= 0xE0000000ULL ||
+        (gamestate & 7) != 0) {
+        return;
+    }
+
+    g_sre_gamestate_ptr = gamestate;
+    g_sre_player_hp        = *(int*)(gamestate + 0xA8);
+    g_sre_player_mana      = *(int*)(gamestate + 0xAC);
+    g_sre_player_coins     = *(int*)(gamestate + 0xB0);
+    g_sre_player_xp        = *(int*)(gamestate + 0xB4);
+    g_sre_player_level     = *(int*)(gamestate + 0xB8);
+    g_sre_player_hp_level  = *(int*)(gamestate + 0xBC);
+    g_sre_player_atk_level = *(int*)(gamestate + 0xC0);
+    g_sre_player_mana_level = *(int*)(gamestate + 0xC4);
+    g_sre_player_max_hp = g_sre_player_hp_level * 2 + 4;
+    g_sre_player_max_mana = g_sre_player_mana_level * 20 + 10;
+
+    /* GameState uses the old libstdc++ string ABI: +0x158 is the character
+     * pointer for current_level_name. Copy with a hard bound and no libc walk. */
+    {
+        extern char g_sre_current_scene_name[128];
+        const char* name = *(const char**)(gamestate + 0x158);
+        uint64_t name_u = (uint64_t)(uintptr_t)name;
+        if (name_u >= 0x10000ULL && name_u <= 0xE0000000ULL - 128) {
+            int i = 0;
+            for (; i < 127 && name[i]; ++i)
+                g_sre_current_scene_name[i] = name[i];
+            g_sre_current_scene_name[i] = '\0';
+        }
+    }
+
+    uint64_t hero = *(uint64_t*)(ctrl + 0xD8);
+    if (sre_gsv_guest_object_valid(hero)) {
+        g_sre_hero_obj = hero;
+        g_sre_hero_pos_x = *(float*)(hero + 0x70);
+        g_sre_hero_pos_y = *(float*)(hero + 0x74);
+        g_sre_hero_pos_z = *(float*)(hero + 0x78);
+
+        /* Do not call ComponentWithInterface from the frame export. New heroes
+         * can still be in Prepare/FinishLoad, and walking their component vector
+         * here re-enters component/Lua setup. Explicit APIs resolve components
+         * on demand after activation. */
+        g_sre_hero_health_comp = 0;
+        g_sre_hero_mana_comp = 0;
+    } else {
+        g_sre_hero_obj = 0;
+        g_sre_hero_health_comp = 0;
+        g_sre_hero_mana_comp = 0;
+    }
+
+    /* Read-only world telemetry retained from the old implementation. The
+     * relay already stepped Scene::Update, so never call a controller/update
+     * function here. */
+    {
+        uint64_t scene = *(uint64_t*)(ctrl + 0x20);
+        if (sre_gsv_guest_object_valid(scene)) {
+            g_sre_world_gate_evals++;
+            if ((g_sre_world_gate_evals % 120) == 7) {
+                uint64_t head = scene + 0x110;
+                uint64_t node = *(uint64_t*)head;
+                uint64_t count = 0;
+                uint64_t hops = 0;
+                while (node && node != head && hops < 50000 &&
+                       node >= 0x20000000ULL && node < 0xE0000000ULL &&
+                       (node & 7) == 0) {
+                    count++;
+                    node = *(uint64_t*)node;
+                    hops++;
+                }
+                if (node == head) {
+                    if (g_sre_scene_object_count > count) {
+                        g_sre_scene_object_removals +=
+                            g_sre_scene_object_count - count;
+                    }
+                    g_sre_scene_object_count = count;
+                }
+            }
+        }
+    }
+
+}
+
+static void sre_GameSceneView_ApplyOverrides(void* self) {
+    extern int g_sre_controls_hidden;
+    if (!g_sre_controls_hidden ||
+        !sre_gsv_guest_object_valid((uint64_t)(uintptr_t)self)) return;
+    uint64_t overlay = *(uint64_t*)((char*)self + 0x100);
+    if (sre_gsv_guest_object_valid(overlay) &&
+        g_sre_GameOverlayView_SetControlsHidden) {
+        /* Never force controls visible against cinematic/menu engine state. */
+        g_sre_GameOverlayView_SetControlsHidden((void*)overlay, 1);
+    }
+}
+
+/* =========================================================================
+ * sre_GameSceneView_Update — RELAY PASSTHROUGH WITH SCENE LOADING GUARD
+ * =========================================================================
+ * Lightweight hook: exposes essential globals for the host, then calls
+ * the ORIGINAL GameSceneView::Update via relay cave — BUT ONLY when a
+ * scene is NOT being loaded. During scene transitions, the original reads
+ * overlay/ctrl/gamestate/health/mana/coin bar pointers that are being
+ * torn down → stale-pointer deref → RenderGuard crash cascade → freeze.
+ *
+ * During loading:
+ *   - Set globals (host needs them for diagnostics/GUI repair drive)
+ *   - Skip relay call entirely (stale struct reads would crash)
+ *   - GUIEffect updates are safe (they operate on self+0x188/0x160/0x170
+ *     which are local members, not shared objects)
+ *
+ * After loading:
+ *   - Full relay passthrough → original runs everything natively
+ *
  * ARM64 ABI: X0 = this, S0 = float deltaTime
  */
 void sre_GameSceneView_Update(void* self, float deltaTime) {
     if (!self) return;
-    char* this_ = (char*)self;
-    
-    /* Store scene view pointer for host */
+
+    /* Always expose essential globals — host reads these for ImGui,
+     * diagnostics, and the GUI repair drive in sre_frame_loop.c. */
     g_sre_gui_scene_view_ptr = (uint64_t)self;
     g_sre_gamesceneview_ptr = self;
     g_sre_gui_scene_active = 1;
+
+    /* ── SCENE TRANSITION GUARD ───────────────────────────────────────────
+     * During scene load/unload (g_sre_scene_loading=1), the GameSceneView's
+     * child pointers (overlay at +0x100, controller at +0xF0, gamestate,
+     * health/mana/coin bars) are being torn down and rebuilt. Calling the
+     * original would read these stale pointers → .dynstr vtable dispatch
+     * crash → RenderGuard cascade → game freeze.
+     *
+     * Safe to skip: the original's GUIEffect updates (+0x188/0x160/0x170)
+     * are local members that don't depend on external objects.
+     * The original's GUIView::Update (view subtree) will run on the next
+     * frame when loading is complete.
+     * ──────────────────────────────────────────────────────────────────── */
+    if (g_sre_scene_loading) {
+        return;  /* globals set above; skip all struct reads */
+    }
+
+    /* Watchdog suppressor: skip for N frames after a forced scene-loading
+     * flag clear (avoids spamming stale HUD data during transition). */
+    if (g_sre_suppress_hud_frames > 0) {
+        g_sre_suppress_hud_frames--;
+        return;  /* globals set above; skip stale reads */
+    }
+
+    /* ── RELAY PASSTHROUGH ────────────────────────────────────────────────
+     * Scene is stable — call through to the ORIGINAL GameSceneView::Update
+     * via relay cave. The relay was installed by TrampolineMgr during
+     * nav_relays[] init:
+     *   cave = original first instruction + B back to original+4
+     *   g_orig_GameSceneView_Update_fn = cave address
+     * This executes the full original: HUD updates, world sim, view subtree.
+     * ──────────────────────────────────────────────────────────────────── */
+    if (g_orig_GameSceneView_Update_fn) {
+        /* Snapshot stable pointers before the original update. A transition can
+         * detach this view while the original call processes callbacks. */
+        sre_GameSceneView_ExportState(self);
+        g_orig_GameSceneView_Update_fn(self, deltaTime);
+        g_sre_guiview_relay_calls++;
+        sre_GameSceneView_ApplyOverrides(self);
+    } else {
+        /* DIAGNOSTIC: relay not installed — original never called.
+         * This means scene_name, health, coins etc. are never extracted. */
+        static int s_relay_warn = 0;
+        if (s_relay_warn++ < 3) {
+            fprintf(stderr, "[SRE/GSV] RELAY NULL: g_orig_GameSceneView_Update_fn=0x%llx "
+                    "— original GameSceneView::Update NOT called\n",
+                    (unsigned long long)(uintptr_t)g_orig_GameSceneView_Update_fn);
+        }
+    }
+}
+
+/* =========================================================================
+ * sre_GameSceneView_Update_disabled — legacy reimplementation (INACTIVE)
+ * =========================================================================
+ * Previously the active hook. Replaced by the relay passthrough above.
+ * Preserved for reference: HUD data extraction, world-drive, scene-
+ * transition guards, coin bar visibility, controls management, etc.
+ *
+ * Do not re-enable wholesale: it duplicates original HUD/effect/controller/
+ * GUI work and contains manual shared_ptr ownership logic. Port any additional
+ * SRE-only behavior into the validated export/override helpers above instead.
+ * =========================================================================
+ * ARM64 ABI: X0 = this, S0 = float deltaTime
+ */
+#if 0  /* Disabled — see relay passthrough above */
+void sre_GameSceneView_Update_disabled(void* self, float deltaTime) {
+    if (!self) return;
+    char* this_ = (char*)self;
+    
+    /* Store scene view pointer for host — always safe, just saves a value */
+    g_sre_gui_scene_view_ptr = (uint64_t)self;
+    g_sre_gamesceneview_ptr = self;
+    g_sre_gui_scene_active = 1;
+
+    /* ── SCENE TRANSITION GUARD ──────────────────────────────────────────────
+     * During scene load/unload, the GameSceneView's child pointers (overlay,
+     * ctrl, gamestate, health/mana/coin bars) are being torn down and rebuilt.
+     * Reading them here causes stale-pointer deref → crash or double-step of
+     * GameSceneController::Update. Skip all struct reads and jump straight to
+     * the safe tail (GUIEffect updates + GUIView::Update chain).
+     * ────────────────────────────────────────────────────────────────────── */
+    extern volatile int g_sre_scene_loading;
+    if (g_sre_scene_loading) {
+        goto do_effects;
+    }
 
     /* Watchdog suppressor: skip game-state reads for N frames after a forced
      * scene-load flag clear (avoids spamming stale HUD data during transition). */
@@ -750,6 +977,7 @@ do_effects:
      * everywhere; do not re-enable the trampoline on GUIView::Update, it would
      * sever exactly this dispatch chain again. */
 }
+#endif  /* sre_GameSceneView_Update_disabled */
 
 /* =========================================================================
  * Scene Loading Pipeline Safety Wrappers & Error Recovery
@@ -781,12 +1009,20 @@ void sre_SceneLoadingView_InitWithGameState(void* self, void* state_ptr, void* m
     }
     fprintf(stderr, "[SRE/Scene] SceneLoadingView::InitWithGameState finished successfully.\n");
 
-    /* BUG FIX: Always clear scene_loading flag on ALL exit paths.
-     * Previously: if the original crashed or longjmp-escaped, flag stayed 1
-     * permanently → world-update drive suppressed forever → game froze.
-     * Fix: clear unconditionally here (the setjmp recovery in Scene::FinishLoad
-     * also clears it, so double-clearing is safe). */
+    /* Clear scene_loading IMMEDIATELY so Lua coroutines can resume during
+     * the load. If we keep it raised, ProgramState::Update skips lua_resume,
+     * which deadlocks the background thread's scene load (FinishLoad never fires).
+     * Instead, use g_sre_suppress_hud_frames (set below) to suppress the relay
+     * passthrough and AudioSystem during the transition window. */
     g_sre_scene_loading = 0;
+
+    /* Suppress relay passthrough + AudioSystem for 60 frames after load starts.
+     * This prevents stale pointer reads in GameSceneView::Update and prevents
+     * AudioSystem from dispatching through destroyed child objects.
+     * The 60-frame window covers the entire transition (assets load + FinishLoad
+     * + FinishTransition + view tree rebuild). */
+    g_sre_suppress_hud_frames = 60;
+    g_sre_audio_suppressed_frames = 60;
 }
 
 typedef void (*pfn_orig_GameSceneController_InitWithScene)(void* self, void* scene_ptr);
@@ -806,67 +1042,98 @@ void sre_GameSceneController_InitWithScene(void* self, void* scene_ptr) {
 typedef void (*pfn_orig_Scene_FinishLoad)(void* self);
 pfn_orig_Scene_FinishLoad g_orig_Scene_FinishLoad = 0;
 
-/* JOB 1 (menu->game transition freeze): capture the Scene* that just finished
- * loading. When the menu-launched GotoLevel stalls the NavController transition
- * inside __do_upcast (0x54c6d4), the current-VC chain still points at the menu
- * VC, so the frame loop can't reach the new scene through nav_ctrl+0x50. This
- * global gives the frame-loop bypass a DIRECT, reliable handle to the live
- * scene so it can drive Scene::Update itself and unfreeze the world. */
+/* Capture the Scene* that just finished loading for diagnostics and the
+ * frame-loop's guarded world-drive fallback. */
 volatile uint64_t g_sre_finishloaded_scene = 0;
+
+/* std::_Rb_tree in-order successor — exact reimplementation of the engine's
+ * sub_54C6A0 (@ guest 0x54c6a0), which Scene::FinishLoad uses to iterate its
+ * object/group maps. Node layout: +0x08 parent, +0x10 right, +0x18 left.
+ * Returns the next node in-order, or the header/sentinel when iteration ends. */
+static uint64_t sub_54C6A0_successor(uint64_t node) {
+    uint64_t right = *(uint64_t*)(node + 0x10);
+    if (right) {
+        /* leftmost of the right subtree */
+        while (*(uint64_t*)(right + 0x18))
+            right = *(uint64_t*)(right + 0x18);
+        return right;
+    }
+    /* walk up until node is its parent's left child */
+    uint64_t parent = *(uint64_t*)(node + 0x08);
+    if (node == *(uint64_t*)(parent + 0x10)) {
+        while (node == *(uint64_t*)(parent + 0x10)) {
+            node = parent;
+            parent = *(uint64_t*)(parent + 0x08);
+        }
+    }
+    /* std::_Rb_tree header edge-case (mirrors the original) */
+    if (*(uint64_t*)(node + 0x10) != parent)
+        return parent;
+    return node;
+}
 
 void sre_Scene_FinishLoad(void* self) {
     if (!self) return;
     extern char g_sre_current_scene_name[128];
-    fprintf(stderr, "[SRE/Scene] Scene::FinishLoad starting (scene=%p, name='%s')...\n", self, g_sre_current_scene_name);
-    /* Publish the freshly-loaded scene for the JOB 1 world-drive bypass. */
+
+    /* Capture scene pointer for JOB1 world-drive bypass and
+     * SceneLoadingView auto-complete guard. */
     g_sre_finishloaded_scene = (uint64_t)self;
 
-    /* CRITICAL: raise scene loading flag BEFORE calling original.
-     * This suppresses all lua_resume calls in ProgramState::Update for the
-     * entire duration of scene loading, preventing mutex-under-longjmp deadlock. */
-    g_sre_scene_loading = 1;
-
-    /* NOTE: Scene's object iteration uses a doubly-linked list, NOT a begin/end vector.
-     * Layout (from Ghidra):
-     *   this+0x28  = ProgramState embedded object (NOT a vector!)
-     *   this+0xb8  = SceneObject linked-list sentinel
-     *   this+0xC8  = SceneObject linked-list head (this+200)
-     *   this+0xe8  = SceneObjectGroup linked-list sentinel
-     *   this+0xf8  = SceneObjectGroup linked-list head
-     * DO NOT sanitize any of these — they are traversed by the original FinishLoad. */
-
+    /* Call original — no pre-sanitization walk, no scene_loading flag toggle.
+     * The slow RB-tree scan was disabled because:
+     *   1. sre_SceneObject_FinishLoad hook is now disabled (offset=0) so the
+     *      component-vtable guard it provided is gone — the pre-scan is moot.
+     *   2. The scan adds up to 100K iterations before load, slowing FinishLoad
+     *      enough to trigger the 8-frame watchdog and cause the freeze itself.
+     * The scene_loading flag is managed by sre_SceneLoadingView_InitWithGameState
+     * which wraps the top-level load; we no longer need to set it here. */
     if (g_orig_Scene_FinishLoad) {
-        lua_State* L = g_sre_last_lua_state;
-        if (L != NULL) {
-            int my_depth = recovery_push(L);
-            if (my_depth >= 0 && sre_setjmp(g_sre_recovery_stack[my_depth].buf) != 0) {
-                recovery_pop(my_depth);
-                fprintf(stderr, "[SRE/Scene] Recovered exception during Scene::FinishLoad! Scene load continuing.\n");
-                /* MUTEX SAFETY: force unlock — a longjmp may have escaped a locked section */
-                if (g_lua_mutex_ptr) pthread_mutex_unlock(g_lua_mutex_ptr);
-                goto finish_load_done;
-            }
-            g_orig_Scene_FinishLoad(self);
-            if (my_depth >= 0) recovery_pop(my_depth);
-        } else {
-            g_orig_Scene_FinishLoad(self);
-        }
+        g_orig_Scene_FinishLoad(self);
     }
 
-finish_load_done:
-    /* Scene load is complete. ProgramState owns its mutex; this wrapper never
-     * locks it, so unlocking here would violate mutex ownership and is undefined. */
-    g_sre_scene_loading = 0;
-    fprintf(stderr, "[SRE/Scene] Scene::FinishLoad finished (name='%s'). Loading flag cleared.\n", g_sre_current_scene_name);
-    /* Keep g_sre_game_level_name in sync so Lua game.current_level_name works */
+    fprintf(stderr, "[SRE/Scene] Scene::FinishLoad done (name='%s' scene=%p)\n",
+            g_sre_current_scene_name, self);
+
+    /* Sync level name for Lua game.current_level_name */
     {
         extern char g_sre_game_level_name[128];
         extern int snprintf(char *str, size_t size, const char *format, ...);
         if (g_sre_current_scene_name[0])
-            snprintf(g_sre_game_level_name, sizeof(g_sre_game_level_name), "%s", g_sre_current_scene_name);
+            snprintf(g_sre_game_level_name, sizeof(g_sre_game_level_name),
+                     "%s", g_sre_current_scene_name);
     }
-}
 
+    /* Refresh g_sre_captured_gvc for in-game transitions.
+     * sre_GUINavigationController_FinishTransition only fires on the initial
+     * menu→game push; for level→level the same GVC stays current and
+     * FinishTransition may not re-fire. Walk the live shell chain here and
+     * update the captured pointer so the GUI repair drive can find the
+     * GameSceneView on the very next frame. */
+    {
+        extern volatile uint64_t g_sre_captured_gvc;
+        extern uint64_t          g_swordigo_base;
+        if (g_swordigo_base) {
+            void** shell_slot = (void**)(g_swordigo_base + 0x6e9c20ULL);
+            void*  sh = *shell_slot;
+            if (sh && (uint64_t)(uintptr_t)sh >= 0x20000000ULL &&
+                      (uint64_t)(uintptr_t)sh <  0xE0000000ULL) {
+                void* nav = *(void**)((char*)sh + 0x98);
+                if (nav && (uint64_t)(uintptr_t)nav >= 0x20000000ULL &&
+                           (uint64_t)(uintptr_t)nav <  0xE0000000ULL) {
+                    void* vc = *(void**)((char*)nav + 0x50);
+                    if (vc && (uint64_t)(uintptr_t)vc >= 0x20000000ULL &&
+                              (uint64_t)(uintptr_t)vc <  0xE0000000ULL &&
+                              *(uint64_t*)(uintptr_t)vc ==
+                                  g_swordigo_base + 0x6cb880ULL) {
+                        g_sre_captured_gvc = (uint64_t)(uintptr_t)vc;
+                    }
+                }
+            }
+        }
+    }
+
+}
 typedef void (*pfn_orig_SceneObject_FinishLoad)(void* self);
 pfn_orig_SceneObject_FinishLoad g_orig_SceneObject_FinishLoad = 0;
 
@@ -923,18 +1190,53 @@ void sre_SceneObject_FinishLoad(void* self) {
             const uint64_t ro_lo   = g_swordigo_base + 0x583480ULL; /* .rodata start */
             const uint64_t ro_hi   = g_swordigo_base + 0x6e8000ULL; /* .bss start */
 
+            /* Guest virtual address space tops out at the bridge/MAGIC_LR region
+             * (0xE0000000). Any real component pointer lives in guest RAM below
+             * this. The old bound (0x800000000000 = 2^47) was far too loose: a
+             * corrupted slot holding packed float data — e.g. a Vector2 { 1.0f,
+             * 1.0f } read as a pointer = 0x3f8000003f800000 — is 8-byte aligned
+             * and below 2^47, so it PASSED the old check, got dereferenced, and
+             * produced a null vtable → virtual dispatch into .dynstr → the
+             * UserDefined2 halt / frozen scene. Bounding by the real guest limit
+             * (0xE0000000) rejects it immediately. */
+            const uint64_t GUEST_ADDR_LIMIT = 0xE0000000ULL;
+
             uint64_t* arr = (uint64_t*)begin_v;
             for (size_t ci = 0; ci < count; ci++) {
                 uint64_t comp = arr[ci];
                 if (!comp) continue;
 
-                /* 1. Alignment check: C++ component pointers MUST be 8-byte aligned */
-                if ((comp & 7) != 0 || comp < 0x10000ULL || comp >= 0x800000000000ULL) {
+                /* 1. Range + alignment check: C++ component pointers MUST be
+                 * 8-byte aligned AND land inside guest RAM [0x10000, 0xE0000000).
+                 * This is the primary fix for the float-pair-as-pointer bug. */
+                if ((comp & 7) != 0 || comp < 0x10000ULL || comp >= GUEST_ADDR_LIMIT) {
                     fprintf(stderr, "[SRE/SceneObject] FinishLoad guard: "
-                            "comp[%zu]=0x%llx is misaligned or invalid range — zeroing\n",
+                            "comp[%zu]=0x%llx is misaligned or outside guest RAM — zeroing\n",
                             ci, (unsigned long long)comp);
                     arr[ci] = 0;
                     continue;
+                }
+
+                /* 1b. Reject slots that are clearly packed float payload rather
+                 * than a pointer. A Vector2/Vector3 component whose fields got
+                 * written where a pointer belongs shows up as two IEEE-754
+                 * floats packed into 64 bits. Detect the common signatures
+                 * (1.0f = 0x3f800000, 0.5f = 0x3f000000, 2.0f = 0x40000000, and
+                 * the value repeated in both halves) so we never dereference
+                 * them. These bit patterns are never valid guest heap pointers
+                 * because their high 32 bits are >= 0x3f000000 > GUEST_ADDR_LIMIT
+                 * anyway, but we log them distinctly to aid future diagnosis. */
+                {
+                    uint32_t hi = (uint32_t)(comp >> 32);
+                    uint32_t lo = (uint32_t)(comp & 0xffffffffULL);
+                    if (hi == lo && (hi == 0x3f800000u || hi == 0x3f000000u ||
+                                     hi == 0x40000000u || hi == 0xbf800000u)) {
+                        fprintf(stderr, "[SRE/SceneObject] FinishLoad guard: "
+                                "comp[%zu]=0x%llx is packed float data (not a pointer) — zeroing\n",
+                                ci, (unsigned long long)comp);
+                        arr[ci] = 0;
+                        continue;
+                    }
                 }
 
                 /* 2. Read vtable pointer */
@@ -1403,10 +1705,13 @@ void sre_Proto_SceneObject_Destroy(void* this_) {
 
     if (bad) {
         fprintf(stderr, "[SRE/Proto] SceneObject::~SceneObject: invalid component array/count "
-                        "array=0x%llx count=%d (obj=%p) — skipping component teardown\n",
+                        "array=0x%llx count=%d (obj=%p) — stale object quarantined\n",
                 (unsigned long long)array_addr, count, this_);
-        *(uint64_t*)(base + 0x20) = 0;
-        *(int*)(base + 0x2c) = 0;
+        /* A nonsensical repeated-field count means this allocation has already
+         * been freed/reused. Writing zeroes into it corrupts the new owner (in
+         * the observed failure, a Lua Table), and calling SharedDtor compounds
+         * the damage. Do not mutate or destruct reclaimed storage. */
+        return;
     }
 
     if (g_orig_Proto_SceneObject_Destroy)

@@ -282,6 +282,20 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
     std::string home_dir = os_external::home_dir();
 
     std::vector<std::string> main_font_candidates = {
+        // dist/ portable layout (standalone release — SWORDIGO_DATA_DIR)
+        get_data_path("fonts/MegalopolisExtra-Regular.otf"),
+        get_data_path("fonts/SpaceGrotesk-VariableFont_wght.ttf"),
+        get_data_path("fonts/Inter-Regular.ttf"),
+        "./data/fonts/MegalopolisExtra-Regular.otf",
+        "./data/fonts/SpaceGrotesk-VariableFont_wght.ttf",
+        "./data/fonts/Inter-Regular.ttf",
+        "./fonts/MegalopolisExtra-Regular.otf",
+        "./fonts/SpaceGrotesk-VariableFont_wght.ttf",
+        "./fonts/Inter-Regular.ttf",
+        "../fonts/MegalopolisExtra-Regular.otf",
+        "../fonts/SpaceGrotesk-VariableFont_wght.ttf",
+        "../fonts/Inter-Regular.ttf",
+        // Dev paths
         "src/assets/fonts/MegalopolisExtra-Regular.otf",
         "src/assets/fonts/Redaction10-Regular.otf",
         "src/assets/fonts/Inter-Regular.ttf",
@@ -350,6 +364,16 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
     }
 
     std::vector<std::string> fa_candidates = {
+        // dist/ portable layout (standalone release — SWORDIGO_DATA_DIR)
+        get_data_path("fonts/Font Awesome 7 Free-Solid-900.otf"),
+        get_data_path("fonts/fa-solid-900.ttf"),
+        "./data/fonts/Font Awesome 7 Free-Solid-900.otf",
+        "./data/fonts/fa-solid-900.ttf",
+        "./fonts/Font Awesome 7 Free-Solid-900.otf",
+        "./fonts/fa-solid-900.ttf",
+        "../fonts/Font Awesome 7 Free-Solid-900.otf",
+        "../fonts/fa-solid-900.ttf",
+        // Dev paths
         "src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
         "src/assets/fonts/fa-solid-900.ttf",
         "/usr/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",

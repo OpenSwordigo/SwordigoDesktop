@@ -22,8 +22,12 @@
 #include <string>
 #include <vector>
 
+#if !defined(SWORDIGO_NO_IMGUI) && !defined(GODOT_ENABLED)
 #include "imgui.h"
 #include "platform/IconsFontAwesome6.h"
+#define SCENE_PLAYER_HAS_IMGUI 1
+#endif
+
 
 #include "tools/scene_loader.h"
 #include "tools/av_renderer.h"

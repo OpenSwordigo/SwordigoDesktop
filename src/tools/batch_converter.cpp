@@ -53,13 +53,14 @@
 #include <vector>
 #include <string>
 #include <map>
-#include <cassert>
-#ifndef BATCH_CONVERTER_NO_UI
+#if !defined(BATCH_CONVERTER_NO_UI) && !defined(SWORDIGO_NO_IMGUI) && !defined(GODOT_ENABLED)
 #include <SDL3/SDL.h>
 
 // imgui.h must be included OUTSIDE any namespace
 #include "imgui.h"
+#define BATCH_HAS_IMGUI 1
 #endif
+
 
 namespace fs = std::filesystem;
 namespace batch {
@@ -1421,11 +1422,11 @@ void draw_batch_converter(BatchState& bs, double now_sec) {
         ImGui::SetScrollHereY(1.0f);
 
     ImGui::EndChild();
-    ImGui::PopStyleColor(); // ChildBg
-
     ImGui::EndPopup();
 }
-
-#endif // BATCH_CONVERTER_NO_UI
+#else
+void draw_batch_converter(BatchState&, double) {}
+#endif
 
 } // namespace batch
+

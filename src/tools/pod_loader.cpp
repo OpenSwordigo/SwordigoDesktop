@@ -1314,11 +1314,29 @@ static void finalize_model_bounds(PODModel& model) {
 
     for (int i = 0; i < static_cast<int>(model.nodes.size()); ++i) {
         if (model.nodes[i].name != "CenterPoint") continue;
-        float matrix[16];
-        get_node_matrix(model, i, 0.0f, matrix);
-        model.center_point[0] = matrix[12];
-        model.center_point[1] = matrix[13];
-        model.center_point[2] = matrix[14];
+        // The game (arm32 libswordigo_ida32.c, CenterPoint handling) reads the
+        // CenterPoint node's OWN LOCAL translation vector (v15 = node
+        // translation at the node-struct offset; a2[20..22] = v15[0..2]) and
+        // offsets the model by -that. It does NOT walk the parent chain.
+        //
+        // Ruby previously used get_node_matrix() here, which accumulates the
+        // full parent chain and returns the CenterPoint's WORLD translation.
+        // When the CenterPoint node has a transformed parent (common on chests
+        // and other props), that world Y is larger than the local Y, so we
+        // subtracted too much and the model floated ABOVE the ground in the
+        // editor even though it sits correctly on the ground in-game. Match the
+        // game: use the node's LOCAL translation only.
+        const auto& cp = model.nodes[i];
+        if (cp.has_matrix) {
+            // An explicit local matrix stores its translation in [12..14].
+            model.center_point[0] = cp.matrix[12];
+            model.center_point[1] = cp.matrix[13];
+            model.center_point[2] = cp.matrix[14];
+        } else {
+            model.center_point[0] = cp.translation[0];
+            model.center_point[1] = cp.translation[1];
+            model.center_point[2] = cp.translation[2];
+        }
         model.has_center_point = true;
         break;
     }

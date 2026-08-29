@@ -3535,6 +3535,13 @@ LaunchConfig show_launcher(BinarySelector& selector) {
         
         // Search paths — SpaceGrotesk is the primary launcher font
         std::string inter_paths[] = {
+            // dist/ portable layout (standalone release)
+            "./fonts/SpaceGrotesk-VariableFont_wght.ttf",
+            "./fonts/MegalopolisExtra-Regular.otf",
+            "./fonts/Inter-Regular.ttf",
+            "../fonts/SpaceGrotesk-VariableFont_wght.ttf",
+            "../fonts/MegalopolisExtra-Regular.otf",
+            "../fonts/Inter-Regular.ttf",
             "src/assets/fonts/SpaceGrotesk-VariableFont_wght.ttf",
             get_data_path("src/assets/fonts/SpaceGrotesk-VariableFont_wght.ttf"),
             get_user_data_dir() + "launcher/fonts/SpaceGrotesk-VariableFont_wght.ttf",
@@ -3561,6 +3568,12 @@ LaunchConfig show_launcher(BinarySelector& selector) {
         std::string fa_paths[] = {
             "src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
             get_data_path("src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf"),
+            // dist/ portable layout (standalone release)
+            "./fonts/Font Awesome 7 Free-Solid-900.otf",
+            "./fonts/fa-solid-900.ttf",
+            "./fonts/fa-solid-900.otf",
+            "../fonts/Font Awesome 7 Free-Solid-900.otf",
+            "../fonts/fa-solid-900.ttf",
             // launcher/ subfolder (RPM/DEB friendly)
             get_user_data_dir() + "launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
             get_user_data_dir() + "launcher/fonts/fa-solid-900.ttf",

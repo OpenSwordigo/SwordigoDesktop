@@ -186,7 +186,7 @@ typedef void* (*pfn_ProgramState_FromLuaState)(lua_State*);
 extern pfn_ProgramState_FromLuaState g_ProgramState_FromLuaState;
 
 // GameOverViewDidContinue
-typedef void (*pfn_GameOverVC_DidContinue)(void*, int);
+typedef void (*pfn_GameOverVC_DidContinue)(void*, void*);
 extern pfn_GameOverVC_DidContinue g_sre_GameOverVC_DidContinue;
 
 // TextBubbleComponent
@@ -300,6 +300,7 @@ extern float g_sre_cam_off_y;
 extern float g_sre_cam_off_z;
 extern float g_sre_cam_aspect;
 extern void (*g_Camera_SetPerspectiveProjection)(void* camera, float fov, float aspect, float near, float far);
+extern void (*g_Camera_EvaluateViewMatrix)(void* camera);
 extern void (*g_orig_CameraController_Update)(void* self, float dt);
 void sre_CameraController_Update(void* self, float dt);
 

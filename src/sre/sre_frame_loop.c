@@ -93,6 +93,7 @@ extern volatile int g_sre_scene_loading;
  * VC current so the nav-chain can't reach the new scene. */
 extern volatile uint64_t g_sre_finishloaded_scene;
 extern volatile uint64_t g_sre_world_drive_count;
+extern volatile int g_sre_audio_suppressed_frames;
 /* sre_is_valid_vtable_ptr / sre_is_valid_code_ptr are declared in sre.h. */
 
 /* From sre_lua.c */
@@ -150,9 +151,9 @@ typedef void (*pfn_GUIView_Update)(void* self, float dt);
 /* ──────────────────────────────────────────────────────────────────────────
  * GAME-VIEW REPAIR DRIVE — scene-object destruction fix
  *
- * BUG (SRE-only): with the NavController menu→game transition stalled inside
- * __vmi_class_type_info::__do_upcast (0x54c6d4), the shell's per-frame root
- * view dispatch (shell+0x88 vtable slot 9) keeps ticking the OLD menu view
+ * If a NavController transition leaves the shell on its old root, the
+ * shell's per-frame root view dispatch (shell+0x88 vtable slot 9) keeps ticking
+ * the old view
  * and GameSceneView::Update is NEVER called. The world simulation survives
  * because the JOB1 fallback drives Scene::Update directly — but the GAME'S
  * VIEW SUBTREE silently dies:
@@ -319,7 +320,12 @@ void sre_CaverShell_Update(void* self, float dt) {
     /* Not calling: dead code on PC, contains STXR/LDXR spin loops for GPlay Games */
 
     /* 4. AudioSystem::Update — find singleton via sharedSystem() and call */
-    {
+    /* TRANSITION GUARD: during scene transitions, BackgroundLoad destroys
+     * old scene objects (MusicPlayers, sound sources) while AudioSystem still
+     * holds references to them. Calling AudioSystem::Update dispatches through
+     * their freed vtables → .dynstr crash cascade. g_sre_audio_suppressed_frames
+     * is set to 60 by InitWithGameState and decremented each frame. */
+    if (g_sre_audio_suppressed_frames <= 0) {
         /* Offsets verified with nm -D -C libswordigo.so. */
         #define OFF_AudioSystem_sharedSystem  0x47e32c
         #define OFF_AudioSystem_Update        0x47fb9c
@@ -463,6 +469,10 @@ void sre_frame_update(void* env, void* obj, float dt) {
          * the still-zero flag to detect frames where it did not. */
         g_sre_gui_scene_active = 0;
 
+        /* Decrement audio suppression counter (set by InitWithGameState). */
+        if (g_sre_audio_suppressed_frames > 0)
+            g_sre_audio_suppressed_frames--;
+
         /* Call our PC-safe CaverShell::Update.
      * This will cascade into GameSceneView::Update (hooked via trampoline)
      * and ProgramState::Update (hooked via trampoline), both of which are
@@ -493,24 +503,59 @@ void sre_frame_update(void* env, void* obj, float dt) {
             uint64_t want_vt = g_swordigo_base + OFF_GameSceneView_vtable_addr_point;
 
             void* gsv = sre_find_view_by_vtable(root, want_vt);
-            /* Fallback: the GameViewController captured by the FinishTransition
-             * hook. GVC+0xD8 = shared_ptr<GameSceneView> px (BackgroundLoad),
-             * so the game view is reachable even though the stuck transition
-             * never attaches it to the tree the shell walks. Validate the
-             * chain: GVC vtable + GSV vtable + GSC(Scene*) must match the
-             * live scene published by Scene::FinishLoad. */
+            /* Fallback A: GameViewController captured by the FinishTransition
+             * hook. GVC+0xD8 = shared_ptr<GameSceneView> px (BackgroundLoad path),
+             * so the game view is reachable even when the stuck transition never
+             * attaches it to the tree the shell walks. Validate: GVC vtable +
+             * GSV vtable. The old scene-identity check (GSC+0x20 == g_sre_finishloaded_scene)
+             * was too strict — it fails when the engine re-loads the same scene
+             * (same-scene teleport) because Scene::FinishLoad may not re-fire,
+             * leaving g_sre_finishloaded_scene stale. vtable match alone is safe. */
             if (!gsv && g_sre_captured_gvc) {
                 uint64_t gvc = g_sre_captured_gvc;
                 if (sre_guest_ptr_plausible(gvc) &&
                     *(uint64_t*)(uintptr_t)gvc == g_swordigo_base + 0x6cb880ULL) {
+                    /* Fallback A: GVC+0xD8 → GSV (BackgroundLoad menu→game path) */
                     uint64_t v = *(uint64_t*)(uintptr_t)(gvc + 0xD8);
                     if (sre_guest_ptr_plausible(v) &&
                         *(uint64_t*)(uintptr_t)v == want_vt) {
-                        uint64_t gsc = *(uint64_t*)(uintptr_t)(v + 0xF0);
-                        if (sre_guest_ptr_plausible(gsc) &&
-                            *(uint64_t*)(uintptr_t)(gsc + 0x20) ==
-                                g_sre_finishloaded_scene) {
-                            gsv = (void*)(uintptr_t)v;
+                        gsv = (void*)(uintptr_t)v;
+                    }
+
+                    /* Fallback B (in-game transition): GVC+0xF0 → GSC → GSC+0xF8 → GSV.
+                     * For in-game transitions the GSV is NOT at GVC+0xD8 (that's the
+                     * BackgroundLoad menu path), but the GameSceneController IS at
+                     * GVC+0xF0 and the GSV back-pointer is at GSC+0xF8. */
+                    if (!gsv) {
+                        uint64_t gsc2 = *(uint64_t*)(uintptr_t)(gvc + 0xF0);
+                        if (sre_guest_ptr_plausible(gsc2) &&
+                            sre_is_valid_vtable_ptr(*(uint64_t*)(uintptr_t)gsc2)) {
+                            uint64_t gsv2 = *(uint64_t*)(uintptr_t)(gsc2 + 0xF8);
+                            if (sre_guest_ptr_plausible(gsv2) &&
+                                *(uint64_t*)(uintptr_t)gsv2 == want_vt) {
+                                gsv = (void*)(uintptr_t)gsv2;
+                            }
+                        }
+                    }
+
+                    /* Fallback C: scan GVC memory for a pointer to an object
+                     * with the GameSceneView vtable. The GVC stores the GSV as
+                     * a shared_ptr member; the exact offset varies between
+                     * menu→game and in-game transitions. Scanning is O(128) and
+                     * only runs when A and B both failed. */
+                    if (!gsv) {
+                        static int s_gvc_scan_warn = 0;
+                        for (uint64_t off = 0; off < 0x400; off += 8) {
+                            uint64_t slot = *(uint64_t*)(uintptr_t)(gvc + off);
+                            if (sre_guest_ptr_plausible(slot) &&
+                                sre_is_valid_vtable_ptr(*(uint64_t*)(uintptr_t)slot) &&
+                                *(uint64_t*)(uintptr_t)slot == want_vt) {
+                                gsv = (void*)(uintptr_t)slot;
+                                if (s_gvc_scan_warn++ < 3)
+                                    fprintf(stderr, "[SRE/FrameLoop] GUI repair: found GSV via GVC scan at offset +0x%llx\n",
+                                            (unsigned long long)off);
+                                break;
+                            }
                         }
                     }
                 }
@@ -535,13 +580,21 @@ void sre_frame_update(void* env, void* obj, float dt) {
                         gsv_update(gsv, dt);   /* → trampoline → sre_GameSceneView_Update */
                     }
                 } else {
+                    /* Reset per scene so the warning fires at ~frame 60 of each
+                     * new stuck transition rather than 240 frames from boot. */
                     static int s_gui_notfound_warn = 0;
-                    if (s_gui_notfound_warn++ == 240) {
+                    static uint64_t s_gui_notfound_scene = 0;
+                    if (s_gui_notfound_scene != g_sre_finishloaded_scene) {
+                        s_gui_notfound_scene = g_sre_finishloaded_scene;
+                        s_gui_notfound_warn = 0;
+                    }
+                    if (s_gui_notfound_warn++ == 60) {
                         fprintf(stderr,
                                 "[SRE/FrameLoop] GUI repair drive: no GameSceneView in "
-                                "shell root view tree (root=0x%llx) — game view unreachable; "
-                                "notifications/chat will not self-dismiss\n",
-                                (unsigned long long)root);
+                                "shell root view tree (root=0x%llx captured_gvc=0x%llx) — "
+                                "game view unreachable\n",
+                                (unsigned long long)root,
+                                (unsigned long long)g_sre_captured_gvc);
                     }
                 }
             }
@@ -555,29 +608,15 @@ void sre_frame_update(void* env, void* obj, float dt) {
     extern void sre_scene_shifter_tick(void);
     sre_scene_shifter_tick();
 
-    /* ─── JOB 1 FIX: menu→game scene-transition freeze bypass ────────────────
-     * A GotoLevel launched from the MENU state completes Scene::FinishLoad but
-     * then the guest SPINS forever in a C++ dynamic_cast RTTI walk:
-     *   __vmi_class_type_info::__do_upcast  (nm 0x54c6d4, in .text) reached from
-     *   Caver::GUINavigationController::FinishTransitionToViewController (0x49a42c)
-     * which runs after FinishLoad to swap the menu ViewController to the
-     * GameViewController. Under the Dynarmic ARM64 JIT that upcast hierarchy
-     * walk never terminates (a mis-relocated type_info/vtable pointer), so the
-     * VC swap never completes, GameSceneView::Update is never dispatched through
-     * shell+0x88, and the world-drive gate in sre_GameSceneView_Update never
-     * sees a scene → FrameDiag stays world_drive=0 / ps_ticks=0 / scene=(none).
-     *
-     * FIX (option (c) from the task): bypass the stuck NavController transition
-     * entirely. Resolve the live GameViewController directly from the CaverShell
+    /* ─── GUARDED WORLD-DRIVE FALLBACK ───────────────────────────────────────
+     * Resolve the live GameViewController directly from the CaverShell
      * singleton chain (shell 0x6E9C20 → +0x98 nav_ctrl → +0x50 current VC = GVC),
      * read its GameSceneController (GVC → GameSceneView field → +0xF0 = GSC, or
      * the GSC held directly), and if a valid Scene exists, drive
      * GameSceneController::Update (nm 0x349d84) once per frame. That runs
      * Scene::Update — object updates, physics, and the deferred-deletion loop —
-     * so the world ticks and destruction runs even though the menu→game VC swap
-     * is still stuck in __do_upcast. We never touch __do_upcast itself and we
-     * never call the stuck FinishTransition path, so the menu render is
-     * unaffected: this fallback only fires once a real Scene is reachable.
+     * so the world ticks if a completed transition is temporarily unreachable
+     * through the shell's view tree. This only fires once a real Scene is live.
      *
      * Guarded so it is a strict no-op until gameplay is actually reachable:
      *   - only when a scene load is NOT in progress
@@ -631,8 +670,8 @@ void sre_frame_update(void* env, void* obj, float dt) {
                                     if (s_bypass_logged == 0) {
                                         fprintf(stderr,
                                             "[SRE/FrameLoop] JOB1 bypass: driving GameSceneController::Update "
-                                            "directly (gvc=%p gsc=%p scene=%p) — NavController transition "
-                                            "stuck in __do_upcast(0x54c6d4)\n", gvc, gsc, scene);
+                                             "directly (gvc=%p gsc=%p scene=%p) — shell view chain "
+                                             "did not drive it\n", gvc, gsc, scene);
                                         s_bypass_logged = 1; /* log once */
                                     }
                                     typedef void (*pfn_gsc_update)(void*, float);
@@ -655,9 +694,8 @@ void sre_frame_update(void* env, void* obj, float dt) {
         /* ─── JOB 1 FALLBACK: drive the captured Scene directly ──────────────
          * The chain above resolves the NavController's CURRENT view controller
          * (nav_ctrl+0x50). But when a GotoLevel is launched from the MENU, the
-         * transition that would make the GameViewController current is exactly
-         * what stalls inside __do_upcast(0x54c6d4) — so nav_ctrl+0x50 still
-         * points at the MENU VC and GVC+0xE9 never gets set. The chain path can
+         * transition may not have made the GameViewController current yet, so
+         * nav_ctrl+0x50 can still point at the menu VC. The chain path can
          * therefore never see the freshly-loaded scene, and the world stays
          * frozen (world_drive=0 / scene=(none)).
          *
@@ -684,8 +722,7 @@ void sre_frame_update(void* env, void* obj, float dt) {
                         if (s_fb_logged == 0) {
                             fprintf(stderr,
                                 "[SRE/FrameLoop] JOB1 fallback: driving Scene::Update directly "
-                                "(scene=%p vt=0x%llx) — NavController transition stuck in "
-                                "__do_upcast(0x54c6d4), menu VC still current\n",
+                                 "(scene=%p vt=0x%llx) — scene not reachable through current VC\n",
                                 scene, (unsigned long long)scene_vt);
                             s_fb_logged = 1;
                         }

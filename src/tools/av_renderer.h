@@ -30,6 +30,15 @@ struct Camera {
     float fov       = 45.0f;        // vertical FOV in degrees
     float near_plane = 0.01f;
     float far_plane  = 1000.0f;
+
+    // ── Camera modifier (parity with the web editor's PerspectiveCamera /
+    //    OrthographicCamera switch) ─────────────────────────────────────────
+    // When `orthographic` is true, begin_3d builds an orthographic projection
+    // whose half-height derives from `distance` (so mouse-wheel zoom keeps
+    // working uniformly) scaled by `ortho_zoom`. The eye still orbits via
+    // yaw/pitch, matching Three.js TransformControls' ortho handling.
+    bool  orthographic = false;     // false = perspective, true = orthographic
+    float ortho_zoom   = 1.0f;      // >1 zooms in, <1 zooms out (multiplies scale)
 };
 
 // ============================================================================
@@ -177,6 +186,34 @@ void clear_directional_lights();
 /// @param color  RGB color (values > 1.0 push it into the bloom threshold)
 /// @param size   Billboard world size (diameter)
 void render_glow_sprite(const float pos[3], const float color[3], float size);
+
+/// Render an editor-viewport preview of a PortalEffectComponent: a
+/// camera-facing animated additive swirl at a world position. Parity with the
+/// web editor's live PortalEffect draw (native previously only rendered portals
+/// as 2D map edges or as a runtime post-fx in fbo_scaler). Procedural — needs
+/// no external texture; feed it from the scene's PortalEffectComponent fields.
+/// @param pos    World position (portal center)
+/// @param color  Portal tint (PortalEffectComponent.Color)
+/// @param size   Billboard world diameter
+/// @param speed  Swirl animation speed (PortalEffectComponent.Speed magnitude)
+/// @param time_sec  Animation clock (seconds)
+void render_portal_effect(const float pos[3], const float color[3], float size,
+                          float speed, float time_sec);
+
+/// Render a procedural ANIMATED fire billboard (torch / campfire / candle) —
+/// an upward-flowing turbulent flame generated in the shader (no texture),
+/// masked to a teardrop silhouette and colored through a fire gradient, drawn
+/// additively so it emits into the scene and feeds the bloom bright-pass. The
+/// flame stands upright in world space and is horizontally camera-facing.
+/// Cheap enough to instance for every torch in a scene (14–34+ point lights).
+/// @param pos      World position (base of the flame)
+/// @param color    Flame tint (typically the torch's warm light color)
+/// @param size     Flame world width (height ≈ 1.6× this)
+/// @param flicker  0..1 current flame brightness — pass the SAME flicker value
+///                 driving the point light so flame + light pulse in sync
+/// @param time_sec Animation clock (seconds)
+void render_fire_sprite(const float pos[3], const float color[3], float size,
+                        float flicker, float time_sec);
 
 /// Convenience: render glow sprites for every point light uploaded via
 /// set_point_lights(). The sprites are compact emitter markers (screen-sized
@@ -437,6 +474,10 @@ void mat4_rotate_y(float out[16], float angle_deg);
 void mat4_rotate_z(float out[16], float angle_deg);
 void mat4_perspective(float out[16], float fov_deg, float aspect,
                       float near_plane, float far_plane);
+/// Orthographic projection (column-major, right-handed). Matches the web
+/// editor's OrthographicCamera / Matrix4.makeOrthographic.
+void mat4_ortho(float out[16], float left, float right, float bottom,
+                float top, float near_plane, float far_plane);
 void mat4_look_at(float out[16],
                   float ex, float ey, float ez,
                   float cx, float cy, float cz,

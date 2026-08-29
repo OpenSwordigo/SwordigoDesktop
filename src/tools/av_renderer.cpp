@@ -149,7 +149,13 @@ void main() {
     //    ever crushes to black (the "black wood" / "black hero" symptom),
     //    but shadows still get real depth in the linear pipeline.
     float hemi = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
-    vec3  amb  = max(mix(uAmbientGround, uAmbient, hemi), vec3(0.025));
+    // Minimum-light floor raised from 0.025 → 0.06: out-of-radius geometry now
+    // reads as "in a dim room" instead of crushing to pure black (the "unlit
+    // black room with lamps" complaint), while still leaving real shadow
+    // contrast for lit areas. This floor applies to EVERY surface the model
+    // shader touches (walls, ground meshes, hero), so ambient is guaranteed to
+    // reach all of them.
+    vec3  amb  = max(mix(uAmbientGround, uAmbient, hemi), vec3(0.06));
     // Textures are authored in sRGB — decode to LINEAR before any lighting
     // math (gamma-correct rendering). This alone recovers most of the lost
     // contrast of the old washed-out look.
@@ -206,11 +212,23 @@ void main() {
         float dist  = length(toL);
         float r     = max(uLightRadius[i], 0.001);
         float norm  = dist / r;
-        // Original-style constant/linear attenuation with a smooth finite
-        // support window: no hard radius ring and zero energy outside it.
+        // Radius-faithful falloff. The old curve
+        //   window(norm)^2 / (1 + 1.6·norm + 1.8·norm²)
+        // was already at ~39% by HALF the authored radius and collapsed to a
+        // few percent well before it — that is the "tiny light pool in a black
+        // void" bug. A torch whose radius says it reaches N units barely lit a
+        // few polygons.
+        //
+        // New model: a gentle inverse-square core (physically warm near the
+        // emitter) MULTIPLIED by a smooth UE4/Karis window that stays wide and
+        // only rolls to exactly zero at the authored radius. `atten(0)=1`,
+        // `atten(0.5)≈0.6`, `atten(0.85)≈0.2`, `atten(1)=0`. Multiple lights
+        // now overlap into a continuous, readable wash instead of isolated
+        // hard-edged discs.
         float window = clamp(1.0 - pow(norm, 4.0), 0.0, 1.0);
-        window *= window;
-        float atten = window / (1.0 + 1.6 * norm + 1.8 * norm * norm);
+        window *= window;                                   // soft shoulder
+        float invsq = 1.0 / (1.0 + 2.0 * norm * norm);      // gentle core
+        float atten = window * mix(1.0, invsq, 0.65);       // blend flat+physical
         // Epsilon keeps normalize() from producing NaN when a vertex sits
         // exactly at the light position (inside the emitter core).
         vec3 L = normalize(toL + vec3(1e-4));
@@ -526,9 +544,14 @@ void main() {
         float dist = length(toL);
         float r = max(uLightRadius[i], 0.001);
         float norm = dist / r;
+        // Radius-faithful falloff (see MODEL_FS for the full rationale): a
+        // gentle inverse-square core blended with a smooth window that only
+        // reaches zero at the authored radius, so torch/lava light spreads and
+        // overlaps the way the original game does instead of dying instantly.
         float window = clamp(1.0 - pow(norm, 4.0), 0.0, 1.0);
         window *= window;
-        float atten = window / (1.0 + 1.6 * norm + 1.8 * norm * norm);
+        float invsq = 1.0 / (1.0 + 2.0 * norm * norm);
+        float atten = window * mix(1.0, invsq, 0.65);
         vec3 L = normalize(toL + vec3(1e-4));
         float ndl = max(dot(N, L), 0.0);
         if (ndl <= 0.0) continue;
@@ -539,9 +562,11 @@ void main() {
         color += (m.diffuse / PI + D * G * F) * uLightCol[i] * ndl * atten;
     }
 
-    // Hemisphere ambient (sky/ground fill) — same feel as the model shader.
+    // Hemisphere ambient (sky/ground fill) — same feel + same raised
+    // minimum-light floor (0.02 → 0.06) as the model shader, so PBR/vendor
+    // geometry out of any light's radius also reads as "dim room", not black.
     float hemi = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
-    vec3 amb = max(mix(uAmbientGround, uAmbient, hemi), vec3(0.02));
+    vec3 amb = max(mix(uAmbientGround, uAmbient, hemi), vec3(0.06));
     color += m.diffuse * amb * m.occlusion;
 
     // ACES filmic tone mapping (Krzysztof Narkowicz; vendor README reference).
@@ -709,6 +734,90 @@ void main() {
 }
 )GLSL";
 
+// --- Animated procedural fire shaders (FBO-based flame billboard) ---
+// A small camera-facing quad on which an upward-flowing turbulent flame is
+// generated PROCEDURALLY (layered value-noise scrolling up + horizontal sway),
+// masked to a teardrop flame silhouette and colored through a fire gradient
+// (dark red → orange → yellow → pale tip). Output is additive with soft alpha
+// edges so it emits into the scene (bloom bright-pass) instead of sitting flat.
+// The same VS as the glow sprite is reused; only the FS differs.
+static const char* FIRE_FS = R"GLSL(
+#version 330 core
+in vec2 vUV;
+
+uniform vec3  uColor;    // torch tint (baked color*intensity from host)
+uniform float uTime;     // seconds, drives the upward flow + flicker
+uniform float uFlicker;  // 0..1 current flame brightness (synced to the light)
+
+out vec4 FragColor;
+
+// Cheap hash-based value noise (no texture dependency — instances freely).
+float hash(vec2 p) {
+    p = fract(p * vec2(123.34, 345.45));
+    p += dot(p, p + 34.345);
+    return fract(p.x * p.y);
+}
+float vnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash(i);
+    float b = hash(i + vec2(1.0, 0.0));
+    float c = hash(i + vec2(0.0, 1.0));
+    float d = hash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+// Fractal turbulence flowing upward over time.
+float fbm(vec2 p) {
+    float v = 0.0, amp = 0.5;
+    for (int i = 0; i < 4; ++i) {
+        v += amp * vnoise(p);
+        p *= 2.0;
+        amp *= 0.5;
+    }
+    return v;
+}
+
+void main() {
+    // Centered coords: x in [-1,1], y 0 (base) .. 1 (tip).
+    vec2 uv = vUV;
+    float x = (uv.x - 0.5) * 2.0;
+    float y = uv.y;
+
+    // Upward-scrolling turbulence + gentle horizontal sway near the tip.
+    float flow = uTime * 1.6;
+    float n = fbm(vec2(uv.x * 3.0 + sin(uTime * 2.3) * 0.15,
+                       uv.y * 2.2 - flow));
+    // Teardrop flame mask: narrow at the top, widest low-mid, soft edges.
+    float width = mix(0.85, 0.06, smoothstep(0.15, 1.0, y));
+    float body  = 1.0 - smoothstep(0.0, width, abs(x) + (n - 0.5) * 0.55 * y);
+    // Vertical envelope: fade in from the base, taper out at the tip.
+    float vert  = smoothstep(0.0, 0.12, y) * (1.0 - smoothstep(0.55, 1.0, y));
+    float flame = clamp(body * vert, 0.0, 1.0);
+    // Turbulent inner detail so it never looks like a solid blob.
+    flame *= 0.65 + 0.35 * fbm(vec2(uv.x * 5.0, uv.y * 4.0 - flow * 1.3));
+
+    if (flame < 0.02) discard;
+
+    // Fire gradient: hot white/yellow core low-center → orange → red tips.
+    float heat = clamp(flame * (1.0 - y * 0.7) * 1.6, 0.0, 1.0);
+    vec3 cool = uColor * 0.7;                     // deep red-ish base tint
+    vec3 warm = uColor * 1.4;                      // orange body (over-driven)
+    vec3 hot  = mix(uColor, vec3(1.0, 0.95, 0.78), 0.8) * 2.2; // white-hot core
+    vec3 col  = mix(cool, warm, smoothstep(0.15, 0.55, heat));
+    col       = mix(col, hot, smoothstep(0.6, 1.0, heat));
+
+    // Flicker modulates overall brightness (synced to the point light).
+    float bright = flame * (0.85 + 0.35 * uFlicker);
+    // Emit additively in HDR range. Fire is an EMITTER: the color must land
+    // well above 1.0 so it stays visibly bright after ACES tonemapping (when
+    // PostFX/HDR is on) AND drives the bloom bright-pass. The old ~1.4 gain
+    // collapsed to a dim smear once the tonemapper compressed it — this ~4x
+    // HDR gain keeps a fierce, glowing flame in both the LDR and HDR paths.
+    FragColor = vec4(col * bright * 4.0, flame);
+}
+)GLSL";
+
 // Water / fluid sheet shader (unlit, tinted, animated UV)
 static const char* WATER_VS = R"GLSL(
 #version 330 core
@@ -747,6 +856,48 @@ void main() {
 }
 )GLSL";
 
+// Portal effect shader (camera-facing animated swirl) — editor-viewport
+// preview of PortalEffectComponent. Procedural: a rotating radial swirl with
+// a bright rim, tinted by the component Color and animated by its Speed. No
+// external texture required (mirrors fbo_scaler's portal quad, but driven by
+// editor scene data + the editor camera instead of SRE frame globals).
+static const char* PORTAL_VS = R"GLSL(
+#version 330 core
+layout(location=0) in vec3 aPos;
+layout(location=2) in vec2 aUV;
+uniform mat4 uMVP;
+out vec2 vUV;
+void main() {
+    vUV = aUV;
+    gl_Position = uMVP * vec4(aPos, 1.0);
+}
+)GLSL";
+
+static const char* PORTAL_FS = R"GLSL(
+#version 330 core
+in vec2 vUV;
+uniform vec3  uColor;    // PortalEffectComponent.Color
+uniform float uTime;     // animation clock (seconds)
+uniform float uSpeed;    // PortalEffectComponent.Speed magnitude
+out vec4 FragColor;
+void main() {
+    vec2  c = vUV - 0.5;
+    float d = length(c) * 2.0;           // 0 center → 1 edge
+    if (d > 1.0) discard;
+    float ang = atan(c.y, c.x);
+    // Swirl: angular + radial phase animated over time by Speed.
+    float sw = sin(ang * 5.0 - uTime * uSpeed * 3.0 + d * 8.0) * 0.5 + 0.5;
+    // Bright core, soft outer edge, animated swirl band in between.
+    float core = 1.0 - smoothstep(0.0, 0.55, d);
+    float rim  = smoothstep(0.55, 1.0, d) * (1.0 - smoothstep(0.92, 1.0, d));
+    float band = sw * (0.35 + 0.65 * rim);
+    float intensity = clamp(core + band, 0.0, 1.5);
+    vec3  col = uColor * (0.6 + 0.8 * intensity);
+    float alpha = clamp(core * 0.9 + band * 0.8, 0.0, 1.0);
+    FragColor = vec4(col, alpha);
+}
+)GLSL";
+
 // ============================================================================
 // Internal state
 // ============================================================================
@@ -757,7 +908,17 @@ static GLuint s_grid_prog  = 0;
 // Glow sprite program + geometry (camera-facing billboard)
 static GLuint s_glow_prog = 0;
 static GLuint s_glow_vao = 0, s_glow_vbo = 0, s_glow_ebo = 0;
+
+// Portal effect program (reuses the glow VAO — same pos+UV unit quad)
+static GLuint s_portal_prog = 0;
+static GLint  s_portal_loc_mvp = -1, s_portal_loc_color = -1,
+              s_portal_loc_time = -1, s_portal_loc_speed = -1;
 static GLint  s_glow_loc_mvp = -1, s_glow_loc_color = -1;
+
+// Animated fire program (reuses the glow VAO — same pos+UV unit quad)
+static GLuint s_fire_prog = 0;
+static GLint  s_fire_loc_mvp = -1, s_fire_loc_color = -1,
+              s_fire_loc_time = -1, s_fire_loc_flicker = -1;
 
 // Water / fluid sheet program + dynamic geometry (rebuilt per frame)
 static GLuint s_water_prog = 0;
@@ -965,6 +1126,22 @@ void mat4_perspective(float out[16], float fov_deg, float aspect,
     out[14] = (2.0f * far_p * near_p) / (near_p - far_p);
 }
 
+void mat4_ortho(float out[16], float left, float right, float bottom,
+                float top, float near_p, float far_p) {
+    // Column-major, right-handed, mirrors THREE.Matrix4.makeOrthographic.
+    memset(out, 0, 16 * sizeof(float));
+    const float rl = (right - left);
+    const float tb = (top - bottom);
+    const float fn = (far_p - near_p);
+    out[0]  = 2.0f / rl;
+    out[5]  = 2.0f / tb;
+    out[10] = -2.0f / fn;
+    out[12] = -(right + left) / rl;
+    out[13] = -(top + bottom) / tb;
+    out[14] = -(far_p + near_p) / fn;
+    out[15] = 1.0f;
+}
+
 void mat4_look_at(float out[16],
                   float ex, float ey, float ez,
                   float cx, float cy, float cz,
@@ -1050,6 +1227,19 @@ void camera_get_view_matrix(const Camera& cam, float out[16]) {
 }
 
 void camera_get_projection(const Camera& cam, float aspect, float out[16]) {
+    if (cam.orthographic) {
+        // Match the on-screen scale of the perspective view at the target
+        // plane: half-height = distance * tan(fov/2), divided by ortho_zoom
+        // so mouse-wheel distance AND the ortho zoom control both frame the
+        // scene consistently (parity with THREE.OrthographicCamera).
+        const float zoom = (cam.ortho_zoom > 1e-4f) ? cam.ortho_zoom : 1.0f;
+        float half_h = cam.distance * tanf(cam.fov * DEG2RAD * 0.5f) / zoom;
+        if (half_h < 1e-4f) half_h = 1e-4f;
+        const float half_w = half_h * aspect;
+        mat4_ortho(out, -half_w, half_w, -half_h, half_h,
+                   cam.near_plane, cam.far_plane);
+        return;
+    }
     mat4_perspective(out, cam.fov, aspect, cam.near_plane, cam.far_plane);
 }
 
@@ -1548,6 +1738,28 @@ bool renderer_init() {
         fprintf(stderr, "[av_renderer] Failed to build glow sprite program.\n");
     }
 
+    // --- Portal effect program (reuses the glow unit-quad VAO) ---
+    s_portal_prog = build_program(PORTAL_VS, PORTAL_FS);
+    if (s_portal_prog) {
+        s_portal_loc_mvp   = glGetUniformLocation(s_portal_prog, "uMVP");
+        s_portal_loc_color = glGetUniformLocation(s_portal_prog, "uColor");
+        s_portal_loc_time  = glGetUniformLocation(s_portal_prog, "uTime");
+        s_portal_loc_speed = glGetUniformLocation(s_portal_prog, "uSpeed");
+    } else {
+        fprintf(stderr, "[av_renderer] Failed to build portal effect program.\n");
+    }
+
+    // --- Animated fire program (reuses the glow unit-quad VAO + GLOW_VS) ---
+    s_fire_prog = build_program(GLOW_VS, FIRE_FS);
+    if (s_fire_prog) {
+        s_fire_loc_mvp     = glGetUniformLocation(s_fire_prog, "uMVP");
+        s_fire_loc_color   = glGetUniformLocation(s_fire_prog, "uColor");
+        s_fire_loc_time    = glGetUniformLocation(s_fire_prog, "uTime");
+        s_fire_loc_flicker = glGetUniformLocation(s_fire_prog, "uFlicker");
+    } else {
+        fprintf(stderr, "[av_renderer] Failed to build fire program.\n");
+    }
+
     // --- Water / fluid sheet program + dynamic geometry ---
     // The vertex buffer is re-filled every frame (grid waves), so it is
     // created with GL_DYNAMIC_DRAW in render_water_sheet; here we only set
@@ -1609,6 +1821,8 @@ void renderer_shutdown() {
     if (s_glow_vao)  { glDeleteVertexArrays(1, &s_glow_vao); s_glow_vao = 0; }
     if (s_glow_vbo)  { glDeleteBuffers(1, &s_glow_vbo); s_glow_vbo = 0; }
     if (s_glow_ebo)  { glDeleteBuffers(1, &s_glow_ebo); s_glow_ebo = 0; }
+    if (s_portal_prog) { glDeleteProgram(s_portal_prog); s_portal_prog = 0; }
+    if (s_fire_prog) { glDeleteProgram(s_fire_prog); s_fire_prog = 0; }
 
     if (s_water_prog) { glDeleteProgram(s_water_prog); s_water_prog = 0; }
     if (s_water_vao)  { glDeleteVertexArrays(1, &s_water_vao); s_water_vao = 0; }
@@ -2539,6 +2753,45 @@ void render_glow_sprite(const float pos[3], const float color[3], float size) {
     glUseProgram(0);
 }
 
+void render_portal_effect(const float pos[3], const float color[3], float size,
+                          float speed, float time_sec) {
+    if (!s_portal_prog || !s_glow_vao || size <= 0.0f) return;
+
+    // Camera-facing billboard (same construction as render_glow_sprite) so the
+    // swirl always faces the editor camera and stays legible in ortho + persp.
+    float M[16];
+    const float* V = s_view;
+    const float right[3] = { V[0], V[4], V[8] };
+    const float up[3]    = { V[1], V[5], V[9] };
+    const float h = size * 0.5f;
+    M[0] = right[0]*h; M[4] = up[0]*h; M[8]  = 0.0f; M[12] = pos[0];
+    M[1] = right[1]*h; M[5] = up[1]*h; M[9]  = 0.0f; M[13] = pos[1];
+    M[2] = right[2]*h; M[6] = up[2]*h; M[10] = 0.0f; M[14] = pos[2];
+    M[3] = 0.0f; M[7] = 0.0f; M[11] = 0.0f; M[15] = 1.0f;
+
+    float mvp[16];
+    mat4_multiply(mvp, s_vp, M);
+
+    glUseProgram(s_portal_prog);
+    glUniformMatrix4fv(s_portal_loc_mvp, 1, GL_FALSE, mvp);
+    glUniform3fv(s_portal_loc_color, 1, color);
+    glUniform1f(s_portal_loc_time, time_sec);
+    glUniform1f(s_portal_loc_speed, speed > 0.0f ? speed : 1.0f);
+
+    // Additive so it glows and feeds the bloom bright-pass; depth test on
+    // (so geometry in front occludes it) but no depth write.
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glBindVertexArray(s_glow_vao);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+    glBindVertexArray(0);
+    glDepthMask(GL_TRUE);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(0);
+}
+
 void render_water_sheet(const WaterSheetData& ws, const float* model_matrix,
                         float time_sec) {
     if (!s_water_prog || !s_water_vao) return;
@@ -2641,6 +2894,54 @@ void render_water_sheet(const WaterSheetData& ws, const float* model_matrix,
     glDepthMask(GL_TRUE);
     glUseProgram(0);
     glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void render_fire_sprite(const float pos[3], const float color[3], float size,
+                        float flicker, float time_sec) {
+    if (!s_fire_prog || !s_glow_vao || size <= 0.0f) return;
+
+    // Camera-facing billboard, but the flame stands UPRIGHT (world +Y up)
+    // rather than tilting on both axes — a real flame grows vertically. We
+    // keep the horizontal axis camera-facing (screen right, flattened onto the
+    // ground plane) and force the vertical axis to world up, so torches read
+    // correctly from any camera yaw.
+    const float* V = s_view;
+    float right[3] = { V[0], V[4], V[8] };      // camera right
+    right[1] = 0.0f;                            // flatten to ground plane
+    float rl = std::sqrt(right[0]*right[0] + right[2]*right[2]);
+    if (rl < 1e-4f) { right[0] = 1.0f; right[2] = 0.0f; rl = 1.0f; }
+    right[0] /= rl; right[2] /= rl;
+    const float up[3] = { 0.0f, 1.0f, 0.0f };   // world up
+
+    const float hw = size * 0.5f;               // half width
+    const float ht = size * 1.6f;               // taller than wide (flame)
+    float M[16];
+    M[0] = right[0]*hw; M[4] = up[0]*ht; M[8]  = 0.0f; M[12] = pos[0];
+    M[1] = right[1]*hw; M[5] = up[1]*ht; M[9]  = 0.0f; M[13] = pos[1];
+    M[2] = right[2]*hw; M[6] = up[2]*ht; M[10] = 0.0f; M[14] = pos[2];
+    M[3] = 0.0f; M[7] = 0.0f; M[11] = 0.0f; M[15] = 1.0f;
+
+    float mvp[16];
+    mat4_multiply(mvp, s_vp, M);
+
+    glUseProgram(s_fire_prog);
+    glUniformMatrix4fv(s_fire_loc_mvp, 1, GL_FALSE, mvp);
+    glUniform3fv(s_fire_loc_color, 1, color);
+    if (s_fire_loc_time    >= 0) glUniform1f(s_fire_loc_time, time_sec);
+    if (s_fire_loc_flicker >= 0) glUniform1f(s_fire_loc_flicker, flicker);
+
+    // Additive, no depth write — feeds the bloom bright-pass and blends into
+    // the scene rather than occluding it.
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glBindVertexArray(s_glow_vao);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+    glBindVertexArray(0);
+    glDepthMask(GL_TRUE);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(0);
 }
 
 void render_point_light_glows() {

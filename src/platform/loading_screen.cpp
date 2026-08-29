@@ -413,19 +413,24 @@ void LoadingScreen::set_stage(const std::string& stage) {
 void LoadingScreen::frame() {
     if (!inited_) return;
 
+    // HiDPI: SDL_GetWindowSize returns logical pixels; we need physical
+    // pixels for glViewport and all GL fixed-function drawing.
     int win_w = 0, win_h = 0;
     SDL_GetWindowSize(window_, &win_w, &win_h);
+    int fb_w = 0, fb_h = 0;
+    SDL_GetWindowSizeInPixels(window_, &fb_w, &fb_h);
+    if (fb_w <= 0 || fb_h <= 0) { fb_w = win_w; fb_h = win_h; }
     if (win_w <= 0 || win_h <= 0) return;
 
     float time = (float)(SDL_GetTicks() / 1000.0 - start_time_);
 
-    // ── GL clear ──
-    glViewport(0, 0, win_w, win_h);
+    // ── GL clear (use framebuffer / physical pixels) ──
+    glViewport(0, 0, fb_w, fb_h);
     glClearColor(0.02f, 0.03f, 0.05f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     // ── Background scenery ──
-    draw_fullscreen_quad(bg_tex_, bg_w_, bg_h_, win_w, win_h);
+    draw_fullscreen_quad(bg_tex_, bg_w_, bg_h_, fb_w, fb_h);
 
     // ── Dark scrim (top + bottom) for readability ──
     glDisable(GL_TEXTURE_2D);
@@ -433,28 +438,28 @@ void LoadingScreen::frame() {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(0, win_w, win_h, 0, -1, 1);
+    glOrtho(0, fb_w, fb_h, 0, -1, 1);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
-    // Top gradient (stronger for logo area)
+    // Top gradient (subtle for readability over bg)
     glBegin(GL_QUADS);
-    glColor4f(0.0f, 0.0f, 0.0f, 0.70f);
+    glColor4f(0.0f, 0.0f, 0.0f, 0.45f);
     glVertex2f(0, 0);
-    glVertex2f(win_w, 0);
-    glColor4f(0.0f, 0.0f, 0.0f, 0.30f);
-    glVertex2f(win_w, win_h * 0.5f);
-    glVertex2f(0, win_h * 0.5f);
+    glVertex2f(fb_w, 0);
+    glColor4f(0.0f, 0.0f, 0.0f, 0.0f);
+    glVertex2f(fb_w, fb_h * 0.4f);
+    glVertex2f(0, fb_h * 0.4f);
     glEnd();
 
-    // Bottom gradient
+    // Bottom gradient (subtle for progress bar readability)
     glBegin(GL_QUADS);
     glColor4f(0.0f, 0.0f, 0.0f, 0.0f);
-    glVertex2f(0, win_h * 0.6f);
-    glVertex2f(win_w, win_h * 0.6f);
-    glColor4f(0.0f, 0.0f, 0.0f, 0.65f);
-    glVertex2f(win_w, win_h);
-    glVertex2f(0, win_h);
+    glVertex2f(0, fb_h * 0.75f);
+    glVertex2f(fb_w, fb_h * 0.75f);
+    glColor4f(0.0f, 0.0f, 0.0f, 0.40f);
+    glVertex2f(fb_w, fb_h);
+    glVertex2f(0, fb_h);
     glEnd();
 
     glDisable(GL_BLEND);
@@ -477,12 +482,12 @@ void LoadingScreen::frame() {
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        glOrtho(0, win_w, win_h, 0, -1, 1);
+        glOrtho(0, fb_w, fb_h, 0, -1, 1);
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
 
-        float cx = win_w * 0.5f;
-        float cy = win_h * 0.55f;
+        float cx = fb_w * 0.5f;
+        float cy = fb_h * 0.55f;
         float r = 20.0f;
         float angle = time * 3.0f;
 
@@ -507,7 +512,7 @@ void LoadingScreen::frame() {
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        glOrtho(0, win_w, win_h, 0, -1, 1);
+        glOrtho(0, fb_w, fb_h, 0, -1, 1);
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
 
@@ -520,8 +525,8 @@ void LoadingScreen::frame() {
             if (m.y < -0.1f) m.y = 1.1f;
             if (m.y > 1.1f) m.y = -0.1f;
 
-            float px = m.x * win_w;
-            float py = m.y * win_h;
+            float px = m.x * fb_w;
+            float py = m.y * fb_h;
             float pulse = 0.5f + 0.5f * sinf(time * 2.0f + m.phase);
             float a = m.alpha * pulse;
 
@@ -537,7 +542,7 @@ void LoadingScreen::frame() {
         glDisable(GL_BLEND);
     }
 
-    // ── ImGui overlay ──
+    // ── ImGui overlay (ImGui handles DPI via its backend; use logical pixels) ──
     draw_overlay();
 
     SDL_GL_SwapWindow(window_);
@@ -548,9 +553,22 @@ void LoadingScreen::draw_overlay() {
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
 
+    // ImGui uses logical pixels (HiDPI-aware via SDL3 backend)
     int win_w = 0, win_h = 0;
     SDL_GetWindowSize(window_, &win_w, &win_h);
     ImVec2 ds((float)win_w, (float)win_h);
+
+    // Make a full-screen invisible window so draw_list covers the whole screen
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ds);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::Begin("##loading_overlay", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                 ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoBackground);
+
     ImDrawList* dl = ImGui::GetWindowDrawList();
     double now = SDL_GetTicks() / 1000.0;
 
@@ -596,8 +614,11 @@ void LoadingScreen::draw_overlay() {
                           IM_COL32(233, 69, 96, (int)(glow_a * 255)));
         }
 
+        // PVR/software-decoded data is top-to-bottom, but glTexImage2D
+        // treats row 0 as bottom — so the image is upside-down.  Flip V.
         dl->AddImage((ImTextureID)(intptr_t)logo_tex_,
-                      ImVec2(lx, ly), ImVec2(lx + lw, ly + lh));
+                      ImVec2(lx, ly), ImVec2(lx + lw, ly + lh),
+                      ImVec2(0, 1), ImVec2(1, 0));
     }
 
     // ── Flavor line (centered, below logo) ──
@@ -663,6 +684,10 @@ void LoadingScreen::draw_overlay() {
     // Version tag
     dl->AddText(ImVec2(ds.x - 120.0f, ds.y - 20.0f),
                 IM_COL32(80, 90, 110, 100), "v8.0 Remaster");
+
+    ImGui::End(); // close ##loading_overlay
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
 
     ImGui::EndFrame();
     ImGui::Render();

@@ -125,8 +125,8 @@ SreHookEntry sre_hook_table[] = {
     { 0x43650c, "sre_SceneLoadingView_Update"    },
     { 0x436a54, "sre_SceneLoadingView_AnimateIn" },
     { 0x4642a8, "sre_Scene_FinishLoad"                   },
-    { 0x470ec4, "sre_SceneObject_FinishLoad"             },
-    { 0x475498, "sre_SceneObjectGroup_FinishLoad"        },
+    //{ 0,        "sre_SceneObject_FinishLoad"             },  /* DISABLED: slow vtable walk, low value */
+    //{ 0,        "sre_SceneObjectGroup_FinishLoad"        },  /* DISABLED: slow vtable walk, low value */
     //{ 0, "sre_ReadPODModelFromFile"               },
     //{ 0, "sre_CPVRTModelPOD_ReadFromMemory"       },
 
@@ -154,7 +154,7 @@ SreHookEntry sre_hook_table[] = {
      * dereferences that branch into the files_dir string area (0x20010).
      * We replace both with safe no-ops. */
     //{ 0, "sre_GUIView_Update"             },  /* GUIView::Update(float) */
-    { 0, "sre_AchievementsManager_Update" },  /* AchievementsManager::Update(float) */
+    //{ 0, "sre_AchievementsManager_Update" },  /* AchievementsManager::Update(float) */
 
     { 0x21ded4, "sre_BackgroundComponent_Draw"             },  /* BackgroundComponent::Draw (const) */
     { 0x2b6760, "sre_RotatingBackgroundComponent_Draw"     },  /* RotatingBackgroundComponent::Draw (const) */
@@ -285,9 +285,12 @@ SreHookEntry sre_hook_table[] = {
      * that scripts call. Those bindings invoke the C++ methods which we've already hooked.
      * AddPlaylist populates the playlist list; harmless since we bypass playlists. */
 
-    /* GUI System — game state extraction.
-     * Hooks GameSceneView::Update to read HP/mana/coins from GameState
-     * every frame. The native HUD won't animate (we own the display). */
+    /* GUI System — relay passthrough.
+     * Lightweight hook: sets essential globals (gamesceneview_ptr, gui_scene_active)
+     * then calls the ORIGINAL GameSceneView::Update via relay cave.
+     * The full reimplementation (HUD extraction, world-drive, scene guards)
+     * is preserved as sre_GameSceneView_Update_disabled() in sre_scene_update.c.
+     * Relay installed by nav_relays[] in main.cpp (mangled: _ZN5Caver13GameSceneView6UpdateEf). */
      { 0x34ed2c, "sre_GameSceneView_Update" },  /* GameSceneView::Update(float)  nm arm64: 0x34ed2c ✓ */
       { 0, "sre_CameraController_Update" },
       { 0, "sre_SceneGrid_UpdateVisibleAreasWithCamera" },

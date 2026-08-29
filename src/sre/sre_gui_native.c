@@ -1200,19 +1200,54 @@ void sre_MainMenuView_ButtonPressed(void* self, void* target, void* sender) {
  *   GameOverViewDidContinue: x0 = GameOverViewController* (this)
  *                            x1 = GameOverView* (the view)
  *
- * We pass NULL for the view — the function likely doesn't use it
- * (it accesses the view through the controller's stored reference).
+ * GameOverViewDidContinue immediately writes view+0xF0, so NULL is invalid.
+ * It also calls ShowAdMaybe again near its tail. Queue the request and service
+ * it from the host only after updateApplication has returned.
  * ===================================================================== */
 
 extern uint64_t g_swordigo_base;  /* from sre_init.c */
 
 extern pfn_GameOverVC_DidContinue g_sre_GameOverVC_DidContinue;
 
+volatile uint64_t g_sre_gameover_respawn_controller = 0;
+static volatile int s_gameover_respawn_running = 0;
+
 void sre_GameOverVC_ShowAdMaybe(void* self) {
-    /* Skip the ad, go straight to respawn */
-    if (g_sre_GameOverVC_DidContinue) {
-        g_sre_GameOverVC_DidContinue(self, 0);
+    if (!self || s_gameover_respawn_running) return;
+
+    /* Match the original one-shot flag so GameOverVC::Update stops requesting
+     * the ad/respawn every frame while the host drains this request. */
+    *((volatile uint8_t*)self + 0x50) = 1;
+    g_sre_gameover_respawn_controller = (uint64_t)(uintptr_t)self;
+}
+
+/* Called as a separate guest invocation after updateApplication returns. */
+void sre_gameover_respawn_tick(void) {
+    uint64_t controller = g_sre_gameover_respawn_controller;
+    if (!controller || s_gameover_respawn_running ||
+        !g_sre_GameOverVC_DidContinue) return;
+
+    g_sre_gameover_respawn_controller = 0;
+    s_gameover_respawn_running = 1;
+
+    /* GUIViewController::view shared_ptr px is at +0x18. LoadView installs the
+     * GameOverView there and also makes it the controller's root view. */
+    uint64_t view = *(uint64_t*)(uintptr_t)(controller + 0x18);
+    if (view >= 0x20000000ULL && view < 0xE0000000ULL && (view & 7) == 0) {
+        fprintf(stderr,
+                "[SRE/GameOver] Servicing deferred respawn (controller=%p view=%p)\n",
+                (void*)(uintptr_t)controller, (void*)(uintptr_t)view);
+        g_sre_GameOverVC_DidContinue((void*)(uintptr_t)controller,
+                                     (void*)(uintptr_t)view);
+    } else {
+        fprintf(stderr,
+                "[SRE/GameOver] Deferred respawn cancelled: invalid view=0x%llx\n",
+                (unsigned long long)view);
+        /* Allow Update to request again if LoadView was not complete yet. */
+        *((volatile uint8_t*)(uintptr_t)controller + 0x50) = 0;
     }
+
+    s_gameover_respawn_running = 0;
 }
 
 /* =====================================================================

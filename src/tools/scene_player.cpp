@@ -1009,24 +1009,19 @@ void player_apply_camera(const Player& p, av::Camera& cam) {
     const float oy = p.cam_pos[1] - p.cam_target[1];
     const float oz = p.cam_pos[2] - p.cam_target[2];
     const float d = std::sqrt(ox * ox + oy * oy + oz * oz);
-    if (d < 0.001f) return;
     cam.target[0] = p.cam_target[0];
     cam.target[1] = p.cam_target[1];
     cam.target[2] = p.cam_target[2];
     cam.distance = d;
     cam.yaw   = std::atan2(ox, oz) * (180.0f / kPi);
     cam.pitch = std::asin(oy / d) * (180.0f / kPi);
-    // The editor default far_plane (1000) clips the whole scene at game
-    // distances — open it up so the scene around Hiro is visible.
     cam.far_plane = std::max(4000.0f, cam.distance * 8.0f);
 }
 
 // ============================================================================
-// Playback panel (ImGui) — drawn INSIDE the right-hand inspector panel by
-// the editor while the scene player is active. No window frame is created;
-// the caller owns the panel rect (see draw_properties_panel).
+// Playback panel (ImGui)
 // ============================================================================
-
+#if defined(SCENE_PLAYER_HAS_IMGUI)
 void player_draw_panel(Player& p) {
     ImGui::TextColored(ImVec4(0.75f, 0.8f, 0.95f, 1.0f), ICON_FA_PLAY " %s",
                        player_mode_name(p.mode));
@@ -1046,7 +1041,7 @@ void player_draw_panel(Player& p) {
         p.paused = false;
     }
 
-    // ── Playback timeline ──
+    // Timeline
     ImGui::Separator();
     ImGui::TextDisabled("TIMELINE");
     float dur = (float)p.total_time;
@@ -1063,10 +1058,6 @@ void player_draw_panel(Player& p) {
     }
     ImGui::SameLine();
     if (ImGui::Checkbox("Loop", &p.loop)) {}
-    ImGui::TextDisabled("Duration (s, 0 = infinite)");
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::DragFloat("##dur", &dur, 5.0f, 0.0f, 36000.0f, "%.0f s"))
-        p.total_time = (double)std::max(0.0f, dur);
 
     if (p.hiro.active) {
         ImGui::Separator();
@@ -1075,38 +1066,20 @@ void player_draw_panel(Player& p) {
         ImGui::Text("anim %s  %s", p.hiro.anim.c_str(),
                     p.hiro.grounded ? "grounded" : "airborne");
         ImGui::Checkbox("Show Collider & Ground Probe", &p.show_collider);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Draw Hiro's physics AABB (scl hitbox) and a probe down to the sampled ground, so standing-vs-falling is visible in the viewport.");
-        ImGui::TextDisabled("A / D move  ·  double-tap A/D run  ·  Space jump");
     }
 
-    // ── Visible collision walls (intelligent wall world) ──
     ImGui::Separator();
     ImGui::Checkbox("Show Collision Walls", &p.show_walls);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Draw the world-space collision walls the scene player uses: solid=white, ground=green, one-way platforms=blue, unsafe (lava/spikes)=red. Built from CollisionShapeComponent / GroundPolygonComponent data (scene_collision.h).");
-    const auto& wl = p.game_world.walls;
-    ImGui::TextDisabled("%zu objects -> %zu walls (x %.0f..%.0f, y %.0f..%.0f)",
-                        wl.shape_objects, wl.segment_count,
-                        wl.min_x > wl.max_x ? 0.0f : wl.min_x,
-                        wl.max_x < wl.min_x ? 0.0f : wl.max_x,
-                        wl.min_y > wl.max_y ? 0.0f : wl.min_y,
-                        wl.max_y < wl.min_y ? 0.0f : wl.max_y);
-
-    // ── Gamestate HUD (CharacterState port — health removed) ──
-    ImGui::Separator();
-    const int xp_next = av::GameState::xp_required_for_level(p.game_state.level);
-    ImGui::Text("Lv %d   XP %d/%d", p.game_state.level, p.game_state.xp,
-                xp_next);
-    ImGui::Text("Coins %d", p.game_state.coins);
-    ImGui::TextDisabled("kills: %d   entities: %zu", p.game_state.kills,
-                        p.entities.entities.size());
 
     if (!p.status.empty()) {
         ImGui::Separator();
         ImGui::TextWrapped("%s", p.status.c_str());
     }
 }
+#else
+void player_draw_panel(Player&) {}
+#endif
+
 
 // ============================================================================
 // Visible collision walls — the scene's collision layout drawn in world space

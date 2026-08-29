@@ -3,12 +3,17 @@
 // =============================================================================
 #include "tools/map_editor.h"
 
+#if !defined(SWORDIGO_NO_IMGUI) && !defined(GODOT_ENABLED)
 #include "platform/embedded_assets.h"   // embedded_asset / asset_decode_image (libswcore)
 #include "platform/gl_inc.h"
 #include "platform/IconsFontAwesome6.h"
 #include "platform/data_path.h"         // get_vfs_save_dir()
-#include "tools/filerift.h"             // decode_protobuf (PlayerProfile schema)#include "imgui.h"
+#include "tools/filerift.h"             // decode_protobuf (PlayerProfile schema)
+#include "imgui.h"
 #include "imgui_internal.h"   // ImRect (label collision avoidance)
+#define MAP_EDITOR_HAS_IMGUI 1
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -32,10 +37,14 @@ static void rebuild_graph_layout(MapEditorState& st);
 // toggles that used to crowd the toolbar row (see draw_toolbar).
 static void draw_view_options_popup(MapEditorState& st);
 
+#if defined(MAP_EDITOR_HAS_IMGUI)
 // ── Embedded texture cache ──────────────────────────────────────────────────
 struct TexInfo { GLuint tex = 0; int w = 0, h = 0; };
 static std::map<std::string, TexInfo> g_tex_cache;
+#endif
 
+
+#if defined(MAP_EDITOR_HAS_IMGUI)
 // stb_image decodes rows top-down; GL textures are bottom-up, so flip the
 // rows so ImGui renders the sprite upright (same convention as load_texture_file).
 static void flip_pixels_vertical(unsigned char* px, int w, int h) {
@@ -89,6 +98,8 @@ static GLuint load_embedded_texture(const std::string& name,
     if (out_h) *out_h = h;
     return tex;
 }
+#endif
+
 
 // ── Layout persistence (sidecar .swmap, editor-only) ────────────────────────
 // Simple line format:
@@ -355,12 +366,14 @@ void map_editor_fit_view(MapEditorState& st) {
     st.zoom = std::clamp(520.f / std::max(bw, bh), st.zoom_min, 2.6f);
 }
 
+#if defined(MAP_EDITOR_HAS_IMGUI)
 // ── World → screen ──────────────────────────────────────────────────────────
 namespace {
 struct Canvas {
     ImVec2 origin;   // canvas top-left in screen space
     ImVec2 size;
 };
+
 
 inline ImVec2 world_to_screen(const MapEditorState& st, const Canvas& c, float wx, float wy) {
     return ImVec2(c.origin.x + c.size.x * 0.5f + (wx - st.cam_x) * st.zoom,
@@ -1698,5 +1711,9 @@ void draw_map_editor(MapEditorState& st) {
         ImGui::EndPopup();
     }
 }
+#else
+void draw_map_editor(MapEditorState&) {}
+#endif
 
 } // namespace mapedit
+

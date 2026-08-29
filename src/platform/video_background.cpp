@@ -296,6 +296,13 @@ namespace VideoBackground {
     static std::unordered_map<uint32_t, std::unique_ptr<PlayerState>> g_players;
 
     void register_texture_maybe(uint32_t tex_id, const std::string& asset_filename, int width, int height, const void* pixels, uint32_t format, uint32_t type) {
+        static int vbg_reg_count = 0;
+        vbg_reg_count++;
+        if (vbg_reg_count <= 5) {
+            std::cout << "[VideoBackground] register_texture_maybe #" << vbg_reg_count
+                      << " tex=" << tex_id << " asset='" << asset_filename << "' "
+                      << width << "x" << height << std::endl;
+        }
         std::string base = asset_filename;
         std::string clean_bare = asset_filename;
         std::vector<std::string> extensions = { ".tex.png", ".pvr.png", ".png", ".pvr", ".jpg", ".jpeg" };

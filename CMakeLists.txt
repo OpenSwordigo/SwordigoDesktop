@@ -47,6 +47,7 @@ include(cmake/components/swordfare.cmake)
 include(cmake/components/swordfare_boot.cmake)
 include(cmake/components/ruby.cmake)
 include(cmake/components/ruby_cli.cmake)
+include(cmake/components/ruby_gg.cmake)
 
 # Guest + third-party build steps and install rules.
 include(cmake/components/sre.cmake)

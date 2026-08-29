@@ -402,7 +402,17 @@ static TValue *newkey (lua_State *L, Table *t, const TValue *key) {
     Node *othern;
     Node *n = getfreepos(t);  /* get a free place */
     if (n == NULL) {  /* cannot find a free place? */
+      int oldasize = t->sizearray;
+      int oldhsize = sizenode(t);
       rehash(L, t, key);  /* grow table */
+      /* A healthy rehash either grows capacity or redistributes integer keys
+      ** between array/hash parts. If both capacities remain unchanged and the
+      ** rebuilt hash still has no free node, recursively retrying luaH_set
+      ** makes newkey resize forever (observed at guest 0x202bbe0). Convert the
+      ** corrupted-table loop into Lua's normal recoverable error path. */
+      if (t->sizearray == oldasize && sizenode(t) == oldhsize &&
+          t->lastfree <= t->node)
+        luaG_runerror(L, "table rehash made no progress");
       return luaH_set(L, t, key);  /* re-insert key into grown table */
     }
     lua_assert(n != dummynode);
