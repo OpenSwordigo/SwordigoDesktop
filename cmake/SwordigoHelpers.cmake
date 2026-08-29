@@ -13,7 +13,7 @@ function(swordigo_target target)
     endif()
     if (NOT WIN32)
         set_target_properties(${target} PROPERTIES
-            BUILD_RPATH "${CMAKE_SOURCE_DIR}/bin/libs"
+            BUILD_RPATH "$ORIGIN/libs"
             INSTALL_RPATH "${SWORDIGO_RPATH}")
     endif()
     if (WIN32 AND SWORDIGO_GLEW_TARGET)
@@ -31,14 +31,14 @@ function(swordigo_library target)
         add_library(${target} SHARED ${ARGN})
     endif()
     if (WIN32 AND NOT SWORDIGO_STATIC)
-        # .dll next to the launcher; .lib import lib under bin/libs.
+        # .dll next to the launcher; .dll.a import lib under <dist>/libs.
         set_target_properties(${target} PROPERTIES
-            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin"
-            ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin/libs")
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/${SWORDIGO_DIST_DIR}"
+            ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/${SWORDIGO_DIST_DIR}/libs")
     elseif (NOT WIN32)
         set_target_properties(${target} PROPERTIES
-            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin/libs"
-            ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin/libs")
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/${SWORDIGO_DIST_DIR}/libs"
+            ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/${SWORDIGO_DIST_DIR}/libs")
     endif()
     swordigo_target(${target})
 endfunction()

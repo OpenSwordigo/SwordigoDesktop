@@ -17,6 +17,10 @@ if (SWORDIGO_BUILD_RUBY)
         ${SRC_DIR}/tools/scene_physics.cpp
         ${SRC_DIR}/tools/scene_game.cpp
         ${SRC_DIR}/tools/scene_generator.cpp
+        ${SRC_DIR}/tools/scene_generator_v2.cpp
+        ${SRC_DIR}/tools/scene_generator_v2_3d.cpp
+        ${SRC_DIR}/tools/scene_generator_v3.cpp
+        ${SRC_DIR}/tools/scene_v3_db.cpp
         ${SRC_DIR}/tools/intellij.cpp
         ${SRC_DIR}/tools/batch_converter.cpp
         ${SRC_DIR}/tools/gltf_export.cpp
@@ -31,7 +35,10 @@ if (SWORDIGO_BUILD_RUBY)
         ${SRC_DIR}/tools/map_loader.cpp
         ${SRC_DIR}/tools/map_editor.cpp
         ${SRC_DIR}/imgui/Guizmo/src/ImGuizmo.cpp
-        ${SRC_DIR}/tools/ufbx/ufbx.c)
+        ${SRC_DIR}/tools/ufbx/ufbx.c
+        # Windows-only: registers an exe-relative libs\ dir with the DLL loader
+        # so shipped DLLs can live in binw/libs (no-op / empty TU elsewhere).
+        ${SRC_DIR}/platform/win_dll_dir.cpp)
     # Output lands in bin/ per the top-level CMakeLists output dirs.
     swordigo_target(ruby)
     target_include_directories(ruby PRIVATE ${SRC_DIR}/tools/ufbx)

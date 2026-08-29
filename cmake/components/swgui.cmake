@@ -11,8 +11,14 @@ swordigo_library(swgui
     ${SRC_DIR}/imgui/backends/imgui_impl_opengl3.cpp
     ${SRC_DIR}/imgui/backends/imgui_impl_vulkan.cpp)
 target_link_libraries(swgui PRIVATE swcore SDL3::SDL3 OpenGL::GL)
+# ImGui's Vulkan backend is compiled with VK_NO_PROTOTYPES (dynamic loader),
+# so it only needs the Vulkan *headers* at build time — the loader is resolved
+# at runtime and must NOT be hard-linked. Link the full loader only when the
+# Vulkan package is actually found (e.g. native Linux); otherwise fall back to
+# just the headers target (vcpkg's Vulkan::Headers) so MinGW/Windows builds
+# that ship only vulkan-headers still compile without an -lvulkan link error.
 if (Vulkan_FOUND)
     target_link_libraries(swgui PRIVATE Vulkan::Vulkan)
-else()
-    target_link_libraries(swgui PRIVATE vulkan)
+elseif (TARGET Vulkan::Headers)
+    target_link_libraries(swgui PRIVATE Vulkan::Headers)
 endif()

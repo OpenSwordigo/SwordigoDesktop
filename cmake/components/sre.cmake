@@ -9,7 +9,10 @@ if (SWORDIGO_BUILD_SRE)
         message(WARNING "aarch64-linux-gnu-gcc not found — libsre.so will not be built. "
                         "Install the cross toolchain or disable SWORDIGO_BUILD_SRE.")
     else()
-        set(SRE_CORE_SRCS sre_init sre_string sre_lua sre_background sre_effects sre_music sre_gui sre_gui_native sre_scene_update sre_frame_loop sre_gui_nav sre_mini_api sre_vfs sre_lua_libs sre_pack_lua sre_raknet_c sre_mod sre_config sre_caver sre_features sre_scene_shifter sre_ffi)
+        # NOTE: sre_ffi removed from core — FFI is now a closed-source feature
+        # living in libsre-extras.so (src/sre-extras-closed-source/sre_ffi.c).
+        # Core only registers the safe stub _G.ffi surface via sre_extras_stubs.
+        set(SRE_CORE_SRCS sre_init sre_string sre_lua sre_background sre_effects sre_music sre_gui sre_gui_native sre_scene_update sre_frame_loop sre_gui_nav sre_mini_api sre_vfs sre_lua_libs sre_pack_lua sre_raknet_c sre_mod sre_config sre_caver sre_features sre_scene_shifter sre_extras_stubs)
         set(SRE_SOCKET_SRCS auxiliar buffer except inet luasocket mime options select tcp timeout udp usocket)
         set(SRE_SRCS)
         foreach(name IN LISTS LUA_SRCS)

@@ -19,6 +19,12 @@ find_package(ZLIB REQUIRED)
 find_package(OpenAL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(Vulkan QUIET)
+# When the full Vulkan loader isn't present (e.g. MinGW cross build with only
+# the vcpkg vulkan-headers port), still expose the headers-only target so the
+# VK_NO_PROTOTYPES ImGui backend can build without hard-linking a loader.
+if (NOT Vulkan_FOUND)
+    find_package(VulkanHeaders CONFIG QUIET)
+endif()
 find_package(SDL3 CONFIG REQUIRED)
 find_package(SDL3_image CONFIG QUIET)
 if (TARGET SDL3_image::SDL3_image-shared)

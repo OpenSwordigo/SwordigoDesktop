@@ -62,3 +62,16 @@ if (MSVC)
     set(SWORDIGO_COMPILE_OPTS /O2)
     set(SWORDIGO_COMPILE_OPTS_RELEASE /DNDEBUG)
 endif()
+
+# --- Optional symbol stripping (opt-in, for distribution) -------------------
+# When SWORDIGO_STRIP_RELEASE is ON, strip our own exes/libs at link time.
+# GNU/Clang/MinGW use the linker's -s flag; MSVC strips via /DEBUG:NONE. This
+# only touches Swordigo's targets — third-party DLLs are stripped separately at
+# packaging time. Default is OFF, so ordinary builds keep their debug symbols.
+if (SWORDIGO_STRIP_RELEASE)
+    if (MSVC)
+        add_link_options(/DEBUG:NONE)
+    else()
+        add_link_options(-s)
+    endif()
+endif()
