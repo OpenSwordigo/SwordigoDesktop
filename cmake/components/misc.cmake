@@ -17,16 +17,6 @@ if (NOT WIN32)
     add_custom_target(ffmpeg-build COMMAND ${CMAKE_COMMAND} -E chdir ${SRC_DIR}/tools/ffmpeg ./configure --prefix=build --enable-static --disable-shared --disable-all --enable-avformat --enable-avcodec --enable-swscale --enable-decoder=h264 --enable-demuxer=mov --enable-parser=h264 --enable-protocols --enable-protocol=file --disable-programs --disable-doc --disable-avdevice --disable-avfilter --disable-swresample --disable-libdrm --disable-vulkan --disable-hwaccels --disable-network --disable-iconv --disable-bzlib --disable-libxcb --disable-lzma --disable-sdl2 --disable-xlib --disable-zlib COMMAND ${CMAKE_COMMAND} -E chdir ${SRC_DIR}/tools/ffmpeg make -j COMMAND ${CMAKE_COMMAND} -E chdir ${SRC_DIR}/tools/ffmpeg make install USES_TERMINAL)
 endif()
 
-# libgodot.so — Godot editor as a shared library (for the ruby_gg frontend).
-# Runs the build script in the vendored Godot tree; the script handles
-# venv bootstrap, SCons invocation, and caching via a stamp file.
-if (SWORDIGO_BUILD_GODOT)
-    add_custom_target(godot-lib-build
-        COMMAND bash ${CMAKE_SOURCE_DIR}/deps/godot-4.7.2-stable/build_libgodot.sh
-        COMMENT "Building libgodot.so (editor, GL Compatibility) …"
-        USES_TERMINAL)
-endif()
-
 # ---------------------------------------------------------------------------
 # Install layout — the build drops products straight into the source tree:
 #   bin/swordfare, bin/ruby, bin/ruby_cli  (executables)
@@ -43,10 +33,6 @@ endif()
 install(TARGETS swcore swgui swfmt swpod filerift swgfx swemu swordfare LIBRARY DESTINATION bin/libs COMPONENT runtime)
 if (WIN32)
     install(TARGETS swcore swgui swfmt swpod filerift swgfx swemu swordfare RUNTIME DESTINATION bin COMPONENT runtime)
-endif()
-if (SWORDIGO_BUILD_GODOT)
-    install(FILES "${CMAKE_SOURCE_DIR}/bin/libs/libgodot.so" DESTINATION bin/libs COMPONENT godot)
-    install(FILES "${CMAKE_SOURCE_DIR}/bin/libs/libgodot.so.debug" DESTINATION bin/libs COMPONENT godot)
 endif()
 if (SWORDIGO_BUILD_RUBY_GG)
     install(TARGETS ruby_gg DESTINATION bin COMPONENT runtime)

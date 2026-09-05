@@ -41,6 +41,20 @@ struct PodConvertOptions {
 
     // Overwrite existing output POD / texture files.
     bool overwrite = false;
+
+    // Uniform scale factor applied to geometry, node translations, and animation.
+    float scale = 1.0f;
+
+    // FBX unit handling. ufbx converts the authored scene to meters at load
+    // (target_unit_meters=1.0), so an FBX authored in centimetres is silently
+    // divided by 100. `unit_scale` is an additional multiplier the user applies
+    // on top of that conversion to reach game units (1 unit ≈ 1 inch ≈ 0.0254 m,
+    // ≈ 39.4 units / metre). Default 1.0 = keep metres as-is.
+    // Common values: 1.0 (source already metres), 100.0 (source in cm), 39.37 (m→in).
+    float unit_scale = 1.0f;
+
+    // Target PVR texture resolution (0 = original source resolution, 512, 1024 [HD], 2048 [Ultra HD], 4096).
+    int pvr_resolution = 0;
 };
 
 // Convert an FBX into a game POD. On success the newly written game textures
@@ -52,8 +66,16 @@ bool fbx_to_pod(const std::string& fbx_path,
                 std::vector<std::string>* written_textures = nullptr,
                 std::string* err = nullptr);
 
-// CLI entry point driven by `bin/ruby --fbx2pod …`. Parses argv, runs the
-// conversion and returns a process exit code (0 = ok, 1 = error).
+// Convert a GLB/glTF into a game POD (with Swordigo-compatible bone naming,
+// embedded/referenced texture extraction to .pvr, and clip extraction).
+bool glb_to_pod(const std::string& glb_path,
+                const std::string& pod_path,
+                const PodConvertOptions& opts,
+                std::vector<std::string>* written_textures = nullptr,
+                std::vector<std::string>* written_clips = nullptr,
+                std::string* err = nullptr);
+
+// CLI entry point driven by `bin/ruby --fbx2pod …` or `bin/ruby --glb2pod …`.
 int pod_convert_cli(int argc, char** argv);
 
 } // namespace av

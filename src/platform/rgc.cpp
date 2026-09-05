@@ -265,8 +265,17 @@ void RedstellGC::auto_flush_tl_queue() {
     }
 }
 
+/* Asset-storm window (defined in jni_bridge_arm64.cpp, armed by bridge_fopen
+ * on hero-scene / hiro-POD opens). While live, guest allocations are part of
+ * a synchronous UI build (hero-selection panels, scene loads) where tracking
+ * is pure hot-path bookkeeping — skip them. FREE events are still tracked so
+ * RAM accounting stays exact; untracked frees degrade to a rate-limited
+ * warning instead of a per-call log flood. */
+extern "C" bool rgc_asset_storm_active(void);
+
 void RedstellGC::track_alloc(uint64_t addr, size_t size, uint64_t lr, const char* reason, RgcResourceType type) {
     if (g_sre_mod.base_addr == 0 || addr == 0) return;
+    if (rgc_asset_storm_active()) return;
     tl_write_queue.push_back({RgcEvent::ALLOC, addr, size, lr, type, reason});
     if (std::this_thread::get_id() != m_main_thread_id) {
         flush_thread_local_queues();
@@ -367,8 +376,20 @@ void RedstellGC::process_event_queue() {
                 m_allocs.erase(it);
                 m_free_counter++;
             } else {
-                std::string symbol = resolve_symbol(ev.lr);
-                log("[Redstell GC] Warning: Invalid or Double free attempt at 0x%lx (caller: 0x%lx %s)", ev.addr, ev.lr, symbol.c_str());
+                /* Untracked frees are expected while an asset-storm window
+                 * (rgc_asset_storm_active) skipped the matching ALLOC events.
+                 * Rate-limit the warning so a panel-build storm can't flood
+                 * the log / resolve_symbol per free. */
+                static std::atomic<int64_t> s_last_invalid_free_log_us{0};
+                int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                int64_t last = s_last_invalid_free_log_us.load(std::memory_order_relaxed);
+                if (now_us - last > 5000000 &&
+                    s_last_invalid_free_log_us.compare_exchange_strong(last, now_us,
+                        std::memory_order_relaxed)) {
+                    std::string symbol = resolve_symbol(ev.lr);
+                    log("[Redstell GC] Warning: Invalid or Double free attempt at 0x%lx (caller: 0x%lx %s)", ev.addr, ev.lr, symbol.c_str());
+                }
             }
         }
     }

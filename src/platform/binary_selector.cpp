@@ -252,6 +252,13 @@ const std::map<std::string, std::pair<std::string, BinaryStatus>> BinarySelector
         {"1.4.6", BinaryStatus::TESTED}},
     {"08d49dd6f7f8639a4c59f290ff2bb79254accf710f530bf53c2fce1659191c9e",
         {"1.4.12", BinaryStatus::TESTED}},
+    {"4e03fb28b16e9ed729b774ffa34f2b370742a8e6bee31f221083908e7a1089fa",
+        {"1.4.13", BinaryStatus::TESTED}},
+    // Vanilla ARM64
+    {"f847814d1b6f81268567ed5ec2473fea4d4ee3b75d2c6fec7057227225e989f8",
+        {"1.4.12", BinaryStatus::TESTED}},
+    {"c2f567a34ec7bed9cf6b0af0ce88e9c925c11e5c2a2f2fbd8604461cf93aae7d",
+        {"1.4.13", BinaryStatus::TESTED}},
     // RLSwordigo ARM32
     {"a7c00ff6f3ed0d5b3221158d6e214bba03288c1e6782be3dc2c736ae80eb19df",
         {"6.6-rl", BinaryStatus::TESTED}},

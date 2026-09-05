@@ -175,7 +175,8 @@ struct AnimData {
 bool gltf_export_glb(const PODModel& model,
                      const std::vector<GLTFTextureImage>& images,
                      const std::string& output_path,
-                     std::string* err) {
+                     std::string* err,
+                     bool flip_v) {
     std::vector<Accessor> accs;
     auto add_accessor = [&](Accessor a) -> int {
         int idx = static_cast<int>(accs.size());
@@ -298,6 +299,13 @@ bool gltf_export_glb(const PODModel& model,
         if (!mesh.uvs.empty()) {
             Accessor a; a.component_type = 5126; a.type = "VEC2"; a.count = mesh.num_vertices;
             a.payload.assign((const uint8_t*)mesh.uvs.data(), (const uint8_t*)mesh.uvs.data() + mesh.uvs.size() * 4);
+            // POD UVs are bottom-origin (v = 0 at bottom). Flip V so the exported GLB
+            // shows textures upright in standard DCC tools (top-origin UV convention).
+            if (flip_v) {
+                float* uv = reinterpret_cast<float*>(a.payload.data());
+                for (int vi = 0; vi < mesh.num_vertices; ++vi)
+                    uv[vi * 2 + 1] = 1.0f - uv[vi * 2 + 1];
+            }
             p.uv = add_accessor(std::move(a));
         }
         if (!mesh.indices.empty()) {

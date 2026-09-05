@@ -1,17 +1,10 @@
-// gltf_import.cpp — glTF 2.0 GLB importer for POD models.
-// Parses a .glb back into a PODModel so edits made in Blender can be written
-// back to .pod + .pvr game assets. Inverse of gltf_export.cpp.
-//
-// Round-trip mapping:
-//   glTF node index  -> POD node index (same order)
-//   mesh node         -> POD mesh node (object_index set, identity transform)
-//   skin.joints       -> POD bone_batches.indices (batch-local JOINTS_0 values)
-//   JOINTS_0/WEIGHTS_0-> POD bone_indices/bone_weights
-//   animations        -> dense per-frame anim_* streams (num_frames, fps)
-//   embedded PNG/JPEG -> GLTFImageBuffer for back-conversion to .pvr
+// gltf_import.cpp — Remastered glTF 2.0 / GLB importer for POD models.
+// Uses tiny_gltf_v3 for robust, 100% spec-compliant glTF parsing,
+// and maps assets into Swordigo PowerVR POD models and PVR textures.
 
 #include "gltf_glb.h"
 #include "pod_loader.h"
+#include "tiny_gltf_v3.h"
 
 #include <algorithm>
 #include <cctype>
@@ -19,795 +12,211 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <string>
+#include <vector>
 
 namespace av {
 namespace {
 
-// ─── Minimal JSON parser (DOM) ─────────────────────────────────────────
-struct JsonNode;
-using JsonArray = std::vector<JsonNode>;
+// ─── Accessor Unpacking Helper ─────────────────────────────────────────
+static bool read_accessor_floats(const tg3_model* model, int32_t acc_idx, std::vector<float>& out) {
+    out.clear();
+    if (!model || acc_idx < 0 || acc_idx >= (int32_t)model->accessors_count) return false;
+    const tg3_accessor* acc = &model->accessors[acc_idx];
+    if (acc->count == 0) return true;
+    if (acc->buffer_view < 0 || acc->buffer_view >= (int32_t)model->buffer_views_count) return false;
+    const tg3_buffer_view* bv = &model->buffer_views[acc->buffer_view];
+    if (bv->buffer < 0 || bv->buffer >= (int32_t)model->buffers_count) return false;
+    const tg3_buffer* buf = &model->buffers[bv->buffer];
+    if (!buf->data.data || buf->data.count == 0) return false;
 
-struct JsonNode {
-    enum Type { NUL, BOOL, NUM, STR, ARR, OBJ } type = NUL;
-    bool b = false;
-    double n = 0;
-    std::string s;
-    JsonArray arr;
-    std::vector<std::pair<std::string, JsonNode>> obj;
-
-    bool is_arr() const { return type == ARR; }
-    bool is_obj() const { return type == OBJ; }
-    bool is_num() const { return type == NUM; }
-    bool is_str() const { return type == STR; }
-    size_t size() const { return type == ARR ? arr.size() : (type == OBJ ? obj.size() : 0); }
-
-    const JsonNode* get(const std::string& key) const {
-        if (type != OBJ) return nullptr;
-        for (const auto& kv : obj) if (kv.first == key) return &kv.second;
-        return nullptr;
-    }
-    double num(double def = 0) const { return type == NUM ? n : def; }
-    int numi(int def = 0) const { return type == NUM ? static_cast<int>(std::lround(n)) : def; }
-    const std::string& str(const std::string& def = "") const {
-        static const std::string empty;
-        return type == STR ? s : def;
-    }
-};
-
-class JsonParser {
-public:
-    JsonParser(const char* data, size_t len) : p_(data), end_(data + len) {}
-
-    bool parse(JsonNode& out) {
-        skip_ws();
-        if (!parse_value(out)) return false;
-        skip_ws();
-        return p_ == end_;
+    int num_comps = 1;
+    switch (acc->type) {
+        case TG3_TYPE_SCALAR: num_comps = 1; break;
+        case TG3_TYPE_VEC2:   num_comps = 2; break;
+        case TG3_TYPE_VEC3:   num_comps = 3; break;
+        case TG3_TYPE_VEC4:   num_comps = 4; break;
+        case TG3_TYPE_MAT2:   num_comps = 4; break;
+        case TG3_TYPE_MAT3:   num_comps = 9; break;
+        case TG3_TYPE_MAT4:   num_comps = 16; break;
+        default: num_comps = 1; break;
     }
 
-private:
-    const char* p_;
-    const char* end_;
-
-    void skip_ws() { while (p_ < end_ && (*p_ == ' ' || *p_ == '\t' || *p_ == '\n' || *p_ == '\r')) ++p_; }
-    bool eof() const { return p_ >= end_; }
-    char peek() const { return eof() ? 0 : *p_; }
-
-    bool parse_value(JsonNode& out) {
-        char c = peek();
-        if (c == '{') return parse_obj(out);
-        if (c == '[') return parse_arr(out);
-        if (c == '"') return parse_string(out.s), out.type = JsonNode::STR, true;
-        if (c == 't') { out.type = JsonNode::BOOL; out.b = true; p_ += 4; return true; }
-        if (c == 'f') { out.type = JsonNode::BOOL; out.b = false; p_ += 5; return true; }
-        if (c == 'n') { out.type = JsonNode::NUL; p_ += 4; return true; }
-        return parse_number(out);
+    size_t comp_size = 4;
+    switch (acc->component_type) {
+        case TG3_COMPONENT_TYPE_BYTE:
+        case TG3_COMPONENT_TYPE_UNSIGNED_BYTE:  comp_size = 1; break;
+        case TG3_COMPONENT_TYPE_SHORT:
+        case TG3_COMPONENT_TYPE_UNSIGNED_SHORT: comp_size = 2; break;
+        case TG3_COMPONENT_TYPE_INT:
+        case TG3_COMPONENT_TYPE_UNSIGNED_INT:
+        case TG3_COMPONENT_TYPE_FLOAT:          comp_size = 4; break;
+        case TG3_COMPONENT_TYPE_DOUBLE:         comp_size = 8; break;
+        default: comp_size = 4; break;
     }
 
-    bool parse_obj(JsonNode& out) {
-        ++p_; // {
-        out.type = JsonNode::OBJ;
-        skip_ws();
-        if (peek() == '}') { ++p_; return true; }
-        while (!eof()) {
-            skip_ws();
-            if (peek() != '"') return false;
-            std::string key;
-            parse_string(key);
-            skip_ws();
-            if (peek() != ':') return false;
-            ++p_;
-            skip_ws();
-            JsonNode val;
-            if (!parse_value(val)) return false;
-            out.obj.emplace_back(std::move(key), std::move(val));
-            skip_ws();
-            if (peek() == ',') { ++p_; continue; }
-            if (peek() == '}') { ++p_; return true; }
-            return false;
-        }
+    size_t elem_size = (size_t)num_comps * comp_size;
+    size_t stride = (bv->byte_stride > 0) ? bv->byte_stride : elem_size;
+    uint64_t start_offset = bv->byte_offset + acc->byte_offset;
+
+    if (start_offset + (acc->count - 1) * stride + elem_size > buf->data.count) {
         return false;
     }
 
-    bool parse_arr(JsonNode& out) {
-        ++p_; // [
-        out.type = JsonNode::ARR;
-        skip_ws();
-        if (peek() == ']') { ++p_; return true; }
-        while (!eof()) {
-            skip_ws();
-            JsonNode val;
-            if (!parse_value(val)) return false;
-            out.arr.push_back(std::move(val));
-            skip_ws();
-            if (peek() == ',') { ++p_; continue; }
-            if (peek() == ']') { ++p_; return true; }
-            return false;
-        }
-        return false;
-    }
+    out.resize(acc->count * num_comps);
+    const uint8_t* base_ptr = buf->data.data + start_offset;
 
-    void parse_string(std::string& out) {
-        ++p_; // "
-        out.clear();
-        while (!eof() && *p_ != '"') {
-            if (*p_ == '\\') {
-                ++p_;
-                char c = *p_++;
-                switch (c) {
-                    case '"': out += '"'; break;
-                    case '\\': out += '\\'; break;
-                    case '/': out += '/'; break;
-                    case 'b': out += '\b'; break;
-                    case 'f': out += '\f'; break;
-                    case 'n': out += '\n'; break;
-                    case 'r': out += '\r'; break;
-                    case 't': out += '\t'; break;
-                    case 'u': {
-                        unsigned v = 0;
-                        for (int i = 0; i < 4 && !eof(); ++i) {
-                            char h = *p_++;
-                            v <<= 4;
-                            v += (h >= '0' && h <= '9') ? (h - '0') : (h >= 'a' && h <= 'f') ? (h - 'a' + 10) : (h - 'A' + 10);
-                        }
-                        if (v < 0x80) out += static_cast<char>(v);
-                        else if (v < 0x800) { out += static_cast<char>(0xC0 | (v >> 6)); out += static_cast<char>(0x80 | (v & 0x3F)); }
-                        else { out += static_cast<char>(0xE0 | (v >> 12)); out += static_cast<char>(0x80 | ((v >> 6) & 0x3F)); out += static_cast<char>(0x80 | (v & 0x3F)); }
-                        break;
-                    }
-                    default: out += c;
-                }
-            } else {
-                out += *p_++;
+    for (uint64_t i = 0; i < acc->count; ++i) {
+        const uint8_t* elem_ptr = base_ptr + i * stride;
+        float* dst = &out[i * num_comps];
+
+        for (int c = 0; c < num_comps; ++c) {
+            const uint8_t* cp = elem_ptr + c * comp_size;
+            float val = 0.0f;
+            switch (acc->component_type) {
+                case TG3_COMPONENT_TYPE_BYTE:
+                    val = acc->normalized ? std::max(-1.0f, (float)*(const int8_t*)cp / 127.0f) : (float)*(const int8_t*)cp;
+                    break;
+                case TG3_COMPONENT_TYPE_UNSIGNED_BYTE:
+                    val = acc->normalized ? (float)*(const uint8_t*)cp / 255.0f : (float)*(const uint8_t*)cp;
+                    break;
+                case TG3_COMPONENT_TYPE_SHORT:
+                    val = acc->normalized ? std::max(-1.0f, (float)*(const int16_t*)cp / 32767.0f) : (float)*(const int16_t*)cp;
+                    break;
+                case TG3_COMPONENT_TYPE_UNSIGNED_SHORT:
+                    val = acc->normalized ? (float)*(const uint16_t*)cp / 65535.0f : (float)*(const uint16_t*)cp;
+                    break;
+                case TG3_COMPONENT_TYPE_INT:
+                    val = (float)*(const int32_t*)cp;
+                    break;
+                case TG3_COMPONENT_TYPE_UNSIGNED_INT:
+                    val = (float)*(const uint32_t*)cp;
+                    break;
+                case TG3_COMPONENT_TYPE_FLOAT:
+                    val = *(const float*)cp;
+                    break;
+                case TG3_COMPONENT_TYPE_DOUBLE:
+                    val = (float)*(const double*)cp;
+                    break;
             }
-        }
-        if (!eof()) ++p_; // trailing "
-    }
-
-    bool parse_number(JsonNode& out) {
-        const char* start = p_;
-        bool has_digit = false;
-        while (!eof() && (isdigit((unsigned char)*p_) || *p_ == '-' || *p_ == '+' || *p_ == '.' || *p_ == 'e' || *p_ == 'E')) {
-            if (isdigit((unsigned char)*p_)) has_digit = true;
-            ++p_;
-        }
-        if (!has_digit) return false;
-        out.type = JsonNode::NUM;
-        out.n = strtod(start, nullptr);
-        return true;
-    }
-};
-
-// ─── Accessor decoding ─────────────────────────────────────────────────
-int component_size(int ct) {
-    switch (ct) {
-        case 5120: case 5121: return 1;   // byte / unsigned byte
-        case 5122: case 5123: return 2;   // short / unsigned short
-        case 5125: case 5126: return 4;   // uint / float
-        default: return 4;
-    }
-}
-int component_count(const std::string& type) {
-    if (type == "SCALAR") return 1;
-    if (type == "VEC2") return 2;
-    if (type == "VEC3") return 3;
-    if (type == "VEC4") return 4;
-    if (type == "MAT4") return 16;
-    return 1;
-}
-
-struct BufferView {
-    int buffer = 0;
-    int byteOffset = 0;
-    int byteLength = 0;
-    int byteStride = 0;
-};
-struct Accessor {
-    int bufferView = -1;
-    int byteOffset = 0;
-    int componentType = 5126;
-    std::string type;
-    int count = 0;
-    bool normalized = false;
-};
-
-struct GltfSkin {
-    int ibm_accessor = -1;
-    std::vector<int> joints;
-    int skeleton = -1;
-};
-struct GltfPrimitive {
-    int material = -1;
-    int pos = -1, nrm = -1, uv = -1, tangent = -1, joints = -1, weights = -1, idx = -1;
-};
-struct GltfMesh {
-    std::vector<GltfPrimitive> prims;
-};
-struct GltfNode {
-    std::string name;
-    int mesh = -1;
-    int skin = -1;
-    std::vector<int> children;
-    // transform: either TRS or matrix (matrix wins)
-    bool has_trs = false;
-    float translation[3] = {0, 0, 0};
-    float rotation[4] = {0, 0, 0, 1};
-    float scale[3] = {1, 1, 1};
-    bool has_matrix = false;
-    float matrix[16];
-};
-struct GltfAnimChannel {
-    int sampler = -1;
-    int node = -1;
-    std::string path;
-};
-struct GltfAnimSampler {
-    int input = -1;
-    int output = -1;
-    std::string interp = "LINEAR";
-};
-struct GltfAnim {
-    std::string name;
-    std::vector<GltfAnimChannel> channels;
-    std::vector<GltfAnimSampler> samplers;
-};
-
-struct GltfDocument {
-    std::vector<BufferView> bufferViews;
-    std::vector<Accessor> accessors;
-    std::vector<GltfSkin> skins;
-    std::vector<GltfMesh> meshes;
-    std::vector<GltfNode> nodes;
-    std::vector<GltfAnim> animations;
-    // materials
-    std::vector<std::string> mat_names;
-    std::vector<float> mat_diffuse; // 3 floats per material
-    std::vector<float> mat_opacity;
-    std::vector<int> mat_base_tex;  // glTF texture index (-1 none)
-    // PBR (pbrMetallicRoughness) — parallel per material
-    std::vector<float> mat_metalness;
-    std::vector<float> mat_roughness;
-    std::vector<float> mat_occlusion;   // occlusionTexture.strength
-    std::vector<float> mat_emissive;    // 3 floats per material
-    std::vector<int> mat_metalrough_tex; // glTF texture index (-1 none)
-    std::vector<int> mat_normal_tex;
-    std::vector<float> mat_normal_scale;
-    std::vector<int> mat_occl_tex;
-    std::vector<int> mat_emissive_tex;
-    std::vector<float> mat_alpha_cutoff;
-    std::vector<int> mat_alpha_mode;    // 0 opaque, 1 mask, 2 blend
-    std::vector<bool> mat_double_sided;
-    // textures -> images
-    std::vector<int> tex_image;     // per glTF texture, image index
-    // images
-    std::vector<std::string> img_names;
-    std::vector<std::vector<uint8_t>> img_data;
-    std::vector<std::string> img_mime;
-};
-
-// Decode a base64 string into raw bytes. Whitespace (data: URIs may wrap
-// lines) is filtered from the INPUT string — never from the decoded output,
-// which may legitimately contain 0x0A/0x0D bytes.
-void decode_base64(const std::string& b64, std::vector<uint8_t>& out) {
-    std::string s;
-    s.reserve(b64.size());
-    for (char c : b64)
-        if (c != '\n' && c != '\r' && c != ' ' && c != '\t') s += c;
-    static const std::string table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const size_t len = s.size();
-    for (size_t i = 0; i + 1 < len; i += 4) {
-        auto d = [&](char c) -> int { if (c == '=') return 0; size_t p = table.find(c); return p == std::string::npos ? 0 : (int)p; };
-        const int a = d(s[i]), b_ = d(s[i + 1]);
-        const int cc = i + 2 < len ? d(s[i + 2]) : 0, dd = i + 3 < len ? d(s[i + 3]) : 0;
-        out.push_back(static_cast<uint8_t>((a << 2) | (b_ >> 4)));
-        if (i + 2 < len && s[i + 2] != '=') out.push_back(static_cast<uint8_t>(((b_ & 0xF) << 4) | (cc >> 2)));
-        if (i + 3 < len && s[i + 3] != '=') out.push_back(static_cast<uint8_t>(((cc & 0x3) << 6) | dd));
-    }
-}
-
-bool parse_document(const uint8_t* json, size_t json_len, const uint8_t* bin, size_t bin_len,
-                    const std::string& base_dir, GltfDocument& doc,
-                    std::vector<uint8_t>* ext_bin) {
-    JsonNode root;
-    JsonParser parser(reinterpret_cast<const char*>(json), json_len);
-    if (!parser.parse(root) || !root.is_obj()) return false;
-
-    // buffers: GLB-stored buffer 0 (no uri) arrives via `bin`; a uri on buffer 0
-    // (bare .gltf — data: base64 or a .bin file) is loaded into *ext_bin.
-    const JsonNode* buffers = root.get("buffers");
-    if (buffers && buffers->is_arr() && !buffers->arr.empty()) {
-        const JsonNode& b0 = buffers->arr[0];
-        const JsonNode* uri = b0.get("uri");
-        if (uri && uri->is_str() && ext_bin) {
-            const std::string& u = uri->s;
-            if (u.rfind("data:", 0) == 0) {
-                size_t comma = u.find(',');
-                if (comma != std::string::npos) decode_base64(u.substr(comma + 1), *ext_bin);
-            } else if (!base_dir.empty()) {
-                std::ifstream bf(base_dir + "/" + u, std::ios::binary | std::ios::ate);
-                if (bf) {
-                    std::streamsize bsz = bf.tellg();
-                    bf.seekg(0);
-                    ext_bin->resize(static_cast<size_t>(bsz));
-                    if (bsz > 0) bf.read(reinterpret_cast<char*>(ext_bin->data()), bsz);
-                }
-            }
-        }
-    }
-
-    const JsonNode* bvs = root.get("bufferViews");
-    if (bvs && bvs->is_arr()) {
-        for (const auto& bv : bvs->arr) {
-            BufferView v;
-            v.buffer = bv.get("buffer") ? bv.get("buffer")->numi(0) : 0;
-            v.byteOffset = bv.get("byteOffset") ? bv.get("byteOffset")->numi(0) : 0;
-            v.byteLength = bv.get("byteLength") ? bv.get("byteLength")->numi(0) : 0;
-            v.byteStride = bv.get("byteStride") ? bv.get("byteStride")->numi(0) : 0;
-            doc.bufferViews.push_back(v);
-        }
-    }
-
-    const JsonNode* accs = root.get("accessors");
-    if (accs && accs->is_arr()) {
-        for (const auto& a : accs->arr) {
-            Accessor ac;
-            ac.bufferView = a.get("bufferView") ? a.get("bufferView")->numi(-1) : -1;
-            ac.byteOffset = a.get("byteOffset") ? a.get("byteOffset")->numi(0) : 0;
-            ac.componentType = a.get("componentType") ? a.get("componentType")->numi(5126) : 5126;
-            ac.type = a.get("type") ? a.get("type")->str("SCALAR") : "SCALAR";
-            ac.count = a.get("count") ? a.get("count")->numi(0) : 0;
-            ac.normalized = a.get("normalized") && a.get("normalized")->b;
-            doc.accessors.push_back(ac);
-        }
-    }
-
-    // skins
-    const JsonNode* skins = root.get("skins");
-    if (skins && skins->is_arr()) {
-        for (const auto& s : skins->arr) {
-            GltfSkin skin;
-            skin.ibm_accessor = s.get("inverseBindMatrices") ? s.get("inverseBindMatrices")->numi(-1) : -1;
-            skin.skeleton = s.get("skeleton") ? s.get("skeleton")->numi(-1) : -1;
-            const JsonNode* joints = s.get("joints");
-            if (joints && joints->is_arr())
-                for (const auto& j : joints->arr) skin.joints.push_back(j.numi(-1));
-            doc.skins.push_back(std::move(skin));
-        }
-    }
-
-    // meshes
-    const JsonNode* meshes = root.get("meshes");
-    if (meshes && meshes->is_arr()) {
-        for (const auto& m : meshes->arr) {
-            GltfMesh gm;
-            const JsonNode* prims = m.get("primitives");
-            if (prims && prims->is_arr()) {
-                for (const auto& p : prims->arr) {
-                    GltfPrimitive gp;
-                    gp.material = p.get("material") ? p.get("material")->numi(-1) : -1;
-                    gp.idx = p.get("indices") ? p.get("indices")->numi(-1) : -1;
-                    const JsonNode* attrs = p.get("attributes");
-                    if (attrs && attrs->is_obj()) {
-                        const JsonNode* v;
-                        if ((v = attrs->get("POSITION"))) gp.pos = v->numi(-1);
-                        if ((v = attrs->get("NORMAL"))) gp.nrm = v->numi(-1);
-                        if ((v = attrs->get("TEXCOORD_0"))) gp.uv = v->numi(-1);
-                        if ((v = attrs->get("TANGENT"))) gp.tangent = v->numi(-1);
-                        if ((v = attrs->get("JOINTS_0"))) gp.joints = v->numi(-1);
-                        if ((v = attrs->get("WEIGHTS_0"))) gp.weights = v->numi(-1);
-                    }
-                    gm.prims.push_back(gp);
-                }
-            }
-            doc.meshes.push_back(std::move(gm));
-        }
-    }
-
-    // nodes
-    const JsonNode* nodes = root.get("nodes");
-    if (nodes && nodes->is_arr()) {
-        for (const auto& n : nodes->arr) {
-            GltfNode gn;
-            if (n.get("name")) gn.name = n.get("name")->str();
-            gn.mesh = n.get("mesh") ? n.get("mesh")->numi(-1) : -1;
-            gn.skin = n.get("skin") ? n.get("skin")->numi(-1) : -1;
-            const JsonNode* children = n.get("children");
-            if (children && children->is_arr())
-                for (const auto& c : children->arr) gn.children.push_back(c.numi(-1));
-            const JsonNode* tr = n.get("translation");
-            if (tr && tr->is_arr() && tr->size() >= 3) {
-                gn.has_trs = true;
-                for (int i = 0; i < 3; ++i) gn.translation[i] = static_cast<float>(tr->arr[i].num());
-            }
-            const JsonNode* rot = n.get("rotation");
-            if (rot && rot->is_arr() && rot->size() >= 4) {
-                gn.has_trs = true;
-                for (int i = 0; i < 4; ++i) gn.rotation[i] = static_cast<float>(rot->arr[i].num());
-            }
-            const JsonNode* sc = n.get("scale");
-            if (sc && sc->is_arr() && sc->size() >= 3) {
-                gn.has_trs = true;
-                for (int i = 0; i < 3; ++i) gn.scale[i] = static_cast<float>(sc->arr[i].num());
-            }
-            const JsonNode* mx = n.get("matrix");
-            if (mx && mx->is_arr() && mx->size() >= 16) {
-                gn.has_matrix = true;
-                for (int i = 0; i < 16; ++i) gn.matrix[i] = static_cast<float>(mx->arr[i].num());
-            }
-            doc.nodes.push_back(std::move(gn));
-        }
-    }
-
-    // animations
-    const JsonNode* anims = root.get("animations");
-    if (anims && anims->is_arr()) {
-        for (const auto& a : anims->arr) {
-            GltfAnim ga;
-            if (a.get("name")) ga.name = a.get("name")->str();
-            const JsonNode* chans = a.get("channels");
-            if (chans && chans->is_arr()) {
-                for (const auto& c : chans->arr) {
-                    GltfAnimChannel ch;
-                    ch.sampler = c.get("sampler") ? c.get("sampler")->numi(-1) : -1;
-                    const JsonNode* target = c.get("target");
-                    if (target) {
-                        ch.node = target->get("node") ? target->get("node")->numi(-1) : -1;
-                        ch.path = target->get("path") ? target->get("path")->str("") : "";
-                    }
-                    ga.channels.push_back(ch);
-                }
-            }
-            const JsonNode* samps = a.get("samplers");
-            if (samps && samps->is_arr()) {
-                for (const auto& s : samps->arr) {
-                    GltfAnimSampler sm;
-                    sm.input = s.get("input") ? s.get("input")->numi(-1) : -1;
-                    sm.output = s.get("output") ? s.get("output")->numi(-1) : -1;
-                    sm.interp = s.get("interpolation") ? s.get("interpolation")->str("LINEAR") : "LINEAR";
-                    ga.samplers.push_back(sm);
-                }
-            }
-            doc.animations.push_back(std::move(ga));
-        }
-    }
-
-    // materials
-    const JsonNode* mats = root.get("materials");
-    if (mats && mats->is_arr()) {
-        for (const auto& m : mats->arr) {
-            doc.mat_names.push_back(m.get("name") ? m.get("name")->str("") : "");
-            float d[3] = {1, 1, 1};
-            float op = 1.0f;
-            int tex = -1;
-            const JsonNode* pbr = m.get("pbrMetallicRoughness");
-            if (pbr) {
-                const JsonNode* bcf = pbr->get("baseColorFactor");
-                if (bcf && bcf->is_arr() && bcf->size() >= 4) {
-                    d[0] = static_cast<float>(bcf->arr[0].num());
-                    d[1] = static_cast<float>(bcf->arr[1].num());
-                    d[2] = static_cast<float>(bcf->arr[2].num());
-                    op = static_cast<float>(bcf->arr[3].num());
-                }
-                const JsonNode* bct = pbr->get("baseColorTexture");
-                if (bct && bct->get("index")) tex = bct->get("index")->numi(-1);
-            }
-            int alpha_mode = 0;
-            const JsonNode* am = m.get("alphaMode");
-            if (am && am->is_str()) {
-                if (am->s == "BLEND") alpha_mode = 2;
-                else if (am->s == "MASK") alpha_mode = 1;
-            }
-            float metal = 1.0f, rough = 1.0f, occ = 1.0f;
-            float emiss[3] = {0, 0, 0};
-            int mr_tex = -1, nm_tex = -1, oc_tex = -1, em_tex = -1;
-            float nm_scale = 1.0f, alpha_cutoff = 0.5f;
-            bool dside = false;
-            if (pbr) {
-                const JsonNode* mf = pbr->get("metallicFactor");
-                if (mf) metal = static_cast<float>(mf->num());
-                const JsonNode* rf = pbr->get("roughnessFactor");
-                if (rf) rough = static_cast<float>(rf->num());
-                const JsonNode* mrt = pbr->get("metallicRoughnessTexture");
-                if (mrt && mrt->get("index")) mr_tex = mrt->get("index")->numi(-1);
-            }
-            const JsonNode* nt = m.get("normalTexture");
-            if (nt && nt->get("index")) {
-                nm_tex = nt->get("index")->numi(-1);
-                const JsonNode* ns = nt->get("scale");
-                if (ns) nm_scale = static_cast<float>(ns->num());
-            }
-            const JsonNode* ot = m.get("occlusionTexture");
-            if (ot && ot->get("index")) {
-                oc_tex = ot->get("index")->numi(-1);
-                const JsonNode* os = ot->get("strength");
-                if (os) occ = static_cast<float>(os->num());
-            }
-            const JsonNode* ef = m.get("emissiveFactor");
-            if (ef && ef->is_arr() && ef->size() >= 3) {
-                emiss[0] = static_cast<float>(ef->arr[0].num());
-                emiss[1] = static_cast<float>(ef->arr[1].num());
-                emiss[2] = static_cast<float>(ef->arr[2].num());
-            }
-            const JsonNode* et = m.get("emissiveTexture");
-            if (et && et->get("index")) em_tex = et->get("index")->numi(-1);
-            const JsonNode* ac = m.get("alphaCutoff");
-            if (ac) alpha_cutoff = static_cast<float>(ac->num());
-            const JsonNode* ds = m.get("doubleSided");
-            if (ds) dside = ds->b;
-            doc.mat_diffuse.push_back(d[0]); doc.mat_diffuse.push_back(d[1]); doc.mat_diffuse.push_back(d[2]);
-            doc.mat_opacity.push_back(op);
-            doc.mat_base_tex.push_back(tex);
-            doc.mat_metalness.push_back(metal);
-            doc.mat_roughness.push_back(rough);
-            doc.mat_occlusion.push_back(occ);
-            doc.mat_emissive.push_back(emiss[0]); doc.mat_emissive.push_back(emiss[1]); doc.mat_emissive.push_back(emiss[2]);
-            doc.mat_metalrough_tex.push_back(mr_tex);
-            doc.mat_normal_tex.push_back(nm_tex);
-            doc.mat_normal_scale.push_back(nm_scale);
-            doc.mat_occl_tex.push_back(oc_tex);
-            doc.mat_emissive_tex.push_back(em_tex);
-            doc.mat_alpha_cutoff.push_back(alpha_cutoff);
-            doc.mat_alpha_mode.push_back(alpha_mode);
-            doc.mat_double_sided.push_back(dside);
-        }
-    }
-
-    // textures -> images
-    const JsonNode* textures = root.get("textures");
-    if (textures && textures->is_arr()) {
-        for (const auto& t : textures->arr) {
-            doc.tex_image.push_back(t.get("source") ? t.get("source")->numi(-1) : -1);
-        }
-    }
-
-    // images
-    const JsonNode* images = root.get("images");
-    if (images && images->is_arr()) {
-        for (const auto& im : images->arr) {
-            doc.img_names.push_back(im.get("name") ? im.get("name")->str("") : "");
-            doc.img_mime.push_back(im.get("mimeType") ? im.get("mimeType")->str("image/png") : "image/png");
-            const JsonNode* bv = im.get("bufferView");
-            if (bv) {
-                int view = bv->numi(-1);
-                if (view >= 0 && view < (int)doc.bufferViews.size()) {
-                    const auto& vb = doc.bufferViews[view];
-                    int off = vb.byteOffset;
-                    int len = vb.byteLength;
-                    if (off + len <= (int)bin_len) {
-                        doc.img_data.emplace_back(bin + off, bin + off + len);
-                        continue;
-                    }
-                }
-            }
-            const JsonNode* uri = im.get("uri");
-            if (uri && uri->is_str()) {
-                const std::string& u = uri->s;
-                if (u.rfind("data:", 0) == 0) {
-                    // data:image/png;base64,...
-                    size_t comma = u.find(',');
-                    if (comma != std::string::npos) {
-                        std::vector<uint8_t> raw;
-                        decode_base64(u.substr(comma + 1), raw);
-                        doc.img_data.push_back(std::move(raw));
-                        continue;
-                    }
-                } else if (!base_dir.empty()) {
-                    // external image file relative to the .gltf
-                    std::ifstream ifile(base_dir + "/" + u, std::ios::binary | std::ios::ate);
-                    if (ifile) {
-                        std::streamsize isz = ifile.tellg();
-                        ifile.seekg(0);
-                        std::vector<uint8_t> raw(static_cast<size_t>(isz));
-                        if (isz > 0) ifile.read(reinterpret_cast<char*>(raw.data()), isz);
-                        doc.img_data.push_back(std::move(raw));
-                        // infer the mime type from the extension when unspecified
-                        size_t dot = u.find_last_of('.');
-                        std::string ext = dot == std::string::npos ? "" : u.substr(dot + 1);
-                        for (auto& c : ext) c = (char)tolower((unsigned char)c);
-                        if (ext == "jpg" || ext == "jpeg" || ext == "webp")
-                            doc.img_mime.back() = "image/jpeg";
-                        continue;
-                    }
-                }
-            }
-            doc.img_data.emplace_back(); // no payload
-        }
-    }
-
-    return true;
-}
-
-// Read a single accessor as floats (normalized handled for u16/u8 joints).
-bool read_accessor(const GltfDocument& doc, int idx, const uint8_t* bin, size_t bin_len, std::vector<float>& out) {
-    if (idx < 0 || idx >= (int)doc.accessors.size()) return false;
-    const auto& ac = doc.accessors[idx];
-    if (ac.bufferView < 0 || ac.bufferView >= (int)doc.bufferViews.size()) return false;
-    const auto& bv = doc.bufferViews[ac.bufferView];
-    if (bv.buffer != 0) return false;
-    size_t base = static_cast<size_t>(bv.byteOffset) + static_cast<size_t>(ac.byteOffset);
-    if (base >= bin_len) return false;
-    const int comps = component_count(ac.type);
-    const int csize = component_size(ac.componentType);
-    const int stride = bv.byteStride > 0 ? bv.byteStride : comps * csize;
-    out.reserve(static_cast<size_t>(ac.count) * comps);
-    for (int i = 0; i < ac.count; ++i) {
-        const uint8_t* p = bin + base + static_cast<size_t>(i) * stride;
-        for (int c = 0; c < comps; ++c) {
-            const uint8_t* q = p + static_cast<size_t>(c) * csize;
-            switch (ac.componentType) {
-                case 5126: { float v; std::memcpy(&v, q, 4); out.push_back(v); break; }
-                case 5123: { uint16_t v = static_cast<uint16_t>(q[0] | (q[1] << 8)); out.push_back(ac.normalized ? v / 65535.0f : (float)v); break; }
-                case 5125: { uint32_t v = static_cast<uint32_t>(q[0] | (q[1] << 8) | (q[2] << 16) | (q[3] << 24)); out.push_back((float)v); break; }
-                case 5121: { out.push_back((float)*q); break; }
-                case 5120: { out.push_back((float)(int8_t)*q); break; }
-                case 5122: { int16_t v = static_cast<int16_t>(q[0] | (q[1] << 8)); out.push_back((float)v); break; }
-                default: out.push_back(0.0f);
-            }
+            dst[c] = val;
         }
     }
     return true;
 }
 
-// Decompose a column-major 4x4 into TRS (matches glTF column-major order).
-void mat_decompose_col(const float m[16], float t[3], float q[4], float s[3]) {
-    t[0] = m[12]; t[1] = m[13]; t[2] = m[14];
-    s[0] = std::sqrt(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);
-    s[1] = std::sqrt(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]);
-    s[2] = std::sqrt(m[8]*m[8] + m[9]*m[9] + m[10]*m[10]);
-    if (s[0] < 1e-8f) s[0] = 1.0f; if (s[1] < 1e-8f) s[1] = 1.0f; if (s[2] < 1e-8f) s[2] = 1.0f;
-    float r[9] = {m[0]/s[0], m[1]/s[0], m[2]/s[0],
-                  m[4]/s[1], m[5]/s[1], m[6]/s[1],
-                  m[8]/s[2], m[9]/s[2], m[10]/s[2]};
-    float trace = r[0] + r[5] + r[10];
-    if (trace > 0.0f) {
-        float S = std::sqrt(trace + 1.0f) * 2.0f;
-        q[0] = (r[7] - r[6]) / S; q[1] = (r[2] - r[8]) / S; q[2] = (r[3] - r[1]) / S; q[3] = 0.25f * S;
-    } else if (r[0] > r[5] && r[0] > r[10]) {
-        float S = std::sqrt(1.0f + r[0] - r[5] - r[10]) * 2.0f;
-        q[0] = 0.25f * S; q[1] = (r[3] + r[1]) / S; q[2] = (r[2] + r[8]) / S; q[3] = (r[7] - r[6]) / S;
-    } else if (r[5] > r[10]) {
-        float S = std::sqrt(1.0f + r[5] - r[0] - r[10]) * 2.0f;
-        q[0] = (r[3] + r[1]) / S; q[1] = 0.25f * S; q[2] = (r[7] + r[6]) / S; q[3] = (r[2] - r[8]) / S;
-    } else {
-        float S = std::sqrt(1.0f + r[10] - r[0] - r[5]) * 2.0f;
-        q[0] = (r[2] + r[8]) / S; q[1] = (r[7] + r[6]) / S; q[2] = 0.25f * S; q[3] = (r[3] - r[1]) / S;
+static int find_attribute_accessor(const tg3_primitive* prim, const char* name) {
+    if (!prim || !prim->attributes || !name) return -1;
+    size_t name_len = std::strlen(name);
+    for (uint32_t i = 0; i < prim->attributes_count; ++i) {
+        if (prim->attributes[i].key.len == name_len &&
+            std::strncmp(prim->attributes[i].key.data, name, name_len) == 0) {
+            return prim->attributes[i].value;
+        }
     }
-    float n = std::sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-    if (n > 1e-8f) { q[0] /= n; q[1] /= n; q[2] /= n; q[3] /= n; }
-    if (n == 0.0f) q[3] = 1.0f;
+    return -1;
 }
 
-} // namespace
+static int find_uv_accessor(const tg3_model* model, const tg3_primitive* prim, int mat_idx) {
+    if (mat_idx >= 0 && mat_idx < (int32_t)model->materials_count) {
+        const tg3_material* mat = &model->materials[mat_idx];
+        int tc = mat->pbr_metallic_roughness.base_color_texture.tex_coord;
+        if (tc > 0) {
+            std::string attr = "TEXCOORD_" + std::to_string(tc);
+            int acc = find_attribute_accessor(prim, attr.c_str());
+            if (acc >= 0) return acc;
+        }
+    }
+    int acc = find_attribute_accessor(prim, "TEXCOORD_0");
+    if (acc < 0) acc = find_attribute_accessor(prim, "TEXCOORD");
+    if (acc < 0) acc = find_attribute_accessor(prim, "TEXCOORD_1");
+    if (acc < 0) acc = find_attribute_accessor(prim, "TEXCOORD_2");
+    return acc;
+}
 
-// Shared rebuild (defined below): parsed GltfDocument → PODModel + PBR info.
-static bool build_pod_from_doc(const GltfDocument& doc, const uint8_t* bin, size_t bin_len,
+static std::string tg3_to_string(const tg3_str& s) {
+    if (!s.data || s.len == 0) return "";
+    return std::string(s.data, s.len);
+}
+
+// ─── Rebuild PODModel from tg3_model ───────────────────────────────────
+static bool build_pod_from_tg3(const tg3_model* model,
                                PODModel& out, std::vector<GLTFImageBuffer>& images,
-                               GLTFPBRInfo* pbr, std::string* err);
+                               GLTFPBRInfo* pbr, std::string* err, float scale = 1.0f) {
+    (void)err;
+    if (!model) return false;
 
-// Parse a GLB file into a PODModel (+ PBR info). See gltf_glb.h.
-bool gltf_import_glb(const std::string& path, PODModel& out,
-                     std::vector<GLTFImageBuffer>& images, std::string* err,
-                     GLTFPBRInfo* pbr) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) { if (err) *err = "cannot open: " + path; return false; }
-    std::streamsize size = f.tellg();
-    f.seekg(0);
-    std::vector<uint8_t> file(static_cast<size_t>(size));
-    if (size > 0) f.read(reinterpret_cast<char*>(file.data()), size);
-    if (!f) { if (err) *err = "read failed"; return false; }
-
-    // GLB container: magic, version, length, then chunks.
-    if (file.size() < 12 || std::memcmp(file.data(), "glTF", 4) != 0) {
-        if (err) *err = "not a GLB file"; return false;
+    std::vector<int> parent_of(model->nodes_count, -1);
+    for (uint32_t i = 0; i < model->nodes_count; ++i) {
+        const tg3_node* n = &model->nodes[i];
+        for (uint32_t c = 0; c < n->children_count; ++c) {
+            int32_t child_idx = n->children[c];
+            if (child_idx >= 0 && child_idx < (int32_t)model->nodes_count) {
+                parent_of[child_idx] = (int)i;
+            }
+        }
     }
-    uint32_t ver = (uint32_t)file[4] | ((uint32_t)file[5] << 8) | ((uint32_t)file[6] << 16) | ((uint32_t)file[7] << 24);
-    if (ver != 2) { if (err) *err = "unsupported GLB version"; return false; }
-
-    const uint8_t* json = nullptr;
-    size_t json_len = 0;
-    const uint8_t* bin = nullptr;
-    size_t bin_len = 0;
-
-    size_t pos = 12;
-    int chunk = 0;
-    while (pos + 8 <= file.size() && chunk < 2) {
-        uint32_t len = (uint32_t)file[pos] | ((uint32_t)file[pos+1] << 8) | ((uint32_t)file[pos+2] << 16) | ((uint32_t)file[pos+3] << 24);
-        std::string type((const char*)file.data() + pos + 4, 4);
-        if (type == "JSON" && !json) { json = file.data() + pos + 8; json_len = len; }
-        else if (type.rfind("BIN", 0) == 0 && !bin) { bin = file.data() + pos + 8; bin_len = len; }
-        ++chunk;
-        pos += 8 + len;
-    }
-    if (!json) { if (err) *err = "missing JSON chunk"; return false; }
-
-    GltfDocument doc;
-    if (!parse_document(json, json_len, bin, bin_len, std::string(), doc, nullptr)) {
-        if (err) *err = "failed to parse glTF JSON"; return false;
-    }
-    return build_pod_from_doc(doc, bin, bin_len, out, images, pbr, err);
-}
-
-// Parse a bare .gltf (JSON) — external buffer/image URIs resolved relative to
-// the file. See gltf_glb.h.
-bool gltf_import_gltf(const std::string& path, PODModel& out,
-                      std::vector<GLTFImageBuffer>& images, std::string* err,
-                      GLTFPBRInfo* pbr) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) { if (err) *err = "cannot open: " + path; return false; }
-    std::streamsize size = f.tellg();
-    f.seekg(0);
-    std::vector<uint8_t> file(static_cast<size_t>(size));
-    if (size > 0) f.read(reinterpret_cast<char*>(file.data()), size);
-    if (!f) { if (err) *err = "read failed"; return false; }
-
-    std::string base_dir;
-    size_t slash = path.find_last_of('/');
-    if (slash != std::string::npos) base_dir = path.substr(0, slash);
-
-    std::vector<uint8_t> ext_bin;
-    GltfDocument doc;
-    if (!parse_document(file.data(), file.size(), nullptr, 0, base_dir, doc, &ext_bin)) {
-        if (err) *err = "failed to parse glTF JSON"; return false;
-    }
-    const uint8_t* bin = ext_bin.empty() ? nullptr : ext_bin.data();
-    return build_pod_from_doc(doc, bin, ext_bin.size(), out, images, pbr, err);
-}
-
-// ── Rebuild PODModel ──────────────────────────────────────────────────
-static bool build_pod_from_doc(const GltfDocument& doc, const uint8_t* bin, size_t bin_len,
-                               PODModel& out, std::vector<GLTFImageBuffer>& images,
-                               GLTFPBRInfo* pbr, std::string* err) {
-    (void)err;   // parse/load failures are reported by the entry points
-    std::vector<int> parent_of(doc.nodes.size(), -1);
-    for (size_t i = 0; i < doc.nodes.size(); ++i)
-        for (int c : doc.nodes[i].children)
-            if (c >= 0 && c < (int)doc.nodes.size()) parent_of[c] = static_cast<int>(i);
 
     std::vector<float> accbuf;
-    auto load = [&](int acc_idx) -> const std::vector<float>& {
+    auto load = [&](int32_t acc_idx) -> const std::vector<float>& {
         accbuf.clear();
-        if (!read_accessor(doc, acc_idx, bin, bin_len, accbuf)) accbuf.clear();
+        if (!read_accessor_floats(model, acc_idx, accbuf)) accbuf.clear();
         return accbuf;
     };
 
-    // ── Meshes ─────────────────────────────────────────────────────────
     out.meshes.clear();
-    for (const auto& gm : doc.meshes) {
-        for (const auto& p : gm.prims) {
+    for (uint32_t mi = 0; mi < model->meshes_count; ++mi) {
+        const tg3_mesh* gm = &model->meshes[mi];
+        for (uint32_t pi = 0; pi < gm->primitives_count; ++pi) {
+            const tg3_primitive* p = &gm->primitives[pi];
             PODMesh m;
-            const std::vector<float>& pos = load(p.pos);
+
+            int pos_acc = find_attribute_accessor(p, "POSITION");
+            const std::vector<float>& pos = load(pos_acc);
             if (!pos.empty()) {
-                int nv = doc.accessors[p.pos].count;
-                m.num_vertices = nv;
                 m.positions = pos;
+                m.num_vertices = (int)(pos.size() / 3);
             }
-            const std::vector<float>& nrm = load(p.nrm);
+
+            int nrm_acc = find_attribute_accessor(p, "NORMAL");
+            const std::vector<float>& nrm = load(nrm_acc);
             if (!nrm.empty()) m.normals = nrm;
-            const std::vector<float>& uv = load(p.uv);
+
+            int uv_acc = find_uv_accessor(model, p, p->material);
+            const std::vector<float>& uv = load(uv_acc);
             if (!uv.empty()) m.uvs = uv;
-            const std::vector<float>& tng = load(p.tangent);
+
+            int tng_acc = find_attribute_accessor(p, "TANGENT");
+            const std::vector<float>& tng = load(tng_acc);
             if (!tng.empty()) m.tangents = tng;
-            const std::vector<float>& idx = load(p.idx);
+
+            const std::vector<float>& idx = load(p->indices);
             if (!idx.empty()) {
                 m.indices.reserve(idx.size());
                 for (float x : idx) m.indices.push_back(static_cast<uint32_t>(x));
                 m.num_faces = static_cast<int>(m.indices.size() / 3);
             }
 
-            // skinning
-            const std::vector<float>& joints = load(p.joints);
-            const std::vector<float>& weights = load(p.weights);
+            int joints_acc = find_attribute_accessor(p, "JOINTS_0");
+            int weights_acc = find_attribute_accessor(p, "WEIGHTS_0");
+            const std::vector<float>& joints = load(joints_acc);
+            const std::vector<float>& weights = load(weights_acc);
+
             if (!joints.empty() && m.num_vertices > 0) {
-                // joints component count from accessor type
-                int jcomps = (p.joints >= 0 && p.joints < (int)doc.accessors.size())
-                             ? component_count(doc.accessors[p.joints].type) : 4;
+                int jcomps = 4;
+                if (joints_acc >= 0 && joints_acc < (int32_t)model->accessors_count) {
+                    if (model->accessors[joints_acc].type == TG3_TYPE_VEC4) jcomps = 4;
+                    else if (model->accessors[joints_acc].type == TG3_TYPE_VEC3) jcomps = 3;
+                    else if (model->accessors[joints_acc].type == TG3_TYPE_VEC2) jcomps = 2;
+                    else jcomps = 1;
+                }
                 int nverts = m.num_vertices;
                 int max_inf = 0;
                 for (int v = 0; v < nverts; ++v) {
                     int infl = 0;
                     for (int k = 0; k < jcomps; ++k) {
                         size_t i = (size_t)v * jcomps + k;
-                        float w = weights.size() > i ? weights[i] : 0.0f;
+                        float w = (weights.size() > i) ? weights[i] : 0.0f;
                         if (w > 0.0f) infl = k + 1;
                     }
                     max_inf = std::max(max_inf, infl);
@@ -820,8 +229,8 @@ static bool build_pod_from_doc(const GltfDocument& doc, const uint8_t* bin, size
                     for (int k = 0; k < max_inf; ++k) {
                         size_t src = (size_t)v * jcomps + k;
                         size_t dst = (size_t)v * max_inf + k;
-                        m.bone_indices[dst] = joints.size() > src ? joints[src] : 0.0f;
-                        m.bone_weights[dst] = weights.size() > src ? weights[src] : 0.0f;
+                        m.bone_indices[dst] = (joints.size() > src) ? joints[src] : 0.0f;
+                        m.bone_weights[dst] = (weights.size() > src) ? weights[src] : 0.0f;
                     }
                 }
                 m.has_bone_batches = true;
@@ -829,246 +238,687 @@ static bool build_pod_from_doc(const GltfDocument& doc, const uint8_t* bin, size
                 m.bone_batches.offsets = {0};
                 m.bone_batches.counts = {1};
                 m.bone_batches.max_bones = 1;
-                // indices filled per-skin below once node→skin known
+            }
+
+            if (scale != 1.0f && scale > 0.0f) {
+                for (float& pv : m.positions) pv *= scale;
             }
 
             m.num_vertices = m.num_vertices ? m.num_vertices : (int)(m.positions.size() / 3);
             if (m.num_vertices == 0 && !m.positions.empty()) m.num_vertices = (int)(m.positions.size() / 3);
             if (m.num_faces == 0) m.num_faces = m.indices.empty()
-                ? (m.num_vertices > 0 ? m.num_vertices / 3 : 0)   // non-indexed triangle soup
+                ? (m.num_vertices > 0 ? m.num_vertices / 3 : 0)
                 : (int)(m.indices.size() / 3);
+
+            float m_minx =  1e30f, m_miny =  1e30f, m_minz =  1e30f;
+            float m_maxx = -1e30f, m_maxy = -1e30f, m_maxz = -1e30f;
+            for (size_t i = 0; i + 2 < m.positions.size(); i += 3) {
+                float px = m.positions[i + 0];
+                float py = m.positions[i + 1];
+                float pz = m.positions[i + 2];
+                m_minx = std::min(m_minx, px); m_maxx = std::max(m_maxx, px);
+                m_miny = std::min(m_miny, py); m_maxy = std::max(m_maxy, py);
+                m_minz = std::min(m_minz, pz); m_maxz = std::max(m_maxz, pz);
+            }
+            if (m.num_vertices > 0) {
+                m.min_x = m_minx; m.max_x = m_maxx;
+                m.min_y = m_miny; m.max_y = m_maxy;
+                m.min_z = m_minz; m.max_z = m_maxz;
+            }
+
             out.meshes.push_back(std::move(m));
         }
     }
 
-    // ── Nodes ──────────────────────────────────────────────────────────
     out.nodes.clear();
-    // glTF mesh index -> POD mesh index. Shared glTF meshes share one POD mesh.
-    std::vector<int> pod_mesh_of_gltf_mesh(doc.meshes.size(), -1);
+    std::vector<int> pod_mesh_of_gltf_mesh(model->meshes_count, -1);
     {
         int cursor = 0;
-        for (size_t m = 0; m < doc.meshes.size(); ++m) {
+        for (uint32_t m = 0; m < model->meshes_count; ++m) {
             pod_mesh_of_gltf_mesh[m] = cursor;
-            cursor += (int)doc.meshes[m].prims.size();
+            cursor += (int)model->meshes[m].primitives_count;
         }
     }
-    std::vector<int> node_mesh_begin(doc.nodes.size(), -1);
-    std::vector<int> node_mesh_end(doc.nodes.size(), -1);
-    for (size_t n = 0; n < doc.nodes.size(); ++n) {
-        if (doc.nodes[n].mesh >= 0 && doc.nodes[n].mesh < (int)doc.meshes.size()) {
-            int m = doc.nodes[n].mesh;
+
+    std::vector<int> mesh_gltf_nodes;
+    std::vector<int> other_gltf_nodes;
+    for (uint32_t i = 0; i < model->nodes_count; ++i) {
+        if (model->nodes[i].mesh >= 0 && model->nodes[i].mesh < (int32_t)model->meshes_count) {
+            mesh_gltf_nodes.push_back(static_cast<int>(i));
+        } else {
+            other_gltf_nodes.push_back(static_cast<int>(i));
+        }
+    }
+
+    std::vector<int> gltf_to_pod_node(model->nodes_count, -1);
+    for (size_t k = 0; k < mesh_gltf_nodes.size(); ++k) {
+        gltf_to_pod_node[mesh_gltf_nodes[k]] = static_cast<int>(k);
+    }
+    for (size_t k = 0; k < other_gltf_nodes.size(); ++k) {
+        gltf_to_pod_node[other_gltf_nodes[k]] = static_cast<int>(mesh_gltf_nodes.size() + k);
+    }
+
+    std::vector<bool> is_joint(model->nodes_count, false);
+    for (uint32_t si = 0; si < model->skins_count; ++si) {
+        const tg3_skin* skin = &model->skins[si];
+        for (uint32_t j = 0; j < skin->joints_count; ++j) {
+            int32_t ji = skin->joints[j];
+            if (ji >= 0 && ji < (int32_t)is_joint.size()) is_joint[ji] = true;
+        }
+    }
+
+    std::vector<int> node_mesh_begin(model->nodes_count, -1);
+    std::vector<int> node_mesh_end(model->nodes_count, -1);
+    for (uint32_t n = 0; n < model->nodes_count; ++n) {
+        if (model->nodes[n].mesh >= 0 && model->nodes[n].mesh < (int32_t)model->meshes_count) {
+            int m = model->nodes[n].mesh;
             node_mesh_begin[n] = pod_mesh_of_gltf_mesh[m];
-            node_mesh_end[n] = pod_mesh_of_gltf_mesh[m] + (int)doc.meshes[m].prims.size();
+            node_mesh_end[n] = pod_mesh_of_gltf_mesh[m] + (int)model->meshes[m].primitives_count;
         }
     }
 
-    for (size_t i = 0; i < doc.nodes.size(); ++i) {
-        const GltfNode& gn = doc.nodes[i];
+    out.nodes.resize(model->nodes_count);
+    for (uint32_t i = 0; i < model->nodes_count; ++i) {
+        int pod_idx = gltf_to_pod_node[i];
+        const tg3_node* gn = &model->nodes[i];
         PODNode n;
-        n.name = gn.name;
-        n.parent_index = parent_of[i];
-        if (gn.mesh >= 0 && gn.mesh < (int)doc.meshes.size()) {
-            n.object_index = pod_mesh_of_gltf_mesh[gn.mesh];
-            // POD stores the material on the mesh node; exporter wrote it as the
-            // prim's material, so recover it from the first prim of the node's mesh.
-            if (!doc.meshes[gn.mesh].prims.empty())
-                n.material_index = doc.meshes[gn.mesh].prims[0].material;
+        std::string name = tg3_to_string(gn->name);
+        for (char& c : name) {
+            if (c == ':' || c == '/' || c == '\\') c = '_';
         }
-        if (gn.has_matrix) {
+        if (is_joint[i]) {
+            if (name.rfind("Bone", 0) != 0 &&
+                name.rfind("Control", 0) != 0 &&
+                name != "CenterPoint") {
+                if (name.empty()) name = "Bone_" + std::to_string(i);
+                else name = "Bone_" + name;
+            }
+        }
+        n.name = name;
+        int orig_parent = parent_of[i];
+        n.parent_index = (orig_parent >= 0 && orig_parent < (int)gltf_to_pod_node.size())
+                         ? gltf_to_pod_node[orig_parent] : -1;
+
+        if (gn->mesh >= 0 && gn->mesh < (int32_t)model->meshes_count) {
+            n.object_index = pod_mesh_of_gltf_mesh[gn->mesh];
+            if (model->meshes[gn->mesh].primitives_count > 0)
+                n.material_index = model->meshes[gn->mesh].primitives[0].material;
+        } else {
+            n.object_index = -1;
+            n.material_index = -1;
+        }
+
+        if (gn->has_matrix) {
             n.has_matrix = true;
-            // glTF matrix is column-major; POD stores row-major? POD is column-major too
-            // (get_node_matrix writes local[col*4+row] style). Store raw.
-            std::memcpy(n.matrix, gn.matrix, 16 * sizeof(float));
-        } else if (gn.has_trs) {
+            for (int k = 0; k < 16; ++k) n.matrix[k] = (float)gn->matrix[k];
+            // Apply opts.scale to world-space position only (translation column).
+            // Do NOT scale the upper 3x3: that would square the scale for any
+            // root node carrying an authored scale (unit-convert, assemblies).
+            if (scale != 1.0f && orig_parent == -1) {
+                n.matrix[12] *= scale;
+                n.matrix[13] *= scale;
+                n.matrix[14] *= scale;
+            }
+        } else {
             n.has_translation = true;
-            std::memcpy(n.translation, gn.translation, sizeof(float) * 3);
+            n.translation[0] = (float)gn->translation[0];
+            n.translation[1] = (float)gn->translation[1];
+            n.translation[2] = (float)gn->translation[2];
+
             n.has_rotation = true;
-            std::memcpy(n.rotation, gn.rotation, sizeof(float) * 4);
+            n.rotation[0] = (float)gn->rotation[0];
+            n.rotation[1] = (float)gn->rotation[1];
+            n.rotation[2] = (float)gn->rotation[2];
+            n.rotation[3] = (float)gn->rotation[3];
+
             n.has_scale = true;
-            std::memcpy(n.scale, gn.scale, sizeof(float) * 3);
+            n.scale[0] = (float)gn->scale[0];
+            n.scale[1] = (float)gn->scale[1];
+            n.scale[2] = (float)gn->scale[2];
+
+            // Scale world-space translation only. The node's own scale channel
+            // must stay authored (it scales children); scaling it here would
+            // double-apply opts.scale to the whole subtree.
+            if (scale != 1.0f && orig_parent == -1) {
+                n.translation[0] *= scale;
+                n.translation[1] *= scale;
+                n.translation[2] *= scale;
+            }
         }
-        out.nodes.push_back(std::move(n));
+        out.nodes[pod_idx] = std::move(n);
     }
 
-    // ── Skins: fill bone batches from skin.joints ──────────────────────
-    for (size_t i = 0; i < doc.nodes.size(); ++i) {
-        if (doc.nodes[i].skin < 0 || doc.nodes[i].skin >= (int)doc.skins.size()) continue;
-        const auto& skin = doc.skins[doc.nodes[i].skin];
-        if (skin.joints.empty()) continue;
+    out.num_mesh_nodes = static_cast<int>(mesh_gltf_nodes.size());
+
+    for (uint32_t i = 0; i < model->nodes_count; ++i) {
+        if (model->nodes[i].skin < 0 || model->nodes[i].skin >= (int32_t)model->skins_count) continue;
+        const tg3_skin* skin = &model->skins[model->nodes[i].skin];
+        if (skin->joints_count == 0) continue;
         int mesh_begin = node_mesh_begin[i];
         int mesh_end = node_mesh_end[i];
         if (mesh_begin < 0) continue;
         for (int mi = mesh_begin; mi < mesh_end; ++mi) {
             PODMesh& m = out.meshes[mi];
             if (m.bones_per_vertex <= 0) continue;
-            m.bone_batches.indices.assign(skin.joints.begin(), skin.joints.end());
-            m.bone_batches.counts = {static_cast<uint32_t>(skin.joints.size())};
+            std::vector<uint32_t> remapped_joints;
+            remapped_joints.reserve(skin->joints_count);
+            for (uint32_t j = 0; j < skin->joints_count; ++j) {
+                int32_t ji = skin->joints[j];
+                int rj = (ji >= 0 && ji < (int)gltf_to_pod_node.size()) ? gltf_to_pod_node[ji] : ji;
+                remapped_joints.push_back(static_cast<uint32_t>(rj));
+            }
+            m.bone_batches.indices = std::move(remapped_joints);
+            m.bone_batches.counts = {static_cast<uint32_t>(m.bone_batches.indices.size())};
             m.bone_batches.offsets = {0};
             m.bone_batches.count = 1;
-            m.bone_batches.max_bones = static_cast<int>(skin.joints.size());
+            m.bone_batches.max_bones = static_cast<int>(m.bone_batches.indices.size());
             m.has_bone_batches = true;
         }
     }
 
-    // ── Materials / textures ───────────────────────────────────────────
-    out.materials.clear();
-    out.texture_filenames.clear();
     images.clear();
-    for (size_t i = 0; i < doc.mat_names.size(); ++i) {
-        PODMaterial mat;
-        mat.name = doc.mat_names[i];
-        mat.diffuse[0] = doc.mat_diffuse[i * 3 + 0];
-        mat.diffuse[1] = doc.mat_diffuse[i * 3 + 1];
-        mat.diffuse[2] = doc.mat_diffuse[i * 3 + 2];
-        mat.opacity = doc.mat_opacity[i];
-        int tex = doc.mat_base_tex[i];
-        if (tex >= 0 && tex < (int)doc.tex_image.size()) {
-            int img = doc.tex_image[tex];
-            if (img >= 0 && img < (int)doc.img_data.size() && !doc.img_data[img].empty()) {
-                // find or create POD texture filename
-                std::string name = doc.img_names[img];
-                if (name.empty()) name = "texture" + std::to_string(i) + ".png";
-                auto it = std::find(out.texture_filenames.begin(), out.texture_filenames.end(), name);
-                int ti = (int)(it - out.texture_filenames.begin());
-                if (it == out.texture_filenames.end()) {
-                    out.texture_filenames.push_back(name);
-                    GLTFImageBuffer ib;
-                    ib.mime = doc.img_mime[img];
-                    ib.data = doc.img_data[img];
-                    images.push_back(std::move(ib));
-                }
-                mat.diffuse_texture_index = ti;
+    std::vector<std::string> loaded_img_names(model->images_count);
+    for (uint32_t img_idx = 0; img_idx < model->images_count; ++img_idx) {
+        const tg3_image* img = &model->images[img_idx];
+        std::string name = tg3_to_string(img->name);
+        if (name.empty()) {
+            std::string uri = tg3_to_string(img->uri);
+            if (!uri.empty()) {
+                size_t slash = uri.find_last_of("/\\");
+                name = (slash != std::string::npos) ? uri.substr(slash + 1) : uri;
             }
         }
-        out.materials.push_back(std::move(mat));
+        if (name.empty()) name = "texture" + std::to_string(img_idx) + ".png";
+        loaded_img_names[img_idx] = name;
+
+        GLTFImageBuffer ib;
+        ib.mime = tg3_to_string(img->mime_type);
+        if (img->image.data && img->image.count > 0) {
+            ib.data.assign(img->image.data, img->image.data + img->image.count);
+        } else if (img->buffer_view >= 0 && img->buffer_view < (int32_t)model->buffer_views_count) {
+            const tg3_buffer_view* bv = &model->buffer_views[img->buffer_view];
+            if (bv->buffer >= 0 && bv->buffer < (int32_t)model->buffers_count) {
+                const tg3_buffer* buf = &model->buffers[bv->buffer];
+                if (buf->data.data && bv->byte_offset + bv->byte_length <= buf->data.count) {
+                    ib.data.assign(buf->data.data + bv->byte_offset,
+                                   buf->data.data + bv->byte_offset + bv->byte_length);
+                }
+            }
+        }
+        images.push_back(std::move(ib));
     }
 
-    // ── PBR material info (optional) ───────────────────────────────────
+    out.materials.clear();
+    out.texture_filenames.clear();
+    for (uint32_t mi = 0; mi < model->materials_count; ++mi) {
+        const tg3_material* mat = &model->materials[mi];
+        PODMaterial pm;
+        pm.name = tg3_to_string(mat->name);
+        pm.diffuse[0] = (float)mat->pbr_metallic_roughness.base_color_factor[0];
+        pm.diffuse[1] = (float)mat->pbr_metallic_roughness.base_color_factor[1];
+        pm.diffuse[2] = (float)mat->pbr_metallic_roughness.base_color_factor[2];
+        pm.opacity    = (float)mat->pbr_metallic_roughness.base_color_factor[3];
+
+        int32_t tex_idx = mat->pbr_metallic_roughness.base_color_texture.index;
+        if (tex_idx >= 0 && tex_idx < (int32_t)model->textures_count) {
+            int32_t src_img = model->textures[tex_idx].source;
+            if (src_img >= 0 && src_img < (int32_t)loaded_img_names.size()) {
+                std::string tname = loaded_img_names[src_img];
+                auto it = std::find(out.texture_filenames.begin(), out.texture_filenames.end(), tname);
+                int ti = (int)(it - out.texture_filenames.begin());
+                if (it == out.texture_filenames.end()) {
+                    out.texture_filenames.push_back(tname);
+                }
+                pm.diffuse_texture_index = ti;
+            }
+        }
+        out.materials.push_back(std::move(pm));
+    }
+
     if (pbr) {
         pbr->materials.clear();
         pbr->images.clear();
-        pbr->image_gltf_index.clear();
-        std::vector<int> img_slot(doc.img_data.size(), -1);   // glTF image → payload
-        auto ensure_image = [&](int img) -> int {
-            if (img < 0 || img >= (int)doc.img_data.size()) return -1;
-            if (img_slot[img] >= 0) return img_slot[img];
-            if (doc.img_data[img].empty()) return -1;
-            int pi = (int)pbr->images.size();
-            GLTFPBRInfo::Image im;
-            im.mime = doc.img_mime[img];
-            im.data = doc.img_data[img];
-            pbr->images.push_back(std::move(im));
-            pbr->image_gltf_index.push_back(img);
-            img_slot[img] = pi;
-            return pi;
-        };
-        auto tex_to_img = [&](int tex_idx) -> int {
-            if (tex_idx < 0 || tex_idx >= (int)doc.tex_image.size()) return -1;
-            return ensure_image(doc.tex_image[tex_idx]);
-        };
-        for (size_t i = 0; i < doc.mat_names.size(); ++i) {
+        pbr->images.reserve(images.size());
+        for (const auto& img : images) {
+            GLTFPBRInfo::Image pimg;
+            pimg.mime = img.mime;
+            pimg.data = img.data;
+            pbr->images.push_back(std::move(pimg));
+        }
+        pbr->image_gltf_index.resize(images.size());
+        for (size_t k = 0; k < images.size(); ++k) pbr->image_gltf_index[k] = (int)k;
+
+        for (uint32_t mi = 0; mi < model->materials_count; ++mi) {
+            const tg3_material* mat = &model->materials[mi];
             GLTFPBRMaterial pm;
-            pm.base_color[0] = doc.mat_diffuse[i * 3 + 0];
-            pm.base_color[1] = doc.mat_diffuse[i * 3 + 1];
-            pm.base_color[2] = doc.mat_diffuse[i * 3 + 2];
-            pm.base_color[3] = doc.mat_opacity[i];
-            if (i < doc.mat_metalness.size()) {
-                pm.metallic = doc.mat_metalness[i];
-                pm.roughness = doc.mat_roughness[i];
-                pm.occlusion = doc.mat_occlusion[i];
-                pm.emissive[0] = doc.mat_emissive[i * 3 + 0];
-                pm.emissive[1] = doc.mat_emissive[i * 3 + 1];
-                pm.emissive[2] = doc.mat_emissive[i * 3 + 2];
-                pm.normal_scale = doc.mat_normal_scale[i];
-                pm.alpha_cutoff = doc.mat_alpha_cutoff[i];
-                pm.alpha_mode = doc.mat_alpha_mode[i];
-                pm.double_sided = doc.mat_double_sided[i];
-                pm.base_tex = tex_to_img(doc.mat_base_tex[i]);
-                pm.metalrough_tex = tex_to_img(i < doc.mat_metalrough_tex.size() ? doc.mat_metalrough_tex[i] : -1);
-                pm.normal_tex = tex_to_img(i < doc.mat_normal_tex.size() ? doc.mat_normal_tex[i] : -1);
-                pm.occl_tex = tex_to_img(i < doc.mat_occl_tex.size() ? doc.mat_occl_tex[i] : -1);
-                pm.emissive_tex = tex_to_img(i < doc.mat_emissive_tex.size() ? doc.mat_emissive_tex[i] : -1);
-            }
+            pm.base_color[0] = (float)mat->pbr_metallic_roughness.base_color_factor[0];
+            pm.base_color[1] = (float)mat->pbr_metallic_roughness.base_color_factor[1];
+            pm.base_color[2] = (float)mat->pbr_metallic_roughness.base_color_factor[2];
+            pm.base_color[3] = (float)mat->pbr_metallic_roughness.base_color_factor[3];
+            pm.metallic      = (float)mat->pbr_metallic_roughness.metallic_factor;
+            pm.roughness     = (float)mat->pbr_metallic_roughness.roughness_factor;
+            pm.occlusion     = (float)mat->occlusion_texture.strength;
+            pm.emissive[0]   = (float)mat->emissive_factor[0];
+            pm.emissive[1]   = (float)mat->emissive_factor[1];
+            pm.emissive[2]   = (float)mat->emissive_factor[2];
+            pm.normal_scale  = (float)mat->normal_texture.scale;
+            pm.alpha_cutoff  = (float)mat->alpha_cutoff;
+
+            std::string am_str = tg3_to_string(mat->alpha_mode);
+            if (am_str == "BLEND") pm.alpha_mode = 2;
+            else if (am_str == "MASK") pm.alpha_mode = 1;
+            else pm.alpha_mode = 0;
+
+            pm.double_sided  = mat->double_sided ? true : false;
+
+            auto tex_to_img = [&](int32_t t_idx) -> int {
+                if (t_idx < 0 || t_idx >= (int32_t)model->textures_count) return -1;
+                return model->textures[t_idx].source;
+            };
+
+            pm.base_tex        = tex_to_img(mat->pbr_metallic_roughness.base_color_texture.index);
+            pm.metalrough_tex  = tex_to_img(mat->pbr_metallic_roughness.metallic_roughness_texture.index);
+            pm.normal_tex      = tex_to_img(mat->normal_texture.index);
+            pm.occl_tex        = tex_to_img(mat->occlusion_texture.index);
+            pm.emissive_tex    = tex_to_img(mat->emissive_texture.index);
+
             pbr->materials.push_back(std::move(pm));
         }
     }
 
-    // ── Animations: dense per-frame streams ────────────────────────────
     out.num_frames = 0;
-    out.fps = 30.0f;
-    if (!doc.animations.empty()) {
-        // collect max time/key count across all samplers
-        int max_keys = 0;
-        for (const auto& anim : doc.animations)
-            for (const auto& s : anim.samplers) {
-                if (s.input < 0 || s.input >= (int)doc.accessors.size()) continue;
-                max_keys = std::max(max_keys, doc.accessors[s.input].count);
-            }
-        // determine fps from the first time accessor's spacing
-        if (max_keys > 0) {
-            float t0 = 0.0f, t1 = 0.0f;
-            for (const auto& anim : doc.animations)
-                for (const auto& s : anim.samplers) {
-                    if (s.input < 0) continue;
-                    const std::vector<float>& times = load(s.input);
-                    if (times.size() >= 2) { t0 = times[0]; t1 = times[1]; break; }
-                }
-            if (t1 > t0) {
-                float fps = std::round(1.0f / (t1 - t0));
-                if (fps >= 1.0f && fps <= 240.0f) out.fps = fps;
-            }
-            out.num_frames = max_keys;
-        }
+    out.fps = 0.0f;
+    out.total_vertices = 0;
+    out.total_faces = 0;
 
-        std::vector<int> node_has_anim(out.nodes.size(), 0);
-        for (const auto& anim : doc.animations) {
-            for (const auto& ch : anim.channels) {
-                if (ch.node < 0 || ch.node >= (int)out.nodes.size()) continue;
-                if (ch.sampler < 0 || ch.sampler >= (int)anim.samplers.size()) continue;
-                const auto& sm = anim.samplers[ch.sampler];
-                // load() returns a reference to a shared buffer; copy so later
-                // loads (output) don't invalidate the times data.
-                const std::vector<float>& times_ref = load(sm.input);
-                std::vector<float> times(times_ref.begin(), times_ref.end());
-                const std::vector<float>& vals = load(sm.output);
-                if (vals.empty()) continue;
-                int comps = 1;
-                if (ch.path == "translation" || ch.path == "scale") comps = 3;
-                else if (ch.path == "rotation") comps = 4;
-                PODNode& node = out.nodes[ch.node];
-                std::vector<float> dense((size_t)out.num_frames * comps, 0.0f);
-                // place keys at integer-frame times (times = k / fps)
-                for (size_t k = 0; k < times.size() && k < vals.size() / (size_t)comps; ++k) {
-                    int frame = static_cast<int>(std::lround(times[k] * out.fps));
-                    frame = std::clamp(frame, 0, out.num_frames - 1);
-                    for (int c = 0; c < comps; ++c)
-                        dense[(size_t)frame * comps + c] = vals[k * (size_t)comps + c];
-                }
-                if (ch.path == "translation") { node.anim_translation = dense; }
-                else if (ch.path == "rotation") { node.anim_rotation = dense; }
-                else if (ch.path == "scale") { node.anim_scale = dense; }
-                node_has_anim[ch.node] = 1;
-            }
-        }
-        // Any node with animation but no scale/rot channel still needs static defaults
-        for (size_t i = 0; i < out.nodes.size(); ++i) {
-            if (!node_has_anim[i]) continue;
-            PODNode& node = out.nodes[i];
-            if (node.anim_scale.empty() && node.anim_rotation.empty() && node.anim_translation.empty())
-                node_has_anim[i] = 0;
-        }
-    }
+    float minx =  1e30f, miny =  1e30f, minz =  1e30f;
+    float maxx = -1e30f, maxy = -1e30f, maxz = -1e30f;
 
-    out.num_mesh_nodes = 0;
-    for (size_t i = 0; i < out.nodes.size(); ++i)
-        if (out.nodes[i].object_index >= 0) out.num_mesh_nodes = (int)(i + 1);
-
-    // Node-less meshes still need valid mesh metadata
     for (auto& mesh : out.meshes) {
         if (mesh.num_vertices == 0) mesh.num_vertices = (int)(mesh.positions.size() / 3);
         if (mesh.num_faces == 0) mesh.num_faces = (int)(mesh.indices.size() / 3);
+        out.total_vertices += mesh.num_vertices;
+        out.total_faces    += mesh.num_faces;
+        if (mesh.num_vertices > 0) {
+            minx = std::min(minx, mesh.min_x); maxx = std::max(maxx, mesh.max_x);
+            miny = std::min(miny, mesh.min_y); maxy = std::max(maxy, mesh.max_y);
+            minz = std::min(minz, mesh.min_z); maxz = std::max(maxz, mesh.max_z);
+        }
     }
 
+    if (!out.meshes.empty() && out.total_vertices > 0) {
+        out.min_x = minx; out.max_x = maxx;
+        out.min_y = miny; out.max_y = maxy;
+        out.min_z = minz; out.max_z = maxz;
+        out.center_x = (minx + maxx) * 0.5f;
+        out.center_y = (miny + maxy) * 0.5f;
+        out.center_z = (minz + maxz) * 0.5f;
+        float dx = maxx - minx, dy = maxy - miny, dz = maxz - minz;
+        out.radius = 0.5f * std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (out.radius < 1.0f) out.radius = 1.0f;
+    }
+
+    return true;
+}
+
+} // namespace
+} // namespace av
+
+namespace av {
+
+bool gltf_import_glb(const std::string& path, PODModel& out,
+                     std::vector<GLTFImageBuffer>& images, std::string* err,
+                     GLTFPBRInfo* pbr, float scale) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) { if (err) *err = "cannot open: " + path; return false; }
+    std::streamsize size = f.tellg();
+    f.seekg(0);
+    std::vector<uint8_t> file(static_cast<size_t>(size));
+    if (size > 0) f.read(reinterpret_cast<char*>(file.data()), size);
+    if (!f) { if (err) *err = "read failed"; return false; }
+
+    tg3_model model;
+    tg3_error_stack errors;
+    std::memset(&model, 0, sizeof(model));
+    tg3_error_stack_init(&errors);
+
+    tg3_parse_options opts;
+    tg3_parse_options_init(&opts);
+    opts.strictness = TG3_PERMISSIVE;
+    opts.images_as_is = 1;
+
+    std::string base_dir;
+    size_t slash = path.find_last_of("/\\");
+    if (slash != std::string::npos) base_dir = path.substr(0, slash);
+
+    tg3_error_code code = tg3_parse_auto(&model, &errors, file.data(), file.size(),
+                                         base_dir.c_str(), (uint32_t)base_dir.size(), &opts);
+
+    if (code != TG3_OK) {
+        if (err) {
+            if (tg3_errors_count(&errors) > 0) {
+                *err = tg3_errors_get(&errors, 0)->message;
+            } else {
+                *err = "glTF parse error code " + std::to_string(code);
+            }
+        }
+        tg3_error_stack_free(&errors);
+        tg3_model_free(&model);
+        return false;
+    }
+
+    bool ok = build_pod_from_tg3(&model, out, images, pbr, err, scale);
+    tg3_error_stack_free(&errors);
+    tg3_model_free(&model);
+    return ok;
+}
+
+bool gltf_import_gltf(const std::string& path, PODModel& out,
+                      std::vector<GLTFImageBuffer>& images, std::string* err,
+                      GLTFPBRInfo* pbr, float scale) {
+    return gltf_import_glb(path, out, images, err, pbr, scale);
+}
+
+bool gltf_import_all_clips(const std::string& path,
+                           std::vector<std::pair<std::string, PODModel>>& out_clips,
+                           std::string* err,
+                           float scale) {
+    out_clips.clear();
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) { if (err) *err = "cannot open: " + path; return false; }
+    std::streamsize size = f.tellg();
+    f.seekg(0);
+    std::vector<uint8_t> file(static_cast<size_t>(size));
+    if (size > 0) f.read(reinterpret_cast<char*>(file.data()), size);
+    if (!f) { if (err) *err = "read failed"; return false; }
+
+    tg3_model model;
+    tg3_error_stack errors;
+    std::memset(&model, 0, sizeof(model));
+    tg3_error_stack_init(&errors);
+
+    tg3_parse_options opts;
+    tg3_parse_options_init(&opts);
+    opts.strictness = TG3_PERMISSIVE;
+    opts.images_as_is = 1;
+
+    std::string base_dir;
+    size_t slash = path.find_last_of("/\\");
+    if (slash != std::string::npos) base_dir = path.substr(0, slash);
+
+    tg3_error_code code = tg3_parse_auto(&model, &errors, file.data(), file.size(),
+                                         base_dir.c_str(), (uint32_t)base_dir.size(), &opts);
+
+    if (code != TG3_OK) {
+        if (err) {
+            if (tg3_errors_count(&errors) > 0) {
+                *err = tg3_errors_get(&errors, 0)->message;
+            } else {
+                *err = "glTF parse error code " + std::to_string(code);
+            }
+        }
+        tg3_error_stack_free(&errors);
+        tg3_model_free(&model);
+        return false;
+    }
+
+    PODModel base_model;
+    std::vector<GLTFImageBuffer> imgs;
+    if (!build_pod_from_tg3(&model, base_model, imgs, nullptr, err, scale)) {
+        tg3_error_stack_free(&errors);
+        tg3_model_free(&model);
+        return false;
+    }
+
+    if (model.animations_count == 0) {
+        tg3_error_stack_free(&errors);
+        tg3_model_free(&model);
+        return true;
+    }
+
+    auto sample_channel = [](const std::string& interp, int comps,
+                             const std::vector<float>& times,
+                             const std::vector<float>& vals,
+                             int num_frames, float fps,
+                             std::vector<float>& out_dense,
+                             float scale = 1.0f) {
+        if (times.empty() || vals.empty() || num_frames <= 0 || comps <= 0) return;
+        out_dense.assign((size_t)num_frames * comps, 0.0f);
+
+        bool is_cubic = (interp == "CUBICSPLINE" || interp == "CUBIC_SPLINE");
+        bool is_step = (interp == "STEP");
+        size_t stride = is_cubic ? (size_t)comps * 3 : (size_t)comps;
+        size_t val_offset = is_cubic ? (size_t)comps : 0;
+
+        auto get_val = [&](size_t k, int c) -> float {
+            size_t idx = k * stride + val_offset + c;
+            return (idx < vals.size()) ? vals[idx] : 0.0f;
+        };
+        auto get_in_tan = [&](size_t k, int c) -> float {
+            size_t idx = k * stride + c;
+            return (idx < vals.size()) ? vals[idx] : 0.0f;
+        };
+        auto get_out_tan = [&](size_t k, int c) -> float {
+            size_t idx = k * stride + 2 * comps + c;
+            return (idx < vals.size()) ? vals[idx] : 0.0f;
+        };
+
+        for (int f = 0; f < num_frames; ++f) {
+            float t = static_cast<float>(f) / fps;
+            float* out_val = &out_dense[(size_t)f * comps];
+
+            if (t <= times.front() || times.size() == 1) {
+                for (int c = 0; c < comps; ++c) out_val[c] = get_val(0, c);
+            } else if (t >= times.back()) {
+                size_t last = times.size() - 1;
+                for (int c = 0; c < comps; ++c) out_val[c] = get_val(last, c);
+            } else {
+                size_t k = 0;
+                while (k + 1 < times.size() && times[k + 1] < t) ++k;
+                float t0 = times[k];
+                float t1 = times[k + 1];
+                float dt = t1 - t0;
+                float alpha = (dt > 1e-6f) ? std::clamp((t - t0) / dt, 0.0f, 1.0f) : 0.0f;
+
+                if (is_step) {
+                    for (int c = 0; c < comps; ++c) out_val[c] = get_val(k, c);
+                } else if (is_cubic) {
+                    float a2 = alpha * alpha;
+                    float a3 = a2 * alpha;
+                    float h00 = 2.0f * a3 - 3.0f * a2 + 1.0f;
+                    float h10 = a3 - 2.0f * a2 + alpha;
+                    float h01 = -2.0f * a3 + 3.0f * a2;
+                    float h11 = a3 - a2;
+
+                    for (int c = 0; c < comps; ++c) {
+                        float p0 = get_val(k, c);
+                        float m0 = get_out_tan(k, c) * dt;
+                        float p1 = get_val(k + 1, c);
+                        float m1 = get_in_tan(k + 1, c) * dt;
+                        out_val[c] = h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1;
+                    }
+                    if (comps == 4) {
+                        float len = std::sqrt(out_val[0]*out_val[0] + out_val[1]*out_val[1] +
+                                              out_val[2]*out_val[2] + out_val[3]*out_val[3]);
+                        if (len > 1e-6f) {
+                            for (int c = 0; c < 4; ++c) out_val[c] /= len;
+                        } else {
+                            out_val[0] = 0; out_val[1] = 0; out_val[2] = 0; out_val[3] = 1;
+                        }
+                    }
+                } else {
+                    if (comps == 4) {
+                        float q0[4] = {get_val(k, 0), get_val(k, 1), get_val(k, 2), get_val(k, 3)};
+                        float q1[4] = {get_val(k+1, 0), get_val(k+1, 1), get_val(k+1, 2), get_val(k+1, 3)};
+                        float dot = q0[0]*q1[0] + q0[1]*q1[1] + q0[2]*q1[2] + q0[3]*q1[3];
+                        if (dot < 0.0f) {
+                            for (int c = 0; c < 4; ++c) q1[c] = -q1[c];
+                            dot = -dot;
+                        }
+                        float s0 = 1.0f - alpha;
+                        float s1 = alpha;
+                        if (dot < 0.9995f) {
+                            float theta = std::acos(std::clamp(dot, -1.0f, 1.0f));
+                            float sin_theta = std::sin(theta);
+                            if (sin_theta > 1e-5f) {
+                                s0 = std::sin((1.0f - alpha) * theta) / sin_theta;
+                                s1 = std::sin(alpha * theta) / sin_theta;
+                            }
+                        }
+                        for (int c = 0; c < 4; ++c) out_val[c] = s0 * q0[c] + s1 * q1[c];
+                        float len = std::sqrt(out_val[0]*out_val[0] + out_val[1]*out_val[1] +
+                                              out_val[2]*out_val[2] + out_val[3]*out_val[3]);
+                        if (len > 1e-6f) {
+                            for (int c = 0; c < 4; ++c) out_val[c] /= len;
+                        } else {
+                            out_val[0] = 0; out_val[1] = 0; out_val[2] = 0; out_val[3] = 1;
+                        }
+                    } else {
+                        for (int c = 0; c < comps; ++c) {
+                            out_val[c] = (1.0f - alpha) * get_val(k, c) + alpha * get_val(k + 1, c);
+                        }
+                    }
+                }
+            }
+
+            if (scale != 1.0f && comps == 3) {
+                for (int c = 0; c < 3; ++c) out_val[c] *= scale;
+            }
+        }
+    };
+
+    std::vector<int> parent_of(model.nodes_count, -1);
+    for (uint32_t i = 0; i < model.nodes_count; ++i) {
+        for (uint32_t c = 0; c < model.nodes[i].children_count; ++c) {
+            int32_t child_idx = model.nodes[i].children[c];
+            if (child_idx >= 0 && child_idx < (int32_t)model.nodes_count)
+                parent_of[child_idx] = static_cast<int>(i);
+        }
+    }
+
+    for (uint32_t a_idx = 0; a_idx < model.animations_count; ++a_idx) {
+        const tg3_animation* anim = &model.animations[a_idx];
+        std::string clip_name = tg3_to_string(anim->name);
+        if (clip_name.empty()) clip_name = "anim_" + std::to_string(a_idx);
+        for (char& c : clip_name) {
+            if (c == ':' || c == '/' || c == '\\' || c == ' ') c = '_';
+        }
+
+        PODModel clip_model = base_model;
+        clip_model.meshes.clear();
+        clip_model.materials.clear();
+        clip_model.texture_filenames.clear();
+        for (auto& n : clip_model.nodes) {
+            n.object_index = -1;
+            n.material_index = -1;
+            n.anim_translation.clear();
+            n.anim_rotation.clear();
+            n.anim_scale.clear();
+            n.anim_flags = 0;
+        }
+
+        std::vector<float> accbuf;
+        auto load_acc = [&](int32_t acc_idx) -> const std::vector<float>& {
+            accbuf.clear();
+            if (!read_accessor_floats(&model, acc_idx, accbuf)) accbuf.clear();
+            return accbuf;
+        };
+
+        float max_time = 0.0f;
+        for (uint32_t si = 0; si < anim->samplers_count; ++si) {
+            int32_t in_acc = anim->samplers[si].input;
+            if (in_acc < 0 || in_acc >= (int32_t)model.accessors_count) continue;
+            const std::vector<float>& times = load_acc(in_acc);
+            if (!times.empty()) max_time = std::max(max_time, times.back());
+        }
+        clip_model.fps = 30.0f;
+        clip_model.num_frames = std::max(1, static_cast<int>(std::lround(max_time * clip_model.fps)) + 1);
+
+        std::vector<int> gltf_to_pod_node(model.nodes_count, -1);
+        {
+            int mesh_count = 0;
+            for (uint32_t i = 0; i < model.nodes_count; ++i) {
+                if (model.nodes[i].mesh >= 0 && model.nodes[i].mesh < (int32_t)model.meshes_count) mesh_count++;
+            }
+            int next_mesh = 0, next_other = 0;
+            for (uint32_t i = 0; i < model.nodes_count; ++i) {
+                if (model.nodes[i].mesh >= 0 && model.nodes[i].mesh < (int32_t)model.meshes_count) {
+                    gltf_to_pod_node[i] = next_mesh++;
+                } else {
+                    gltf_to_pod_node[i] = mesh_count + (next_other++);
+                }
+            }
+        }
+
+        for (uint32_t ci = 0; ci < anim->channels_count; ++ci) {
+            const tg3_animation_channel* ch = &anim->channels[ci];
+            if (ch->target.node < 0 || ch->target.node >= (int32_t)model.nodes_count) continue;
+            int pod_node_idx = gltf_to_pod_node[ch->target.node];
+            if (pod_node_idx < 0 || pod_node_idx >= (int)clip_model.nodes.size()) continue;
+            if (ch->sampler < 0 || ch->sampler >= (int32_t)anim->samplers_count) continue;
+            const tg3_animation_sampler* sm = &anim->samplers[ch->sampler];
+
+            const std::vector<float>& times_ref = load_acc(sm->input);
+            std::vector<float> times(times_ref.begin(), times_ref.end());
+            const std::vector<float>& vals_ref = load_acc(sm->output);
+            std::vector<float> vals(vals_ref.begin(), vals_ref.end());
+            if (times.empty() || vals.empty()) continue;
+
+            std::string path_str = tg3_to_string(ch->target.path);
+            int comps = (path_str == "rotation") ? 4 : 3;
+            PODNode& node = clip_model.nodes[pod_node_idx];
+            float chan_scale = (path_str == "translation" && parent_of[ch->target.node] == -1) ? scale : 1.0f;
+            std::string interp_str = tg3_to_string(sm->interpolation);
+
+            if (path_str == "translation") {
+                sample_channel(interp_str, comps, times, vals, clip_model.num_frames, clip_model.fps, node.anim_translation, chan_scale);
+                node.anim_flags |= 1;
+            } else if (path_str == "rotation") {
+                sample_channel(interp_str, comps, times, vals, clip_model.num_frames, clip_model.fps, node.anim_rotation, 1.0f);
+                node.anim_flags |= 2;
+            } else if (path_str == "scale") {
+                sample_channel(interp_str, comps, times, vals, clip_model.num_frames, clip_model.fps, node.anim_scale, 1.0f);
+                node.anim_flags |= 4;
+            }
+        }
+
+        for (auto& node : clip_model.nodes) {
+            if (node.anim_translation.empty()) {
+                node.anim_translation.assign((size_t)clip_model.num_frames * 3, 0.0f);
+                for (int f = 0; f < clip_model.num_frames; ++f) {
+                    node.anim_translation[f * 3 + 0] = node.translation[0];
+                    node.anim_translation[f * 3 + 1] = node.translation[1];
+                    node.anim_translation[f * 3 + 2] = node.translation[2];
+                }
+            }
+            if (node.anim_rotation.empty()) {
+                node.anim_rotation.assign((size_t)clip_model.num_frames * 4, 0.0f);
+                for (int f = 0; f < clip_model.num_frames; ++f) {
+                    node.anim_rotation[f * 4 + 0] = node.rotation[0];
+                    node.anim_rotation[f * 4 + 1] = node.rotation[1];
+                    node.anim_rotation[f * 4 + 2] = node.rotation[2];
+                    node.anim_rotation[f * 4 + 3] = (node.rotation[3] == 0.0f && node.rotation[0] == 0.0f) ? 1.0f : node.rotation[3];
+                }
+            }
+            if (node.anim_scale.empty()) {
+                node.anim_scale.assign((size_t)clip_model.num_frames * 3, 1.0f);
+                for (int f = 0; f < clip_model.num_frames; ++f) {
+                    node.anim_scale[f * 3 + 0] = (node.scale[0] != 0.0f) ? node.scale[0] : 1.0f;
+                    node.anim_scale[f * 3 + 1] = (node.scale[1] != 0.0f) ? node.scale[1] : 1.0f;
+                    node.anim_scale[f * 3 + 2] = (node.scale[2] != 0.0f) ? node.scale[2] : 1.0f;
+                }
+            }
+            if (node.anim_flags == 0) {
+                node.anim_flags = 7;
+            }
+        }
+
+        clip_model.num_mesh_nodes = 0;
+        out_clips.emplace_back(clip_name, std::move(clip_model));
+    }
+
+    tg3_error_stack_free(&errors);
+    tg3_model_free(&model);
     return true;
 }
 

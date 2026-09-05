@@ -235,6 +235,9 @@ bool g_use_sre = true;        // Set via launcher or --no-sre
 bool g_advanced_redstell_opts = false; // Advanced Redstell Optimisations (off by default)
 uint64_t g_sre_profile_addr = 0;
 
+// Global Swordigo ABI version: 12 for 1.4.12, 13 for 1.4.13
+extern "C" int swordi_abi = 12;
+
 // =========================================================================
 // Crash-Report-03 Render-Guard Globals
 //
@@ -1133,6 +1136,30 @@ void load_and_boot() {
         std::cerr << "[Loader] Failed to load SO" << std::endl;
         exit(1);
     }
+
+    // Determine ABI version from SHA256 / instance metadata
+    {
+        std::string sha = BinarySelector::compute_sha256(so_path);
+        std::cout << "[ABI] Binary SHA256: " << sha << std::endl;
+        if (sha == "f847814d1b6f81268567ed5ec2473fea4d4ee3b75d2c6fec7057227225e989f8" || // 1.4.12 arm64
+            sha == "08d49dd6f7f8639a4c59f290ff2bb79254accf710f530bf53c2fce1659191c9e") {  // 1.4.12 arm32
+            swordi_abi = 12;
+            std::cout << "[ABI] Detected Swordigo ABI v1.4.12 (swordi_abi = 12)" << std::endl;
+        } else if (sha == "c2f567a34ec7bed9cf6b0af0ce88e9c925c11e5c2a2f2fbd8604461cf93aae7d" || // 1.4.13 arm64
+                   sha == "4e03fb28b16e9ed729b774ffa34f2b370742a8e6bee31f221083908e7a1089fa") {  // 1.4.13 arm32
+            swordi_abi = 13;
+            std::cout << "[ABI] Detected Swordigo ABI v1.4.13 (swordi_abi = 13)" << std::endl;
+        } else {
+            const BinaryInfo* binfo = g_binary_selector.get_loaded_info();
+            if (binfo && binfo->version.find("1.4.13") != std::string::npos) {
+                swordi_abi = 13;
+                std::cout << "[ABI] Detected Swordigo ABI v1.4.13 via instance metadata (swordi_abi = 13)" << std::endl;
+            } else {
+                swordi_abi = 12;
+                std::cout << "[ABI] Unknown binary hash, fallback to swordi_abi = 12" << std::endl;
+            }
+        }
+    }
     
     // 2. Internal Relocations
     g_loader->relocate(&g_main_mod);
@@ -1322,7 +1349,7 @@ void load_and_boot() {
         // Lua coin limit: offset 0x27fce0
         // Game event limit: offset 0x27e656
         // Too rich check: offset 0x27e666
-        {
+        if (swordi_abi == 12) {
             uint32_t base_addr = g_main_mod.base_addr;
             if (base_addr) {
                 extern int g_sre_coin_limit;
@@ -2592,6 +2619,30 @@ void load_and_boot_arm64() {
         std::cerr << "[Loader64] Failed to load SO" << std::endl;
         exit(1);
     }
+
+    // Determine ABI version from SHA256 / instance metadata
+    {
+        std::string sha = BinarySelector::compute_sha256(so_path);
+        std::cout << "[ABI] Binary SHA256: " << sha << std::endl;
+        if (sha == "f847814d1b6f81268567ed5ec2473fea4d4ee3b75d2c6fec7057227225e989f8" || // 1.4.12 arm64
+            sha == "08d49dd6f7f8639a4c59f290ff2bb79254accf710f530bf53c2fce1659191c9e") {  // 1.4.12 arm32
+            swordi_abi = 12;
+            std::cout << "[ABI] Detected Swordigo ABI v1.4.12 (swordi_abi = 12)" << std::endl;
+        } else if (sha == "c2f567a34ec7bed9cf6b0af0ce88e9c925c11e5c2a2f2fbd8604461cf93aae7d" || // 1.4.13 arm64
+                   sha == "4e03fb28b16e9ed729b774ffa34f2b370742a8e6bee31f221083908e7a1089fa") {  // 1.4.13 arm32
+            swordi_abi = 13;
+            std::cout << "[ABI] Detected Swordigo ABI v1.4.13 (swordi_abi = 13)" << std::endl;
+        } else {
+            const BinaryInfo* binfo = g_binary_selector.get_loaded_info();
+            if (binfo && binfo->version.find("1.4.13") != std::string::npos) {
+                swordi_abi = 13;
+                std::cout << "[ABI] Detected Swordigo ABI v1.4.13 via instance metadata (swordi_abi = 13)" << std::endl;
+            } else {
+                swordi_abi = 12;
+                std::cout << "[ABI] Unknown binary hash, fallback to swordi_abi = 12" << std::endl;
+            }
+        }
+    }
     
     BOOT_LOADING(0.30f, "Relocating symbols");
     // 2. Internal Relocations
@@ -2623,13 +2674,8 @@ void load_and_boot_arm64() {
     
     std::cout << "[Loader64] Game binary ready (all symbols bridged)." << std::endl;
 
-    // [DIAG/vtable] Verify the CaverShell vtable + its Render slot survived
-    // relocation AND bridge-resolution. drawApplication calls vtable[0x70]
-    // (= CaverShell::Render). Observed crash: that slot resolves into .dynstr.
-    // Print: the GOT slot 0x6e76a0 (-> _ZTVN5Caver10CaverShellE base),
-    //        the vtable Render slot 0x6b8f40 (-> CaverShell::Render code),
-    //        and the expected values, so we can see which stage corrupts it.
-    {
+    if (swordi_abi == 12) {
+        // [DIAG/vtable] Verify the CaverShell vtable + its Render slot survived (1.4.12 only)
         uint64_t got_slot   = g_main_mod_64.base_addr + 0x6e76a0; // GOT: &vtable
         uint64_t vt_render  = g_main_mod_64.base_addr + 0x6b8f40; // vtable[Render]
         uint64_t got_val    = *(uint64_t*)(g_guest_memory + got_slot);
@@ -2644,42 +2690,41 @@ void load_and_boot_arm64() {
                   << (render_val == exp_render ? " OK" : " *** MISMATCH ***") << std::dec << std::endl;
     }
 
-    // Diagnostic: find the symbol for address 0x1478ccc (offset 0x478ccc)
-    std::cout << "[SRE DIAG] Finding closest symbol to 0x1478ccc..." << std::endl;
-    Elf64_Sym* closest_sym = nullptr;
-    uint64_t closest_diff = 0xffffffffffffffffULL;
-    for (int i = 0; i < g_main_mod_64.num_dynsym; i++) {
-        Elf64_Sym* sym = &g_main_mod_64.dynsym[i];
-        if (sym->st_value == 0) continue;
-        uint64_t addr = g_main_mod_64.base_addr + sym->st_value;
-        if (0x1478ccc >= addr) {
-            uint64_t diff = 0x1478ccc - addr;
-            if (diff < closest_diff) {
-                closest_diff = diff;
-                closest_sym = sym;
+    if (swordi_abi == 12) {
+        // Diagnostic: find the symbol for address 0x1478ccc (offset 0x478ccc, 1.4.12 only)
+        std::cout << "[SRE DIAG] Finding closest symbol to 0x1478ccc..." << std::endl;
+        Elf64_Sym* closest_sym = nullptr;
+        uint64_t closest_diff = 0xffffffffffffffffULL;
+        for (int i = 0; i < g_main_mod_64.num_dynsym; i++) {
+            Elf64_Sym* sym = &g_main_mod_64.dynsym[i];
+            if (sym->st_value == 0) continue;
+            uint64_t addr = g_main_mod_64.base_addr + sym->st_value;
+            if (0x1478ccc >= addr) {
+                uint64_t diff = 0x1478ccc - addr;
+                if (diff < closest_diff) {
+                    closest_diff = diff;
+                    closest_sym = sym;
+                }
             }
         }
-    }
-    if (closest_sym) {
-        std::cout << "[SRE DIAG] Closest symbol to 0x1478ccc: '" 
-                  << (g_main_mod_64.dynstr + closest_sym->st_name)
-                  << "' @ 0x" << std::hex << (g_main_mod_64.base_addr + closest_sym->st_value)
-                  << " (diff: +" << std::dec << closest_diff << " bytes)" << std::endl;
-    }
+        if (closest_sym) {
+            std::cout << "[SRE DIAG] Closest symbol to 0x1478ccc: '" 
+                      << (g_main_mod_64.dynstr + closest_sym->st_name)
+                      << "' @ 0x" << std::hex << (g_main_mod_64.base_addr + closest_sym->st_value)
+                      << " (diff: +" << std::dec << closest_diff << " bytes)" << std::endl;
+        }
 
-
-
-
-    // Dump disassembly bytes at 0x1478ccc
-    std::cout << "[SRE DIAG] Hex bytes at 0x1478ccc (offset 0x478ccc):" << std::endl;
-    if (g_guest_memory) {
-        for (int i = -16; i < 48; i++) {
-            uint64_t addr = 0x1478ccc + i;
-            uint8_t byte_val = g_guest_memory[0x1478ccc + i];
-            if (i == 0) std::cout << "-> ";
-            else std::cout << "   ";
-            std::cout << "0x" << std::hex << addr << ": " 
-                      << std::setw(2) << std::setfill('0') << (int)byte_val << std::dec << std::endl;
+        // Dump disassembly bytes at 0x1478ccc
+        std::cout << "[SRE DIAG] Hex bytes at 0x1478ccc (offset 0x478ccc):" << std::endl;
+        if (g_guest_memory) {
+            for (int i = -16; i < 48; i++) {
+                uint64_t addr = 0x1478ccc + i;
+                uint8_t byte_val = g_guest_memory[0x1478ccc + i];
+                if (i == 0) std::cout << "-> ";
+                else std::cout << "   ";
+                std::cout << "0x" << std::hex << addr << ": " 
+                          << std::setw(2) << std::setfill('0') << (int)byte_val << std::dec << std::endl;
+            }
         }
     }
 
@@ -3001,16 +3046,30 @@ void load_and_boot_arm64() {
         std::cerr << "  [SRE] Swordigo Runtime Engine — Checking..." << std::endl;
         std::cerr << "============================================" << std::endl;
 
-        std::string sre_path = "bin/libs/libsre.so";
-        if (access(sre_path.c_str(), F_OK) != 0) {
-            std::string alt_path = get_data_path("bin/libs/libsre.so");
-            if (!alt_path.empty() && access(alt_path.c_str(), F_OK) == 0) {
-                sre_path = alt_path;
-            } else if (access("libsre.so", F_OK) == 0) {
-                sre_path = "libsre.so";
+        std::string sre_path;
+        if (swordi_abi == 13) {
+            sre_path = "bin/libs/libsre13.so";
+            if (access(sre_path.c_str(), F_OK) != 0) {
+                std::string alt_path = get_data_path("bin/libs/libsre13.so");
+                if (!alt_path.empty() && access(alt_path.c_str(), F_OK) == 0) {
+                    sre_path = alt_path;
+                } else if (access("libsre13.so", F_OK) == 0) {
+                    sre_path = "libsre13.so";
+                } else {
+                    sre_path = "";
+                }
+            }
+        } else {
+            sre_path = "bin/libs/libsre.so";
+            if (access(sre_path.c_str(), F_OK) != 0) {
+                std::string alt_path = get_data_path("bin/libs/libsre.so");
+                if (!alt_path.empty() && access(alt_path.c_str(), F_OK) == 0) {
+                    sre_path = alt_path;
+                } else if (access("libsre.so", F_OK) == 0) {
+                    sre_path = "libsre.so";
+                }
             }
         }
-
 
         if (!sre_path.empty() && access(sre_path.c_str(), F_OK) == 0) {
             std::cerr << "[SRE] FOUND: " << sre_path << std::endl;
@@ -3487,7 +3546,9 @@ void load_and_boot_arm64() {
                 // ========= Resolve ProgramState symbols for hook targets =========
                 // Map from SRE symbol name → libswordigo mangled symbol name
                 struct SymHookMap { const char* sre_sym; const char* engine_sym; };
-                SymHookMap sym_hooks[] = {
+                
+                // 1.4.12 libstdc++ symbols
+                SymHookMap sym_hooks_12[] = {
                     {"sre_ProgramState_destructor", "_ZN5Caver12ProgramStateD1Ev"},
                     {"sre_ProgramState_Execute", "_ZN5Caver12ProgramState7ExecuteEi"},
                     {"sre_ProgramState_Resume",  "_ZN5Caver12ProgramState6ResumeEi"},
@@ -3498,6 +3559,9 @@ void load_and_boot_arm64() {
                     {"sre_AchievementsManager_Update", "_ZN5Caver19AchievementsManager6UpdateEf"},
                     {"sre_SetResourcesPath",           "_ZN5Caver16SetResourcesPathERKSs"},
                     {"sre_IsAndroidAssetsPath",        "_ZN5Caver19IsAndroidAssetsPathERKSs"},
+                    {"sre_AudioSystem_EndAudioInterruptionIfNecessary", "_ZN5Caver11AudioSystem31EndAudioInterruptionIfNecessaryEv"},
+                    {"sre_stack_chk_fail",             "__stack_chk_fail"},
+                    {"sre_GameOverViewController_ShowAdMaybe", "_ZN5Caver22GameOverViewController11ShowAdMaybeEv"},
                     // Core Lua functions
                     {"lua_pcall",     "_Z9lua_pcallP9lua_Stateiii"},
                     {"lua_resume",    "_Z10lua_resumeP9lua_Statei"},
@@ -3577,7 +3641,115 @@ void load_and_boot_arm64() {
                     {"sre_HeroEquipmentManager_ApplyArmorTrinket",   "_ZN5Caver20HeroEquipmentManager17ApplyArmorTrinketERKN5boost10shared_ptrINS_4ItemEEE"},
                     {"sre_HeroEquipmentManager_ApplyWeaponTrinket",  "_ZN5Caver20HeroEquipmentManager18ApplyWeaponTrinketERKN5boost10shared_ptrINS_4ItemEEE"},
                 };
-                const int NUM_SYM_HOOKS = sizeof(sym_hooks) / sizeof(sym_hooks[0]);
+
+                // 1.4.13 libc++ symbols
+                SymHookMap sym_hooks_13[] = {
+                    {"sre_ProgramState_destructor", "_ZN5Caver12ProgramStateD1Ev"},
+                    {"sre_ProgramState_Execute", "_ZN5Caver12ProgramState7ExecuteEi"},
+                    {"sre_ProgramState_Resume",  "_ZN5Caver12ProgramState6ResumeEi"},
+                    {"sre_ProgramState_Update",  "_ZN5Caver12ProgramState6UpdateEf"},
+                    {"sre_AudioSystem_EndAudioInterruptionIfNecessary", "_ZN5Caver11AudioSystem31EndAudioInterruptionIfNecessaryEv"},
+                    {"sre_stack_chk_fail",             "__stack_chk_fail"},
+                    {"sre_GameOverViewController_ShowAdMaybe", "_ZN5Caver22GameOverViewController11ShowAdMaybeEv"},
+                    // Scene Loading & Transition
+                    {"sre_SceneLoadingView_InitWithGameState", "_ZN5Caver16SceneLoadingView17InitWithGameStateERKN5boost10shared_ptrINS_9GameStateEEERKNS2_INS_7MapNodeEEE"},
+                    {"sre_SceneLoadingView_Update",            "_ZN5Caver16SceneLoadingView6UpdateEf"},
+                    {"sre_SceneLoadingView_AnimateIn",         "_ZN5Caver16SceneLoadingView9AnimateInEv"},
+                    {"sre_Scene_FinishLoad",                   "_ZN5Caver5Scene10FinishLoadEv"},
+                    {"sre_SceneObjectGroup_FinishLoad",        "_ZN5Caver16SceneObjectGroup10FinishLoadEv"},
+                    {"sre_ComponentOutletBase_Connect",        "_ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE"},
+                    {"sre_SceneObject_ComponentWithInterface", "_ZNK5Caver11SceneObject22ComponentWithInterfaceEl"},
+                    {"sre_GameData_Clear",                     "_ZN5Caver5Proto8GameData5ClearEv"},
+                    {"sre_Proto_SceneObject_Clear",            "_ZN5Caver5Proto11SceneObject5ClearEv"},
+                    // OpenAL Music & Audio Controls
+                    {"sre_PlayMusicWithName",                  "_ZN5Caver11MusicPlayer17PlayMusicWithNameERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEEb"},
+                    {"sre_MusicPlayer_FadeIn",                 "_ZN5Caver11MusicPlayer6FadeInEf"},
+                    {"sre_MusicPlayer_FadeOut",                "_ZN5Caver11MusicPlayer7FadeOutEf"},
+                    {"sre_MusicPlayer_Update",                 "_ZN5Caver11MusicPlayer6UpdateEf"},
+                    {"sre_AudioSystem_SetMusicVolume",         "_ZN5Caver11AudioSystem14SetMusicVolumeEf"},
+                    {"sre_MusicPlayer_SetEnabled",             "_ZN5Caver11MusicPlayer10SetEnabledEb"},
+                    {"sre_MusicPlayer_SetSuspended",           "_ZN5Caver11MusicPlayer12SetSuspendedEb"},
+                    // UI & Input
+                    {"sre_StartTextInputWithDelegate",         "_ZN5Caver26StartTextInputWithDelegateEPNS_18ITextInputDelegateERKNSt6__ndk112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE"},
+                    {"sre_StopTextInputWithDelegate",          "_ZN5Caver25StopTextInputWithDelegateEPNS_18ITextInputDelegateE"},
+                    {"sre_textInputTextDidChange",             "Java_com_touchfoo_swordigo_Native_textInputTextDidChange"},
+                    {"sre_textInputDidFinish",                 "Java_com_touchfoo_swordigo_Native_textInputDidFinish"},
+                    // VFS
+                    {"sre_SetResourcesPath",                   "_ZN5Caver16SetResourcesPathERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE"},
+                    {"sre_IsAndroidAssetsPath",                "_ZN5Caver19IsAndroidAssetsPathERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE"},
+                    // Core Lua functions
+                    {"lua_pcall",     "_Z9lua_pcallP9lua_Stateiii"},
+                    {"lua_resume",    "_Z10lua_resumeP9lua_Statei"},
+                    {"lua_settop",    "_Z10lua_settopP9lua_Statei"},
+                    {"lua_gettop",    "_Z10lua_gettopP9lua_State"},
+                    {"lua_tolstring", "_Z13lua_tolstringP9lua_StateiPm"},
+                    {"lua_call",      "_Z8lua_callP9lua_Stateii"},
+                    {"lua_pushstring","_Z14lua_pushstringP9lua_StatePKc"},
+                    {"lua_pushcclosure","_Z16lua_pushcclosureP9lua_StatePFiS0_Ei"},
+                    {"lua_setfield",  "_Z12lua_setfieldP9lua_StateiPKc"},
+                    {"lua_getfield",  "_Z12lua_getfieldP9lua_StateiPKc"},
+                    {"lua_createtable","_Z15lua_createtableP9lua_Stateii"},
+                    {"lua_pushnumber","_Z14lua_pushnumberP9lua_Stated"},
+                    {"lua_pushboolean","_Z15lua_pushbooleanP9lua_Statei"},
+                    {"lua_pushnil",   "_Z11lua_pushnilP9lua_State"},
+                    {"lua_tonumber",  "_Z12lua_tonumberP9lua_Statei"},
+                    {"lua_toboolean", "_Z13lua_tobooleanP9lua_Statei"},
+                    {"lua_type",      "_Z8lua_typeP9lua_Statei"},
+                    {"luaL_register", "_Z13luaL_registerP9lua_StatePKcPK8luaL_Reg"},
+                    {"lua_touserdata","_Z14lua_touserdataP9lua_Statei"},
+                    {"lua_pushlightuserdata","_Z21lua_pushlightuserdataP9lua_StatePv"},
+                    {"lua_error",     "_Z9lua_errorP9lua_State"},
+                    {"lua_pushvalue",   "_Z13lua_pushvalueP9lua_Statei"},
+                    {"lua_remove",      "_Z10lua_removeP9lua_Statei"},
+                    {"lua_insert",      "_Z10lua_insertP9lua_Statei"},
+                    {"lua_replace",     "_Z11lua_replaceP9lua_Statei"},
+                    {"lua_checkstack",  "_Z14lua_checkstackP9lua_Statei"},
+                    {"lua_rawget",      "_Z10lua_rawgetP9lua_Statei"},
+                    {"lua_rawset",      "_Z10lua_rawsetP9lua_Statei"},
+                    {"lua_rawgeti",     "_Z11lua_rawgetiP9lua_Stateii"},
+                    {"lua_rawseti",     "_Z11lua_rawsetiP9lua_Stateii"},
+                    {"lua_next",        "_Z8lua_nextP9lua_Statei"},
+                    {"lua_objlen",      "_Z10lua_objlenP9lua_Statei"},
+                    {"lua_settable",    "_Z12lua_settableP9lua_Statei"},
+                    {"lua_gettable",    "_Z12lua_gettableP9lua_Statei"},
+                    {"lua_isnumber",    "_Z12lua_isnumberP9lua_Statei"},
+                    {"lua_isstring",    "_Z12lua_isstringP9lua_Statei"},
+                    {"lua_tointeger",   "_Z13lua_tointegerP9lua_Statei"},
+                    {"lua_pushinteger", "_Z15lua_pushintegerP9lua_Statel"},
+                    {"lua_concat",      "_Z10lua_concatP9lua_Statei"},
+                    {"lua_pushlstring", "_Z15lua_pushlstringP9lua_StatePKcm"},
+                    {"lua_setmetatable","_Z16lua_setmetatableP9lua_Statei"},
+                    {"sre_lua_close",    "_Z9lua_closeP9lua_State"},
+                    {"lua_dump",        "_Z8lua_dumpP9lua_StatePFiS0_PKvmPvES3_"},
+                    {"lua_atpanic",     "_Z11lua_atpanicP9lua_StatePFiS0_E"},
+                    {"lua_getmetatable","_Z16lua_getmetatableP9lua_Statei"},
+                    {"lua_rawequal",    "_Z12lua_rawequalP9lua_Stateii"},
+                    {"lua_equal",       "_Z9lua_equalP9lua_Stateii"},
+                    {"lua_lessthan",    "_Z12lua_lessthanP9lua_Stateii"},
+                    {"lua_isuserdata",  "_Z14lua_isuserdataP9lua_Statei"},
+                    {"sre_luaL_newstate", "_Z13luaL_newstatev"},
+                    {"luaL_loadstring", "_Z15luaL_loadstringP9lua_StatePKc"},
+                    {"luaL_loadbuffer", "_Z15luaL_loadbufferP9lua_StatePKcmS2_"},
+                    {"luaL_loadfile",   "_Z13luaL_loadfileP9lua_StatePKc"},
+                    {"luaopen_base",    "_Z12luaopen_baseP9lua_State"},
+                    {"luaopen_package", "_Z15luaopen_packageP9lua_State"},
+                    {"luaopen_table",   "_Z13luaopen_tableP9lua_State"},
+                    {"luaopen_io",      "_Z10luaopen_ioP9lua_State"},
+                    {"luaopen_os",      "_Z10luaopen_osP9lua_State"},
+                    {"luaopen_string",  "_Z14luaopen_stringP9lua_State"},
+                    {"luaopen_math",    "_Z12luaopen_mathP9lua_State"},
+                    {"luaopen_debug",   "_Z13luaopen_debugP9lua_State"},
+                    {"luaL_openlibs",   "_Z13luaL_openlibsP9lua_State"},
+                    {"lua_newthread",   "_Z13lua_newthreadP9lua_State"},
+                    {"lua_tothread",    "_Z12lua_tothreadP9lua_Statei"},
+                    {"lua_pushthread",  "_Z14lua_pushthreadP9lua_State"},
+                    {"lua_status",      "_Z10lua_statusP9lua_State"},
+                    {"lua_gc",          "_Z6lua_gcP9lua_Stateii"},
+                };
+
+                const SymHookMap* sym_hooks = (swordi_abi == 13) ? sym_hooks_13 : sym_hooks_12;
+                const int NUM_SYM_HOOKS = (swordi_abi == 13) ? (sizeof(sym_hooks_13) / sizeof(sym_hooks_13[0]))
+                                                             : (sizeof(sym_hooks_12) / sizeof(sym_hooks_12[0]));
 
                 // Read the hook table from libsre.so and install trampolines
                 uint64_t table_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_hook_table");
@@ -3596,8 +3768,10 @@ void load_and_boot_arm64() {
                     // ─── Pre-save relays via TrampolineMgr (no magic addresses) ─
                     // OLD: Hard-coded 0x3000040, 0x3000080, 0x3000300 etc.
                     // NEW: TrampolineMgr allocs sequentially, no overlaps possible.
-                    const uint64_t CXA_THROW_OFFSET = 0x51e108;
-                    uint64_t cxa_throw_vaddr = load_addr + CXA_THROW_OFFSET;
+                    uint64_t cxa_throw_vaddr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "__cxa_throw");
+                    if (!cxa_throw_vaddr && swordi_abi == 12) {
+                        cxa_throw_vaddr = load_addr + 0x51e108;
+                    }
                     uint64_t CXA_RELAY = 0;
                     uint64_t g_orig_cxa_addr = g_loader_64->get_symbol_vaddr(
                         &g_sre_mod, "g_original_cxa_throw");
@@ -3690,149 +3864,94 @@ void load_and_boot_arm64() {
 
 
 
-                    // ─── GUINavigationController relay caves ────────────────────────
-                    // Save original first instructions so our safe hooks can call-through.
-                    // Three functions in the transition chain (v1.4.12 arm64
-                    // nm-verified offsets; the old 0x303099/0x3030bd/0x303681
-                    // comment values were stale):
-                    //   Update (0x49923c), ViewControllerViewLoaded (0x499288), FinishTransition (0x49a42c)
-                    struct GUINavRelay {
-                        uint64_t    nm_offset;
-                        const char* engine_sym;
-                        const char* sre_orig_sym;
-                    };
-                    const GUINavRelay nav_relays[] = {
-                        /* GameSceneView::Update relay — lightweight passthrough hook.
-                         * The relay cave lets sre_GameSceneView_Update call the original
-                         * via g_orig_GameSceneView_Update_fn. nm offset verified. */
-                        { 0x34ed2c, "_ZN5Caver13GameSceneView6UpdateEf",
-                          "g_orig_GameSceneView_Update_fn" },
-                        { 0x49923c, "_ZN5Caver23GUINavigationController6UpdateEf",
-                          "g_orig_GUINavigationController_Update" },
-                        { 0x499288, "_ZN5Caver23GUINavigationController24ViewControllerViewLoadedEPNS_17GUIViewControllerE",
-                          "g_orig_GUINavigationController_VCLoaded" },
-                        { 0x49a42c, "_ZN5Caver23GUINavigationController32FinishTransitionToViewControllerERKN5boost10shared_ptrINS_17GUIViewControllerEEEPvPNS_8GUIEventE",
-                          "g_orig_GUINavigationController_Finish" },
-                        { 0, "_ZN5Caver24OrbitControllerComponent12FollowObjectERKN5boost13intrusive_ptrINS_11SceneObjectEEE",
-                          "g_orig_OrbitController_FollowObject" },
-                        { 0, "_ZN5Caver20HeroEquipmentManager17ApplyArmorTrinketERKN5boost10shared_ptrINS_4ItemEEE",
-                          "g_orig_HeroEquipmentManager_ApplyArmorTrinket" },
-                        { 0, "_ZN5Caver20HeroEquipmentManager18ApplyWeaponTrinketERKN5boost10shared_ptrINS_4ItemEEE",
-                          "g_orig_HeroEquipmentManager_ApplyWeaponTrinket" },
-                        /* GameData::Clear crash guard — nm 0x2e6d60 arm64-v8a */
-                        { 0x2e6d60, "_ZN5Caver5Proto8GameData5ClearEv",
-                          "g_orig_GameData_Clear" },
-                        /* Proto::SceneObject::Clear crash guard — nm 0x2fc030
-                         * Confirmed crash path (live log LR=0x12fe290):
-                         *   Scene::LoadFromFile → Proto::Scene::~Scene()
-                         *   → ObjectLibrary → ObjectTemplate → SceneObject::Clear()
-                         *   → vtable[+32] on corrupted Component ptr
-                         *   → PC = 0x47bfda9034ff4 (ARM64 STP instruction bytes)
-                         *   → Dynarmic NoExecuteFault → game freeze.
-                         * Our hook caps this+40 (count) before delegating. */
-                        { 0x2fc030, "_ZN5Caver5Proto11SceneObject5ClearEv",
-                          "g_orig_Proto_SceneObject_Clear" },
-                        /* Proto::SceneObject D1/D2 destructor — nm 0x2fe23c.
-                         * Separate from Clear(): it directly dispatches component
-                         * vtable[1] during scene teardown and needs its own guard. */
-                        { 0x2fe23c, "_ZN5Caver5Proto11SceneObjectD1Ev",
-                          "g_orig_Proto_SceneObject_Destroy" },
-                        /* ComponentOutletBase::Connect vtable safety guard
-                         * nm arm64-v8a 0x247c48: _ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE
-                         * Crash: freed component's 'this' carries garbage vtable (0xf9443508d0002308)
-                         * from heap allocator free-list link → PC jumps to kernel space →
-                         * Dynarmic NoExecuteFault. Our hook validates vtable[1] and vtable[4]
-                         * before dispatching. Bail = return 0 (same as 'no identifier' path). */
-                        { 0x247c48, "_ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE",
-                          "g_orig_ComponentOutletBase_Connect" },
-                        /* Proto::ObjectLibrary::Clear crash guard — nm 0x2fd374
-                         * Belt-and-suspenders: guards 3 vtable-dispatch loops
-                         * one level above SceneObject::Clear in the chain. */
-                        { 0x2fd374, "_ZN5Caver5Proto13ObjectLibrary5ClearEv",
-                          "g_orig_Proto_ObjectLibrary_Clear" },
-                        /* Scene::FinishLoad relay — nm arm64 0x4642a8
-                         * Called by sre_Scene_FinishLoad under setjmp recovery.
-                         * Without this, g_orig_Scene_FinishLoad=0 → silent no-op
-                         * → no SceneObjects initialized → freeze on first frame. */
-                        { 0x4642a8, "_ZN5Caver5Scene10FinishLoadEv",
-                          "g_orig_Scene_FinishLoad" },
-                        /* SceneObject::FinishLoad relay — nm arm64 0x470ec4
-                         * The primary crash source: vtable[9] dispatch on corrupt
-                         * component ptr → PC=0x10771ac (.dynstr) → Dynarmic halt.
-                         * sre_SceneObject_FinishLoad wraps the call with setjmp so
-                         * the exception is caught before force-returning to raw LR. */
-                        { 0x470ec4, "_ZN5Caver11SceneObject10FinishLoadEv",
-                          "g_orig_SceneObject_FinishLoad" },
-                        /* SceneObjectGroup::FinishLoad relay — nm arm64 0x475498
-                         * IDA at 0x475498: calls ProgramState::Execute on attached
-                         * Lua scripts immediately during scene load. Without the relay,
-                         * g_orig_SceneObjectGroup_FinishLoad=0 → silent no-op → group
-                         * scripts never run → objects in scripted groups never initialize. */
-                        { 0x475498, "_ZN5Caver16SceneObjectGroup10FinishLoadEv",
-                           "g_orig_SceneObjectGroup_FinishLoad" },
-                        /* SceneLoadingView::InitWithGameState needs the original
-                         * continuation; without this relay its wrapper only flips
-                         * flags and skips construction of the loading view. */
-                        { 0x4358dc, "_ZN5Caver16SceneLoadingView17InitWithGameStateERKN5boost10shared_ptrINS_9GameStateEEERKNS2_INS_7MapNodeEEE",
-                           "g_orig_SceneLoadingView_InitWithGameState" },
-                        /* RegisterProgramLibrary relay — nm arm64 0x4c0f18
-                         * sre_RegisterProgramLibrary wraps this to intercept mod
-                         * library registrations. Without the relay, g_orig=0 and
-                         * vanilla Lua library registration is silently skipped:
-                         * all built-in Caver Lua APIs (DB, Scene, etc.) never load. */
-                        { 0x4c0f18, "_ZN5Caver21RegisterProgramLibraryERKSsPFvPNS_12ProgramStateEE",
-                          "g_orig_RegisterProgramLibrary" },
-                        /* NOTE: g_orig_RenderingContext_C1 is NOT in nav_relays.
-                         * It is handled by gui_relays[] below using copy_and_relocate,
-                         * which runs before the hook installer and captures the real
-                         * first instruction before it is patched. */
-                    };
-                    for (const auto& nr : nav_relays) {
-                        uint64_t fn_vaddr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, nr.engine_sym);
-                        if (!fn_vaddr && nr.nm_offset != 0) {
-                            fn_vaddr = load_addr + nr.nm_offset;
+                    // ─── Relay Initialization ───────────────────────────────────────
+                    if (swordi_abi == 13) {
+                        struct RelayMap13 { const char* engine_sym; const char* sre_orig_sym; };
+                        const RelayMap13 relays_13[] = {
+                            {"_ZN5Caver16SceneLoadingView17InitWithGameStateERKN5boost10shared_ptrINS_9GameStateEEERKNS2_INS_7MapNodeEEE", "g_orig_SceneLoadingView_InitWithGameState"},
+                            {"_ZN5Caver16SceneLoadingView6UpdateEf", "g_orig_SceneLoadingView_Update"},
+                            {"_ZN5Caver16SceneLoadingView9AnimateInEv", "g_orig_SceneLoadingView_AnimateIn"},
+                            {"_ZN5Caver5Scene10FinishLoadEv", "g_orig_Scene_FinishLoad"},
+                            {"_ZN5Caver16SceneObjectGroup10FinishLoadEv", "g_orig_SceneObjectGroup_FinishLoad"},
+                            {"_ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE", "g_orig_ComponentOutletBase_Connect"},
+                            {"_ZN5Caver5Proto8GameData5ClearEv", "g_orig_GameData_Clear"},
+                            {"_ZN5Caver5Proto11SceneObject5ClearEv", "g_orig_Proto_SceneObject_Clear"},
+                        };
+                        for (const auto& r : relays_13) {
+                            uint64_t fn_vaddr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, r.engine_sym);
+                            uint64_t orig_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, r.sre_orig_sym);
+                            if (fn_vaddr && orig_addr) {
+                                TrampolineMgr::instance().install_relay(r.sre_orig_sym, fn_vaddr, orig_addr);
+                            }
                         }
-                        if (!fn_vaddr) {
-                            std::cerr << "[SRE] WARNING: GUINav relay not found: " << nr.engine_sym << std::endl;
-                            continue;
+                    } else {
+                        // ─── GUINavigationController relay caves (1.4.12) ───────────────
+                        struct GUINavRelay {
+                            uint64_t    nm_offset;
+                            const char* engine_sym;
+                            const char* sre_orig_sym;
+                        };
+                        const GUINavRelay nav_relays[] = {
+                            { 0x34ed2c, "_ZN5Caver13GameSceneView6UpdateEf", "g_orig_GameSceneView_Update_fn" },
+                            { 0x49923c, "_ZN5Caver23GUINavigationController6UpdateEf", "g_orig_GUINavigationController_Update" },
+                            { 0x499288, "_ZN5Caver23GUINavigationController24ViewControllerViewLoadedEPNS_17GUIViewControllerE", "g_orig_GUINavigationController_VCLoaded" },
+                            { 0x49a42c, "_ZN5Caver23GUINavigationController32FinishTransitionToViewControllerERKN5boost10shared_ptrINS_17GUIViewControllerEEEPvPNS_8GUIEventE", "g_orig_GUINavigationController_Finish" },
+                            { 0, "_ZN5Caver24OrbitControllerComponent12FollowObjectERKN5boost13intrusive_ptrINS_11SceneObjectEEE", "g_orig_OrbitController_FollowObject" },
+                            { 0, "_ZN5Caver20HeroEquipmentManager17ApplyArmorTrinketERKN5boost10shared_ptrINS_4ItemEEE", "g_orig_HeroEquipmentManager_ApplyArmorTrinket" },
+                            { 0, "_ZN5Caver20HeroEquipmentManager18ApplyWeaponTrinketERKN5boost10shared_ptrINS_4ItemEEE", "g_orig_HeroEquipmentManager_ApplyWeaponTrinket" },
+                            { 0x2e6d60, "_ZN5Caver5Proto8GameData5ClearEv", "g_orig_GameData_Clear" },
+                            { 0x2fc030, "_ZN5Caver5Proto11SceneObject5ClearEv", "g_orig_Proto_SceneObject_Clear" },
+                            { 0x2fe23c, "_ZN5Caver5Proto11SceneObjectD1Ev", "g_orig_Proto_SceneObject_Destroy" },
+                            { 0x247c48, "_ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE", "g_orig_ComponentOutletBase_Connect" },
+                            { 0x2fd374, "_ZN5Caver5Proto13ObjectLibrary5ClearEv", "g_orig_Proto_ObjectLibrary_Clear" },
+                            { 0x4642a8, "_ZN5Caver5Scene10FinishLoadEv", "g_orig_Scene_FinishLoad" },
+                            { 0x470ec4, "_ZN5Caver11SceneObject10FinishLoadEv", "g_orig_SceneObject_FinishLoad" },
+                            { 0x475498, "_ZN5Caver16SceneObjectGroup10FinishLoadEv", "g_orig_SceneObjectGroup_FinishLoad" },
+                            { 0x4358dc, "_ZN5Caver16SceneLoadingView17InitWithGameStateERKN5boost10shared_ptrINS_9GameStateEEERKNS2_INS_7MapNodeEEE", "g_orig_SceneLoadingView_InitWithGameState" },
+                            { 0x4c0f18, "_ZN5Caver21RegisterProgramLibraryERKSsPFvPNS_12ProgramStateEE", "g_orig_RegisterProgramLibrary" },
+                        };
+                        for (const auto& nr : nav_relays) {
+                            uint64_t fn_vaddr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, nr.engine_sym);
+                            if (!fn_vaddr && nr.nm_offset != 0) {
+                                fn_vaddr = load_addr + nr.nm_offset;
+                            }
+                            if (!fn_vaddr) {
+                                std::cerr << "[SRE] WARNING: GUINav relay not found: " << nr.engine_sym << std::endl;
+                                continue;
+                            }
+                            uint64_t orig_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, nr.sre_orig_sym);
+                            if (!TrampolineMgr::instance().install_relay(
+                                    nr.sre_orig_sym, fn_vaddr, orig_addr)) {
+                                std::cerr << "[SRE] WARNING: relay unavailable for "
+                                          << nr.sre_orig_sym << std::endl;
+                            }
                         }
-                        uint64_t orig_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, nr.sre_orig_sym);
-                        if (!TrampolineMgr::instance().install_relay(
-                                nr.sre_orig_sym, fn_vaddr, orig_addr)) {
-                            std::cerr << "[SRE] WARNING: relay unavailable for "
-                                      << nr.sre_orig_sym << std::endl;
-                        }
-                    }
 
-                    // ─── GUI relay stubs (TrampolineMgr — no hard-coded addresses) ──
-                    // Each entry gets its own fresh cave slot from the arena.
-                    // RenderingContext_C1 is included here; updateApplication gets its
-                    // own slot below — they NO LONGER share 0x3000300.
-                    struct GuiRelay {
-                        uint64_t    nm_offset;
-                        const char* orig_sym;
-                    };
-                    const GuiRelay gui_relays[] = {
-                        { 0x4a28bc, "g_orig_GUIWindow_DrawRect"    },
-                        { 0x49f310, "g_orig_GUIView_DrawRect"      },
-                        { 0x49565c, "g_orig_GUIButton_DrawRect"    },
-                        { 0x497aa0, "g_orig_GUILabel_DrawRect"     },
-                        { 0x497658, "g_orig_GUIFrameView_DrawRect" },
-                        { 0x491b54, "g_orig_GUIAlertView_DrawRect" },
-                        { 0x49cd40, "g_orig_GUISlider_DrawRect"    },
-                        { 0x42bae4, "g_orig_NewMenuView_DrawRect"  },
-                        { 0x393094, "g_orig_MainMenuView_ButtonPressed" },
-                        { 0x48afb0, "g_orig_RenderingContext_C1"   },  /* nm arm64: 0x48afb0 (was wrong 0x2fc03c) */
-                    };
-                    for (const auto& r : gui_relays) {
-                        uint64_t vaddr = g_main_mod_64.base_addr + r.nm_offset;
-                        uint64_t orig_sym_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, r.orig_sym);
-                        // Find the matching SRE hook function name (strip "g_orig_" prefix)
-                        // For GUI relay stubs we build the cave manually and point g_orig_* at it.
-                        if (!TrampolineMgr::instance().install_relay(
-                                r.orig_sym, vaddr, orig_sym_addr)) {
-                            std::cerr << "[SRE] WARNING: GUI relay unavailable for "
-                                      << r.orig_sym << std::endl;
+                        // ─── GUI relay stubs (1.4.12) ──
+                        struct GuiRelay {
+                            uint64_t    nm_offset;
+                            const char* orig_sym;
+                        };
+                        const GuiRelay gui_relays[] = {
+                            { 0x4a28bc, "g_orig_GUIWindow_DrawRect"    },
+                            { 0x49f310, "g_orig_GUIView_DrawRect"      },
+                            { 0x49565c, "g_orig_GUIButton_DrawRect"    },
+                            { 0x497aa0, "g_orig_GUILabel_DrawRect"     },
+                            { 0x497658, "g_orig_GUIFrameView_DrawRect" },
+                            { 0x491b54, "g_orig_GUIAlertView_DrawRect" },
+                            { 0x49cd40, "g_orig_GUISlider_DrawRect"    },
+                            { 0x42bae4, "g_orig_NewMenuView_DrawRect"  },
+                            { 0x393094, "g_orig_MainMenuView_ButtonPressed" },
+                            { 0x48afb0, "g_orig_RenderingContext_C1"   },
+                        };
+                        for (const auto& r : gui_relays) {
+                            uint64_t vaddr = g_main_mod_64.base_addr + r.nm_offset;
+                            uint64_t orig_sym_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, r.orig_sym);
+                            if (!TrampolineMgr::instance().install_relay(
+                                    r.orig_sym, vaddr, orig_sym_addr)) {
+                                std::cerr << "[SRE] WARNING: GUI relay unavailable for "
+                                          << r.orig_sym << std::endl;
+                            }
                         }
                     }
 
@@ -3926,6 +4045,22 @@ void load_and_boot_arm64() {
                             relay_orig_sym = "g_orig_ComponentOutletBase_Connect";
                         else if (strcmp(sym_name, "sre_RenderingContext_C1") == 0)
                             relay_orig_sym = "g_orig_RenderingContext_C1";
+                        else if (strcmp(sym_name, "sre_ProfileSelectionView_LoadProfiles") == 0)
+                            relay_orig_sym = "g_orig_ProfileSelectionView_LoadProfiles";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_InitWithProfile") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_InitWithProfile";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_Update") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_Update";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_DrawRect") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_DrawRect";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_LayoutSubviews") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_LayoutSubviews";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_AnimateIn") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_AnimateIn";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_AnimateOut") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_AnimateOut";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_ButtonPressed") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_ButtonPressed";
 
                         if (relay_orig_sym) {
                             uint64_t orig_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, relay_orig_sym);
@@ -5083,6 +5218,18 @@ void load_and_boot_arm64() {
         g_emulator_64->call(applicationDidBecomeActive, {env_ptr, 0});
     }
     std::cout << "[Diag64] Post-applicationDidBecomeActive" << std::endl;
+
+    // ── Profile-panel PVR prefetch (profile-screen fix, rec 5) ─────────────
+    // The hero-selection screen (LoadProfiles → one ProfilePanelView per
+    // save) loads the same hero texture set on its first panel; warm the
+    // content-hash PVR decode cache now, while the main menu is still booting,
+    // so the guest's first panel build never pays the decompression. Defined
+    // in jni_bridge_arm64.cpp; no-op with SRE_NO_PVR_PREFETCH=1.
+    {
+        extern void sre_prefetch_profile_panel_assets(void);
+        sre_prefetch_profile_panel_assets();
+    }
+
     std::cout.flush();
 
     // Boot is complete — the game will render its own frames from here on.
@@ -5114,9 +5261,12 @@ void load_and_boot_arm64() {
 
         // Also patch IsProductPurchased -> return true
         uint64_t isPurchased = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
-            "_ZN5Caver23StoreController_Android18IsProductPurchasedERKSs");
+            "_ZN5Caver23StoreController_Android18IsProductPurchasedERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE");
         if (!isPurchased) {
-            // Try the base class version
+            isPurchased = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+                "_ZN5Caver23StoreController_Android18IsProductPurchasedERKSs");
+        }
+        if (!isPurchased) {
             isPurchased = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
                 "_ZN5Caver15StoreController18IsProductPurchasedERKSs");
         }
@@ -5129,9 +5279,12 @@ void load_and_boot_arm64() {
 
         // Patch ShowInterstitialAd to return immediately — the death state machine
         // can't be replicated on non-Android (same issue as PS Vita port).
-        // Death recovery uses execv process restart.
         uint64_t showAd = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
-            "_ZN5Caver24OnlineController_Android18ShowInterstitialAdERKSsif");
+            "_ZN5Caver24OnlineController_Android18ShowInterstitialAdERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEEif");
+        if (!showAd) {
+            showAd = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+                "_ZN5Caver24OnlineController_Android18ShowInterstitialAdERKSsif");
+        }
         if (showAd) {
             *(uint32_t*)(memory + showAd) = 0xD65F03C0; // RET
             std::cout << "[Fix64] Patched ShowInterstitialAd at 0x" << std::hex << showAd
@@ -5144,12 +5297,21 @@ void load_and_boot_arm64() {
             std::cout << "[Fix64] Patched AndroidShowInterstitialAd at 0x" << std::hex << showAd2
                       << " -> ret" << std::dec << std::endl;
         }
+        if (swordi_abi == 13) {
+            uint64_t showAdMaybe = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+                "_ZN5Caver22GameOverViewController11ShowAdMaybeEv");
+            if (showAdMaybe) {
+                *(uint32_t*)(memory + showAdMaybe) = 0xD65F03C0; // RET
+                std::cout << "[Fix64] Patched ShowAdMaybe at 0x" << std::hex << showAdMaybe
+                          << " -> ret" << std::dec << std::endl;
+            }
+        }
 
-        // Coin limit patches (ARM64)
+        // Coin limit patches (ARM64, 1.4.12 only)
         // Lua coin limit check 1 & 2: offsets 0x35e25c, 0x35e260
         // Game event limit check 3 & 4: offsets 0x3597a0, 0x3597a4
         // Too rich patch: 0x3597ac, 0x3597b4, 0x3597b8
-        {
+        if (swordi_abi == 12) {
             uint64_t base_addr = g_main_mod_64.base_addr;
             if (base_addr) {
                 extern int g_sre_coin_limit;
@@ -5601,8 +5763,8 @@ void load_and_boot_arm64() {
                         // vtable), zero it so the guest's own null-checks skip the dispatch this
                         // frame. Self-heals: once CaverShell::InitView installs a valid view
                         // (sane vtable in code range), the guard stops firing and draws proceed.
-                        if (g_guest_memory) {
-                            static const uint64_t kShellAddr   = 0x16e9c20ULL; // DAT_007e9c20 + 0x1000000
+                        if (g_guest_memory && swordi_abi == 12) {
+                            static const uint64_t kShellAddr   = 0x16e9c20ULL; // DAT_007e9c20 + 0x1000000 (1.4.12 only)
                             static const uint64_t kArenaEnd    = 0xE0000000ULL;
                             static const uint32_t kRootOff     = 0x88;
                             const uint64_t code_lo = 0x1000000ULL;

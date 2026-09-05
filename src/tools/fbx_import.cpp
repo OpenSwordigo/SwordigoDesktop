@@ -339,45 +339,47 @@ PODModel fbx_parse(const std::vector<uint8_t>& data, const std::string& hint_pat
 
     if (model.meshes.empty()) return model;
 
-    // Normalize: center + fit into unit cube.
+    // Compute accurate per-mesh and whole-model bounding box without squashing
     float minx =  1e30f, miny =  1e30f, minz =  1e30f;
     float maxx = -1e30f, maxy = -1e30f, maxz = -1e30f;
-    for (auto& m : model.meshes)
-        for (size_t i = 0; i < m.positions.size(); i += 3) {
-            minx = std::min(minx, m.positions[i]);
-            miny = std::min(miny, m.positions[i + 1]);
-            minz = std::min(minz, m.positions[i + 2]);
-            maxx = std::max(maxx, m.positions[i]);
-            maxy = std::max(maxy, m.positions[i + 1]);
-            maxz = std::max(maxz, m.positions[i + 2]);
-        }
-    float cx = (minx + maxx) * 0.5f;
-    float cy = (miny + maxy) * 0.5f;
-    float cz = (minz + maxz) * 0.5f;
-    float ext = std::max(maxx - minx, std::max(maxy - miny, maxz - minz));
-    float scale = ext > 1e-12f ? 1.0f / ext : 1.0f;
-    for (auto& m : model.meshes)
-        for (size_t i = 0; i < m.positions.size(); i += 3) {
-            m.positions[i]     = (m.positions[i]     - cx) * scale;
-            m.positions[i + 1] = (m.positions[i + 1] - cy) * scale;
-            m.positions[i + 2] = (m.positions[i + 2] - cz) * scale;
-        }
-
-    model.num_mesh_nodes = (int)model.nodes.size();
-    model.center_x = model.center_y = model.center_z = 0;
-    model.radius = 0.866f; // half diagonal of the normalized unit cube
-    model.min_x = (minx - cx) * scale; model.max_x = (maxx - cx) * scale;
-    model.min_y = (miny - cy) * scale; model.max_y = (maxy - cy) * scale;
-    model.min_z = (minz - cz) * scale; model.max_z = (maxz - cz) * scale;
-
-    // Aggregate totals (POD loader populates these; the viewer's model panel
-    // reads them, so an FBX must too or it shows "0 vertices / 0 faces").
     model.total_vertices = 0;
     model.total_faces    = 0;
+
     for (auto& m : model.meshes) {
+        float m_minx =  1e30f, m_miny =  1e30f, m_minz =  1e30f;
+        float m_maxx = -1e30f, m_maxy = -1e30f, m_maxz = -1e30f;
+        for (size_t i = 0; i + 2 < m.positions.size(); i += 3) {
+            float px = m.positions[i + 0];
+            float py = m.positions[i + 1];
+            float pz = m.positions[i + 2];
+            m_minx = std::min(m_minx, px); m_maxx = std::max(m_maxx, px);
+            m_miny = std::min(m_miny, py); m_maxy = std::max(m_maxy, py);
+            m_minz = std::min(m_minz, pz); m_maxz = std::max(m_maxz, pz);
+        }
+        m.min_x = m_minx; m.max_x = m_maxx;
+        m.min_y = m_miny; m.max_y = m_maxy;
+        m.min_z = m_minz; m.max_z = m_maxz;
+
+        minx = std::min(minx, m_minx); maxx = std::max(maxx, m_maxx);
+        miny = std::min(miny, m_miny); maxy = std::max(maxy, m_maxy);
+        minz = std::min(minz, m_minz); maxz = std::max(maxz, m_maxz);
+
         model.total_vertices += m.num_vertices;
         model.total_faces    += m.num_faces;
     }
+
+    model.min_x = minx; model.max_x = maxx;
+    model.min_y = miny; model.max_y = maxy;
+    model.min_z = minz; model.max_z = maxz;
+    model.center_x = (minx + maxx) * 0.5f;
+    model.center_y = (miny + maxy) * 0.5f;
+    model.center_z = (minz + maxz) * 0.5f;
+
+    float dx = maxx - minx, dy = maxy - miny, dz = maxz - minz;
+    model.radius = 0.5f * std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (model.radius < 1.0f) model.radius = 1.0f;
+
+    model.num_mesh_nodes = (int)model.nodes.size();
     model.num_frames = 0; // static FBX import; animation not decoded yet
     return model;
 }

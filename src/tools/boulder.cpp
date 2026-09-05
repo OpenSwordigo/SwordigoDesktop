@@ -526,6 +526,18 @@ static GroundMesh parse_gmesh(const std::string& content) {
             gm.bottom_texture = val;
         } else if (key == "Z") {
             line_ss >> gm.z;
+        } else if (key == "SurfaceWidth") {
+            line_ss >> gm.surface_width;
+        } else if (key == "HatHeight") {
+            line_ss >> gm.hat_height;
+        } else if (key == "HatWidthOffset1") {
+            line_ss >> gm.hat_width_offset_1;
+        } else if (key == "HatWidthOffset2") {
+            line_ss >> gm.hat_width_offset_2;
+        } else if (key == "TextureScale") {
+            line_ss >> gm.texture_scale;
+        } else if (key == "RandomSeed") {
+            line_ss >> gm.random_seed;
         }
     }
     
@@ -546,6 +558,12 @@ std::string serialize_swdm(const GroundMesh& gm) {
     ss << "GenerateTop " << (gm.generate_top ? "true" : "false") << "\n";
     ss << "TopTexture \"" << gm.top_texture << "\"\n";
     ss << "BottomTexture \"" << gm.bottom_texture << "\"\n";
+    ss << "SurfaceWidth " << gm.surface_width << "\n";
+    ss << "HatHeight " << gm.hat_height << "\n";
+    ss << "HatWidthOffset1 " << gm.hat_width_offset_1 << "\n";
+    ss << "HatWidthOffset2 " << gm.hat_width_offset_2 << "\n";
+    ss << "TextureScale " << gm.texture_scale << "\n";
+    ss << "RandomSeed " << gm.random_seed << "\n";
     ss << "Hat[\n";
     for (const auto& h : gm.hats)
         ss << h.x << " " << h.y << " " << h.radius << " " << h.height << "\n";
@@ -888,9 +906,13 @@ static proto::Writer make_mesh(const std::vector<uint8_t>& vertex_bits,
 
 std::string generate_ground_mesh_object(const std::string& gmesh_content,
                                         const std::string& identifier,
-                                        double depth) {
+                                        double depth,
+                                        const GroundComponentIds* ids) {
     GroundMesh gm = parse_gmesh(gmesh_content);
     if (gm.polygon.size() < 3) return "";
+
+    GroundComponentIds default_ids;
+    const GroundComponentIds& cid = ids ? *ids : default_ids;
 
     double left = gm.polygon[0].x, right = gm.polygon[0].x;
     double bottom = gm.polygon[0].y, top = gm.polygon[0].y;
@@ -929,7 +951,7 @@ std::string generate_ground_mesh_object(const std::string& gmesh_content,
     gpc.write_float_field(5, static_cast<float>(gm.max_depth)); // MaxDepth
     proto::Writer comp_ground_polygon;
     comp_ground_polygon.write_string_field(1, "GroundPolygon");
-    comp_ground_polygon.write_varint_field(2, 980);
+    comp_ground_polygon.write_varint_field(2, static_cast<uint64_t>(cid.polygon_id));
     comp_ground_polygon.write_nested_field(110, gpc); // Component.GroundPolygonComponent
 
     // ── GroundMeshComponent ──
@@ -948,25 +970,25 @@ std::string generate_ground_mesh_object(const std::string& gmesh_content,
     gmc.write_nested_field(10, make_float_color(1, 1, 1, 1)); // Color
     proto::Writer comp_ground_mesh;
     comp_ground_mesh.write_string_field(1, "GroundMesh");
-    comp_ground_mesh.write_varint_field(2, 981);
+    comp_ground_mesh.write_varint_field(2, static_cast<uint64_t>(cid.mesh_id));
     comp_ground_mesh.write_nested_field(111, gmc); // Component.GroundMeshComponent
 
     // ── GroundMeshGeneratorComponent ──
     proto::Writer ggc;
-    ggc.write_varint_field(1, 980);  // GroundPolygonId
-    ggc.write_varint_field(2, 981);  // TargetMeshId
-    ggc.write_varint_field(3, 985);  // FrontTextureMappingId
-    ggc.write_varint_field(4, 984);  // SurfaceTextureMappingId
-    ggc.write_varint_field(5, 1291618994u); // RandomSeed
+    ggc.write_varint_field(1, static_cast<uint64_t>(cid.polygon_id));  // GroundPolygonId
+    ggc.write_varint_field(2, static_cast<uint64_t>(cid.mesh_id));     // TargetMeshId
+    ggc.write_varint_field(3, static_cast<uint64_t>(cid.tm_front_id)); // FrontTextureMappingId
+    ggc.write_varint_field(4, static_cast<uint64_t>(cid.tm_surface_id)); // SurfaceTextureMappingId
+    ggc.write_varint_field(5, static_cast<uint64_t>(gm.random_seed));  // RandomSeed
     ggc.write_float_field(6, 0.0f);  // HorizNoise
     ggc.write_varint_field(7, 1);    // MeshType
-    ggc.write_float_field(8, 80.0f); // SurfaceWidth
-    ggc.write_float_field(9, 25.0f); // HatHeight
-    ggc.write_float_field(10, 5.0f); // HatWidthOffset1
-    ggc.write_float_field(11, 5.0f); // HatWidthOffset2
+    ggc.write_float_field(8, static_cast<float>(gm.surface_width));      // SurfaceWidth
+    ggc.write_float_field(9, static_cast<float>(gm.hat_height));         // HatHeight
+    ggc.write_float_field(10, static_cast<float>(gm.hat_width_offset_1)); // HatWidthOffset1
+    ggc.write_float_field(11, static_cast<float>(gm.hat_width_offset_2)); // HatWidthOffset2
     proto::Writer comp_generator;
     comp_generator.write_string_field(1, "GroundMeshGenerator");
-    comp_generator.write_varint_field(2, 982);
+    comp_generator.write_varint_field(2, static_cast<uint64_t>(cid.generator_id));
     comp_generator.write_nested_field(112, ggc); // Component.GroundMeshGeneratorComponent
 
     // ── CollisionShape (ShapeComponent polygon + CollisionShapeComponent) ──
@@ -979,28 +1001,28 @@ std::string generate_ground_mesh_object(const std::string& gmesh_content,
     csc.write_varint_field(11, 1);                   // Enabled
     proto::Writer comp_collision;
     comp_collision.write_string_field(1, "CollisionShape");
-    comp_collision.write_varint_field(2, 983);
-    comp_collision.write_varint_field(4, 980); // ParentComponentIdentifier
+    comp_collision.write_varint_field(2, static_cast<uint64_t>(cid.collision_id));
+    comp_collision.write_varint_field(4, static_cast<uint64_t>(cid.polygon_id)); // ParentComponentIdentifier
     comp_collision.write_nested_field(120, shape); // Component.ShapeComponent
     comp_collision.write_nested_field(121, csc);   // Component.CollisionShapeComponent
 
-    // ── TextureMapping x2 (984 = surface, 985 = front) ──
+    // ── TextureMapping x2 (surface, front) ──
     proto::Writer tm_surface;
     tm_surface.write_string_field(1, gm.top_texture);
-    tm_surface.write_float_field(2, 250.0f);
+    tm_surface.write_float_field(2, static_cast<float>(gm.texture_scale));
     tm_surface.write_nested_field(3, make_vector2(0, 0));
     proto::Writer comp_tm_surface;
     comp_tm_surface.write_string_field(1, "TextureMapping");
-    comp_tm_surface.write_varint_field(2, 984);
+    comp_tm_surface.write_varint_field(2, static_cast<uint64_t>(cid.tm_surface_id));
     comp_tm_surface.write_nested_field(113, tm_surface);
 
     proto::Writer tm_front;
     tm_front.write_string_field(1, gm.bottom_texture);
-    tm_front.write_float_field(2, 250.0f);
+    tm_front.write_float_field(2, static_cast<float>(gm.texture_scale));
     tm_front.write_nested_field(3, make_vector2(0, 0));
     proto::Writer comp_tm_front;
     comp_tm_front.write_string_field(1, "TextureMapping");
-    comp_tm_front.write_varint_field(2, 985);
+    comp_tm_front.write_varint_field(2, static_cast<uint64_t>(cid.tm_front_id));
     comp_tm_front.write_nested_field(113, tm_front);
 
     // ── Object ──

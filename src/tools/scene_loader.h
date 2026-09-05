@@ -374,4 +374,16 @@ bool scene_set_program_source(std::string& program_data, const std::string& sour
 bool scene_save(const std::string& path, const SceneData& scene,
                 std::string* error_message = nullptr);
 
+// --- SCL (ObjectLibrary) direct editing and serialization ---
+struct SclTemplateEntry {
+    std::string name;
+    float scaling = 1.0f;
+    std::string raw_object_bytes;
+    SceneObject object;
+};
+
+std::vector<SclTemplateEntry> scl_load_templates(const std::string& scl_bytes);
+bool scl_update_template(std::string& scl_bytes, const std::string& template_name, const SceneObject& obj);
+bool scl_save_to_file(const std::string& filepath, const std::string& scl_bytes, std::string* error_message = nullptr);
+
 } // namespace av

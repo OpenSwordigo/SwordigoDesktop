@@ -36,6 +36,7 @@ if (SWORDIGO_BUILD_RUBY)
         ${SRC_DIR}/tools/map_editor.cpp
         ${SRC_DIR}/imgui/Guizmo/src/ImGuizmo.cpp
         ${SRC_DIR}/tools/ufbx/ufbx.c
+        ${SRC_DIR}/tools/tiny_gltf_v3.c
         # Windows-only: registers an exe-relative libs\ dir with the DLL loader
         # so shipped DLLs can live in binw/libs (no-op / empty TU elsewhere).
         ${SRC_DIR}/platform/win_dll_dir.cpp)

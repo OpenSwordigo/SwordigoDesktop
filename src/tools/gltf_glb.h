@@ -27,10 +27,14 @@ struct GLTFTextureImage {
 
 // Serialize `model` to `output_path` as a GLB file. `images` are the textures
 // referenced by the model; missing entries simply leave materials untextured.
+// `flip_v` flips the V coordinate (v = 1 - v) so exported GLBs display textures
+// correctly in standard DCC tools (Blender, etc.), which expect top-origin UVs.
+// POD UVs are bottom-origin (v = 0 at bottom), so flip_v defaults to true.
 bool gltf_export_glb(const PODModel& model,
                      const std::vector<GLTFTextureImage>& images,
                      const std::string& output_path,
-                     std::string* err = nullptr);
+                     std::string* err = nullptr,
+                     bool flip_v = true);
 
 // A texture image extracted from a GLB (PNG or JPEG payload) ready for
 // conversion back into game texture formats (e.g. .pvr / .tex.png).
@@ -80,7 +84,8 @@ bool gltf_import_glb(const std::string& path,
                      PODModel& out,
                      std::vector<GLTFImageBuffer>& images,
                      std::string* err = nullptr,
-                     GLTFPBRInfo* pbr = nullptr);
+                     GLTFPBRInfo* pbr = nullptr,
+                     float scale = 1.0f);
 
 // Parse a bare .gltf JSON file into a PODModel (same outputs as the GLB
 // importer). External resources are resolved relative to the .gltf file:
@@ -90,6 +95,15 @@ bool gltf_import_gltf(const std::string& path,
                       PODModel& out,
                       std::vector<GLTFImageBuffer>& images,
                       std::string* err = nullptr,
-                      GLTFPBRInfo* pbr = nullptr);
+                      GLTFPBRInfo* pbr = nullptr,
+                      float scale = 1.0f);
+
+// Extract all animation clips inside a .glb / .gltf as individual PODModel
+// objects (each containing the skeleton nodes + keyframed animation streams
+// formatted as Swordigo clip PODs).
+bool gltf_import_all_clips(const std::string& path,
+                           std::vector<std::pair<std::string, PODModel>>& out_clips,
+                           std::string* err = nullptr,
+                           float scale = 1.0f);
 
 } // namespace av

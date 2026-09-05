@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <cstdint>
 
 namespace boulder {
 
@@ -36,6 +37,21 @@ namespace boulder {
         double z = 40.0;                     // constant Z (world depth) for the whole mesh
         std::string top_texture = "fire_grass";
         std::string bottom_texture = "graveyard_ground";
+        double surface_width = 80.0;
+        double hat_height = 25.0;
+        double hat_width_offset_1 = 5.0;
+        double hat_width_offset_2 = 5.0;
+        double texture_scale = 250.0;
+        uint32_t random_seed = 1291618994u;
+    };
+
+    struct GroundComponentIds {
+        int polygon_id = 980;
+        int mesh_id = 981;
+        int generator_id = 982;
+        int collision_id = 983;
+        int tm_surface_id = 984;
+        int tm_front_id = 985;
     };
 
     // Parses a .gmesh / .swdm file content and generates FileRift-compatible
@@ -56,6 +72,7 @@ namespace boulder {
     // Returns empty string on failure (polygon < 3 points, etc).
     std::string generate_ground_mesh_object(const std::string& gmesh_content,
                                             const std::string& identifier,
-                                            double depth);
+                                            double depth,
+                                            const GroundComponentIds* ids = nullptr);
 
 } // namespace boulder

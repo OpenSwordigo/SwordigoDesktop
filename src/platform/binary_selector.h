@@ -4,6 +4,9 @@
 #include <map>
 #include <algorithm>
 
+// Global Swordigo ABI version (12 = 1.4.12, 13 = 1.4.13)
+extern "C" int swordi_abi;
+
 // Binary version status
 enum class BinaryStatus {
     TESTED,     // Known stable

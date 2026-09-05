@@ -141,6 +141,9 @@ int ElfLoader::load(so_module* mod, const std::string& filename, uint32_t load_a
         } else if (name == ".init_array") {
             mod->init_array_vaddr = addr;
             mod->init_array_size = size;
+        } else if (name == ".text") {
+            mod->text_base = addr;
+            mod->text_size = size;
         }
     }
 

@@ -291,14 +291,14 @@ static void parse_ground_mesh_component(SceneObject& obj, const SceneComponent& 
             std::vector<std::string> base_meshes;
             while (gm_reader.read_field(gm_f)) {
                 if (gm_f.wire_type == proto::WIRE_LEN) {
-                    // libswordigo_arm32.c order: FrontMesh(8), SurfaceMesh(9), Mesh(6).
-                    if (gm_f.field_number == 8) front_meshes.push_back(gm_f.bytes_val);
-                    else if (gm_f.field_number == 9) surface_meshes.push_back(gm_f.bytes_val);
+                    // libswordigo_ida32.c order: SurfaceMesh(8), FrontMesh(9), Mesh(6).
+                    if (gm_f.field_number == 8) surface_meshes.push_back(gm_f.bytes_val);
+                    else if (gm_f.field_number == 9) front_meshes.push_back(gm_f.bytes_val);
                     else if (gm_f.field_number == 6) base_meshes.push_back(gm_f.bytes_val);
                 }
             }
-            for (const auto& mesh : front_meshes) parse_single_mesh(obj, mesh, 8);
-            for (const auto& mesh : surface_meshes) parse_single_mesh(obj, mesh, 9);
+            for (const auto& mesh : surface_meshes) parse_single_mesh(obj, mesh, 8);
+            for (const auto& mesh : front_meshes) parse_single_mesh(obj, mesh, 9);
             for (const auto& mesh : base_meshes) parse_single_mesh(obj, mesh, 6);
         }
     }
@@ -680,6 +680,12 @@ static std::vector<std::string> parse_imported_library_names(const std::string& 
 // Resolve ImportedLibrary references into external_libraries by loading each
 // <name>.scl from the scene directory / resources tree. Cached per load call;
 // called only from scene_load so interactive scene_refresh stays cheap.
+//
+// Supports:
+// 1. Direct scene imports from scene.object_libraries.
+// 2. Transitive / recursive imports: .scl files that import other .scl files (e.g. hiro -> rlsw -> groundmeshes).
+// 3. Global modular mesh libraries: automatically enqueues groundmeshes / groundmeshes2
+//    if present in the candidate roots (modded Swordigo loads these at bootup).
 static void load_external_libraries(SceneData& scene) {
     if (scene.filepath.empty()) return;
     const fs::path scene_dir = fs::path(scene.filepath).parent_path();
@@ -694,17 +700,48 @@ static void load_external_libraries(SceneData& scene) {
         scene_dir / "resources",
         scene_dir.parent_path(),
         scene_dir.parent_path() / "resources",
+        scene_dir.parent_path().parent_path() / "resources",
         data_res,
         local_res
     };
 
-    std::vector<std::string> wanted;
+    std::vector<std::string> queue;
+    std::unordered_set<std::string> visited;
+
+    auto enqueue = [&](const std::string& name) {
+        if (!name.empty() && visited.find(name) == visited.end()) {
+            visited.insert(name);
+            queue.push_back(name);
+        }
+    };
+
+    // 1. Direct imports from the scene's embedded ObjectLibrary
     for (const auto& library : scene.object_libraries) {
-        for (auto& name : parse_imported_library_names(library))
-            if (!name.empty()) wanted.push_back(std::move(name));
+        for (const auto& name : parse_imported_library_names(library))
+            enqueue(name);
     }
 
-    for (const auto& name : wanted) {
+    // 2. Auto-discover standard/modder global mesh databases (groundmeshes, groundmeshes2)
+    // if present in candidate roots. Modded scenes use templates like pgm_0..kgm_10 without
+    // explicit ImportedLibrary tags because the engine loads them at bootup.
+    static const char* kGlobalLibraries[] = {"groundmeshes", "groundmeshes2"};
+    for (const char* gname : kGlobalLibraries) {
+        if (visited.find(gname) == visited.end()) {
+            const std::string fname = std::string(gname) + ".scl";
+            for (const auto& root : roots) {
+                std::error_code ec;
+                if (fs::is_regular_file(root / fname, ec)) {
+                    enqueue(gname);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. Process worklist transitively (queue grows as child libraries are parsed)
+    size_t q_head = 0;
+    while (q_head < queue.size()) {
+        const std::string name = queue[q_head++];
         const std::string filename = name + ".scl";
         fs::path found;
         for (const auto& root : roots) {
@@ -722,6 +759,10 @@ static void load_external_libraries(SceneData& scene) {
         if (!in) continue;
         std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         if (!bytes.empty()) {
+            // Transitive resolution: enqueue any libraries imported by this .scl
+            for (const auto& child : parse_imported_library_names(bytes)) {
+                enqueue(child);
+            }
             scene.external_libraries.push_back(std::move(bytes));
             scene.imported_library_names.push_back(name);
             scene.imported_library_paths.push_back(found.string());
@@ -750,11 +791,21 @@ static void resolve_scene_templates(SceneData& scene) {
             if (object.components.empty()) {
                 object.resolved_components = item->second.components;
             } else {
-                std::unordered_set<int> overridden;
-                for (const auto& component : object.components) overridden.insert(component.type_id);
+                // Determine which component classes are explicitly overridden by the object.
+                // Matching by component schema class (e.g. GroundMeshComponent) rather than
+                // arbitrary sequential Identifier (e.g. 101) ensures that an unrelated
+                // component with ID 101 never accidentally masks the template's GroundMesh.
+                std::unordered_set<std::string> overridden_schemas;
+                for (const auto& component : object.components) {
+                    std::string sname = component_schema_name(component);
+                    if (!sname.empty()) overridden_schemas.insert(sname);
+                }
                 std::vector<SceneComponent> merged;
                 for (const auto& component : item->second.components) {
-                    if (overridden.find(component.type_id) == overridden.end()) merged.push_back(component);
+                    std::string sname = component_schema_name(component);
+                    if (sname.empty() || overridden_schemas.find(sname) == overridden_schemas.end()) {
+                        merged.push_back(component);
+                    }
                 }
                 merged.insert(merged.end(), object.components.begin(), object.components.end());
                 object.resolved_components = std::move(merged);
@@ -861,6 +912,31 @@ static std::string rebuild_ground_mesh_component(const SceneObject& obj,
                 proto::Field g;
                 proto::Writer gw;
                 while (gm.read_field(g)) {
+                    if (g.field_number == 7 && g.wire_type == proto::WIRE_LEN) {
+                        // Dynamically recompute LocalAabb from mesh bounds
+                        float min_x = 1e30f, min_y = 1e30f, max_x = -1e30f, max_y = -1e30f;
+                        for (const auto& m : obj.ground_meshes) {
+                            for (size_t vi = 0; vi + 1 < m.positions.size(); vi += 3) {
+                                const float vx = m.positions[vi];
+                                const float vy = m.positions[vi + 1];
+                                if (vx < min_x) min_x = vx;
+                                if (vx > max_x) max_x = vx;
+                                if (vy < min_y) min_y = vy;
+                                if (vy > max_y) max_y = vy;
+                            }
+                        }
+                        if (min_x <= max_x) {
+                            proto::Writer rect;
+                            rect.write_float_field(1, min_x);
+                            rect.write_float_field(2, min_y);
+                            rect.write_float_field(3, max_x - min_x);
+                            rect.write_float_field(4, max_y - min_y);
+                            gw.write_nested_field(7, rect);
+                        } else {
+                            gw.write_field(g);
+                        }
+                        continue;
+                    }
                     const bool is_mesh_child = (g.field_number == 6 || g.field_number == 8 ||
                                                 g.field_number == 9) && g.wire_type == proto::WIRE_LEN;
                     if (!is_mesh_child) {
@@ -934,9 +1010,32 @@ static std::string serialize_object(const SceneObject& obj) {
     // Tag 7: Scaling (uniform — use scale_x)
     w.write_float_field(7, obj.scale_x);
 
-    // Tag 8: LocalAabb (preserved raw bytes)
-    if (!obj.local_aabb.empty())
+    // Tag 8: LocalAabb (recomputed if ground meshes are dirty to fix frustum culling)
+    if (obj.ground_meshes_dirty && !obj.ground_meshes.empty()) {
+        float min_x = 1e30f, min_y = 1e30f, max_x = -1e30f, max_y = -1e30f;
+        for (const auto& gm : obj.ground_meshes) {
+            for (size_t i = 0; i + 1 < gm.positions.size(); i += 3) {
+                const float x = gm.positions[i];
+                const float y = gm.positions[i + 1];
+                if (x < min_x) min_x = x;
+                if (x > max_x) max_x = x;
+                if (y < min_y) min_y = y;
+                if (y > max_y) max_y = y;
+            }
+        }
+        if (min_x <= max_x) {
+            proto::Writer rect;
+            rect.write_float_field(1, min_x);
+            rect.write_float_field(2, min_y);
+            rect.write_float_field(3, max_x - min_x);
+            rect.write_float_field(4, max_y - min_y);
+            w.write_nested_field(8, rect);
+        } else if (!obj.local_aabb.empty()) {
+            w.write_bytes_field(8, obj.local_aabb);
+        }
+    } else if (!obj.local_aabb.empty()) {
         w.write_bytes_field(8, obj.local_aabb);
+    }
 
     // Tag 9: Hidden
     w.write_varint_field(9, obj.hidden ? 1ULL : 0ULL);
@@ -1983,6 +2082,119 @@ bool scene_save(const std::string& path, const SceneData& scene, std::string* er
 
     std::cout << "[scene_loader] saved " << fs::path(path).filename().string()
               << " (" << data.size() << " bytes, " << scene.objects.size() << " objects)\n";
+    return true;
+}
+
+std::vector<SclTemplateEntry> scl_load_templates(const std::string& scl_bytes) {
+    std::vector<SclTemplateEntry> entries;
+    try {
+        proto::Reader library(scl_bytes);
+        proto::Field field;
+        while (library.read_field(field)) {
+            if (field.field_number != 2 || field.wire_type != proto::WIRE_LEN) continue;
+            SclTemplateEntry entry;
+            proto::Reader object_template(field.bytes_val);
+            proto::Field template_field;
+            while (object_template.read_field(template_field)) {
+                if (template_field.field_number == 1 && template_field.wire_type == proto::WIRE_LEN) {
+                    entry.raw_object_bytes = template_field.bytes_val;
+                    entry.object = parse_object(template_field.bytes_val);
+                    entry.name = entry.object.name;
+                } else if (template_field.field_number == 2 && template_field.wire_type == proto::WIRE_I32) {
+                    entry.scaling = template_field.float_val;
+                }
+            }
+            if (!entry.name.empty()) {
+                resolve_object_render_data(entry.object);
+                entries.push_back(std::move(entry));
+            }
+        }
+    } catch (...) {}
+    return entries;
+}
+
+bool scl_update_template(std::string& scl_bytes, const std::string& template_name, const SceneObject& obj) {
+    try {
+        proto::Reader library(scl_bytes);
+        proto::Writer lib_writer;
+        proto::Field field;
+        bool found = false;
+
+        while (library.read_field(field)) {
+            if (field.field_number == 2 && field.wire_type == proto::WIRE_LEN) {
+                proto::Reader object_template(field.bytes_val);
+                proto::Field tf;
+                bool is_target = false;
+                float scaling = 1.0f;
+                std::vector<proto::Field> other_fields;
+
+                while (object_template.read_field(tf)) {
+                    if (tf.field_number == 1 && tf.wire_type == proto::WIRE_LEN) {
+                        SceneObject existing = parse_object(tf.bytes_val);
+                        if (existing.name == template_name) {
+                            is_target = true;
+                        } else {
+                            other_fields.push_back(tf);
+                        }
+                    } else if (tf.field_number == 2 && tf.wire_type == proto::WIRE_I32) {
+                        scaling = tf.float_val;
+                    } else {
+                        other_fields.push_back(tf);
+                    }
+                }
+
+                if (is_target) {
+                    proto::Writer new_tpl;
+                    std::string new_obj_bytes = serialize_object(obj);
+                    new_tpl.write_bytes_field(1, new_obj_bytes);
+                    new_tpl.write_float_field(2, scaling);
+                    for (const auto& ofld : other_fields) {
+                        if (ofld.field_number != 1 && ofld.field_number != 2)
+                            new_tpl.write_field(ofld);
+                    }
+                    lib_writer.write_bytes_field(2, new_tpl.to_string());
+                    found = true;
+                } else {
+                    lib_writer.write_field(field);
+                }
+            } else {
+                lib_writer.write_field(field);
+            }
+        }
+
+        if (found) {
+            scl_bytes = lib_writer.to_string();
+            return true;
+        }
+    } catch (...) {}
+    return false;
+}
+
+bool scl_save_to_file(const std::string& filepath, const std::string& scl_bytes, std::string* error_message) {
+    const std::string tmp_path = filepath + ".ruby-scl.tmp";
+    {
+        std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            if (error_message) *error_message = "Cannot write temporary file: " + tmp_path;
+            return false;
+        }
+        out.write(scl_bytes.data(), static_cast<std::streamsize>(scl_bytes.size()));
+        out.flush();
+        if (!out.good()) {
+            if (error_message) *error_message = "Failed writing to temporary file: " + tmp_path;
+            return false;
+        }
+    }
+    std::error_code ec;
+    fs::rename(tmp_path, filepath, ec);
+    if (ec) {
+        fs::copy_file(tmp_path, filepath, fs::copy_options::overwrite_existing, ec);
+        fs::remove(tmp_path, ec);
+        if (ec) {
+            if (error_message) *error_message = "Failed replacing destination file: " + ec.message();
+            return false;
+        }
+    }
     return true;
 }
 

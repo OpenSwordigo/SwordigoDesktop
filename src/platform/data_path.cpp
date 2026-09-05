@@ -6,6 +6,8 @@
 #include <vector>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
+#include <unordered_map>
 #ifndef _WIN32
 #include <unistd.h>
 #include <pwd.h>
@@ -343,7 +345,7 @@ static bool check_file_exists(const std::string& path, std::string& out_resolved
     return false;
 }
 
-extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_path, int max_len) {
+extern "C" bool resolve_vfs_path_impl(const char* original_path, char* out_resolved_path, int max_len) {
     if (!original_path || original_path[0] == '\0') {
         return false;
     }
@@ -486,6 +488,71 @@ extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_p
     std::string fallback = data_dir + "/" + g_instance_assets_dir + "/resources/" + path;
     strncpy(out_resolved_path, fallback.c_str(), max_len - 1);
     out_resolved_path[max_len - 1] = '\0';
+    return true;
+}
+
+/* ============================================================
+ *  resolve_vfs_path — memoized entry point (profile-screen fix, rec 3)
+ *
+ *  Every guest fopen/stat/opendir funnels through here and the
+ *  implementation below costs up to 6 std::filesystem::exists()
+ *  stat calls per invocation. The hero-selection screen
+ *  (ProfileSelectionView::LoadProfiles → ProfilePanelView per
+ *  save) re-resolves the SAME handful of asset paths once per
+ *  save panel, so the identical mapping is recomputed N times.
+ *
+ *  The memo keys on the VFS layering fingerprint (active mod,
+ *  active profile, instance assets dir) and is cleared whenever
+ *  that changes or the entry bound is hit, so mod/profile
+ *  switches and installs can never serve a stale mapping.
+ *  Failed resolutions are never cached (impl returns false only
+ *  for empty paths, which bypass the cache anyway).
+ * ============================================================ */
+extern "C" bool resolve_vfs_path(const char* original_path, char* out_resolved_path, int max_len) {
+    if (!original_path || original_path[0] == '\0') {
+        return false;
+    }
+
+    static std::mutex s_cache_mutex;
+    static std::unordered_map<std::string, std::string> s_cache;
+    static std::string s_cached_mod;      /* layering fingerprint            */
+    static std::string s_cached_profile;
+    static std::string s_cached_assets;
+    static bool s_cache_state_valid = false;
+    static constexpr size_t kCacheMaxEntries = 32768;
+
+    {
+        std::lock_guard<std::mutex> lock(s_cache_mutex);
+        const bool state_changed = !s_cache_state_valid ||
+                                   s_cached_mod != g_active_mod_name ||
+                                   s_cached_profile != g_active_profile_id ||
+                                   s_cached_assets != g_instance_assets_dir;
+        if (state_changed) {
+            s_cache.clear();
+            s_cached_mod = g_active_mod_name;
+            s_cached_profile = g_active_profile_id;
+            s_cached_assets = g_instance_assets_dir;
+            s_cache_state_valid = true;
+        }
+        auto it = s_cache.find(original_path);
+        if (it != s_cache.end()) {
+            strncpy(out_resolved_path, it->second.c_str(), max_len - 1);
+            out_resolved_path[max_len - 1] = '\0';
+            return true;
+        }
+    }
+
+    if (!resolve_vfs_path_impl(original_path, out_resolved_path, max_len)) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(s_cache_mutex);
+        if (s_cache.size() >= kCacheMaxEntries) {
+            s_cache.clear();   /* bound exceeded — cheap cold rebuild */
+        }
+        s_cache.emplace(original_path, out_resolved_path);
+    }
     return true;
 }
 

@@ -180,7 +180,7 @@ int decode_directory(const std::string& in_dir, const std::string& out_dir,
     for (auto& f : files) {
         if (filetype_for_path(f.string()).empty()) continue;
         std::string rel = fs::relative(f, fs::path(in_dir)).string();
-        std::string dst = fs::path(out_dir) / rel;
+        std::string dst = (fs::path(out_dir) / rel).string();
         std::string markup, error;
         if (!decode_file(f.string(), opt, markup, error)) {
             std::printf("%s×%s %s %s(%s)%s\n", C_ERROR, C_RESET,
@@ -207,7 +207,7 @@ int recode_directory(const std::string& in_dir, const std::string& out_dir,
     for (auto& f : files) {
         if (filetype_for_path(f.string()).empty()) continue;
         std::string rel = fs::relative(f, fs::path(in_dir)).string();
-        std::string dst = fs::path(out_dir) / rel;
+        std::string dst = (fs::path(out_dir) / rel).string();
         std::string bytes, error;
         if (!recode_file(f.string(), opt, bytes, error)) {
             std::printf("%s×%s %s %s(%s)%s\n", C_ERROR, C_RESET,
@@ -1315,7 +1315,7 @@ int run_cli(int argc, char** argv) {
             for (auto& p : decode_list) run_decode(p);
             break;
         case Mode::USER:
-            run_decode(wd / "de_in" / opt.user_folder);
+            run_decode((wd / "de_in" / opt.user_folder).string());
             break;
         case Mode::RECODE:
         case Mode::FORCE:

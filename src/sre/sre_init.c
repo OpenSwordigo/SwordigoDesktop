@@ -193,6 +193,28 @@ SreHookEntry sre_hook_table[] = {
     /* Game-specific views */
      { 0x42bae4, "sre_NewMenuView_DrawRect"  },  /* main menu */
 
+    /* ─── Hero-selection (profile) screen loader mitigation ───────────────
+     * LoadProfiles() builds one ProfilePanelView per save SYNCHRONOUSLY on
+     * the main thread; each panel re-parses hero.scene (no scene cache),
+     * builds a SceneView and binds HeroEquipmentManager. With many saves
+     * that is a multi-second stall between the main menu and hero selection.
+     * sre_profile_panels.c defers each panel's InitWithProfile onto its own
+     * Update ticks (2 panels / 17 ms) and instruments per-panel timing.
+     * All offsets verified in arm64_dyn_symbols.txt (v1.4.12 arm64):
+     *   LoadProfiles 0x3a1684  InitWithProfile 0x39ac98  Update 0x39dc7c
+     *   DrawRect 0x39e1a4 (4-byte tail-call thunk!)  LayoutSubviews 0x39d76c
+     *   AnimateIn 0x39da3c  AnimateOut 0x39db60  ButtonPressed 0x39ac04
+     * Relay pointers g_orig_Profile* are wired in main.cpp's hook installer.
+     * Kill switch: SRE_PROFILE_PANELS_SYNC=1 → vanilla synchronous build. */
+    { 0x3a1684, "sre_ProfileSelectionView_LoadProfiles" },
+     { 0x39ac98, "sre_ProfilePanelView_InitWithProfile"  },
+     { 0x39dc7c, "sre_ProfilePanelView_Update"           },
+     { 0x39e1a4, "sre_ProfilePanelView_DrawRect"         },
+     { 0x39d76c, "sre_ProfilePanelView_LayoutSubviews"   },
+     { 0x39da3c, "sre_ProfilePanelView_AnimateIn"        },
+     { 0x39db60, "sre_ProfilePanelView_AnimateOut"       },
+     { 0x39ac04, "sre_ProfilePanelView_ButtonPressed"    },
+
 
     /* Options button — intercept Offers click at the delegate level.
      * When Offers is clicked, ButtonPressed calls the delegate method
@@ -418,7 +440,9 @@ SreHookEntry sre_hook_table[] = {
      * Hook offset 0x4b44b8 = Caver::FileExistsAtPath (v1.4.12 ARM64). */
      { 0x4b44b8, "sre_FileExistsAtPath"                    },  /* nm arm64: 0x4b44b8 ✓ */
      { 0x4b4254, "sre_NewByteBufferFromAndroidAsset"        },  /* nm arm64: 0x4b4254 ✓ */
-     { 0x5196c4, "sre_PVRTTextureLoadFromPVRBuffer_hook", 0 },  /* nm arm64: 0x5196c4 ✓ */
+     /* PVRT hook DISABLED — native engine handles PVR/texture loading
+      * itself (runs fine pre-SRE). Left as reference for re-enable.
+      * { 0x5196c4, "sre_PVRTTextureLoadFromPVRBuffer_hook", 0 },  // nm arm64: 0x5196c4 ✓ */
      { 0, "sre_SetResourcesPath" },
      /* IsAndroidAssetsPath — ARM64 offset NOT YET VERIFIED.
       * README offsets are ARM32/Thumb — 0x084472 was wrong (mid-instruction).
@@ -648,7 +672,10 @@ void sre_init(uint64_t swordigo_base, uint64_t empty_bss_off) {
     sre_install_exception_safeguard();
 }
 
-// Host-side bridge function import
+// Host-side bridge function import — DISABLED with the PVRT hook (see hook
+// table). The guest engine's native PVRTTextureLoadFromPVRBuffer handles
+// texture loading; we no longer import this bridge symbol.
+#if 0
 extern void sre_PVRTTextureLoadFromPVRBuffer(
     void *param_1, unsigned long param_2, unsigned int *param_3, 
     void *param_4, unsigned int param_5, unsigned int param_6, 
@@ -663,6 +690,7 @@ void sre_PVRTTextureLoadFromPVRBuffer_hook(
 ) {
     sre_PVRTTextureLoadFromPVRBuffer(param_1, param_2, param_3, param_4, param_5, param_6, param_7, param_8);
 }
+#endif
 
 /* =========================================================================
  * sre_custom_terminate_handler — intercepts ARM64 __verbose_terminate_handler

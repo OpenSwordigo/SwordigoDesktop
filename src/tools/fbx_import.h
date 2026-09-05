@@ -10,7 +10,9 @@
 //   - each node's world transform (geometry_to_world) is baked into the
 //     vertices and normals,
 //   - the scene is converted to right-handed Y-up space by ufbx,
-//   - the whole model is re-centered and normalized to fit a unit cube,
+//     and authored units are converted to metres (ufbx target_unit_meters=1.0),
+//     so a cm-authored FBX is divided by 100 — NOT normalised to a unit cube;
+//     callers apply opts.unit_scale/opts.scale to reach game units,
 //   - each material's diffuse texture is resolved to an existing file next to
 //     the .fbx (or the .fbx itself) so texture_filenames can be loaded by the
 //     viewer's texture pipeline.

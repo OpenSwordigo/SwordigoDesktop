@@ -40,6 +40,7 @@ extern uint64_t g_sre_dynstr_base;        // libswordigo .dynstr STRTAB start (n
 extern uint64_t g_sre_dynstr_end;         // libswordigo .dynstr STRTAB end (non-exec)
 extern uint64_t g_sre_runtime_text_base;  // libsre executable segment start
 extern uint64_t g_sre_runtime_text_end;   // libsre executable segment end
+extern "C" int swordi_abi;
 
 // ============================================================================
 // is_valid_exec_pc — Crash-Report-03 render-guard PC validator
@@ -245,10 +246,12 @@ static void sre_install_rbtree_guard_once() {
     static bool installed = false;
     if (installed) return;
     installed = true;
-    if (sre_emulator_install_pc_hook(SRE_RBTREE_INCREMENT,
-                                     sre_rbtree_increment_handler, nullptr) == 0) {
-        std::cout << "[SRE/RBTreeGuard] Installed bounded scene-tree successor hook"
-                  << std::endl;
+    if (swordi_abi == 12) {
+        if (sre_emulator_install_pc_hook(SRE_RBTREE_INCREMENT,
+                                         sre_rbtree_increment_handler, nullptr) == 0) {
+            std::cout << "[SRE/RBTreeGuard] Installed bounded scene-tree successor hook (1.4.12)"
+                      << std::endl;
+        }
     }
 }
 

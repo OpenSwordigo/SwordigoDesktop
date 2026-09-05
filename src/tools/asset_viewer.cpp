@@ -616,6 +616,23 @@ struct ViewerState {
     bool  mesh_edit_drag = false;       // currently dragging the selected vertex
     float mesh_edit_plane_y = 0.0f;     // world Y of the vertex-drag plane
 
+    // --- Templated Mesh Editing Modal State ---
+    bool  template_mesh_modal_open = false;
+    int   template_mesh_modal_object = -1;
+    int   template_mesh_modal_choice = 0;   // 0 = Copy & keep link, 1 = Copy & detach, 2 = Edit library master
+    bool  template_mesh_modal_remember = false;
+    int   template_mesh_session_choice = -1; // -1 = ask every time, 0/1/2 = remembered
+
+    // --- SCL Mesh Studio Mode ---
+    bool   scl_studio_active = false;
+    std::string scl_studio_filepath;
+    std::string scl_studio_raw_bytes;
+    std::vector<av::SclTemplateEntry> scl_studio_templates;
+    int    scl_studio_selected_template = -1;
+    bool   scl_studio_dirty = false;
+    std::set<std::string> scl_studio_modified_templates;
+    char   scl_studio_search[64] = {};
+
     // Triple-tap mesh selection: 3 rapid taps at the same spot drill into the
     // sub-mesh under the cursor (object picking stays the default).
     int    scene_tap_count = 0;         // consecutive rapid taps at ~same spot
@@ -661,6 +678,13 @@ struct ViewerState {
 
     char  gm_top_tex[96]    = "fire_grass";
     char  gm_bottom_tex[96] = "graveyard_ground";
+    float gm_surface_width = 80.0f;
+    float gm_hat_height = 25.0f;
+    float gm_hat_offset_1 = 5.0f;
+    float gm_hat_offset_2 = 5.0f;
+    float gm_texture_scale = 250.0f;
+    uint32_t gm_random_seed = 1291618994u;
+    boulder::GroundComponentIds gm_target_ids;
     int   gm_drag_point = -1;           // point being dragged (-1 = none)
     bool  gm_dragging = false;
     int   gm_tool = 0;                  // 0=move/add, 1=add-only, 2=erase, 3=freehand
@@ -676,7 +700,6 @@ struct ViewerState {
     bool  gm_hat_dragging = false;
     bool  gm_hat_resizing = false;      // dragging a hat's radius handle
     float gm_hat_radius = 60.0f;        // defaults for newly placed hats
-    float gm_hat_height  = 40.0f;
     int   gm_edit_apply_object = -1;    // object being edited via the 2D canvas
     bool  gm_inline_edit = false;       // inline 2D polygon editing in the visualizer
     bool  gm_inline_dirty = false;      // sketch changed since last live re-apply
@@ -933,9 +956,12 @@ pid_t                    pty_child_pid   = -1;
     std::mutex  blender_mutex;               // guards blender_source_pod/status writes
     std::thread blender_daemon;
 
-    // FBX → game POD converter (right-panel "Convert to POD" button)
-    bool        convert_tex_pgm  = true;     // re-encode textures to .tex.png
-    bool        convert_flip_v   = true;      // flip V (FBX top → game bottom)
+    // Model → game POD converter (right-panel "Convert to POD" button & modal)
+    bool        convert_tex_pgm    = true;     // re-encode textures to .pvr / .tex.png
+    bool        convert_flip_v     = true;     // flip V (FBX/GLTF top → game bottom)
+    float       convert_scale      = 1.0f;     // uniform scale factor for model conversion (e.g. 80.0)
+    int         convert_pvr_res    = 0;        // target PVR texture resolution (0 = original default, 512, 1024 HD, 2048 UHD, 4096)
+    bool        show_convert_modal = false;    // model conversion settings modal
     std::string convert_status;                // last conversion result line
 
     // World-map (.scmap) editor state
@@ -955,6 +981,13 @@ static GLuint load_ground_mesh_texture(const fs::path& scene_dir,
                                        const std::string& tex_name);
 static void frame_scene_camera(ViewerState& st);
 static void frame_scene_at_spawn(ViewerState& st, int index);
+static void enter_scl_studio(ViewerState& st, const std::string& path,
+                             std::string bytes = "",
+                             std::vector<av::SclTemplateEntry> tpls = {});
+static void scl_studio_select_template(ViewerState& st, int index);
+static bool scl_studio_save(ViewerState& st);
+static void draw_scl_studio_sidebar(ViewerState& st);
+static void draw_scl_studio_inspector(ViewerState& st);
 static std::string scene_play_anim_pod(const ViewerState& st, int obj_index,
                                        const std::string& base_mname);
 
@@ -2531,6 +2564,23 @@ static void select_file(ViewerState& st, const FileEntry& fe) {
         auto dot = fe.full_path.rfind('.');
         std::string ext = (dot != std::string::npos) ? fe.full_path.substr(dot) : "";
         for (auto& c : ext) c = (char)tolower((unsigned char)c);
+
+        if (ext == ".scl" && !content.decoded_markup) {
+            std::ifstream f(fe.full_path, std::ios::binary);
+            if (f) {
+                std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                auto tpls = av::scl_load_templates(bytes);
+                bool has_gm = false;
+                for (const auto& t : tpls) {
+                    if (!t.object.ground_meshes.empty()) { has_gm = true; break; }
+                }
+                if (has_gm) {
+                    enter_scl_studio(st, fe.full_path, std::move(bytes), std::move(tpls));
+                    break;
+                }
+            }
+        }
+
         bool is_protobuf = !st.text_protobuf_type.empty() && !content.decoded_markup;
         if (is_protobuf) {
             std::ifstream f(fe.full_path, std::ios::binary);
@@ -4034,6 +4084,7 @@ static void draw_object_inspector(ViewerState& st) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.65f, 0.85f, 1.0f));
     ImGui::TextUnformatted(cat_label);
     ImGui::PopStyleColor();
+    const bool is_overridden_template = !obj.template_name.empty() && !obj.components.empty();
     if (from_library) {
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.7f, 0.35f, 1.0f));
@@ -4041,6 +4092,13 @@ static void draw_object_inspector(ViewerState& st) {
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("This object is linked to a scene template — components are inherited.\nUse 'Materialize' to copy them into the object.");
+    } else if (is_overridden_template) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.85f, 0.55f, 1.0f));
+        ImGui::TextUnformatted(ICON_FA_BOX " local override");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("This object is linked to template '%s' with custom components saved in this scene file.", obj.template_name.c_str());
     }
     ImGui::Separator();
 
@@ -4130,17 +4188,49 @@ static void draw_object_inspector(ViewerState& st) {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Depth (world Z / parallax layer)");
         ImGui::TextUnformatted("Rotation");
         ImGui::SameLine(label_w);
-        if (ImGui::DragFloat("##rot_y", &obj.rot_y, 0.01f, -6.2832f, 6.2832f, "%.4f")) {
+        float rot_deg = obj.rot_y * 180.0f / 3.14159265f;
+        if (ImGui::DragFloat("##rot_deg", &rot_deg, 0.5f, -360.0f, 360.0f, "%.1f°")) {
+            obj.rot_y = rot_deg * (3.14159265f / 180.0f);
+            while (obj.rot_y > 3.14159265f)  obj.rot_y -= 2.0f * 3.14159265f;
+            while (obj.rot_y < -3.14159265f) obj.rot_y += 2.0f * 3.14159265f;
             obj.rot_x = obj.rot_z = 0.0f;
             av::scene_refresh(st.scene);
             st.scene_dirty = true;
         }
         if (ImGui::IsItemActivated()) snapshot_scene(st);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Rotation (radians, around depth axis)");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("In-plane rotation (Tag 6, around depth/Z axis)\nDrag to rotate in degrees. Raw radians: %.4f", obj.rot_y);
+        
+        ImGui::SameLine();
+        if (ImGui::SmallButton("0°")) { snapshot_scene(st); obj.rot_y = 0.0f; av::scene_refresh(st.scene); st.scene_dirty = true; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("90°")) { snapshot_scene(st); obj.rot_y = 1.5707963f; av::scene_refresh(st.scene); st.scene_dirty = true; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("180°")) { snapshot_scene(st); obj.rot_y = 3.1415927f; av::scene_refresh(st.scene); st.scene_dirty = true; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("270°")) { snapshot_scene(st); obj.rot_y = -1.5707963f; av::scene_refresh(st.scene); st.scene_dirty = true; }
+
+        if (obj.has_model_y_rotation) {
+            ImGui::TextUnformatted("Model Yaw");
+            ImGui::SameLine(label_w);
+            float myaw_deg = obj.model_y_rotation * 180.0f / 3.14159265f;
+            if (ImGui::DragFloat("##myaw_deg", &myaw_deg, 1.0f, -360.0f, 360.0f, "%.1f° (3D)")) {
+                obj.model_y_rotation = myaw_deg * (3.14159265f / 180.0f);
+                av::scene_refresh(st.scene);
+                st.scene_dirty = true;
+            }
+            if (ImGui::IsItemActivated()) snapshot_scene(st);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("3D ModelComponent Y-axis facing angle (radians: %.4f)", obj.model_y_rotation);
+        }
+
         ImGui::TextUnformatted("Scale");
         ImGui::SameLine(label_w);
-        if (ImGui::DragFloat("##scale_x", &obj.scale_x, 0.01f, 0.001f, 100.f, "%.3f")) {
+        // Game culls objects with render-scale < 0.01 (Scene::DrawModels), so clamp
+        // the editor to the same floor to avoid "invisible in-game" surprises.
+        if (ImGui::DragFloat("##scale_x", &obj.scale_x, 0.01f, 0.01f, 100.f, "%.3f")) {
             obj.scale_y = obj.scale_z = obj.scale_x;
+            // LocalAABB (Tag 8) is in object-local space and does NOT include the
+            // scene-object scale, so it stays valid across scale edits — no refresh
+            // needed here. (Ground-mesh geometry holders recompute their own AABB.)
             av::scene_refresh(st.scene);
             st.scene_dirty = true;
         }
@@ -4413,6 +4503,28 @@ static void draw_object_inspector(ViewerState& st) {
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Copy the template's components into this object so it no longer depends on the library (main.js 'materializeComponents').");
+    } else if (is_overridden_template) {
+        if (ImGui::Button(ICON_FA_ARROW_ROTATE_LEFT " Revert to Template")) {
+            snapshot_scene(st);
+            obj.components.clear();
+            av::scene_refresh(st.scene);
+            const fs::path scene_dir = fs::path(st.scene.filepath).parent_path();
+            upload_scene_ground_meshes(st, scene_dir.string());
+            st.scene_dirty = true;
+            st.status_msg = "Reverted '" + obj.name + "' to clean template '" + obj.template_name + "'.";
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Discard local mesh/component edits and re-inherit directly from the library template.");
+
+        ImGui::SameLine();
+        if (ImGui::Button(ICON_FA_XMARK " Detach")) {
+            snapshot_scene(st);
+            obj.template_name.clear();
+            st.scene_dirty = true;
+            st.status_msg = "Detached object from template (now 100% standalone).";
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Clear TemplateName to make this a completely independent object with zero external library links.");
     }
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.18f, 0.18f, 1.0f));
@@ -4445,6 +4557,20 @@ static void draw_scene_inspector(ViewerState& st) {
     const ImGuiIO& io = ImGui::GetIO();
     const float avail_y = ImGui::GetContentRegionAvail().y;
     const float list_h = std::max(120.0f, avail_y * 0.46f);
+
+    if (st.scl_studio_active) {
+        ImGui::BeginChild("##ObjectsPanel", ImVec2(0, list_h), ImGuiChildFlags_Borders);
+        draw_scl_studio_sidebar(st);
+        ImGui::EndChild();
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::BeginChild("##PropertiesPanel", ImVec2(0, 0), ImGuiChildFlags_Borders);
+        draw_scl_studio_inspector(st);
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        return;
+    }
 
     // ── OBJECTS (top) ──────────────────────────────────────────────────
     ImGui::BeginChild("##ObjectsPanel", ImVec2(0, list_h), ImGuiChildFlags_Borders);
@@ -5444,6 +5570,7 @@ static bool gm_regenerate_object_geometry(ViewerState& st, int idx, std::string*
                                           bool live = false);
 static void gm_apply_to_object(ViewerState& st);          // GMG tab: apply to object
 static bool gm_begin_inline_edit(ViewerState& st);        // inline 2D edit in viewport
+static void request_begin_ground_mesh_edit(ViewerState& st); // checks template modal first
 static void gm_end_inline_edit(ViewerState& st);
 static void gm_revert_inline_edit(ViewerState& st);       // discard the session
 static void draw_inline_polygon_overlay(ViewerState& st, ImDrawList* overlay,
@@ -5462,6 +5589,12 @@ static std::string gm_build_swdm_text(const ViewerState& st) {
     gm.z           = st.gm_z;
     gm.top_texture = st.gm_top_tex;
     gm.bottom_texture = st.gm_bottom_tex;
+    gm.surface_width = st.gm_surface_width;
+    gm.hat_height = st.gm_hat_height;
+    gm.hat_width_offset_1 = st.gm_hat_offset_1;
+    gm.hat_width_offset_2 = st.gm_hat_offset_2;
+    gm.texture_scale = st.gm_texture_scale;
+    gm.random_seed = st.gm_random_seed;
     return boulder::serialize_swdm(gm);
 }
 
@@ -5574,56 +5707,128 @@ static int gm_add_to_scene(ViewerState& st) {
 }
 
 // Import an existing GroundMesh object's polygon into the sketch editor.
-// The object's own texture + depth metadata is carried over too, so re-applying
-// the sketch keeps the vanilla look (a vanilla mesh edited in 2D must not fall
-// back to the generator's hardcoded default textures / depth).
+// Authoritatively extracts TextureMapping, GroundMeshGenerator parameters,
+// Min/Max depth, and component IDs to prevent metadata loss on apply.
 static void gm_import_from_scene(ViewerState& st) {
     if (st.selected_object < 0 || st.selected_object >= (int)st.scene.objects.size()) return;
     const auto& obj = st.scene.objects[st.selected_object];
     gm_push_undo(st);              // the previous sketch stays one Ctrl+Z away
     st.gm_points.clear();
     bool have_depth = false;
-    for (const auto& comp : obj.components) {
+
+    // Use resolved_components if object is templated and components is empty
+    const auto& comps = obj.components.empty() ? obj.resolved_components : obj.components;
+
+    uint32_t surface_tm_id = 0, front_tm_id = 0;
+    std::string top_tex_from_tm, front_tex_from_tm;
+    float scale_from_tm = 250.0f;
+
+    for (const auto& comp : comps) {
         const int payload = comp.payload_field;
-        if (payload != 110) continue;   // GroundPolygonComponent
-        try {
-            proto::Reader wrapper(comp.raw_data);
-            proto::Field f;
-            while (wrapper.read_field(f)) {
-                if (f.field_number != 110 || f.wire_type != proto::WIRE_LEN) continue;
-                proto::Reader gpc(f.bytes_val);
-                proto::Field g;
-                while (gpc.read_field(g)) {
-                    if (g.field_number == 4 && g.wire_type == proto::WIRE_I32) {
-                        st.gm_min_depth = g.float_val; have_depth = true; continue;
-                    } else if (g.field_number == 5 && g.wire_type == proto::WIRE_I32) {
-                        st.gm_max_depth = g.float_val; have_depth = true; continue;
-                    } else if (g.field_number != 2 || g.wire_type != proto::WIRE_LEN) {
-                        continue;
-                    }
-                    proto::Reader poly(g.bytes_val);
-                    proto::Field p;
-                    while (poly.read_field(p)) {
-                        if (p.field_number != 1 || p.wire_type != proto::WIRE_LEN) continue; // Vertex
-                        proto::Reader vec2(p.bytes_val);
-                        proto::Field v;
-                        float x = 0, y = 0;
-                        while (vec2.read_field(v)) {
-                            if (v.field_number == 1) x = v.float_val;
-                            else if (v.field_number == 2) y = v.float_val;
+        // GroundPolygon (110)
+        if (payload == 110 || comp.type_name == "GroundPolygon") {
+            if (comp.type_id > 0) st.gm_target_ids.polygon_id = comp.type_id;
+            try {
+                proto::Reader wrapper(comp.raw_data);
+                proto::Field f;
+                while (wrapper.read_field(f)) {
+                    if (f.field_number != 110 || f.wire_type != proto::WIRE_LEN) continue;
+                    proto::Reader gpc(f.bytes_val);
+                    proto::Field g;
+                    while (gpc.read_field(g)) {
+                        if (g.field_number == 4 && g.wire_type == proto::WIRE_I32) {
+                            st.gm_min_depth = g.float_val; have_depth = true; continue;
+                        } else if (g.field_number == 5 && g.wire_type == proto::WIRE_I32) {
+                            st.gm_max_depth = g.float_val; have_depth = true; continue;
+                        } else if (g.field_number != 2 || g.wire_type != proto::WIRE_LEN) {
+                            continue;
                         }
-                        st.gm_points.push_back({x, y});
+                        proto::Reader poly(g.bytes_val);
+                        proto::Field p;
+                        while (poly.read_field(p)) {
+                            if (p.field_number != 1 || p.wire_type != proto::WIRE_LEN) continue; // Vertex
+                            proto::Reader vec2(p.bytes_val);
+                            proto::Field v;
+                            float x = 0, y = 0;
+                            while (vec2.read_field(v)) {
+                                if (v.field_number == 1) x = v.float_val;
+                                else if (v.field_number == 2) y = v.float_val;
+                            }
+                            st.gm_points.push_back({x, y});
+                        }
                     }
                 }
+            } catch (...) {}
+        }
+        // GroundMesh (111)
+        else if (payload == 111 || comp.type_name == "GroundMesh") {
+            if (comp.type_id > 0) st.gm_target_ids.mesh_id = comp.type_id;
+        }
+        // GroundMeshGenerator (112)
+        else if (payload == 112 || comp.type_name == "GroundMeshGenerator") {
+            if (comp.type_id > 0) st.gm_target_ids.generator_id = comp.type_id;
+            try {
+                proto::Reader wrapper(comp.raw_data);
+                proto::Field f;
+                while (wrapper.read_field(f)) {
+                    if (f.field_number != 112 || f.wire_type != proto::WIRE_LEN) continue;
+                    proto::Reader ggc(f.bytes_val);
+                    proto::Field g;
+                    while (ggc.read_field(g)) {
+                        if (g.field_number == 3) front_tm_id = static_cast<uint32_t>(g.varint_val);
+                        else if (g.field_number == 4) surface_tm_id = static_cast<uint32_t>(g.varint_val);
+                        else if (g.field_number == 5) st.gm_random_seed = static_cast<uint32_t>(g.varint_val);
+                        else if (g.field_number == 8 && g.wire_type == proto::WIRE_I32) st.gm_surface_width = g.float_val;
+                        else if (g.field_number == 9 && g.wire_type == proto::WIRE_I32) st.gm_hat_height = g.float_val;
+                        else if (g.field_number == 10 && g.wire_type == proto::WIRE_I32) st.gm_hat_offset_1 = g.float_val;
+                        else if (g.field_number == 11 && g.wire_type == proto::WIRE_I32) st.gm_hat_offset_2 = g.float_val;
+                    }
+                }
+            } catch (...) {}
+        }
+        // CollisionShape (120/121)
+        else if (payload == 120 || payload == 121 || comp.type_name == "CollisionShape") {
+            if (comp.type_id > 0) st.gm_target_ids.collision_id = comp.type_id;
+        }
+        // TextureMapping (113)
+        else if (payload == 113 || comp.type_name == "TextureMapping") {
+            const uint32_t tm_id = static_cast<uint32_t>(comp.type_id);
+            std::string tname;
+            float tscale = 250.0f;
+            try {
+                proto::Reader wrapper(comp.raw_data);
+                proto::Field f;
+                while (wrapper.read_field(f)) {
+                    if (f.field_number != 113 || f.wire_type != proto::WIRE_LEN) continue;
+                    proto::Reader tmc(f.bytes_val);
+                    proto::Field g;
+                    while (tmc.read_field(g)) {
+                        if (g.field_number == 1 && g.wire_type == proto::WIRE_LEN) tname = g.bytes_val;
+                        else if (g.field_number == 2 && g.wire_type == proto::WIRE_I32) tscale = g.float_val;
+                    }
+                }
+            } catch (...) {}
+            if (tm_id == surface_tm_id || (surface_tm_id == 0 && top_tex_from_tm.empty())) {
+                top_tex_from_tm = tname;
+                scale_from_tm = tscale;
+                if (comp.type_id > 0) st.gm_target_ids.tm_surface_id = comp.type_id;
+            } else if (tm_id == front_tm_id || (front_tm_id == 0 && front_tex_from_tm.empty())) {
+                front_tex_from_tm = tname;
+                if (comp.type_id > 0) st.gm_target_ids.tm_front_id = comp.type_id;
             }
-        } catch (...) {}
-        if (!st.gm_points.empty()) break;
+        }
     }
-    // Carry the object's own textures over (vanilla layout: the first
-    // SurfaceMesh (field 8) is the TOP, later field-8 meshes + the FrontMesh
-    // (field 9) are the side walls). Re-applying then regenerates the mesh
-    // with the SAME materials instead of the generator defaults.
-    {
+
+    if (!top_tex_from_tm.empty()) {
+        snprintf(st.gm_top_tex, sizeof(st.gm_top_tex), "%s", top_tex_from_tm.c_str());
+        st.gm_texture_scale = scale_from_tm;
+    }
+    if (!front_tex_from_tm.empty()) {
+        snprintf(st.gm_bottom_tex, sizeof(st.gm_bottom_tex), "%s", front_tex_from_tm.c_str());
+    }
+
+    // Fallback to mesh textures if TextureMappingComponent was not populated
+    if (st.gm_top_tex[0] == '\0' || st.gm_bottom_tex[0] == '\0') {
         const size_t n = std::min({obj.ground_meshes.size(),
                                    obj.ground_mesh_textures.size(),
                                    obj.ground_mesh_fields.size()});
@@ -5643,11 +5848,30 @@ static void gm_import_from_scene(ViewerState& st) {
         }
         if (top_tex.empty()) top_tex = bottom_tex;
         if (bottom_tex.empty()) bottom_tex = top_tex;
-        if (!top_tex.empty())
+        if (!top_tex.empty() && st.gm_top_tex[0] == '\0')
             snprintf(st.gm_top_tex, sizeof(st.gm_top_tex), "%s", top_tex.c_str());
-        if (!bottom_tex.empty())
+        if (!bottom_tex.empty() && st.gm_bottom_tex[0] == '\0')
             snprintf(st.gm_bottom_tex, sizeof(st.gm_bottom_tex), "%s", bottom_tex.c_str());
     }
+
+    // Fallback: derive 2D points from mesh vertices if GroundPolygon was absent
+    if (st.gm_points.empty() && !obj.ground_meshes.empty()) {
+        for (const auto& gm : obj.ground_meshes) {
+            for (size_t i = 0; i + 2 < gm.positions.size(); i += 3) {
+                const float vx = gm.positions[i];
+                const float vy = gm.positions[i + 1];
+                bool dup = false;
+                for (const auto& pt : st.gm_points) {
+                    if (std::fabs(pt.x - vx) < 0.01 && std::fabs(pt.y - vy) < 0.01) {
+                        dup = true; break;
+                    }
+                }
+                if (!dup && st.gm_points.size() < 64) st.gm_points.push_back({vx, vy});
+            }
+            if (st.gm_points.size() >= 3) break;
+        }
+    }
+
     if (!st.gm_points.empty()) {
         st.gm_sketch_dirty = true;
         st.gm_canvas_framed = false;     // reframe the GMG canvas on the import
@@ -5655,8 +5879,6 @@ static void gm_import_from_scene(ViewerState& st) {
         // Keep the object's depth as the default Z.
         st.gm_z = obj.pos_z;
         if (!have_depth) {
-            // No MinDepth/MaxDepth on the polygon — derive the slab from the
-            // parsed mesh extents so the regenerated mesh keeps its thickness.
             float dmin = 1e30f, dmax = -1e30f;
             for (const auto& pm : obj.ground_meshes) {
                 dmin = std::min(dmin, pm.min_z); dmax = std::max(dmax, pm.max_z);
@@ -5669,13 +5891,8 @@ static void gm_import_from_scene(ViewerState& st) {
 }
 
 // Core: regenerate an object's ground-mesh geometry from the current sketch
-// (polygon + hats) and re-upload it. The object keeps its identity and world
-// transform; its GroundPolygon / GroundMesh / generator components are replaced
-// by the freshly generated ones. Used by both the GMG tab's "Apply to Object"
-// and the inline (in-viewport) 2D editor's live preview. Callers own the undo
-// snapshot. Returns false with *err filled on any failure. When live=true only
-// the edited object's GPU buffers are resynced (grow/shrink safe) so the 3D
-// mesh reshapes under the outline without re-uploading the whole scene.
+// (polygon + hats) and re-upload it. Preserves existing component IDs and
+// all non-ground components on the object.
 static bool gm_regenerate_object_geometry(ViewerState& st, int idx, std::string* err,
                                           bool live) {
     const auto fail = [&](const std::string& msg) {
@@ -5689,7 +5906,8 @@ static bool gm_regenerate_object_geometry(ViewerState& st, int idx, std::string*
     const std::string swdm = gm_build_swdm_text(st);
     std::string bin = boulder::generate_ground_mesh_object(swdm,
                                                            st.scene.objects[idx].name,
-                                                           st.gm_z);
+                                                           st.gm_z,
+                                                           &st.gm_target_ids);
     if (bin.empty())
         return fail("Ground mesh generation failed (degenerate polygon?).");
     const std::string tmp_path = st.scene.filepath + ".ruby-gm-apply.tmp";
@@ -5714,7 +5932,25 @@ static bool gm_regenerate_object_geometry(ViewerState& st, int idx, std::string*
     av::SceneObject& target = st.scene.objects[idx];
     const bool was_dim = target.is_dimension_object;
     av::SceneObject fresh = std::move(parsed.objects[0]);
+
+    // Preserve any non-ground components on the target (scripts, tags, etc.)
+    const auto is_ground_comp = [](const av::SceneComponent& c) {
+        return c.payload_field == 110 || c.payload_field == 111 ||
+               c.payload_field == 112 || c.payload_field == 113 ||
+               c.payload_field == 120 || c.payload_field == 121 ||
+               c.type_name == "GroundPolygon" || c.type_name == "GroundMesh" ||
+               c.type_name == "GroundMeshGenerator" || c.type_name == "CollisionShape" ||
+               c.type_name == "TextureMapping";
+    };
+    std::vector<av::SceneComponent> preserved;
+    for (auto& c : target.components) {
+        if (!is_ground_comp(c)) preserved.push_back(std::move(c));
+    }
     target.components = std::move(fresh.components);
+    for (auto& c : preserved) {
+        target.components.push_back(std::move(c));
+    }
+
     if (was_dim || st.gm_dimension_object)
         gm_append_dimension_component(target);   // keep/promote the rift gate
     target.pos_z = st.gm_z;               // depth layer chosen in the editor
@@ -5874,6 +6110,456 @@ static void gm_revert_inline_edit(ViewerState& st) {
         st.gm_inline_saved_valid = false;
     }
     st.status_msg = "Reverted mesh edit \xe2\x80\x94 session changes discarded.";
+}
+
+static void apply_template_mesh_edit_choice(ViewerState& st, int obj_idx, int choice) {
+    if (obj_idx < 0 || obj_idx >= (int)st.scene.objects.size()) return;
+    auto& obj = st.scene.objects[obj_idx];
+    snapshot_scene(st);
+
+    if (choice == 0) {
+        // Choice 0: Copy to Scene & Keep Link (Recommended by Xpera & Community)
+        obj.components = obj.resolved_components;
+        av::scene_refresh(st.scene);
+        av::scene_mark_ground_mesh_dirty(st.scene, obj_idx);
+        st.scene_dirty = true;
+        st.status_msg = "Copied ground mesh to scene file ('" + obj.template_name + "' link preserved).";
+    } else if (choice == 1) {
+        // Choice 1: Copy to Scene & Detach Completely
+        obj.components = obj.resolved_components;
+        obj.template_name.clear();
+        av::scene_refresh(st.scene);
+        av::scene_mark_ground_mesh_dirty(st.scene, obj_idx);
+        st.scene_dirty = true;
+        st.status_msg = "Copied ground mesh to scene file (detached from library).";
+    } else if (choice == 2) {
+        // Choice 2: Edit Global Master in SCL Mesh Studio
+        std::string target_scl_path;
+        for (const auto& lpath : st.scene.imported_library_paths) {
+            std::ifstream in(lpath, std::ios::binary);
+            if (in) {
+                std::string lbytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                for (const auto& t : av::scl_load_templates(lbytes)) {
+                    if (t.name == obj.template_name) { target_scl_path = lpath; break; }
+                }
+            }
+            if (!target_scl_path.empty()) break;
+        }
+        if (!target_scl_path.empty()) {
+            enter_scl_studio(st, target_scl_path);
+            for (size_t ti = 0; ti < st.scl_studio_templates.size(); ++ti) {
+                if (st.scl_studio_templates[ti].name == obj.template_name) {
+                    scl_studio_select_template(st, static_cast<int>(ti));
+                    break;
+                }
+            }
+            return;
+        }
+        st.status_msg = "Editing master template for '" + obj.template_name + "' in library (Global).";
+    }
+}
+
+static void request_begin_ground_mesh_edit(ViewerState& st) {
+    if (st.selected_object < 0 || st.selected_object >= (int)st.scene.objects.size()) return;
+    auto& obj = st.scene.objects[st.selected_object];
+    const bool from_lib = !obj.template_name.empty() && obj.components.empty() && !obj.resolved_components.empty();
+    if (from_lib) {
+        if (st.template_mesh_session_choice >= 0) {
+            apply_template_mesh_edit_choice(st, st.selected_object, st.template_mesh_session_choice);
+            if (!st.scl_studio_active) gm_begin_inline_edit(st);
+        } else {
+            st.template_mesh_modal_open = true;
+            st.template_mesh_modal_object = st.selected_object;
+        }
+    } else {
+        gm_begin_inline_edit(st);
+    }
+}
+
+static void draw_template_mesh_edit_modal(ViewerState& st) {
+    if (st.template_mesh_modal_open) {
+        ImGui::OpenPopup("Templated Ground Mesh Edit##modal");
+        st.template_mesh_modal_open = false;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(620, 390), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Templated Ground Mesh Edit##modal", nullptr, ImGuiWindowFlags_NoResize)) {
+        return;
+    }
+
+    const int obj_idx = st.template_mesh_modal_object;
+    std::string tname = (obj_idx >= 0 && obj_idx < (int)st.scene.objects.size())
+        ? st.scene.objects[obj_idx].template_name : "template";
+
+    ImGui::PushStyleColor(ImGuiCol_Text, g_theme.warning);
+    ImGui::TextUnformatted(ICON_FA_TRIANGLE_EXCLAMATION "  Templated Ground Mesh");
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+
+    ImGui::TextWrapped("Object #%d is an instance of template '%s' from an external library.",
+                       obj_idx, tname.c_str());
+    ImGui::TextWrapped("How would you like to handle your mesh modifications?");
+    ImGui::Spacing();
+
+    // Option 0: Copy & Keep Link
+    ImGui::PushStyleColor(ImGuiCol_Text, g_theme.accent);
+    ImGui::RadioButton("1. Copy to Scene & Keep Link (Recommended by Xpera)", &st.template_mesh_modal_choice, 0);
+    ImGui::PopStyleColor();
+    ImGui::Indent(24.0f);
+    ImGui::TextDisabled("• Copies mesh geometry into this .scene file; groundmeshes.scl stays untouched.\n"
+                        "• Preserves 'TemplateName: %s' so you can [Revert to Clean Template] anytime.", tname.c_str());
+    ImGui::Unindent(24.0f);
+    ImGui::Spacing();
+
+    // Option 1: Copy & Detach Completely
+    ImGui::RadioButton("2. Copy to Scene & Detach Completely", &st.template_mesh_modal_choice, 1);
+    ImGui::Indent(24.0f);
+    ImGui::TextDisabled("• Copies mesh geometry into this .scene file; groundmeshes.scl stays untouched.\n"
+                        "• Clears TemplateName: becomes a 100%% independent standalone scene object.");
+    ImGui::Unindent(24.0f);
+    ImGui::Spacing();
+
+    // Option 2: Edit Global Master
+    ImGui::RadioButton("3. Edit Global Library Master ('groundmeshes.scl')", &st.template_mesh_modal_choice, 2);
+    ImGui::Indent(24.0f);
+    ImGui::TextDisabled("• ⚠️ Opens the master template definition in SCL Mesh Studio directly!\n"
+                        "• All scenes and levels referencing '%s' will update when saved.", tname.c_str());
+    ImGui::Unindent(24.0f);
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    ImGui::Checkbox("Remember my choice for this session", &st.template_mesh_modal_remember);
+
+    ImGui::Spacing();
+    const float btn_w = 130.0f;
+    ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - (btn_w * 2 + 10.0f));
+
+    if (ImGui::Button(ICON_FA_CHECK " Confirm Edit", ImVec2(btn_w, 0))) {
+        if (st.template_mesh_modal_remember) {
+            st.template_mesh_session_choice = st.template_mesh_modal_choice;
+        }
+        apply_template_mesh_edit_choice(st, obj_idx, st.template_mesh_modal_choice);
+        ImGui::CloseCurrentPopup();
+        if (!st.scl_studio_active) gm_begin_inline_edit(st);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(btn_w, 0))) {
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::EndPopup();
+}
+
+// ── SCL Mesh Studio Implementation ──
+
+static void enter_scl_studio(ViewerState& st, const std::string& path,
+                             std::string bytes,
+                             std::vector<av::SclTemplateEntry> tpls) {
+    if (bytes.empty()) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return;
+        bytes.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
+    if (tpls.empty()) {
+        tpls = av::scl_load_templates(bytes);
+    }
+    if (tpls.empty()) return;
+
+    st.scl_studio_active = true;
+    st.scl_studio_filepath = path;
+    st.scl_studio_raw_bytes = std::move(bytes);
+    st.scl_studio_templates = std::move(tpls);
+    st.scl_studio_modified_templates.clear();
+    st.scl_studio_dirty = false;
+    st.scl_studio_selected_template = -1;
+    st.preview_type = PREVIEW_SCENE;
+    st.scene_preview_tab = 1;
+
+    // Select first template with a ground mesh
+    int sel = 0;
+    for (size_t i = 0; i < st.scl_studio_templates.size(); ++i) {
+        if (!st.scl_studio_templates[i].object.ground_meshes.empty()) {
+            sel = static_cast<int>(i);
+            break;
+        }
+    }
+    scl_studio_select_template(st, sel);
+    st.status_msg = "Entered SCL Mesh Studio: " + fs::path(path).filename().string() +
+                    " (" + std::to_string(st.scl_studio_templates.size()) + " templates).";
+}
+
+static void scl_studio_select_template(ViewerState& st, int index) {
+    if (index < 0 || index >= (int)st.scl_studio_templates.size()) return;
+
+    // If currently editing in 2D, commit and exit before switching
+    if (st.gm_inline_edit && !st.scene.objects.empty()) {
+        gm_end_inline_edit(st);
+    }
+
+    // If previous template was modified in scene, sync back to template array
+    if (st.scl_studio_selected_template >= 0 &&
+        st.scl_studio_selected_template < (int)st.scl_studio_templates.size() &&
+        !st.scene.objects.empty() && st.scene_dirty) {
+        auto& prev_tpl = st.scl_studio_templates[st.scl_studio_selected_template];
+        prev_tpl.object = st.scene.objects[0];
+        av::scl_update_template(st.scl_studio_raw_bytes, prev_tpl.name, st.scene.objects[0]);
+        st.scl_studio_modified_templates.insert(prev_tpl.name);
+        st.scl_studio_dirty = true;
+    }
+
+    st.scl_studio_selected_template = index;
+    auto& tpl = st.scl_studio_templates[index];
+
+    // Build virtual scene with just this 1 object
+    st.scene = av::SceneData();
+    st.scene.filepath = st.scl_studio_filepath;
+    st.scene.filename = fs::path(st.scl_studio_filepath).filename().string() + " [" + tpl.name + "]";
+
+    av::SceneObject obj = tpl.object;
+    obj.pos_x = 0; obj.pos_y = 0; obj.pos_z = 0;
+    obj.rot_x = 0; obj.rot_y = 0; obj.rot_z = 0;
+    obj.scale_x = 1; obj.scale_y = 1; obj.scale_z = 1;
+
+    st.scene.objects.push_back(std::move(obj));
+    st.selected_object = 0;
+    st.scene_selection = {0};
+    st.scene_dirty = false;
+
+    // Upload GPU meshes and import sketch for 2D editing
+    const fs::path scene_dir = fs::path(st.scl_studio_filepath).parent_path();
+    upload_scene_ground_meshes(st, scene_dir.string());
+    gm_import_from_scene(st);
+
+    // Frame camera on the tile
+    frame_scene_camera(st);
+}
+
+static bool scl_studio_save(ViewerState& st) {
+    if (!st.scl_studio_active || st.scl_studio_filepath.empty()) return false;
+
+    if (st.gm_inline_edit && !st.scene.objects.empty()) {
+        gm_end_inline_edit(st);
+    }
+
+    if (st.scl_studio_selected_template >= 0 &&
+        st.scl_studio_selected_template < (int)st.scl_studio_templates.size() &&
+        !st.scene.objects.empty()) {
+        auto& tpl = st.scl_studio_templates[st.scl_studio_selected_template];
+        tpl.object = st.scene.objects[0];
+        av::scl_update_template(st.scl_studio_raw_bytes, tpl.name, st.scene.objects[0]);
+    }
+
+    std::string err;
+    if (!av::scl_save_to_file(st.scl_studio_filepath, st.scl_studio_raw_bytes, &err)) {
+        st.status_msg = "Error saving SCL: " + err;
+        return false;
+    }
+
+    st.scl_studio_dirty = false;
+    st.scl_studio_modified_templates.clear();
+    st.scene_dirty = false;
+    st.status_msg = "Saved " + fs::path(st.scl_studio_filepath).filename().string() +
+                    " (" + std::to_string(st.scl_studio_templates.size()) + " templates).";
+    return true;
+}
+
+static void draw_scl_studio_sidebar(ViewerState& st) {
+    ImGui::TextDisabled(ICON_FA_CUBE " TEMPLATES IN LIBRARY  (%d)", (int)st.scl_studio_templates.size());
+    ImGui::SameLine();
+    if (ImGui::SmallButton(ICON_FA_CROSSHAIR " Frame")) {
+        frame_scene_camera(st);
+    }
+
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##scl_search", ICON_FA_MAGNIFYING_GLASS " Filter templates...",
+                             st.scl_studio_search, sizeof(st.scl_studio_search));
+    ImGui::Separator();
+
+    std::string q(st.scl_studio_search);
+    for (auto& c : q) c = (char)tolower((unsigned char)c);
+
+    struct BiomeGroup {
+        const char* prefix;
+        const char* name;
+        const char* icon;
+    };
+    static const BiomeGroup kBiomes[] = {
+        {"pgm_", "Plains Ground (pgm)", ICON_FA_CUBE},
+        {"fgm_", "Forest Ground (fgm)", ICON_FA_SHIELD},
+        {"cgm_", "Caves Ground (cgm)",  ICON_FA_MOUNTAIN_SUN},
+        {"wgm_", "Wasteland Ground (wgm)", ICON_FA_TRIANGLE_EXCLAMATION},
+        {"sgm_", "Snowy Ground (sgm)",  ICON_FA_CLOUD},
+        {"ggm_", "Grove Ground (ggm)",  ICON_FA_GEM},
+        {"kgm_", "Keep Ground (kgm)",   ICON_FA_SHIELD_HALVED},
+    };
+
+    auto render_tpl_row = [&](int idx) {
+        const auto& tpl = st.scl_studio_templates[idx];
+        const bool is_active = (st.scl_studio_selected_template == idx);
+        const bool is_mod = st.scl_studio_modified_templates.find(tpl.name) != st.scl_studio_modified_templates.end();
+
+        std::string label = (is_mod ? "\xe2\x97\x8f " : "  ") + tpl.name;
+        if (is_active) {
+            ImGui::PushStyleColor(ImGuiCol_Text, g_theme.accent);
+        }
+        if (ImGui::Selectable((label + "##tpl_entry" + std::to_string(idx)).c_str(), is_active)) {
+            scl_studio_select_template(st, idx);
+        }
+        if (is_active) {
+            ImGui::PopStyleColor();
+        }
+        if (ImGui::IsItemHovered()) {
+            std::string tip = "Template: " + tpl.name + "\n";
+            tip += "Ground meshes: " + std::to_string(tpl.object.ground_meshes.size()) + "\n";
+            tip += "Components: " + std::to_string(tpl.object.components.size());
+            ImGui::SetTooltip("%s", tip.c_str());
+        }
+    };
+
+    const float list_h = ImGui::GetContentRegionAvail().y;
+    if (ImGui::BeginChild("##scl_tpl_list", ImVec2(0, list_h), ImGuiChildFlags_Borders)) {
+        for (size_t bi = 0; bi < sizeof(kBiomes)/sizeof(kBiomes[0]); ++bi) {
+            const auto& bg = kBiomes[bi];
+            std::vector<int> matching;
+            for (size_t i = 0; i < st.scl_studio_templates.size(); ++i) {
+                const auto& tpl = st.scl_studio_templates[i];
+                if (tpl.name.rfind(bg.prefix, 0) == 0) {
+                    if (q.empty() || tpl.name.find(q) != std::string::npos)
+                        matching.push_back(static_cast<int>(i));
+                }
+            }
+            if (matching.empty()) continue;
+
+            if (ImGui::TreeNodeEx((void*)(intptr_t)(bi + 7000), ImGuiTreeNodeFlags_DefaultOpen,
+                                  "%s %s (%d)", bg.icon, bg.name, (int)matching.size())) {
+                for (int idx : matching) {
+                    render_tpl_row(idx);
+                }
+                ImGui::TreePop();
+            }
+        }
+
+        // Remaining non-biome templates
+        std::vector<int> remaining;
+        for (size_t i = 0; i < st.scl_studio_templates.size(); ++i) {
+            const auto& tpl = st.scl_studio_templates[i];
+            bool is_biome = false;
+            for (const auto& bg : kBiomes) {
+                if (tpl.name.rfind(bg.prefix, 0) == 0) { is_biome = true; break; }
+            }
+            if (!is_biome) {
+                if (q.empty() || tpl.name.find(q) != std::string::npos)
+                    remaining.push_back(static_cast<int>(i));
+            }
+        }
+        if (!remaining.empty()) {
+            if (ImGui::TreeNodeEx((void*)(intptr_t)(9999), ImGuiTreeNodeFlags_DefaultOpen,
+                                  ICON_FA_CUBES " Other Templates (%d)", (int)remaining.size())) {
+                for (int idx : remaining) {
+                    render_tpl_row(idx);
+                }
+                ImGui::TreePop();
+            }
+        }
+    }
+    ImGui::EndChild();
+}
+
+static void draw_scl_studio_inspector(ViewerState& st) {
+    if (st.scl_studio_selected_template < 0 ||
+        st.scl_studio_selected_template >= (int)st.scl_studio_templates.size() ||
+        st.scene.objects.empty()) {
+        ImGui::TextDisabled("No template selected.");
+        return;
+    }
+
+    auto& tpl = st.scl_studio_templates[st.scl_studio_selected_template];
+    auto& obj = st.scene.objects[0];
+
+    ImGui::PushStyleColor(ImGuiCol_Text, g_theme.accent);
+    ImGui::TextUnformatted((ICON_FA_CUBE "  " + tpl.name).c_str());
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::TextDisabled("#%d", st.scl_studio_selected_template);
+
+    ImGui::Separator();
+
+    if (ImGui::Button(ICON_FA_FLOPPY_DISK " Save SCL File", ImVec2(-1, 30))) {
+        scl_studio_save(st);
+    }
+    ImGui::Spacing();
+
+    // 2D Edit button
+    const bool is_2d = st.gm_inline_edit;
+    if (is_2d) ImGui::PushStyleColor(ImGuiCol_Button, g_theme.warning);
+    if (ImGui::Button(is_2d ? ICON_FA_CHECK " Finish 2D Edit (Esc)" : ICON_FA_PEN " Edit 2D Polygon (M)", ImVec2(-1, 28))) {
+        if (is_2d) gm_end_inline_edit(st);
+        else gm_begin_inline_edit(st);
+    }
+    if (is_2d) ImGui::PopStyleColor();
+
+    ImGui::Separator();
+
+    // Ground Mesh Generation Parameters
+    if (ImGui::CollapsingHeader(ICON_FA_SLIDERS " Generator & Materials", ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool changed = false;
+
+        // Texture inputs
+        ImGui::TextDisabled("SURFACE TEXTURE (TOP)");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##scl_top_tex", st.gm_top_tex, sizeof(st.gm_top_tex))) changed = true;
+
+        ImGui::TextDisabled("FRONT / SIDE TEXTURE");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##scl_bot_tex", st.gm_bottom_tex, sizeof(st.gm_bottom_tex))) changed = true;
+
+        ImGui::Spacing();
+        ImGui::TextDisabled("GEOMETRY PARAMETERS");
+
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::DragFloat("Surface Width", &st.gm_surface_width, 1.0f, 20.0f, 400.0f, "%.1f")) changed = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Width of the top surface/grass slab");
+
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::DragFloat("Hat Height", &st.gm_hat_height, 0.5f, 0.0f, 150.0f, "%.1f")) changed = true;
+
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::DragFloat("Texture Scale", &st.gm_texture_scale, 5.0f, 50.0f, 1000.0f, "%.0f")) changed = true;
+
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::DragFloat("Min Depth (Z)", &st.gm_min_depth, 1.0f, -200.0f, 200.0f, "%.1f")) changed = true;
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::DragFloat("Max Depth (Z)", &st.gm_max_depth, 1.0f, -200.0f, 200.0f, "%.1f")) changed = true;
+
+        if (changed) {
+            st.gm_sketch_dirty = true;
+        }
+
+        if (ImGui::Button(ICON_FA_ARROW_ROTATE_RIGHT " Regenerate Mesh", ImVec2(-1, 26))) {
+            snapshot_scene(st);
+            std::string err;
+            if (gm_regenerate_object_geometry(st, 0, &err, false)) {
+                st.scl_studio_modified_templates.insert(tpl.name);
+                st.scl_studio_dirty = true;
+                st.status_msg = "Regenerated geometry for '" + tpl.name + "'.";
+            } else {
+                st.status_msg = "Regenerate failed: " + err;
+            }
+        }
+    }
+
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader(ICON_FA_CIRCLE_INFO " Mesh Statistics", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("Submeshes: %d", (int)obj.ground_meshes.size());
+        int total_verts = 0, total_faces = 0;
+        for (const auto& gm : obj.ground_meshes) {
+            total_verts += gm.num_vertices;
+            total_faces += gm.num_faces;
+        }
+        ImGui::Text("Vertices:  %d", total_verts);
+        ImGui::Text("Faces:     %d", total_faces);
+        ImGui::Text("2D Nodes:  %d", (int)st.gm_points.size());
+    }
 }
 
 // Intersect a world ray with the plane spanned by an object matrix's X/Y axes
@@ -8666,25 +9352,79 @@ static void draw_object_browser(ViewerState& st) {
                                               ImGuiTreeNodeFlags_DefaultOpen,
                                               "%s %s  (%d)", swk::obj_category_icon(cat),
                                               swk::obj_category_label(cat), (int)trows.size())) {
-                            for (const auto* tpl : trows) {
-                                const bool clicked = ImGui::Selectable(
-                                    (tpl->name + "##tpl" + std::to_string(ci)).c_str());
-                                if (ImGui::IsItemHovered()) {
-                                    std::string tip = "Add linked object from template\n";
-                                    tip += "scale x" + std::to_string(tpl->scaling) + "\n";
-                                    if (tpl->component_types.empty())
-                                        tip += "(no components)";
-                                    else {
-                                        tip += "components: ";
-                                        for (size_t k = 0; k < tpl->component_types.size() && k < 6; ++k) {
-                                            if (k) tip += ", ";
-                                            tip += tpl->component_types[k];
-                                        }
-                                        if (tpl->component_types.size() > 6) tip += ", …";
+                            if (cat == swk::ObjCategory::Geometry) {
+                                struct BiomeGroup {
+                                    const char* prefix;
+                                    const char* name;
+                                    const char* icon;
+                                };
+                                static const BiomeGroup kBiomes[] = {
+                                    {"pgm_", "Plains Ground (pgm)", ICON_FA_CUBE},
+                                    {"fgm_", "Forest Ground (fgm)", ICON_FA_SHIELD},
+                                    {"cgm_", "Caves Ground (cgm)",  ICON_FA_MOUNTAIN_SUN},
+                                    {"wgm_", "Wasteland Ground (wgm)", ICON_FA_WARNING},
+                                    {"sgm_", "Snowy Ground (sgm)",  ICON_FA_CLOUD},
+                                    {"ggm_", "Grove Ground (ggm)",  ICON_FA_GEM},
+                                    {"kgm_", "Keep Ground (kgm)",   ICON_FA_SHIELD_HALVED},
+                                };
+                                std::vector<const av::SceneTemplateInfo*> remaining;
+                                for (size_t bi = 0; bi < sizeof(kBiomes)/sizeof(kBiomes[0]); ++bi) {
+                                    const auto& bg = kBiomes[bi];
+                                    std::vector<const av::SceneTemplateInfo*> brows;
+                                    for (const auto* tpl : trows) {
+                                        if (tpl->name.rfind(bg.prefix, 0) == 0) brows.push_back(tpl);
                                     }
-                                    ImGui::SetTooltip("%s", tip.c_str());
+                                    if (brows.empty()) continue;
+                                    if (ImGui::TreeNodeEx((void*)(intptr_t)(ci * 100 + bi + 5000), 0,
+                                                          "%s %s (%d)", bg.icon, bg.name, (int)brows.size())) {
+                                        for (const auto* tpl : brows) {
+                                            const bool clicked = ImGui::Selectable((tpl->name + "##tpl_bg" + std::to_string(bi)).c_str());
+                                            if (ImGui::IsItemHovered()) {
+                                                std::string tip = "Add modular ground mesh from template\nscale x" + std::to_string(tpl->scaling);
+                                                ImGui::SetTooltip("%s", tip.c_str());
+                                            }
+                                            if (clicked) template_add_to_scene(st, tpl->name);
+                                        }
+                                        ImGui::TreePop();
+                                    }
                                 }
-                                if (clicked) template_add_to_scene(st, tpl->name);
+                                for (const auto* tpl : trows) {
+                                    bool is_biome = false;
+                                    for (const auto& bg : kBiomes) {
+                                        if (tpl->name.rfind(bg.prefix, 0) == 0) { is_biome = true; break; }
+                                    }
+                                    if (!is_biome) remaining.push_back(tpl);
+                                }
+                                for (const auto* tpl : remaining) {
+                                    const bool clicked = ImGui::Selectable(
+                                        (tpl->name + "##tpl" + std::to_string(ci)).c_str());
+                                    if (ImGui::IsItemHovered()) {
+                                        std::string tip = "Add linked object from template\nscale x" + std::to_string(tpl->scaling);
+                                        ImGui::SetTooltip("%s", tip.c_str());
+                                    }
+                                    if (clicked) template_add_to_scene(st, tpl->name);
+                                }
+                            } else {
+                                for (const auto* tpl : trows) {
+                                    const bool clicked = ImGui::Selectable(
+                                        (tpl->name + "##tpl" + std::to_string(ci)).c_str());
+                                    if (ImGui::IsItemHovered()) {
+                                        std::string tip = "Add linked object from template\n";
+                                        tip += "scale x" + std::to_string(tpl->scaling) + "\n";
+                                        if (tpl->component_types.empty())
+                                            tip += "(no components)";
+                                        else {
+                                            tip += "components: ";
+                                            for (size_t k = 0; k < tpl->component_types.size() && k < 6; ++k) {
+                                                if (k) tip += ", ";
+                                                tip += tpl->component_types[k];
+                                            }
+                                            if (tpl->component_types.size() > 6) tip += ", …";
+                                        }
+                                        ImGui::SetTooltip("%s", tip.c_str());
+                                    }
+                                    if (clicked) template_add_to_scene(st, tpl->name);
+                                }
                             }
                             ImGui::TreePop();
                         }
@@ -9014,8 +9754,72 @@ static void draw_scene_visualizer(ViewerState& st) {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, th_alpha(g_theme.surface_hover, 0.55f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, g_theme.surface_hover);
-    if (ImGui::Button("View")) ImGui::OpenPopup("##scene_view");
-    if (ImGui::BeginPopup("##scene_view")) {
+
+    if (st.scl_studio_active) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushStyleColor(ImGuiCol_Text, g_theme.accent);
+        ImGui::TextUnformatted(ICON_FA_CUBE " SCL MESH STUDIO");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::TextDisabled("— %s", fs::path(st.scl_studio_filepath).filename().string().c_str());
+
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, g_theme.accent);
+        if (ImGui::Button(ICON_FA_FLOPPY_DISK " Save .SCL")) {
+            scl_studio_save(st);
+        }
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Save modified template definitions directly to %s", st.scl_studio_filepath.c_str());
+
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+
+        ImGui::SameLine();
+        const bool mesh_2d_active = st.gm_inline_edit;
+        if (mesh_2d_active) ImGui::PushStyleColor(ImGuiCol_Button, g_theme.warning);
+        if (ImGui::Button(mesh_2d_active ? ICON_FA_CHECK " Finish 2D Edit (Esc)" : ICON_FA_PEN " 2D Polygon Edit (M)")) {
+            if (mesh_2d_active) gm_end_inline_edit(st);
+            else gm_begin_inline_edit(st);
+        }
+        if (mesh_2d_active) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Edit ground polygon in 2D (drag vertices, right click edge to split)");
+
+        ImGui::SameLine();
+        if (ImGui::Button(ICON_FA_CROSSHAIR " Frame (F)")) {
+            frame_scene_camera(st);
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button(st.show_wireframe ? "Wireframe [ON]" : "Wireframe")) {
+            st.show_wireframe = !st.show_wireframe;
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button(st.scene_snap ? "Snap *" : "Snap")) ImGui::OpenPopup("##snap_options");
+        if (ImGui::BeginPopup("##snap_options")) {
+            ImGui::MenuItem("Enabled", nullptr, &st.scene_snap);
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::DragFloat("Step", &st.scene_snap_step, 0.1f, 0.01f, 100.0f, "%.2f");
+            ImGui::EndPopup();
+        }
+
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.2f, 0.2f, 1.0f));
+        if (ImGui::Button(ICON_FA_XMARK " Exit Studio")) {
+            if (st.gm_inline_edit) gm_end_inline_edit(st);
+            st.scl_studio_active = false;
+            st.scene = av::SceneData();
+            st.preview_type = PREVIEW_TEXT;
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::PopStyleColor(3);
+        ImGui::EndChild();
+    } else {
+        if (ImGui::Button("View")) ImGui::OpenPopup("##scene_view");
+        if (ImGui::BeginPopup("##scene_view")) {
         if (ImGui::MenuItem("Frame Selected", "F")) frame_scene_selection(st);
         if (ImGui::MenuItem("Frame All", "Home")) frame_scene_camera(st);
         if (ImGui::BeginMenu("Camera Ports")) {
@@ -9114,7 +9918,7 @@ static void draw_scene_visualizer(ViewerState& st) {
             // message; there is no legacy-3D fallback anymore.
             const bool has_sel = st.selected_object >= 0 &&
                                  st.selected_object < (int)st.scene.objects.size();
-            if (has_sel) gm_begin_inline_edit(st);
+            if (has_sel) request_begin_ground_mesh_edit(st);
         }
     }
     if (mesh_active) ImGui::PopStyleColor();
@@ -9273,6 +10077,7 @@ static void draw_scene_visualizer(ViewerState& st) {
 
     ImGui::PopStyleColor(3);
     ImGui::EndChild();
+    }
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
     // Logical viewport size drives all UI/picking/overlay math.
@@ -10336,7 +11141,7 @@ static void draw_scene_visualizer(ViewerState& st) {
         // modes, ImGuizmo offers a combined handle we expose as an option).
         ImGuizmo::OPERATION op = st.gizmo_universal ? ImGuizmo::UNIVERSAL
                                : st.scene_transform_mode == 1 ? ImGuizmo::TRANSLATE
-                               : st.scene_transform_mode == 2 ? ImGuizmo::ROTATE
+                               : st.scene_transform_mode == 2 ? (ImGuizmo::ROTATE_Z | ImGuizmo::ROTATE_SCREEN)
                                : ImGuizmo::SCALE;
         // Per-axis masking (web showX/showY/showZ): drop the bits for any
         // hidden axis so its handle disappears and its motion is locked.
@@ -10347,9 +11152,10 @@ static void draw_scene_visualizer(ViewerState& st) {
                 if (st.gizmo_show_y) masked = masked | ImGuizmo::TRANSLATE_Y;
                 if (st.gizmo_show_z) masked = masked | ImGuizmo::TRANSLATE_Z;
             } else if (st.scene_transform_mode == 2) {
-                if (st.gizmo_show_x) masked = masked | ImGuizmo::ROTATE_X;
+                // In 2.5D Swordigo scenes, rotation is primarily in the XY plane around the Z (depth) axis.
+                if (st.gizmo_show_z) masked = masked | ImGuizmo::ROTATE_Z | ImGuizmo::ROTATE_SCREEN;
                 if (st.gizmo_show_y) masked = masked | ImGuizmo::ROTATE_Y;
-                if (st.gizmo_show_z) masked = masked | ImGuizmo::ROTATE_Z;
+                if (st.gizmo_show_x) masked = masked | ImGuizmo::ROTATE_X;
             } else {
                 if (st.gizmo_show_x) masked = masked | ImGuizmo::SCALE_X;
                 if (st.gizmo_show_y) masked = masked | ImGuizmo::SCALE_Y;
@@ -10377,19 +11183,33 @@ static void draw_scene_visualizer(ViewerState& st) {
                                  snap_active ? snap : nullptr)) {
             if (!was_using && ImGuizmo::IsUsing()) snapshot_scene(st);   // snapshot at drag start
             // Decompose the manipulated matrix back into scene fields.
-            gobj.pos_x = matrix[12]; gobj.pos_y = matrix[13]; gobj.pos_z = matrix[14];
-            const float sx = std::sqrt(matrix[0]*matrix[0] + matrix[1]*matrix[1] + matrix[2]*matrix[2]);
-            const float sy = std::sqrt(matrix[4]*matrix[4] + matrix[5]*matrix[5] + matrix[6]*matrix[6]);
-            const float sz = std::sqrt(matrix[8]*matrix[8] + matrix[9]*matrix[9] + matrix[10]*matrix[10]);
-            if (op == ImGuizmo::ROTATE) {
-                // The scene format stores a single Z rotation (rot_y, radians).
-                if (sx > 1e-6f && sy > 1e-6f)
-                    gobj.rot_y = atan2f(matrix[1] / sy, matrix[0] / sx);
-            } else if (op == ImGuizmo::SCALE) {
+            float m_trans[3] = {0}, m_rot[3] = {0}, m_scale[3] = {1, 1, 1};
+            ImGuizmo::DecomposeMatrixToComponents(matrix, m_trans, m_rot, m_scale);
+            
+            gobj.pos_x = m_trans[0];
+            gobj.pos_y = m_trans[1];
+            gobj.pos_z = m_trans[2];
+
+            if (st.scene_transform_mode == 2 || st.gizmo_universal || (op & (ImGuizmo::ROTATE_Z | ImGuizmo::ROTATE_SCREEN | ImGuizmo::ROTATE_X | ImGuizmo::ROTATE_Y))) {
+                // Decomposed Z-rotation in degrees -> radians (Tag 6 in-plane rotation)
+                float z_rad = m_rot[2] * (3.14159265f / 180.0f);
+                while (z_rad > 3.14159265f)  z_rad -= 2.0f * 3.14159265f;
+                while (z_rad < -3.14159265f) z_rad += 2.0f * 3.14159265f;
+                gobj.rot_y = z_rad;
+
+                // If ModelComponent is present and rotated along Y, update model_y_rotation
+                if (gobj.has_model_y_rotation && (op & ImGuizmo::ROTATE_Y)) {
+                    float y_rad = m_rot[1] * (3.14159265f / 180.0f);
+                    while (y_rad > 3.14159265f)  y_rad -= 2.0f * 3.14159265f;
+                    while (y_rad < -3.14159265f) y_rad += 2.0f * 3.14159265f;
+                    gobj.model_y_rotation = y_rad;
+                }
+            }
+            if (st.scene_transform_mode == 3 || st.gizmo_universal || (op & (ImGuizmo::SCALE_X | ImGuizmo::SCALE_Y | ImGuizmo::SCALE_Z))) {
                 const float ts = std::fabsf(gobj.template_scaling) > 1e-6f ? gobj.template_scaling : 1.0f;
-                gobj.scale_x = std::clamp(sx / ts, 0.001f, 100.0f);
-                gobj.scale_y = std::clamp(sy / ts, 0.001f, 100.0f);
-                gobj.scale_z = std::clamp(sz / ts, 0.001f, 100.0f);
+                gobj.scale_x = std::clamp(m_scale[0] / ts, 0.001f, 100.0f);
+                gobj.scale_y = std::clamp(m_scale[1] / ts, 0.001f, 100.0f);
+                gobj.scale_z = std::clamp(m_scale[2] / ts, 0.001f, 100.0f);
             }
             // Mirror the delta to the rest of the selection.
             if (st.scene_selection.size() > 1) {
@@ -10599,7 +11419,7 @@ static void draw_scene_visualizer(ViewerState& st) {
             // M = inline 2D edit (2D-only, no legacy-3D fallback).
             if (st.selected_object >= 0 &&
                 st.selected_object < (int)st.scene.objects.size()) {
-                gm_begin_inline_edit(st);
+                request_begin_ground_mesh_edit(st);
             }
         }
         if (ImGui::IsKeyPressed(ImGuiKey_X)) st.transform_axis = (st.transform_axis == 0) ? -1 : 0;
@@ -11431,6 +12251,17 @@ static void draw_text_preview(ViewerState& st) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Edit this %s visually on the sketch canvas",
                               is_swdm ? ".swdm" : ".gmesh");
+    }
+
+    if (ext == ".scl" || (is_protobuf && st.text_protobuf_type == "scl")) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, g_theme.accent);
+        if (ImGui::Button(ICON_FA_CUBE " Open in SCL Mesh Studio")) {
+            enter_scl_studio(st, st.sel_path);
+        }
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Open this template library in the visual Ground Mesh Studio.");
     }
 
     // Style Selection combo box and Import button
@@ -12425,7 +13256,7 @@ static void draw_properties_panel(ViewerState& st) {
         ImGui::Separator();
         ImGui::TextColored(g_theme.accent, "Export Options");
         ImGui::BeginDisabled(st.blender_active);
-        if (ImGui::Button(ICON_FA_FLOPPY_DISK " Export to Blender", ImVec2(-1, 32))) {
+        if (ImGui::Button(ICON_FA_FLOPPY_DISK " Export to Blender", ImVec2(-1, 0))) {
             blender_start_roundtrip(st);
         }
         ImGui::EndDisabled();
@@ -12434,49 +13265,197 @@ static void draw_properties_panel(ViewerState& st) {
                 ? "A Blender round-trip is in progress."
                 : "Export the POD to Blender via GLB, edit it there, and save to round-trip back.");
         }
+
+        std::string sel_ext = "";
+        size_t dot_pos = st.sel_path.find_last_of('.');
+        if (dot_pos != std::string::npos) sel_ext = st.sel_path.substr(dot_pos);
+        std::string low_ext = sel_ext;
+        for (char& c : low_ext) c = (char)tolower((unsigned char)c);
+        bool is_convertible = (low_ext == ".glb" || low_ext == ".gltf" || low_ext == ".fbx" || low_ext == ".obj");
+
+        if (is_convertible) {
+            if (ImGui::Button(ICON_FA_CUBE " Convert to Game POD...", ImVec2(-1, 0))) {
+                st.show_convert_modal = true;
+                st.convert_status.clear();
+                ImGui::OpenPopup("Convert Model to Game Asset##modal");
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Open conversion settings to export this %s model to a Swordigo game .POD with custom scaling and textures.", low_ext.c_str());
+        }
+
         if (!st.blender_status.empty()) {
             ImGui::TextColored(st.blender_active ? ImVec4(0.9f, 0.8f, 0.3f, 1.0f)
                                                  : ImVec4(0.5f, 0.8f, 0.5f, 1.0f), "%s", st.blender_status.c_str());
         }
 
-        // ── FBX → game POD conversion (only meaningful for .fbx previews) ──
-        {
-            std::string sel_low = st.sel_path;
-            for (auto& c : sel_low) c = (char)tolower((unsigned char)c);
-            bool is_fbx = sel_low.size() >= 4 && sel_low.substr(sel_low.size() - 4) == ".fbx";
-            if (is_fbx) {
-                ImGui::Separator();
-                ImGui::TextColored(g_theme.accent, ICON_FA_GEAR "  Convert to Game");
-                ImGui::Checkbox("Flip V (FBX top → game bottom)", &st.convert_flip_v);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("The game samples POD UVs with v = 0 at the bottom; FBX/glTF UVs have v = 0 at the top, so this flips them to match.");
-                ImGui::Checkbox("Convert textures to game .pvr", &st.convert_tex_pgm);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Re-encodes referenced textures to the game's ETC1/PVR .v3 (.pvr) container next to the output POD.");
-                if (ImGui::Button(ICON_FA_ARROWS_ROTATE " Convert to POD", ImVec2(-1, 32))) {
-                    av::PodConvertOptions opts;
-                    opts.flip_v           = st.convert_flip_v;
-                    opts.convert_textures = st.convert_tex_pgm;
-                    opts.output_pvr       = true;
-                    std::string out = (fs::path(st.sel_path).parent_path() /
-                                      (fs::path(st.sel_path).stem().string() + ".POD")).string();
-                    std::vector<std::string> written;
-                    std::string conv_err;
-                    if (av::fbx_to_pod(st.sel_path, out, opts, &written, &conv_err)) {
-                        st.convert_status = "Wrote " + out;
-                        if (!written.empty())
-                            st.convert_status += "  (" + std::to_string(written.size()) + " textures)";
-                        st.status_msg = st.convert_status;
-                    } else {
-                        st.convert_status = "Failed: " + (conv_err.empty() ? std::string("unknown error") : conv_err);
-                        st.status_msg = st.convert_status;
+        if (st.show_convert_modal) {
+            ImGui::OpenPopup("Convert Model to Game Asset##modal");
+        }
+
+        if (ImGui::BeginPopupModal("Convert Model to Game Asset##modal", &st.show_convert_modal, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(g_theme.accent, ICON_FA_CUBE "  Convert Model to Game Asset");
+            ImGui::Separator();
+            
+            std::string stem = fs::path(st.sel_path).stem().string();
+            std::string pod_out_name = stem + ".POD";
+            
+            ImGui::Text("Source Model: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.4f, 0.85f, 0.4f, 1.0f), "%s", fs::path(st.sel_path).filename().string().c_str());
+            
+            ImGui::Text("Output File:  "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "%s", pod_out_name.c_str());
+            
+            float cur_h = st.model.max_y - st.model.min_y;
+            float cur_w = st.model.max_x - st.model.min_x;
+            float cur_d = st.model.max_z - st.model.min_z;
+            if (cur_h < 0.0001f && !st.model.meshes.empty()) {
+                float my0 = 1e30f, my1 = -1e30f, mx0 = 1e30f, mx1 = -1e30f, mz0 = 1e30f, mz1 = -1e30f;
+                for (const auto& m : st.model.meshes) {
+                    for (size_t i = 0; i + 2 < m.positions.size(); i += 3) {
+                        mx0 = std::min(mx0, m.positions[i]);   mx1 = std::max(mx1, m.positions[i]);
+                        my0 = std::min(my0, m.positions[i+1]); my1 = std::max(my1, m.positions[i+1]);
+                        mz0 = std::min(mz0, m.positions[i+2]); mz1 = std::max(mz1, m.positions[i+2]);
                     }
                 }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Convert the selected FBX into a game .POD (plus textures) next to the source file.");
-                if (!st.convert_status.empty())
-                    ImGui::TextWrapped("%s", st.convert_status.c_str());
+                cur_w = mx1 - mx0; cur_h = my1 - my0; cur_d = mz1 - mz0;
             }
+            ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.85f, 1.0f), "Source Dimensions: %.2f W  ×  %.2f H  ×  %.2f D units", cur_w, cur_h, cur_d);
+            
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextColored(g_theme.accent, "Scale & Geometry");
+            
+            ImGui::SetNextItemWidth(180.0f);
+            ImGui::DragFloat("Scale Multiplier", &st.convert_scale, 0.1f, 0.0001f, 10000.0f, "%.4fx");
+            
+            ImGui::TextDisabled("Quick Presets:");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("1.0x (Raw)")) st.convert_scale = 1.0f;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("3.28x (m -> ft)")) st.convert_scale = 3.28084f;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("80.0x (Sketchfab)")) st.convert_scale = 80.0f;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("100.0x (cm -> m)")) st.convert_scale = 100.0f;
+            
+            if (cur_h > 0.0001f) {
+                ImGui::TextDisabled("Auto-Fit to Swordigo In-Game Scales:");
+                // Reference heights measured from shipped resources/*.POD (see docs/formats_and_schemas/pod_fbx_gltf_interconversion_report.md):
+                //   hero (ash.POD) = 74.2u, knight = 61.4u, grasswalker = 49.8u  -> target ~70u for humanoids
+                //   dragonkin_statue.POD = 100.6u, house_door.POD = 103u          -> target ~100u for props/doors
+                //   fountain.POD = 247u, grass_tree1.POD = 459u, grove_gate = 149u -> larger decor
+                float s_hero   = 70.0f / cur_h;
+                float s_prop   = 100.0f / cur_h;
+                float s_decor  = 250.0f / cur_h;
+                float s_large  = 500.0f / cur_h;
+
+                char b1[48], b2[48], b3[48], b4[48];
+                snprintf(b1, sizeof(b1), "Hero/NPC ~70u (%.2fx)", s_hero);
+                snprintf(b2, sizeof(b2), "Prop/Door ~100u (%.2fx)", s_prop);
+                snprintf(b3, sizeof(b3), "Decor/Tree ~250u (%.2fx)", s_decor);
+                snprintf(b4, sizeof(b4), "Large/Boss ~500u (%.2fx)", s_large);
+
+                if (ImGui::SmallButton(b1)) st.convert_scale = s_hero;
+                ImGui::SameLine();
+                if (ImGui::SmallButton(b2)) st.convert_scale = s_prop;
+                ImGui::SameLine();
+                if (ImGui::SmallButton(b3)) st.convert_scale = s_decor;
+                ImGui::SameLine();
+                if (ImGui::SmallButton(b4)) st.convert_scale = s_large;
+            }
+            
+            float est_h = cur_h * st.convert_scale;
+            float est_w = cur_w * st.convert_scale;
+            float est_d = cur_d * st.convert_scale;
+            ImGui::TextColored(ImVec4(0.95f, 0.9f, 0.2f, 1.0f),
+                               "Resulting Game Bounds: %.1f W  x  %.1f H  x  %.1f D units",
+                               est_w, est_h, est_d);
+            ImGui::TextDisabled("(Reference: Hero=74u, Knight=61u, Statue=101u, Door=103u, Tree=459u | 1 unit ~ 1 inch)");
+            
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextColored(g_theme.accent, "Texture & Coordinates");
+            ImGui::Checkbox("Flip V UVs (glTF/FBX top-origin -> Game bottom-origin)", &st.convert_flip_v);
+            ImGui::Checkbox("Convert textures to game .pvr (ETC1 compressed)", &st.convert_tex_pgm);
+            
+            if (st.convert_tex_pgm) {
+                ImGui::Spacing();
+                ImGui::Text("PVR Texture Resolution:");
+                const char* res_labels[] = {
+                    "Original (Source Resolution - Default)",
+                    "512 x 512 (Standard)",
+                    "1024 x 1024 (HD)",
+                    "2048 x 2048 (Ultra HD)",
+                    "4096 x 4096 (4K Cinema)"
+                };
+                int res_values[] = { 0, 512, 1024, 2048, 4096 };
+                int current_idx = 0;
+                for (int i = 0; i < 5; ++i) {
+                    if (st.convert_pvr_res == res_values[i]) current_idx = i;
+                }
+                ImGui::SetNextItemWidth(260.0f);
+                if (ImGui::Combo("##PVRResCombo", &current_idx, res_labels, 5)) {
+                    st.convert_pvr_res = res_values[current_idx];
+                }
+                ImGui::SameLine();
+                if (st.convert_pvr_res == 0) {
+                    ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "[Default 1:1]");
+                } else {
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "[HD Mode]");
+                }
+            }
+            
+            ImGui::Spacing();
+            ImGui::Separator();
+            
+            if (ImGui::Button(ICON_FA_CHECK "  Convert Now", ImVec2(140, 0))) {
+                std::string pod_out = (fs::path(st.sel_path).parent_path() / pod_out_name).string();
+                av::PodConvertOptions opts;
+                opts.overwrite        = true;
+                opts.scale            = st.convert_scale;
+                opts.flip_v           = st.convert_flip_v;
+                opts.convert_textures = st.convert_tex_pgm;
+                opts.pvr_resolution   = st.convert_pvr_res;
+                opts.output_pvr       = true;
+                
+                std::vector<std::string> written_tex, written_clips;
+                std::string conv_err;
+                bool ok = false;
+                
+                if (low_ext == ".glb" || low_ext == ".gltf") {
+                    ok = av::glb_to_pod(st.sel_path, pod_out, opts, &written_tex, &written_clips, &conv_err);
+                } else {
+                    ok = av::fbx_to_pod(st.sel_path, pod_out, opts, &written_tex, &conv_err);
+                }
+                
+                if (ok) {
+                    st.status_msg = "Successfully converted " + fs::path(st.sel_path).filename().string() +
+                                    " -> " + pod_out_name + " (Scale " + std::to_string(opts.scale) + "x, " +
+                                    std::to_string(written_tex.size()) + " textures, " +
+                                    std::to_string(written_clips.size()) + " clips)";
+                    st.convert_status = st.status_msg;
+                    refresh_directory(st);
+                    apply_filters(st);
+                    st.show_convert_modal = false;
+                    ImGui::CloseCurrentPopup();
+                } else {
+                    st.status_msg = "Conversion failed: " + (conv_err.empty() ? "unknown error" : conv_err);
+                    st.convert_status = st.status_msg;
+                }
+            }
+            
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(90, 0))) {
+                st.show_convert_modal = false;
+                ImGui::CloseCurrentPopup();
+            }
+            
+            if (!st.convert_status.empty()) {
+                ImGui::Spacing();
+                ImGui::TextWrapped("%s", st.convert_status.c_str());
+            }
+            
+            ImGui::EndPopup();
         }
     } break;
 
@@ -12795,12 +13774,16 @@ static void draw_properties_panel(ViewerState& st) {
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Depth (world Z / parallax layer)");
 
-            if (ImGui::DragFloat("##rot", &obj.rot_y, 0.01f, -6.2832f, 6.2832f, "Rot: %.4f rad")) {
+            float rot_deg2 = obj.rot_y * 180.0f / 3.14159265f;
+            if (ImGui::DragFloat("##rot", &rot_deg2, 0.5f, -360.0f, 360.0f, "Rot: %.1f°")) {
+                obj.rot_y = rot_deg2 * (3.14159265f / 180.0f);
+                while (obj.rot_y > 3.14159265f)  obj.rot_y -= 2.0f * 3.14159265f;
+                while (obj.rot_y < -3.14159265f) obj.rot_y += 2.0f * 3.14159265f;
                 obj.rot_x = obj.rot_z = 0.0f;
                 av::scene_refresh(st.scene);
                 st.scene_dirty = true;
             }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Y-axis rotation (radians)");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("In-plane rotation (Tag 6, around depth/Z axis)\nRaw radians: %.4f", obj.rot_y);
 
             if (ImGui::DragFloat("##scale", &obj.scale_x, 0.01f, 0.001f, 100.f, "Scale: %.3f")) {
                 obj.scale_y = obj.scale_z = obj.scale_x;
@@ -12947,7 +13930,7 @@ static void draw_properties_panel(ViewerState& st) {
                                                         : ICON_FA_PEN " Edit in Viewport")) {
                         if (st.selected_object >= 0) {
                             switch_scene_tab(st, 1);
-                            gm_begin_inline_edit(st);   // pure 2D outline editing
+                            request_begin_ground_mesh_edit(st);   // pure 2D outline editing
                         }
                     }
                     ImGui::SameLine();
@@ -13045,7 +14028,7 @@ static void draw_properties_panel(ViewerState& st) {
                                 // geometry, so this opens the inline editor.
                                 if (st.selected_object >= 0) {
                                     switch_scene_tab(st, 1);
-                                    gm_begin_inline_edit(st);
+                                    request_begin_ground_mesh_edit(st);
                                 }
                             }
 
@@ -15860,10 +16843,13 @@ int main(int argc, char* argv[]) {
     if (mcp_http) return mcp::RunHttpServer(mcp_port, mcp_root);
     if (mcp_mode) return mcp::RunStdioServer(mcp_root);
 
-    // Headless FBX → POD converter (see tools/pod_convert.cpp).
+    // Headless FBX / GLB → POD converter (see tools/pod_convert.cpp).
     //   bin/ruby --fbx2pod <in.fbx> [out.pod] [--no-flip] [--no-textures] [--force]
+    //   bin/ruby --glb2pod <in.glb> [out.pod] [--no-flip] [--no-textures] [--force]
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--fbx2pod") == 0)
+        if (strcmp(argv[i], "--fbx2pod") == 0 ||
+            strcmp(argv[i], "--glb2pod") == 0 ||
+            strcmp(argv[i], "--gltf2pod") == 0)
             return av::pod_convert_cli(argc - (i + 1), argv + (i + 1));
     }
 
@@ -16518,6 +17504,7 @@ int main(int argc, char* argv[]) {
         draw_scene_creator_dialog(g_state);
         draw_procedural_generator(g_state);
         draw_settings_dialog(g_state);
+        draw_template_mesh_edit_modal(g_state);
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
